@@ -2,3 +2,4 @@ boot.bin
 os.iso
 obj/*.o
 .vscode
+iso
