@@ -37,7 +37,7 @@ obj/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf *.o *.bin os.iso iso obj
+	rm -rf *.o *.bin os.iso iso obj/*
 
 run: os.iso
 	qemu-system-x86_64 os.iso
