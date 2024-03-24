@@ -2,6 +2,7 @@
 #define idt_h
 
 #include "types.h"
+#include "utils.h"
 #define GDT_OFFSET_KERNEL_CODE 0x08
 
 typedef struct {
@@ -21,7 +22,7 @@ typedef struct {
 } __attribute__((packed)) idtr_t;
 
 __attribute__((noreturn))
-void exception_handler(int i);
+void exception_handler();
 static idtr_t idtr;
 __attribute__((aligned(0x10))) 
 static idt_entry_t idt[256]; // Create an array of IDT entries; aligned for performance

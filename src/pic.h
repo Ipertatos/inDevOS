@@ -1,6 +1,7 @@
 #pragma once 
 
 #include "types.h"
+#include "registers.h"
 
 #define PIC1 0x20
 #define PIC2 0xA0
@@ -32,6 +33,6 @@ void pic_remap(int offset1, int offset2);
 void pic_disable();
 
 void pic_send_eoi(uint8_t irq);
-static uint16_t __pic_get_irq_reg(int ocw3);
+uint16_t __pic_get_irq_reg(int ocw3);
 uint16_t pic_get_irr(void);
 uint16_t pic_get_isr(void);

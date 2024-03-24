@@ -1,6 +1,8 @@
 #pragma once 
 #include "types.h"
+#include "idt.h"
 #include "registers.h"
+#include "utils.h"
 
 void NMI_enable();
 

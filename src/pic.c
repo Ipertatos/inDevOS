@@ -46,7 +46,7 @@ void pic_send_eoi(uint8_t irq) {
     outb(PIC1_COMMAND, PIC_EOI);
 }
 
-static uint16_t __pic_get_irq_reg(int ocw3)
+uint16_t __pic_get_irq_reg(int ocw3)
 {
     /* OCW3 to PIC CMD to get the register values.  PIC2 is chained, and
      * represents IRQs 8-15.  PIC1 is IRQs 0-7, with 2 being the chain */

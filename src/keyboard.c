@@ -1,5 +1,7 @@
 #include "keyboard.h"
 
+bool capslock = false;
+
 int keyboard_init() {
     __asm__ volatile ("cli");
     int i;
@@ -35,7 +37,10 @@ void keyboard_handler(void) {
         // Key pressed
         switch (scancode) {
             case 0x1E:
-                print("A");
+                if(capslock)
+                    print("a");
+                else
+                    print("A");
                 break;
             case 0x30:
                 print("B");
@@ -150,6 +155,9 @@ void keyboard_handler(void) {
                 break;
             case 0x39:
                 print(" ");
+                break;
+            case 0x3A:
+                capslock = !capslock;
                 break;
             default:
                 print("?");
