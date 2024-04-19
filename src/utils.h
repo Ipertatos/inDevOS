@@ -16,4 +16,7 @@ extern void stack_dump();
 
 void dump_hex(char *stack);
 void dump_str(char *stack);
+
+void memset(void *dest, char val, uint32_t count);
+
 uint32_t get_total_memory();

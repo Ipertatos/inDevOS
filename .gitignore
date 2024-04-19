@@ -3,3 +3,5 @@ os.iso
 obj/*.o
 .vscode
 iso/
+src/idt.o
+src/kernel.o

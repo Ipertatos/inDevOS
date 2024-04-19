@@ -125,6 +125,12 @@ void dump_str(char *stack) {
     print("\n");
 }
 
+void memset(void *dest, char val, uint32_t count)
+{
+    char *temp = (char *)dest;
+    for( ; count != 0; count--) *temp++ = val;
+}
+
 //get RAM size of the system
 uint32_t get_total_memory() {
     uint32_t mem = 0;

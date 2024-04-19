@@ -1,11 +1,7 @@
-#ifndef keyboard_h
-#define keyboard_h
-
+#pragma once
 #include "types.h"
 #include "registers.h"
 #include "pic.h"
-
-int keyboard_init();
-void keyboard_handler();
-
-#endif
+#include "idt.h"
+void keyboard_init();
+void keyboard_handler(registers_t *regs);

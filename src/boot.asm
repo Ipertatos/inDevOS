@@ -45,6 +45,8 @@ start:
 	mov eax, 0x10
 	mov ds, ax
 	mov es, ax
+	mov fs, ax
+	mov gs, ax
 	mov ss, ax
 
 	mov rsp, Stack + 0xFFFFFFFF80000000
