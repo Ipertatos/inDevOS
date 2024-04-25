@@ -6,12 +6,19 @@
 #include "pic.h"
 #include "utils.h"
 #include "timer.h"
+
+void wait(uint64_t nops) {
+    uint64_t i =0;
+    while(i++ < nops*115) __asm__("nop");
+}
+
 void kmain() {
     printk("Kernel started\n");
     printk("Initializing Interrupts\n");
     
     initIDT();
-
+    //I HAVE NO FUCKING IDEA 
+    wait(100000);
     printk("IDT initialized\n");
     printk("Checking APIC\n");
 
@@ -37,7 +44,18 @@ void kmain() {
 
     //initialize keyboard
     printk("Initializing keyboard\n");
+
     keyboard_init();
+        wait(8000);
+
     initTimer();
+
+
+
+
+
+    while(1) {
+        __asm__("nop");
+    }
 
 }

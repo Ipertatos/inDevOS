@@ -46,6 +46,7 @@ void initIDT() {
     setIdtGate(30, (uint32_t)isr30, 0x08, 0x8E);
     setIdtGate(31, (uint32_t)isr31, 0x08, 0x8E);
 
+    //IRQs
     setIdtGate(32, (uint32_t)irq0, 0x08, 0x8E);
     setIdtGate(33, (uint32_t)irq1, 0x08, 0x8E);
     setIdtGate(34, (uint32_t)irq2, 0x08, 0x8E);
@@ -141,6 +142,8 @@ void irq_uninstall_handler(int irq) {
 }
 
 void irq_handler(registers_t* r) {
+    outb(0x20, 0x20);
+
     void (*handler)(registers_t *r);
     handler = irq_routines[r->int_no - 32];
     if(handler) {
@@ -151,5 +154,4 @@ void irq_handler(registers_t* r) {
         outb(0xA0, 0x20);
     }
 
-    outb(0x20, 0x20);
 }

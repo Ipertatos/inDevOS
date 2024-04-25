@@ -1,5 +1,9 @@
 # Variables
-CC = gcc
+
+#use local cross compiler
+CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
+
+#CC = gcc
 LD = ld
 AS = nasm
 
@@ -44,6 +48,6 @@ run: os.iso
 	qemu-system-x86_64 os.iso
 
 debug: os.iso
-	qemu-system-x86_64 -s -S os.iso
+	qemu-system-x86_64 -s -S os.iso -d int -M smm=off
 
 .PHONY: all clean

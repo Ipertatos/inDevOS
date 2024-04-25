@@ -159,7 +159,8 @@ isr_common_stub:
     pop r14
     pop r15
     add rsp, 16
-    iret
+    sti
+    iretq
 
 
 extern irq_handler
@@ -183,11 +184,10 @@ irq_common_stub:
     mov rdi, rsp
     cld
     call irq_handler
-
+    add rsp, 8 ; pop the error code
     pop rdi
     pop rsi
     pop rbp
-    add rsp, 8
     pop rbx
     pop rdx
     pop rcx
@@ -201,4 +201,5 @@ irq_common_stub:
     pop r14
     pop r15
     add rsp, 16
-    iret
+    sti
+    iretq

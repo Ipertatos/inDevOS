@@ -99,6 +99,20 @@ char* int2hex(uint32_t value) {
     return &buf[i+1];
 }
 
+uint32_t strlen(const char* str) {
+    uint32_t len = 0;
+    while(str[len] != '\0') len++;
+    return len;
+}
+
+bool strEql(const char* str1, const char* str2) {
+    if(strlen(str1) != strlen(str2)) return false;
+    for(int i = 0; i < strlen(str1); i++) {
+        if(str1[i] != str2[i]) return false;
+    }
+    return true;
+}
+
 void dump_hex(char *stack) {
             int x = 0;
     for (int i = 0; i < 64; i++) {
@@ -140,4 +154,20 @@ uint32_t get_total_memory() {
         mem_ptr++;
     }
     return mem;
+}
+
+void call(char* buffer, uint32_t buff_len)
+{
+
+    if(strEql(buffer, "ping"))
+    {
+        print("pong\n");
+    }
+    else if (strEql(buffer, "clear")) {
+        print("\v");
+    }
+    if(!strEql(buffer,""))
+        print("supreme@IpertatOS:~$ ");
+    else
+        print("\n");
 }

@@ -2,6 +2,11 @@
 
 bool capsOn, capsLock;
 
+
+char buffer[256];
+uint32_t buff_len = 0;
+bool tobuffer = true;
+
 const uint32_t UNKNOWN = 0xFFFFFFFF,
                ESC = 0xFFFFFFFF - 1,
                CTRL = 0xFFFFFFFF - 2,
@@ -62,8 +67,11 @@ UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN
 void keyboard_init(){
     capsOn = false;
     capsLock = false;
+    //init buffer
+    memset(&buffer,'\0',sizeof(char)*256);
     irq_install_handler(1, &keyboard_handler);
 }
+
 
 void keyboard_handler(registers_t *regs)
 {
@@ -73,6 +81,14 @@ void keyboard_handler(registers_t *regs)
     switch (scancode)
     {
     case 1:
+    case 8:
+        buffer[buff_len--] = '\0';
+        printch('\b');
+    case 28:
+        call(buffer, buff_len);
+        memset(&buffer,'\0',sizeof(char)*256);
+        buff_len = 0;
+        break;
     case 29:
     case 56:
     case 59:
@@ -104,11 +120,14 @@ void keyboard_handler(registers_t *regs)
         
         break;
     default:
+        // if (press == 0) print(capsOn || capsLock ? (char)uppercase[scancode] : (char)lowercase[scancode]); 
         if(press==0)
             if(capsOn || capsLock){
-                print(uppercase[scancode]);
+                printch((char)uppercase[scancode]);
+                buffer[buff_len++] = (char)uppercase[scancode];
             }else{
-                print(lowercase[scancode]);
+                printch((char)lowercase[scancode]);
+                buffer[buff_len++] = (char)lowercase[scancode];
             }
     }
 }
