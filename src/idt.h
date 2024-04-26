@@ -20,7 +20,7 @@ typedef struct {
 
 typedef struct {
 	uint16_t	limit;
-	uint32_t	base;
+	uint64_t	base;
 } __attribute__((packed)) idtr_t;
 
 void initIDT();

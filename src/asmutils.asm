@@ -1,3 +1,4 @@
+[BITS 64]
 global stack_dump
 stack_dump:
     push rdi

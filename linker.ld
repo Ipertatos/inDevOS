@@ -18,6 +18,8 @@ SECTIONS
 		. += 0x8000;
 		Stack = .;
 	}
-	.text	: { *(.text) }
-	.data	: { *(.data) }
+	.text	: { *(.text .text.*) }
+	.data	: { *(.data .data.*) }
+	.rodata : { *(.rodata .rodata.*) }
+	.bss	: { *(.bss .bss.*) }
 }

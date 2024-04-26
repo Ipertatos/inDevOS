@@ -1,4 +1,4 @@
-
+[BITS 64]
 %macro ISR_NOERRCODE 1
 global isr%1
 isr%1:
@@ -12,7 +12,6 @@ isr%1:
 global isr%1
 isr%1:
     cli
-    push %1
     push %1
     jmp isr_common_stub
 %endmacro
