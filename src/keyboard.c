@@ -83,7 +83,9 @@ void keyboard_handler(registers_t *regs)
     case 1:
     case 8:
         buffer[buff_len--] = '\0';
-        printch('\b');
+        if(buff_len < 0) buff_len = 0;
+        else
+            printch('\b');
     case 28:
         call(buffer, buff_len);
         memset(&buffer,'\0',sizeof(char)*256);

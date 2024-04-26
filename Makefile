@@ -7,7 +7,7 @@ CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
 LD = ld
 AS = nasm
 
-CFLAGS = -g -m64 -ffreestanding -fno-pie
+CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only
  #-Wall -Wextra
 LDFLAGS = -T linker.ld -melf_x86_64
 ASFLAGS = -g -F dwarf -f elf64

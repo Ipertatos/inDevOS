@@ -2,7 +2,7 @@ OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(start)
 SECTIONS
 {
-	. = 0x001000;
+	. = 0x00110000;
 	.boot :
 	{
 		*(.mbhdr)

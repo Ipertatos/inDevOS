@@ -30,8 +30,8 @@ void pic_remap(int offset1, int offset2) {
     outb(PIC2_DATA, ICW4_8086);
    // io_wait();
 
-    outb(PIC1_DATA, 0x0);   // restore saved masks.
-    outb(PIC2_DATA, 0x0);
+    outb(PIC1_DATA, a1);   // restore saved masks.
+    outb(PIC2_DATA, a2);
 }
 
 void pic_disable() {

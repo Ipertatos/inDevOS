@@ -133,7 +133,6 @@ isr_common_stub:
     push rcx
     push rdx
     push rbx
-    push rsp
     push rbp
     push rsi
     push rdi
@@ -144,7 +143,6 @@ isr_common_stub:
     pop rdi
     pop rsi
     pop rbp
-    add rsp, 8
     pop rbx
     pop rdx
     pop rcx
@@ -158,7 +156,6 @@ isr_common_stub:
     pop r14
     pop r15
     add rsp, 16
-    sti
     iretq
 
 
@@ -176,14 +173,12 @@ irq_common_stub:
     push rcx
     push rdx
     push rbx
-    push rsp
     push rbp
     push rsi
     push rdi
     mov rdi, rsp
     cld
     call irq_handler
-    add rsp, 8 ; pop the error code
     pop rdi
     pop rsi
     pop rbp
@@ -200,5 +195,4 @@ irq_common_stub:
     pop r14
     pop r15
     add rsp, 16
-    sti
     iretq

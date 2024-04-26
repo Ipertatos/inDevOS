@@ -50,10 +50,6 @@ void kmain() {
 
     initTimer();
 
-
-
-
-
     while(1) {
         __asm__("nop");
     }
