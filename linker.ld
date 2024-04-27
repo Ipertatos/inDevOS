@@ -5,6 +5,8 @@ SECTIONS
 	. = 0x00110000;
 	.boot :
 	{
+		. = ALIGN(8);
+		KEEP(*(.multiboot))
 		*(.mbhdr)
 		_loadStart = .;
 		*(.boot)

@@ -22,6 +22,4 @@ void dump_str(char *stack);
 
 void memset(void *dest, char val, uint32_t count);
 
-uint32_t get_total_memory();
-
 void call(char* buffer, uint32_t buff_len);

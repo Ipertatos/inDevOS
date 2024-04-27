@@ -145,17 +145,6 @@ void memset(void *dest, char val, uint32_t count)
     for( ; count != 0; count--) *temp++ = val;
 }
 
-//get RAM size of the system
-uint32_t get_total_memory() {
-    uint32_t mem = 0;
-    uint32_t* mem_ptr = (uint32_t*)0x8000;
-    while(*mem_ptr != 0) {
-        mem += *mem_ptr;
-        mem_ptr++;
-    }
-    return mem;
-}
-
 void call(char* buffer, uint32_t buff_len)
 {
 
