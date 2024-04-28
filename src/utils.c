@@ -1,16 +1,23 @@
 #include "utils.h"
 
+struct limine_framebuffer *fb;
+
+void initFB(){
+    fb = fb_rq.response->framebuffers[0];
+}
+
 void print(const char* str){
     static unsigned char x = 0, y = 0;
     unsigned short attrib = 0x07;
     volatile unsigned short* vidmem;
+    uint32_t *fb_ptr = fb->address; 
 
     for(int i = 0; str[i] != '\0'; i++) {
-        vidmem = (volatile unsigned short*)0xb8000 + (y * 80 + x);
+        vidmem = fb_ptr + (y * 80 + x);
         switch (str[i])
         {
             case '\b':
-                vidmem = (volatile unsigned short*)0xb8000 + (y * 80 + x);
+                vidmem = fb_ptr + (y * 80 + x);
                 *vidmem = ' ' | (attrib << 8);
                 vidmem--;
                 *vidmem = '_' | (attrib << 8);
@@ -24,7 +31,7 @@ void print(const char* str){
             case '\v':
                 for(y=0; y<25; y++) {
                     for(x=0; x<80; x++) {
-                        vidmem = (volatile unsigned short*)0xb8000 + (y * 80 + x);
+                        vidmem = fb_ptr + (y * 80 + x);
                         *vidmem = 0x00;
                     }
                 }
@@ -47,7 +54,7 @@ void print(const char* str){
 			for (y = 1; y < 25; y++) {	
 				for (x = 0; x < 80; x++) {
 					
-					vidmem = (volatile unsigned short*)0xb8000 + (80*y+x);
+					vidmem = fb_ptr + (80*y+x);
 					scroll_temp = *vidmem;
 						
 					vidmem -= 80;
@@ -55,7 +62,7 @@ void print(const char* str){
 					
 					if (y == 24) {
 						
-						vidmem = (volatile unsigned short*)0xb8000 + (1920+x);
+						vidmem = fb_ptr + (1920+x);
 						*vidmem = ' ' | (attrib << 8);
 					}
 				}
@@ -139,10 +146,52 @@ void dump_str(char *stack) {
     print("\n");
 }
 
-void memset(void *dest, char val, uint32_t count)
+void *memset(void *dest, int val, uint32_t count)
 {
-    char *temp = (char *)dest;
-    for( ; count != 0; count--) *temp++ = val;
+    uint8_t *p = (uint8_t *)dest;
+    for(uint32_t i = 0; i < count; i++)
+        p[i] = (uint8_t)val;
+
+    return dest;
+}
+
+void *memcpy(void *dest, const void *src, uint32_t count)
+{
+    uint8_t *pdest = (uint8_t *)dest;
+    const uint8_t *psrc = (const uint8_t *)src;
+    for(uint32_t i = 0; i < count; i++)
+        pdest[i] = psrc[i];
+    
+    return dest;
+}
+
+void *memmove(void *dest, const void *src, uint32_t count)
+{
+    uint8_t *pdest = (uint8_t *)dest;
+    const uint8_t *psrc = (const uint8_t *)src;
+    if(pdest < psrc)
+    {
+        for(uint32_t i = 0; i < count; i++)
+            pdest[i] = psrc[i];
+    }
+    else
+    {
+        for(uint32_t i = count; i != 0; i--)
+            pdest[i-1] = psrc[i-1];
+    }
+    return dest;
+}
+
+int memcmp(const void *a, const void *b, uint32_t count)
+{
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for(uint32_t i = 0; i < count; i++)
+    {
+        if(pa[i] != pb[i])
+            return pa[i] < pb[i] ? -1 : 1;
+    }
+    return 0;
 }
 
 void call(char* buffer, uint32_t buff_len)

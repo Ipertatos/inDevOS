@@ -6,13 +6,31 @@
 #include "pic.h"
 #include "utils.h"
 #include "timer.h"
+#include "limine.h"
 
+static volatile LIMINE_BASE_REVISION(1);
 
-void kmain() {
-    printk("Kernel started\n");
+void kmain(void) {
+    //printk("Kernel started\n");
+
+    if(LIMINE_BASE_REVISION_SUPPORTED == false) {
+        //printk("Limine revision not supported\n");
+        return;
+    }
+
+    //printk("Limine revision supported\n");
+
+    if(fb_rq.response == NULL
+    || fb_rq.response->framebuffer_count < 1){
+        //printk("No framebuffer found\n");
+        return;
+    }
+
+    initFB();
+
     printk("Initializing Interrupts\n");
     
-    initIDT();
+  /*  initIDT();
 
     printk("IDT initialized\n");
     printk("Checking APIC\n");
@@ -48,6 +66,6 @@ void kmain() {
 
     while(1) {
         __asm__("nop");
-    }
+    }*/
 
 }

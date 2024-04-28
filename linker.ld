@@ -1,27 +1,44 @@
 OUTPUT_FORMAT(elf64-x86-64)
-ENTRY(start)
+ENTRY(kmain)
+
+PHDRS
+{
+	text	PT_LOAD		FLAGS((1 << 0) | (1 << 2)) ;	/*EXEC + READ	*/
+	rodata	PT_LOAD		FLAGS((1 << 2)) ; 				/*READ ONLY		*/
+	data	PT_LOAD		FLAGS((1 << 1) | (1 << 2)) ;	/*WRITE + READ	*/
+	dynamic	PT_DYNAMIC	FLAGS((1 << 1) | (1 << 2)) ;	/* DYNAMIC PHDR */
+}
 SECTIONS
 {
-	. = 0x00110000;
-	.boot :
-	{
-		. = ALIGN(8);
-		KEEP(*(.multiboot))
-		*(.mbhdr)
-		_loadStart = .;
-		*(.boot)
-		. = ALIGN(4096);
-		Pml4 = .;
-		. += 0x1000;
-		Pdpt = .;
-		. += 0x1000;
-		Pd = .;
-		. += 0x1000;
-		. += 0x8000;
-		Stack = .;
+	. = 0xffffffff80000000;
+
+	.text : {
+		*(.text .text.*)
+	} :text
+
+	. += CONSTANT(MAXPAGESIZE);
+
+	.rodata : {
+        *(.rodata .rodata.*)
+    } :rodata
+
+	. += CONSTANT(MAXPAGESIZE);
+ 
+    .data : {
+        *(.data .data.*)
+    } :data
+
+    .dynamic : {
+        *(.dynamic)
+    } :data :dynamic
+
+    .bss : {
+        *(.bss .bss.*)
+        *(COMMON)
+    } :data
+
+    /DISCARD/ : {
+        *(.eh_frame)
+        *(.note .note.*)
 	}
-	.text	: { *(.text .text.*) }
-	.data	: { *(.data .data.*) }
-	.rodata : { *(.rodata .rodata.*) }
-	.bss	: { *(.bss .bss.*) }
 }

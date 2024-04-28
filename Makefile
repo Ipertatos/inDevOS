@@ -7,7 +7,7 @@ CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
 LD = ld
 AS = nasm
 
-CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only
+CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel
  #-Wall -Wextra
 LDFLAGS = -T linker.ld -melf_x86_64
 ASFLAGS = -g -F dwarf -f elf64
@@ -25,10 +25,18 @@ OBJ = $(patsubst src/%.c, obj/%.o, $(C_SOURCES)) $(patsubst src/%.asm, obj/%.o, 
 all: os.iso
 
 os.iso: boot.bin
-	mkdir -p iso/boot/grub
+	mkdir -p iso/boot/limine
 	cp boot.bin iso/boot/
-	cp grub.cfg iso/boot/grub/
-	grub-mkrescue -o os.iso iso
+	cp limine.cfg limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso/boot/limine/
+	mkdir -p iso/EFI/BOOT
+	cp -v limine/BOOTX64.EFI iso/EFI/BOOT/
+	cp -v limine/BOOTIA32.EFI iso/EFI/BOOT/
+	xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        --efi-boot boot/limine/limine-uefi-cd.bin \
+        -efi-boot-part --efi-boot-image --protective-msdos-label \
+        iso -o os.iso
+		limine/limine bios-install os.iso
 
 
 boot.bin: $(OBJ)
