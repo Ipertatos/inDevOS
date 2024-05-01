@@ -4,7 +4,7 @@
 #include "utils.h"
 #include "pic.h"
 
-#define GDT_OFFSET_KERNEL_CODE 0x08
+#define GDT_OFFSET_KERNEL_CODE 0x28
 
 
 typedef struct {
@@ -23,8 +23,8 @@ typedef struct {
 	uint64_t	base;
 } __attribute__((packed)) idtr_t;
 
-void initIDT();
-void setIdtGate(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags);
+void initIDT(void);
+void setIdtGate(uint8_t num, void* base, uint8_t flags);
 
 void isr_handler(registers_t* r);
 void irq_install_handler(int irq, void (*handler)(registers_t *r));

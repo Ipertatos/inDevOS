@@ -6,9 +6,10 @@
 #include "pic.h"
 #include "utils.h"
 #include "timer.h"
-#include "limine.h"
+#include "gdt.h"
 
 static volatile LIMINE_BASE_REVISION(1);
+
 
 void kmain(void) {
     //printk("Kernel started\n");
@@ -18,45 +19,50 @@ void kmain(void) {
         return;
     }
 
+    gdt_init();
+    initIDT();
+    
+    pic_remap(0x20, 0x28);
+
+
     //printk("Limine revision supported\n");
-
-    if(fb_rq.response == NULL
-    || fb_rq.response->framebuffer_count < 1){
-        //printk("No framebuffer found\n");
-        return;
-    }
-
     initFB();
 
-    printk("Initializing Interrupts\n");
+    //printk("Initializing Interrupts\n");
     
-  /*  initIDT();
 
-    printk("IDT initialized\n");
-    printk("Checking APIC\n");
-
-    if(check_apic()) printk("APIC found\n"); 
-    else             printk("APIC not found\n");
+    //printk("IDT initialized\n");
+    //printk("Checking APIC\n");
 
 
+    if(check_apic()) {
+        //green window
+        fillrect(0x00ff00,0,0,32,32);
+    } else {
+        fillrect(0xff0000,0,0,32,32);
+    }
+    //if(check_apic()) printk("APIC found\n"); 
+    //else             printk("APIC not found\n");
 
-    printk("Enabling APIC\n");
+
+
+    //printk("Enabling APIC\n");
     enable_apic();
-    printk("APIC enabled\n");
+    //printk("APIC enabled\n");
 
 
 
-    printk("APIC Base: ");
-    print("0x");
-    print(int2hex(cpu_get_apic_base()));
-    print("\n");
+    //printk("APIC Base: ");
+    //print("0x");
+    //print(int2hex(cpu_get_apic_base()));
+    //print("\n");
 
-    printk("Total memory: ");
+    //printk("Total memory: ");
     //print(int2string(get_ram_size()));
-    print(" \n");
+    //print(" \n");
 
     //initialize keyboard
-    printk("Initializing keyboard\n");
+    //printk("Initializing keyboard\n");
 
     keyboard_init();
 
@@ -66,6 +72,6 @@ void kmain(void) {
 
     while(1) {
         __asm__("nop");
-    }*/
+    }
 
 }

@@ -1,13 +1,13 @@
 # Variables
 
 #use local cross compiler
-CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
+#CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
 
-#CC = gcc
+CC = gcc
 LD = ld
 AS = nasm
 
-CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel
+CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel -fcommon
  #-Wall -Wextra
 LDFLAGS = -T linker.ld -melf_x86_64
 ASFLAGS = -g -F dwarf -f elf64

@@ -5,6 +5,7 @@ const uint32_t freq = 100;
 
 void onIrq0(registers_t *r) {
     ticks += 1;
+    putpixel(ticks, 100, 0xFFFFFF);
 }
 
 void initTimer(){
