@@ -1,5 +1,5 @@
 #include "keyboard.h"
-
+#include "apic.h"
 bool capsOn, capsLock;
 
 
@@ -69,67 +69,70 @@ void keyboard_init(){
     capsLock = false;
     //init buffer
     memset(&buffer,'\0',sizeof(char)*256);
-    irq_install_handler(1, &keyboard_handler);
+    outb(0x64, 0xAD);
+    outb(0x64, 0xA7);
+
+    uint16_t j =1;
+    while (j != 0)
+    {
+        inb(0x60);
+        j = (inb(0x64) >>1) &1;
+    }
+
+
+    //test ps2 controller 
+    outb(0x64, 0xAA);
+    uint16_t data = inb(0x60);
+    if(data == 0x55)
+        fillrect(0x00ff00,32,0,32,32);
+    else if (data == 0xFC)
+        fillrect(0xff0000,32,0,32,32);
+    else
+        fillrect(0x0000ff,32,0,32,32);
+
+    while (j!=0){
+        inb(0x60);
+        j = (inb(0x64) >>1) &1;
+    }
+
+    outb(0x64, 0xAE);
+    
 }
 
-
-void keyboard_handler(registers_t *regs)
-{
-    char scancode = inb(0x60)&0x7F; //read the scan code
-    char press = inb(0x60)&0x80; //read the press/release bit
-
-    switch (scancode)
-    {
-    case 1:
-    case 8:
-        buffer[buff_len--] = '\0';
-        if(buff_len < 0) buff_len = 0;
-        else
-            printch('\b');
-    case 28:
-        call(buffer, buff_len);
-        memset(&buffer,'\0',sizeof(char)*256);
-        buff_len = 0;
-        break;
-    case 29:
-    case 56:
-    case 59:
-    case 61:
-    case 62:
-    case 63:
-    case 64:
-    case 65:
-    case 66:
-    case 67:
-    case 68:
-    case 87:
-    case 88:
-        break;
-    case 42:
-        //shift 
-        if(press==0)
-            capsOn = true;
-        else
-            capsOn = false;
-
-        break;
-    case 58:
-        //caps lock
-        if(!capsLock && press==0)
-            capsLock = true;
-        else if(capsLock && press==0)
-            capsLock = false;
-        
-        break;
-    default:
-        // if (press == 0) print(capsOn || capsLock ? (char)uppercase[scancode] : (char)lowercase[scancode]); 
-        if(press==0)
-            if(capsOn || capsLock){
-                printch((char)uppercase[scancode]);
-                buffer[buff_len++] = (char)uppercase[scancode];
-            }else{
-                printch((char)lowercase[scancode]);
-                buffer[buff_len++] = (char)lowercase[scancode];
-            }
+char ps2_translate2ascii(uint16_t scancode){
+    if(scancode > 0x58)
+        return 0;
+    
+    if(scancode == 0x2A || scancode == 0x36){
+        capsOn = !capsOn;
+        return 0;
     }
+
+    if(scancode == 0x3A){
+        capsLock = !capsLock;
+        return 0;
+    }
+
+    if(lowercase[scancode] == UNKNOWN)
+        return 0;
+    
+    if(capsOn && !capsLock)
+        return uppercase[scancode];
+    else if(capsLock && !capsOn)
+        return uppercase[scancode];
+    else
+        return lowercase[scancode];
+
+}
+
+void keyboard_handler(){
+    uint16_t scancode = inb(0x60);
+    
+    char ch = ps2_translate2ascii(scancode);
+    if(ch == 0){
+        apic_eoi();
+        return;
+    }
+    printch(ch);
+    apic_eoi();
 }

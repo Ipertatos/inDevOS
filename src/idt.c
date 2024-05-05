@@ -62,7 +62,7 @@ char* exception_messages[] = {
     "Segment not present",
     "Stack fault",
     "General protection fault",
-    "Page fault",
+    "Page fault",   
     "Unknown Interrupt",
     "Coprocessor Fault",
     "Alignment Fault",

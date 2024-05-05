@@ -1,43 +1,50 @@
 #include "gdt.h"
 #include "utils.h"
-gdt_t gdt = {
-    {0, 0, 0, 0, 0, 0}, // null
-    {0xffff, 0, 0, 0x9a, 0x80, 0}, // 16-bit code
-    {0xffff, 0, 0, 0x92, 0x80, 0}, // 16-bit data
-    {0xffff, 0, 0, 0x9a, 0xcf, 0}, // 32-bit code
-    {0xffff, 0, 0, 0x92, 0xcf, 0}, // 32-bit data
-    {0, 0, 0, 0x9a, 0xa2, 0}, // 64-bit code
-    {0, 0, 0, 0x92, 0xa0, 0}, // 64-bit data
-    {0, 0, 0, 0xF2, 0, 0}, // user data
-    {0, 0, 0, 0xFA, 0x20, 0}, // user code
-    {0x68, 0, 0, 0x89, 0x20, 0, 0, 0} // tss
-};
+
+#define GDTSEGMENTS 7 // 6 + 1 - TSS takes up 2
+
+static gdt_entry_t gdt[GDTSEGMENTS];
 
 gdt_pointer_t gdt_pointer;
 tss_t tss;
 
+void gdt_set_entry(int num, uint64_t base, uint64_t limit, uint8_t access, uint8_t granularity){
+    gdt[num].base_low = (base & 0xFFFF);
+    gdt[num].base_middle = (base >> 16) & 0xFF;
+    gdt[num].base_high = (base >> 24) & 0xFF;
+
+    gdt[num].limit_low = (limit & 0xFFFF);
+    gdt[num].granularity = ((limit >> 16) & 0x0F);
+
+    gdt[num].granularity |= (granularity & 0xF) << 4;
+    gdt[num].access = access;
+}
+
 void gdt_init(){
-    tss_init();
-    gdt_pointer.size = sizeof(gdt_t) -1;
+    gdt_pointer.size = (sizeof(gdt_pointer) * GDTSEGMENTS) - 1;
     gdt_pointer.offset = (uint64_t)&gdt;
 
-    gdt_flush(&gdt_pointer);
-    tss_flush();
-}
+    memset(&tss , 0 , sizeof(tss));
 
-void tss_init(){
-    memset(&tss, 0, sizeof(tss_t));
-    tss.rsp[0] = 0x10;
-    tss.ist[1] = 0x10;
+    //entry 0 null
+    gdt_set_entry(0,0,0,0,0);
 
-    tss.iopb_offset = sizeof(tss);
-    gdt.tss.base_low16 = (uint64_t)&tss & 0xFFFF;
-    gdt.tss.base_mid8 = ((uint64_t)&tss >> 16) & 0xFF;
-    gdt.tss.base_high8 = ((uint64_t)&tss >> 24) & 0xFF;
-    gdt.tss.base_upper32 = (uint64_t)&tss >> 32;
+    //entry 1 kmode code seg
+    gdt_set_entry(1,0,0xFFFF, 0x9A, 0xA);
 
-}
+    //entry 2 kmode data seg
+    gdt_set_entry(2,0,0xFFFF, 0x92, 0xA);
 
-void tss_set_stack(uint64_t stack){
-    tss.rsp[0] = stack;
+    //entry 3 umode code seg
+    gdt_set_entry(3,0,0xFFFF, 0xFA, 0xA);
+
+    //entry 4 umode data seg
+    gdt_set_entry(4,0,0xFFFF,0xF2,0xA);
+
+    //entry 5 TSS
+    gdt_set_entry(5,(uint64_t)&tss,sizeof(tss),0x89,0x0);
+
+    s_setgdt(gdt_pointer.size, gdt_pointer.offset);
+
+    s_settss();
 }

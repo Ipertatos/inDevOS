@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "registers.h"
 
 typedef struct __attribute__((packed)) {
     uint16_t size;
@@ -17,43 +18,27 @@ typedef struct __attribute__((packed)) {
 } gdt_entry_t;  
 
 
-typedef struct __attribute__((packed)) {
-    uint16_t length;
-    uint16_t base_low16;
-    uint8_t base_mid8;
-    uint8_t flags0;
-    uint8_t flags1;
-    uint8_t base_high8;
-    uint32_t base_upper32;
-    uint32_t reserved;
-} tss_entry_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t reserved0;
-    uint64_t rsp[3];
-    uint64_t reserved1;
-    uint64_t ist[7];
-    uint32_t reserved2;
-    uint32_t reserved3;
+typedef struct {
+    uint32_t reseved1;
+    uint64_t rsp0;
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved2;
+    uint64_t ist1;
+    uint64_t ist2;
+    uint64_t ist3;
+    uint64_t ist4;
+    uint64_t ist5;
+    uint64_t ist6;
+    uint64_t ist7;
+    uint64_t reserved3;
     uint16_t reserved4;
-    uint16_t iopb_offset;
-} tss_t;
-
-typedef struct __attribute__((packed)) {
-    gdt_entry_t null;
-    gdt_entry_t _16bit_code;
-    gdt_entry_t _16bit_data;
-    gdt_entry_t _32bit_code;
-    gdt_entry_t _32bit_data;
-    gdt_entry_t _64bit_code;
-    gdt_entry_t _64bit_data;
-    gdt_entry_t user_data;
-    gdt_entry_t user_code;
-    tss_entry_t tss;
-} gdt_t;
+    uint16_t iopb;
+} __attribute__((packed)) tss_t;
 
 void gdt_init(void);
-void tss_init(void);
-void tss_set_stack(uint64_t stack);
-extern void gdt_flush(gdt_pointer_t *);
-extern void tss_flush(void);
+void gdt_set_entry(int num, uint64_t base, uint64_t limit,uint8_t access, uint8_t granularity);
+
+extern void s_setgdt(uint32_t limit, uint64_t base);
+extern void s_flushgdt(void);
+extern void s_settss(void);

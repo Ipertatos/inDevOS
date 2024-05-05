@@ -7,6 +7,10 @@
 #include "utils.h"
 #include "timer.h"
 #include "gdt.h"
+#include "acpi.h"
+
+#include "pmm.h"
+#include "vmm.h"
 
 static volatile LIMINE_BASE_REVISION(1);
 
@@ -22,8 +26,6 @@ void kmain(void) {
     gdt_init();
     initIDT();
     
-    pic_remap(0x20, 0x28);
-
 
     //printk("Limine revision supported\n");
     initFB();
@@ -34,20 +36,19 @@ void kmain(void) {
     //printk("IDT initialized\n");
     //printk("Checking APIC\n");
 
-
-    if(check_apic()) {
-        //green window
-        fillrect(0x00ff00,0,0,32,32);
-    } else {
-        fillrect(0xff0000,0,0,32,32);
-    }
+    fillrect(0x0000ff,0,0,32*3,32);
+    pmm_init();
+    fillrect(0x00ff00,0,32,32,32);
+    init_acpi();
+    fillrect(0x00ff00,32,32,32,32);
+    vmm_init();
+    fillrect(0x00ff00,64,32,32,32);
     //if(check_apic()) printk("APIC found\n"); 
     //else             printk("APIC not found\n");
 
 
 
     //printk("Enabling APIC\n");
-    enable_apic();
     //printk("APIC enabled\n");
 
 

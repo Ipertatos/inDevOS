@@ -1,22 +1,27 @@
-[bits 64]
+default rel
 
-global gdt_flush
-gdt_flush:
-    lgdt [rdi]
-    mov ax, 0x30
-    mov ds,ax
-    mov es,ax
-    mov fs,ax
-    mov gs,ax
-    mov ss,ax
-    pop rdi
-    mov rax, 0x28
-    push rax    
-    push rdi
+[GLOBAL s_setgdt]
+[GLOBAL s_flushgdt]
+[GLOBAL s_settss]
+
+extern gdt_pointer
+
+s_setgdt:
+    mov [gdt_pointer], di
+    mov [gdt_pointer+2], rsi
+    lgdt [gdt_pointer]
+    mov rax, 0x10 ;kdata offset
+    mov ds, rax
+    mov es, rax
+    mov gs, rax
+    mov fs, rax
+    mov ss, rax
+    pop rax
+    push 0x08   ;kcode offset
+    push rax
     retfq
 
-global tss_flush
-tss_flush:
-    mov ax, 0x48
+s_settss:
+    mov ax, 0x28 ; tss offset in gdt
     ltr ax
     ret

@@ -6,4 +6,5 @@
 
 
 void keyboard_init();
-void keyboard_handler(registers_t *regs);
+char ps2_translate2ascii(uint16_t scanncode);
+void keyboard_handler();
