@@ -176,21 +176,16 @@ void ps2_int_init(){
     log_success("PS/2 keyboard initialized");
 } 
 
-#define LAPIC_TIMERDIV_REG  0x3E0
-#define LAPIC_LVTTIMER_REG  0x320
-#define LAPIC_INITCNT_REG   0x380
-#define LAPIC_CURCNT_REG    0x390
-#define LAPIC_PERIODIC      0x20000
 void calibrate_timer(madt_t *madt){
     lapic_address= (uint32_t)madt->lapicaddr;
-    apic_write(lapic_address,0x3E0,3); //divisor 16
-    apic_write(lapic_addr,0x380,0xFFFFFFFF);
+    apic_write(lapic_address,LAPIC_TIMERDIV_REG,3); //divisor 16
+    apic_write(lapic_addr,LAPIC_INITCNT_REG,0xFFFFFFFF);
     pmt_delay(50000);
-    apic_write(lapic_address,0x3E0,0x10000); //0x10000 = masked, sdm
-    uint32_t calibarion = 0xffffffff - apic_read(lapic_address, 0x390);
-    apic_write(lapic_address,0x320,172 | 0x20000);
-    apic_write(lapic_address, 0x3E0,0x3); // 16
-    apic_write(lapic_address, 0x380,calibarion);
+    apic_write(lapic_address,LAPIC_TIMERDIV_REG,0x10000); //0x10000 = masked, sdm
+    uint32_t calibarion = 0xffffffff - apic_read(lapic_address, LAPIC_CURCNT_REG);
+    apic_write(lapic_address,LAPIC_LVTTIMER_REG,172 | LAPIC_PERIODIC);
+    apic_write(lapic_address, LAPIC_TIMERDIV_REG,0x3); // 16
+    apic_write(lapic_address, LAPIC_INITCNT_REG,calibarion);
 }
 void init_apic(madt_t *madt, uint64_t hhdmoffset){
     asm("cli");
@@ -199,7 +194,7 @@ void init_apic(madt_t *madt, uint64_t hhdmoffset){
     printf("apic: MADT tables listed through{n}");
     printf("apic: writing to SIV register{n}");
     lapic_addr = madt->lapicaddr;
-    uint32_t spurius_reg = apic_read((void*)madt->lapicaddr , 0xF0);
+    uint32_t spurius_reg = apic_read((void*)madt->lapicaddr + hhdmoffset , 0xF0);
     printf("madt lapic adr: 0x{xn}", lapic_addr);
     apic_write((void*)madt->lapicaddr, 0xF0,spurius_reg | (0x100));
     log_success("LAPIC initialized");

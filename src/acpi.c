@@ -58,7 +58,7 @@ void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
         if(!memcmp(header->signature + hhdmoffset,sig,4))
         {
             printf("acpi: Found table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
-            return (void*)header;
+            return (void*)header + hhdmoffset;
         }
     }
     printf("acpi: Table '{s}' not found{n}", sig);
