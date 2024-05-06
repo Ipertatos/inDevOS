@@ -7,6 +7,12 @@ static volatile struct limine_memmap_request memmap_request = {
     .revision = 0
 };
 
+
+static volatile struct limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST,
+    .revision = 0
+}; 
+
 uint64_t memmap_entry_cnt = 0;// number of entries in the memory map
 uint64_t pmm_usable_addr = 0;// first usable address
 uint64_t pmm_usable_top = 0;//top of the first usable address
@@ -16,7 +22,7 @@ uint64_t pmm_mem_size =0;//size of the memory in bytes
 uint8_t *pmm_bitmap = 0;//bitmap of the memory
 
 struct limine_memmap_response *memmap;
-extern uint64_t hhdmoffset;
+uint64_t hhdmoffset;
 
 void mmap_set(int bit){
     pmm_bitmap[bit/8] |= (1 << (bit % 8));
@@ -65,6 +71,11 @@ void pmm_free_block(uint64_t addr){
     mmap_unset(addr2block(addr));
 }
 void pmm_init(){
+    
+    hhdmoffset = hhdm_request.response->offset;
+    if(!hhdmoffset){
+        while(1) asm("hlt");
+    }
     if(memmap_request.response ==NULL)
     {
         //failed to get memory map

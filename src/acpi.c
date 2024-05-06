@@ -49,10 +49,10 @@ void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
     }
     for(int i = 0; i < entries; i++){
         sdt_t *header;
-        if(usexsdt)
-            header = (sdt_t*)xsdt->tableptrs[i];
-        else
+        if(usexsdt == 0)
             header = (sdt_t*)rsdt->tableptrs[i];
+        else
+            header = (sdt_t*)xsdt->tableptrs[i];
 
         if(!memcmp(header->signature,sig,4))
             return (void*)header;

@@ -6,17 +6,13 @@
 
 struct limine_kernel_address_request kernel_addr_request = {
     .id = LIMINE_KERNEL_ADDRESS_REQUEST,
-    .response = 0
+    .revision = 0
 };
 
-static volatile struct limine_hhdm_request hhdm_request = {
-    .id = LIMINE_HHDM_REQUEST,
-    .revision = 0
-}; 
 struct limine_kernel_address_response *kernel_address;
 
 page_map kernel_page_map = {0x0};
-uint64_t hhdmoffset;
+extern uint64_t hhdmoffset;
 uint64_t kernel_pml4addr;
 
 void vmm_set_ctx(page_map *pgmp){
@@ -27,10 +23,6 @@ void vmm_set_ctx(page_map *pgmp){
 }
 
 void vmm_init(){
-    hhdmoffset = hhdm_request.response->offset;
-    if(!hhdmoffset){
-        while(1) asm("hlt");
-    }
 
     struct limine_kernel_address_response *kernel_address = kernel_addr_request.response;
     if(!kernel_address){
