@@ -1,36 +1,83 @@
 #include "idt.h"
-
-idt_entry_t idt_entries[256];
+#include "apic.h"
+#include "utils.h"
+#include "keyboard.h"
+__attribute__((aligned(0x10))) static idt_entry_t idt_entries[256];
 idtr_t idtr;
 
-static bool vectors[256];
-
-extern void idt_flush(uint64_t);
-
-void* isr_table[32] = {
-    isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7, isr8, isr9, isr10, isr11, isr12, isr13, isr14, isr15,
-    isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23, isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
-};
-
-void* irq_table[16] = {
-    irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7, irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15
-};
+extern void isr0();
+extern void isr1();
+extern void isr2();
+extern void isr3();
+extern void isr4();
+extern void isr5();
+extern void isr6();
+extern void isr7();
+extern void isr8();
+extern void isr9();
+extern void isr10();
+extern void isr11();
+extern void isr12();
+extern void isr13();
+extern void isr14();
+extern void isr15();
+extern void isr16();
+extern void isr17();
+extern void isr18();
+extern void isr19();
+extern void isr20();
+extern void isr21();
+extern void isr22();
+extern void isr23();
+extern void isr24();
+extern void isr25();
+extern void isr26();
+extern void isr27();
+extern void isr28();
+extern void isr29();
+extern void isr30();
+extern void isr31();
+extern void isr33();
+extern void isr172();
 
 void initIDT() {
     idtr.limit = (uint16_t)sizeof(idt_entry_t) * 256 - 1;
     idtr.base = (uint64_t)&idt_entries[0];
 
-    memset(&idt_entries, 0, sizeof(idt_entry_t) * 256);
-
-    for(int i = 0; i < 32; i++) {
-        setIdtGate(i, isr_table[i], 0x8E);
-        vectors[i] = true;
-    }
-
-    for(int i = 32; i < 48; i++) {
-        setIdtGate(i, irq_table[i - 32], 0x8E);
-        vectors[i] = true;
-    }
+    setIdtGate(0, isr0, 0x8E);
+    setIdtGate(1, isr1, 0x8E);
+    setIdtGate(2, isr2, 0x8E);
+    setIdtGate(3, isr3, 0x8E);
+    setIdtGate(4, isr4, 0x8E);
+    setIdtGate(5, isr5, 0x8E);
+    setIdtGate(6, isr6, 0x8E);
+    setIdtGate(7, isr7, 0x8E);
+    setIdtGate(8, isr8, 0x8E);
+    setIdtGate(9, isr9, 0x8E);
+    setIdtGate(10, isr10, 0x8E);
+    setIdtGate(11, isr11, 0x8E);
+    setIdtGate(12, isr12, 0x8E);
+    setIdtGate(13, isr13, 0x8E);
+    setIdtGate(14, isr14, 0x8E);
+    setIdtGate(15, isr15, 0x8E);
+    setIdtGate(16, isr16, 0x8E);
+    setIdtGate(17, isr17, 0x8E);
+    setIdtGate(18, isr18, 0x8E);
+    setIdtGate(19, isr19, 0x8E);
+    setIdtGate(20, isr20, 0x8E);
+    setIdtGate(21, isr21, 0x8E);
+    setIdtGate(22, isr22, 0x8E);
+    setIdtGate(23, isr23, 0x8E);
+    setIdtGate(24, isr24, 0x8E);
+    setIdtGate(25, isr25, 0x8E);
+    setIdtGate(26, isr26, 0x8E);
+    setIdtGate(27, isr27, 0x8E);
+    setIdtGate(28, isr28, 0x8E);
+    setIdtGate(29, isr29, 0x8E);
+    setIdtGate(30, isr30, 0x8E);
+    setIdtGate(31, isr31, 0x8E);
+    setIdtGate(33, isr33, 0x8E);//LAPIC timer
+    setIdtGate(172, isr172, 0x8E); //PS/2 keyboard
 
     __asm__ __volatile__("lidtq %0" : : "m"(idtr));
     __asm__ __volatile__("sti");
@@ -38,14 +85,17 @@ void initIDT() {
 }
 
 void setIdtGate(uint8_t num, void* base, uint8_t flags) {
-    idt_entries[num].isr_low = (uint64_t)base & 0xFFFF;
-    idt_entries[num].kernel_cs = GDT_OFFSET_KERNEL_CODE;
-    idt_entries[num].ist = 0;
-    idt_entries[num].attributes = flags;
-    idt_entries[num].isr_mid = ((uint64_t)base >> 16) & 0xFFFF;
-    idt_entries[num].isr_high = ((uint64_t)base >> 32) & 0xFFFFFFFF;
-    idt_entries[num].reserved = 0;
+    idt_entry_t* desc = &idt_entries[num];
+    
+    desc->isr_low        = (uint64_t)base & 0xFFFF;
+    desc->kernel_cs      = 0x08;
+    desc->ist            = 0;
+    desc->attributes     = flags;
+    desc->isr_mid        = ((uint64_t)base >> 16) & 0xFFFF;
+    desc->isr_high       = ((uint64_t)base >> 32) & 0xFFFFFFFF;
+    desc->reserved       = 0;
 }
+
 
 char* exception_messages[] = {
     "Division By Zero",
@@ -84,38 +134,19 @@ char* exception_messages[] = {
 
 void isr_handler(registers_t* r) {
     if(r->int_no < 32) {
-        print(exception_messages[r->int_no]);
-        print("\n");
-        print("Exception. System Halted\n");
-        print("Error code: ");
-        print(int2string(r->err_code));
-        print("\n");
-        for(;;);
+        printf(exception_messages[r->int_no]);
+        printf("\n");
+        printf("Exception. System Halted\n");
+        printf("Error code: ");
+        printf(int2string(r->err_code));
+        printf("\n");
+        __asm__ volatile ("cli");
+        __asm__ volatile ("hlt");
     }
-}
-
-
-void *irq_routines[16] = {0};
-
-void irq_install_handler(int irq, void (*handler)(registers_t *r)) {
-    irq_routines[irq] = handler;
-}
-
-void irq_uninstall_handler(int irq) {
-    irq_routines[irq] = 0;
-}
-
-void irq_handler(registers_t* r) {
-    outb(0x20, 0x20);
-
-    void (*handler)(registers_t *r);
-    handler = irq_routines[r->int_no - 32];
-    if(handler) {
-        handler(r);
+    if(r->int_no == 33){
+        apic_timer();
     }
-
-    if(r->int_no >= 40) {
-        outb(0xA0, 0x20);
+    if(r->int_no == 172){
+        keyboard_handler();
     }
-    outb(0x20, 0x20);
 }

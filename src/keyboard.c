@@ -133,6 +133,6 @@ void keyboard_handler(){
         apic_eoi();
         return;
     }
-    printch(ch);
+    printf(ch);
     apic_eoi();
 }

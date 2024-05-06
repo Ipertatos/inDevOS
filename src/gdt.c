@@ -21,8 +21,8 @@ void gdt_set_entry(int num, uint64_t base, uint64_t limit, uint8_t access, uint8
 }
 
 void gdt_init(){
-    gdt_pointer.size = (sizeof(gdt_pointer) * GDTSEGMENTS) - 1;
-    gdt_pointer.offset = (uint64_t)&gdt;
+    gdt_pointer.limit_low = (sizeof(gdt_pointer) * GDTSEGMENTS) - 1;
+    gdt_pointer.base = (uint64_t)&gdt;
 
     memset(&tss , 0 , sizeof(tss));
 
@@ -39,12 +39,12 @@ void gdt_init(){
     gdt_set_entry(3,0,0xFFFF, 0xFA, 0xA);
 
     //entry 4 umode data seg
-    gdt_set_entry(4,0,0xFFFF,0xF2,0xA);
+    gdt_set_entry(4,0,0xFFFF, 0xF2, 0xA);
 
     //entry 5 TSS
     gdt_set_entry(5,(uint64_t)&tss,sizeof(tss),0x89,0x0);
 
-    s_setgdt(gdt_pointer.size, gdt_pointer.offset);
+    s_setgdt(gdt_pointer.limit_low, gdt_pointer.base);
 
     s_settss();
 }

@@ -28,21 +28,18 @@ void kmain(void) {
     
 
     //printk("Limine revision supported\n");
-    initFB();
+    ft_ctx = initFB();
 
-    //printk("Initializing Interrupts\n");
+    printk(ft_ctx,"Initializing Interrupts\n");
     
 
-    //printk("IDT initialized\n");
-    //printk("Checking APIC\n");
+    printk(ft_ctx,"IDT initialized\n");
+    printk(ft_ctx,"Checking APIC\n");
 
-    fillrect(0x0000ff,0,0,32*3,32);
+
     pmm_init();
-    fillrect(0x00ff00,0,32,32,32);
     init_acpi();
-    fillrect(0x00ff00,32,32,32,32);
     vmm_init();
-    fillrect(0x00ff00,64,32,32,32);
     //if(check_apic()) printk("APIC found\n"); 
     //else             printk("APIC not found\n");
 

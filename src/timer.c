@@ -10,7 +10,7 @@ void onIrq0(registers_t *r) {
 
 void initTimer(){
     ticks = 0;
-    irq_install_handler(0, &onIrq0);
+    //irq_install_handler(0, &onIrq0);
     //119318.16666 Mhz
     uint32_t divisor = 1193180 / freq;
     

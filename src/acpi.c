@@ -40,6 +40,7 @@ fadt_t *fetch_fadt(){
 void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
     int usexsdt;
     int entries;
+    printf("acpi: looking for table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
     if(!xsdt){
         usexsdt = 0;
         entries = (rsdt->header.length - sizeof(sdt_t)) / 4;
@@ -54,18 +55,21 @@ void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
         else
             header = (sdt_t*)xsdt->tableptrs[i];
 
-        if(!memcmp(header->signature,sig,4))
+        if(!memcmp(header->signature + hhdmoffset,sig,4))
+        {
+            printf("acpi: Found table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
             return (void*)header;
+        }
     }
-    //table not found
+    printf("acpi: Table '{s}' not found{n}", sig);
     return NULL;
 }
 
 
 void init_acpi(void){
     if(rsdp_request.response == NULL)
-        while(1) __asm__("hlt");
-
+        log_panic("RSDP not received, halting");
+    
     rsdp_t *rsdp = (rsdp_t*)rsdp_request.response->address;
 
     rsdt = parse_rsdt(hhdmoffset,rsdp);
@@ -74,13 +78,13 @@ void init_acpi(void){
     madt = find_acpi_table("APIC",rsdt,xsdt); // APIC - sig for MADT table
 
     if(madt == NULL)
-        while (1) __asm__("hlt"); // No MADT table found
+        log_panic("MADT table not found");
 
     fadt = find_acpi_table("FACP",rsdt,xsdt); // FACP - sig for FADT table
 
     if(fadt == NULL)
-        while (1) __asm__("hlt"); // No FADT table found
-
+        log_panic("FADT table not found");
+    
     // Enable ACPI
     init_apic(madt, hhdmoffset);
         
@@ -88,8 +92,8 @@ void init_acpi(void){
 
 void pmt_delay(uint64_t us){
     if(fadt->PMTimerLength != 4)
-        while (1) __asm__("hlt"); // ACPI timer not unavailable
-
+        log_panic("PMTimer not implemented");
+    
     uint64_t count = inl(fadt->PMTimerBlock);
     uint64_t target = count + (us * PMT_TIMER_FREQ) / 1000000;
     uint64_t cur = 0;

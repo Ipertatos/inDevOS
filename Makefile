@@ -13,9 +13,9 @@ LDFLAGS = -T linker.ld -melf_x86_64
 ASFLAGS = -g -F dwarf -f elf64
 
 #c files
-C_SOURCES = $(wildcard src/*.c)
+C_SOURCES = $(wildcard src/flanterm/*.c) $(wildcard src/flanterm/backends/*.c) $(wildcard src/*.c) 
 #assembly files
-ASM_SOURCES = $(wildcard src/*.asm)
+ASM_SOURCES = $(wildcard src/*.asm) 
 
 files = $(C_SOURCES) $(ASM_SOURCES)
 # Object files
@@ -51,6 +51,8 @@ obj/%.o: src/%.c
 
 clean:
 	rm -rf *.o *.bin os.iso iso obj/*
+	mkdir obj/flanterm
+	mkdir obj/flanterm/backends
 
 run: os.iso
 	qemu-system-x86_64 os.iso

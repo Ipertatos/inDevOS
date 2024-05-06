@@ -65,6 +65,7 @@ void get_madt_tables(madt_t *madt)
             if(plapic->flags == 0)
                 break;
             else {
+                printf("apic: found cpu: {dn}", plapic->apicID);
                 ics_arr[i].address = (uint64_t*)cur_ics;
                 ics_arr[i].type = cur_ics->entry_type;
                 ics_arr[i].apic_id = plapic->apicID;
@@ -153,8 +154,10 @@ int find_gsi(int leg_pin){
     for(int i = 0; i < 64; i++){ //no reason to have more than 64 ics entries
         if(ics_arr[i].type == 2){
             madt_iso_t *iso = (madt_iso_t*)ics_arr[i].address;
-            if(iso->source == leg_pin)
+            if(iso->source == leg_pin){
+                printf("apic: found legacy pin {d} connected to IOAPIC {dn}", leg_pin, iso->gsi);
                 return iso->gsi;//we found a legacy pin connected to IOAPIC
+            }
         }
     }
     return leg_pin; //no IOAPIC found, return the legacy pin
@@ -163,11 +166,14 @@ int find_gsi(int leg_pin){
 
 //we can do ps2 here
 void ps2_int_init(){
+    log_info("Initializing PS/2 keyboard\n");
     int gsi = find_gsi(1);
 
     keyboard_init();//TODO
     ioapic_configure_entry(ioapic_address, gsi, 0 << 16);
     ioapic_configure_entry(ioapic_address, gsi , 33);
+    printf("ps2: configured IOAPIC redirection entry{n}");
+    log_success("PS/2 keyboard initialized");
 } 
 
 #define LAPIC_TIMERDIV_REG  0x3E0
@@ -189,16 +195,21 @@ void calibrate_timer(madt_t *madt){
 void init_apic(madt_t *madt, uint64_t hhdmoffset){
     asm("cli");
     get_madt_tables(madt);
+    
+    printf("apic: MADT tables listed through{n}");
+    printf("apic: writing to SIV register{n}");
     lapic_addr = madt->lapicaddr;
     uint32_t spurius_reg = apic_read((void*)madt->lapicaddr , 0xF0);
+    printf("madt lapic adr: 0x{xn}", lapic_addr);
     apic_write((void*)madt->lapicaddr, 0xF0,spurius_reg | (0x100));
+    log_success("LAPIC initialized");
     calibrate_timer(madt);
     for(int i=0 ; i != ((ioapic_read(ioapic_address,0x2) >> 16)&0xFF); i++){
         ioapic_configure_entry(ioapic_address,i,1<<16);
     }
     asm("sti");
     ps2_int_init();
-    fillrect(0x00ff00,64,0,32,32);
+    log_success("IOAPIC initialized");
 }
 
 void int_apic_ap(){
