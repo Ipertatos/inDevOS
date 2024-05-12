@@ -1,9 +1,9 @@
 # Variables
 
 #use local cross compiler
-#CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
+CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
 
-CC = gcc
+#CC = gcc
 LD = ld
 AS = nasm
 
@@ -23,6 +23,9 @@ OBJ = $(patsubst src/%.c, obj/%.o, $(C_SOURCES)) $(patsubst src/%.asm, obj/%.o, 
 
 # Targets
 all: os.iso
+
+limine:
+	make -C limine
 
 os.iso: boot.bin
 	mkdir -p iso/boot/limine
