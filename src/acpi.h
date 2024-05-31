@@ -44,7 +44,6 @@ typedef struct
 }__attribute((packed)) madt_record_t;
 
 
-
 typedef struct {                        // Processor LAPIC struct 
     uint8_t entry_type;
     uint8_t entry_length;
@@ -126,7 +125,21 @@ typedef struct{
   uint64_t Address;
 
 }__attribute((packed))gas_t;
-
+// HPET table (High Precision Event Timer).
+typedef struct
+{
+    sdt_t desc;
+    uint8_t hardware_rev_id;
+    uint8_t comparator_count:5;
+    uint8_t counter_size:1;
+    uint8_t reserved:1;
+    uint8_t legacy_replacement:1;
+    uint16_t pci_vendor_id;
+    gas_t address;
+    uint8_t hpet_number;
+    uint16_t minimum_tick;
+    uint8_t page_protection;
+} __attribute__((packed)) hpet_t; 
 typedef struct{
     sdt_t header;
     uint32_t FirmwareCtrl;
@@ -199,7 +212,13 @@ typedef struct {
     madt_record_t header;
 } __attribute((packed)) ics_list_t;
 
+
+
 void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt);
 void init_acpi(void);
 void pmt_delay(uint64_t us);
 fadt_t *fetch_fadt();
+
+extern hpet_t *hpet;
+extern madt_ioapic_t *ioapic_list[];
+extern madt_iso_t *iso_list[];

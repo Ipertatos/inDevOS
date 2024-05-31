@@ -140,6 +140,19 @@ void printstr(struct flanterm_context *ft_ctx, char *str)
     flanterm_write(ft_ctx,str,strlen(str));
 }
 
+void printbin(struct flanterm_context *ft_ctx, uint64_t num){
+    char bin[MAX_INT_SIZE];
+    int i = 0;
+    while(num > 0){
+        bin[i] = num % 2 + '0';
+        num /= 2;
+        i++;
+    }
+    for(int j = i-1; j >= 0; j--){
+        printch(ft_ctx,bin[j]);
+    }
+}
+
 void printint(struct flanterm_context *ft_ctx, uint64_t i)
 {
     flanterm_write(ft_ctx,int2string(i),strlen(int2string(i)));
@@ -190,8 +203,8 @@ char* int2string(uint32_t value) {
     return &buf[i+1];
 }
 
-char* int2hex(uint32_t value) {
-    static char buf[32] = {0};
+char* int2hex(uint64_t value) {
+    static char buf[64] = {0};
     int i = 30;
     for(; value && i ; --i, value /= 16) {
         buf[i] = "0123456789ABCDEF"[value % 16];
@@ -232,50 +245,3 @@ void dump_str(char *stack) {
     printf("\n");
 }
 
-void *memset(void *dest, int val, uint32_t count)
-{
-    uint8_t *p = (uint8_t *)dest;
-    for(uint32_t i = 0; i < count; i++)
-        p[i] = (uint8_t)val;
-
-    return dest;
-}
-
-void *memcpy(void *dest, const void *src, uint32_t count)
-{
-    uint8_t *pdest = (uint8_t *)dest;
-    const uint8_t *psrc = (const uint8_t *)src;
-    for(uint32_t i = 0; i < count; i++)
-        pdest[i] = psrc[i];
-    
-    return dest;
-}
-
-void *memmove(void *dest, const void *src, uint32_t count)
-{
-    uint8_t *pdest = (uint8_t *)dest;
-    const uint8_t *psrc = (const uint8_t *)src;
-    if(pdest < psrc)
-    {
-        for(uint32_t i = 0; i < count; i++)
-            pdest[i] = psrc[i];
-    }
-    else
-    {
-        for(uint32_t i = count; i != 0; i--)
-            pdest[i-1] = psrc[i-1];
-    }
-    return dest;
-}
-
-int memcmp(const void *a, const void *b, uint32_t count)
-{
-    const uint8_t *pa = (const uint8_t *)a;
-    const uint8_t *pb = (const uint8_t *)b;
-    for(uint32_t i = 0; i < count; i++)
-    {
-        if(pa[i] != pb[i])
-            return pa[i] < pb[i] ? -1 : 1;
-    }
-    return 0;
-}

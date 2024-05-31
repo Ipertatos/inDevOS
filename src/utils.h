@@ -35,7 +35,7 @@ void fillrect(uint32_t color,uint64_t x , uint64_t y,uint64_t w, uint64_t h);
 
 void printch(struct flanterm_context *ft_ctx, char c);
 void printstr(struct flanterm_context *ft_ctx, char* str);
-
+void printbin(struct flanterm_context *ft_ctx, uint64_t num);
 void printint(struct flanterm_context *ft_ctx, uint64_t i);
 void printhex(struct flanterm_context *ft_ctx, uint64_t num);
 
@@ -53,7 +53,7 @@ void printex(struct flanterm_context *ft_ctx,char* str);
 
 char* int2string(uint32_t n);
 
-char* int2hex(uint32_t value);
+char* int2hex(uint64_t value);
 
 uint32_t strlen(const char* str);
 
@@ -63,10 +63,4 @@ extern void stack_dump();
 void dump_hex(char *stack);
 void dump_str(char *stack);
 
-void *memset(void *dest, int val, uint32_t count);
-
 void call(char* buffer, uint32_t buff_len);
-
-void *memcpy(void *dest, const void *src, uint32_t count);
-void *memmove(void *dest, const void *src, uint32_t count);
-int memcmp(const void *a, const void *b, uint32_t count);

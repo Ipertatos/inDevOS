@@ -50,8 +50,8 @@ ISR_NOERRCODE 28
 ISR_NOERRCODE 29
 ISR_NOERRCODE 30
 ISR_NOERRCODE 31
+ISR_NOERRCODE 32
 ISR_NOERRCODE 33
-ISR_NOERRCODE 172
 ISR_NOERRCODE 128
 ISR_NOERRCODE 177
 
@@ -73,7 +73,6 @@ isr_common_stub:
     push rsi
     push rdi
     mov rdi, rsp
-    cld
     call isr_handler
 
     pop rdi

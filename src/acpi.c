@@ -1,15 +1,14 @@
 #include "acpi.h"
 #include "utils.h"
 #include "registers.h"
-
+#include "mem.h"
 rsdt_t *rsdt;
 xsdt_t *xsdt;
 fadt_t *fadt;
 madt_t *madt;
+hpet_t *hpet;
 
 #define PMT_TIMER_FREQ 3579545 // 3.579545 MHz
-
-extern uint64_t hhdmoffset; 
 
 static volatile struct limine_rsdp_request rsdp_request = {
     .id = LIMINE_RSDP_REQUEST,
@@ -17,25 +16,26 @@ static volatile struct limine_rsdp_request rsdp_request = {
 };
 
 
-xsdt_t *parse_xsdt(uint64_t hhdmoffset, rsdp_t *rsdp)
+xsdt_t *parse_xsdt(uint64_t vmm_higher_half_offset, rsdp_t *rsdp)
 {
     if(!rsdp->xsdt_address)
         return NULL;
 
-    return (xsdt_t*)(rsdp->xsdt_address + hhdmoffset);
+    return (xsdt_t*)((uint64_t)rsdp->xsdt_address + vmm_higher_half_offset);
 }
 
-rsdt_t *parse_rsdt(uint64_t hhdmoffset, rsdp_t *rsdp)
+rsdt_t *parse_rsdt(uint64_t vmm_higher_half_offset, rsdp_t *rsdp)
 {
     if(!rsdp->rsdt_address)
         return NULL;
 
-    return (rsdt_t*)(rsdp->rsdt_address + hhdmoffset);
+    return (rsdt_t*)((uint64_t)rsdp->rsdt_address + vmm_higher_half_offset);
 }
 
 fadt_t *fetch_fadt(){
     return find_acpi_table("FACP",rsdt,xsdt);
 }
+
 
 void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
     int usexsdt;
@@ -43,22 +43,22 @@ void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
     printf("acpi: looking for table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
     if(!xsdt){
         usexsdt = 0;
-        entries = (rsdt->header.length - sizeof(sdt_t)) / 4;
+        entries = (rsdt->header.length - 36) / 4;
     }else{
         usexsdt = 1;
-        entries = (xsdt->header.length - sizeof(sdt_t)) / 8;
+        entries = (xsdt->header.length - 36) / 8;
     }
     for(int i = 0; i < entries; i++){
         sdt_t *header;
         if(usexsdt == 0)
-            header = (sdt_t*)rsdt->tableptrs[i];
+            header = (sdt_t*)((uint64_t)rsdt->tableptrs[i] + vmm_higher_half_offset);
         else
-            header = (sdt_t*)xsdt->tableptrs[i];
+            header = (sdt_t*)((uint64_t)xsdt->tableptrs[i] + vmm_higher_half_offset);
 
-        if(!memcmp(header->signature + hhdmoffset,sig,4))
+        if(!memcmp(header->signature,sig,4))
         {
             printf("acpi: Found table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
-            return (void*)header + hhdmoffset;
+            return (void*)header;
         }
     }
     printf("acpi: Table '{s}' not found{n}", sig);
@@ -72,8 +72,8 @@ void init_acpi(void){
     
     rsdp_t *rsdp = (rsdp_t*)rsdp_request.response->address;
 
-    rsdt = parse_rsdt(hhdmoffset,rsdp);
-    xsdt = parse_xsdt(hhdmoffset,rsdp);
+    rsdt = parse_rsdt(vmm_higher_half_offset,rsdp);
+    xsdt = parse_xsdt(vmm_higher_half_offset,rsdp);
 
     madt = find_acpi_table("APIC",rsdt,xsdt); // APIC - sig for MADT table
 
@@ -85,8 +85,13 @@ void init_acpi(void){
     if(fadt == NULL)
         log_panic("FADT table not found");
     
+    hpet = find_acpi_table("HPET",rsdt,xsdt); // HPET - sig for HPET table
+
+    if(hpet == NULL)
+        log_panic("HPET table not found");
+
     // Enable ACPI
-    init_apic(madt, hhdmoffset);
+    init_apic(madt);
         
 }
 

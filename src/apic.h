@@ -24,8 +24,8 @@ typedef struct{
 } __attribute((packed))madt_ics_t;
 
 void get_madt_tables(madt_t *madt);
-int ioapic_read(void *ioapic_addr, uint8_t reg);
-void ioapic_write(void *ioapic_addr, uint8_t reg, uint32_t data);
+uint32_t ioapic_read(madt_ioapic_t *pApic, uint8_t reg);
+void ioapic_write(madt_ioapic_t *pApic, uint8_t reg, uint32_t data);
 void ioapic_redt_write(void *ioapic_addr, uint8_t reg, uint64_t value);
 uint32_t apic_read(void* apic_base, uint32_t reg);
 void apic_write(void* apic_base, uint32_t reg, uint32_t data);
@@ -34,8 +34,9 @@ void apic_eoi();
 void apic_asleep();
 void apic_timer();
 void ioapic_configure_entry(uint64_t* addr, uint8_t reg, uint64_t val);
-int find_gsi(int leg_pin);
+void ioapic_redirect_irq(uint32_t lapic_id, uint8_t irq, uint8_t vector, bool status);
+madt_ioapic_t* find_gsi(int leg_pin);
 void ps2_int_init();
 void calibrate_timer(madt_t *madt);
-void init_apic(madt_t *madt, uint64_t hhdmoffset);
+void init_apic(madt_t *madt);
 void init_apic_ap();

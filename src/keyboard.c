@@ -1,5 +1,8 @@
 #include "keyboard.h"
 #include "apic.h"
+#include "acpi.h"
+#include "cpu.h"
+#include "utils.h"
 bool capsOn, capsLock;
 
 
@@ -69,33 +72,48 @@ void keyboard_init(){
     capsLock = false;
     //init buffer
     memset(&buffer,'\0',sizeof(char)*256);
-    outb(0x64, 0xAD);
-    outb(0x64, 0xA7);
 
-    uint16_t j =1;
-    while (j != 0)
+    while ((inb(0x64) & 2) != 0)
     {
-        inb(0x60);
-        j = (inb(0x64) >>1) &1;
+        outb(0x64, 0xAD);
     }
-
-
-    //test ps2 controller 
-    outb(0x64, 0xAA);
-    uint16_t data = inb(0x60);
-    if(data == 0x55)
-        fillrect(0x00ff00,32,0,32,32);
-    else if (data == 0xFC)
-        fillrect(0xff0000,32,0,32,32);
-    else
-        fillrect(0x0000ff,32,0,32,32);
-
-    while (j!=0){
-        inb(0x60);
-        j = (inb(0x64) >>1) &1;
+    while ((inb(0x64) & 2) != 0)
+    {
+        outb(0x64, 0xA7);
     }
-
-    outb(0x64, 0xAE);
+    inb(0x60);
+    while ((inb(0x64) & 2) != 0)
+    {
+        outb(0x64, 0x20);
+    }
+    uint8_t config = inb(0x60);
+    config |= (1 << 0) | (1 << 6);
+    if(config & (1 << 5) != 0){
+        config |= (1 << 1);
+    }
+    while ((inb(0x64) & 2) != 0)
+    {
+        outb(0x64, 0x60);
+    }
+    while ((inb(0x64) & 2) != 0)
+    {
+        outb(0x60, config);
+    }
+    ioapic_redirect_irq(bsp_lapic_id, 33, 1, true);
+    while ((inb(0x64) & 2) != 0)
+    {
+        outb(0x64, 0xAE);
+    }
+    while ((inb(0x64) & 2) != 0)
+    {
+        outb(0x64, 0x20);
+    }
+    if(config & (1 << 5) != 0){
+        while ((inb(0x64) & 2) != 0)
+        {
+            outb(0x64, 0xA8);
+        }
+    }
     
 }
 
@@ -133,6 +151,6 @@ void keyboard_handler(){
         apic_eoi();
         return;
     }
-    printf(ch);
+    printf("{c}",ch);
     apic_eoi();
 }

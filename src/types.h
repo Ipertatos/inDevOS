@@ -16,9 +16,9 @@ typedef signed long int64_t;
 typedef long unsigned int uintptr_t;
 typedef unsigned long size_t;
 
-typedef enum { false, true } bool;
-#define true 1
-#define false 0
+#define bool	_Bool
+#define true	1
+#define false	0
 
 
 #endif

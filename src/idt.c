@@ -37,8 +37,8 @@ extern void isr28();
 extern void isr29();
 extern void isr30();
 extern void isr31();
+extern void isr32();
 extern void isr33();
-extern void isr172();
 
 void initIDT() {
     idtr.limit = (uint16_t)sizeof(idt_entry_t) * 256 - 1;
@@ -76,8 +76,8 @@ void initIDT() {
     setIdtGate(29, isr29, 0x8E);
     setIdtGate(30, isr30, 0x8E);
     setIdtGate(31, isr31, 0x8E);
-    setIdtGate(33, isr33, 0x8E);//LAPIC timer
-    setIdtGate(172, isr172, 0x8E); //PS/2 keyboard
+    setIdtGate(32, isr32, 0x8E);//LAPIC timer
+    setIdtGate(33, isr33, 0x8E); //PS/2 keyboard
 
     __asm__ __volatile__("lidtq %0" : : "m"(idtr));
     __asm__ __volatile__("sti");
@@ -143,10 +143,10 @@ void isr_handler(registers_t* r) {
         __asm__ volatile ("cli");
         __asm__ volatile ("hlt");
     }
-    if(r->int_no == 33){
+    if(r->int_no == 32){
         apic_timer();
     }
-    if(r->int_no == 172){
+    if(r->int_no == 33){
         keyboard_handler();
     }
 }
