@@ -135,11 +135,11 @@ char* exception_messages[] = {
 void isr_handler(registers_t* r) {
     if(r->int_no < 32) {
         printf(exception_messages[r->int_no]);
-        printf("\n");
-        printf("Exception. System Halted\n");
+        printf("{n}");
+        printf("Exception. System Halted{n}");
         printf("Error code: ");
         printf(int2string(r->err_code));
-        printf("\n");
+        printf("{n}");
         __asm__ volatile ("cli");
         __asm__ volatile ("hlt");
     }

@@ -57,13 +57,6 @@ void hpet_init(){
     printf("    hpet legacy replacement: {d}{n}", hpet->legacy_replacement);
 
     base_addr = (uint64_t*)(hpet->address.Address + vmm_higher_half_offset);
-    printf("hpet: base address: {x}{n}", base_addr);
-    printhex(ft_ctx,hpet->address.Address);
-    printf("{n}");
-    printhex(ft_ctx,vmm_higher_half_offset);
-    printf("{n}");
-
-
 
     hpet_regs = (volatile struct hpet_regs*)base_addr;
     hpet_main_cnt = (volatile uint64_t*)((char*)base_addr + HPET_REG_MAIN_CNT);

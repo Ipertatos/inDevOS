@@ -57,7 +57,6 @@ void add_ioapic(madt_ioapic_t *pIOApic)
 {
     for (int i = 0; i < 128; i++) {
         if (ioapic_list[i] == NULL) {
-            printf("IO APIC: {x} -> {x}.{n}", pIOApic, pIOApic->ioapicaddr);
             ioapic_list[i] = pIOApic;
             return;
         }
@@ -200,9 +199,7 @@ void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool st
 }
 static uint64_t ioapic_max_gsi(struct madt_ioapic_t *pIOApic)
 {
-    printf("I/O APIC: 0x{xn}", pIOApic);
     uint64_t max = (ioapic_read(pIOApic, 0x01) & 0xFF0000) >> 16;
-    printf("Max GSI: {d}.{n}", max);
     return max;
 }
 madt_ioapic_t* find_gsi(int leg_pin){
@@ -224,8 +221,6 @@ madt_ioapic_t* find_gsi(int leg_pin){
 
 void _ioapic_redirect_gsi(uint32_t lapic_id, uint8_t vector, uint8_t gsi, uint16_t flags, bool status)
 {
-    //print function arguments
-    printf("LAPIC ID: {d}, Vector: {d}, GSI: {d}, Flags: {d}, Status: {d}.{n}", lapic_id, vector, gsi, flags, status);
     madt_ioapic_t *pIOApic = find_gsi(gsi);
 
     uint64_t redirect = vector;
