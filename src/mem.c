@@ -31,6 +31,8 @@ uint64_t vmm_higher_half_offset = 0;
 uint64_t allocation_cursor = 0;
 uint64_t num_pages_available = 0;
 
+uint64_t malloc_cursor = 0;
+
 struct PageEntry{
     uint32_t pages_allocated;
 } __attribute__((packed));
@@ -100,6 +102,15 @@ int memcmp(const void *s1, const void *s2, size_t n)
     return 0;
 }
 
+//malloc
+void *malloc(size_t size)
+{
+    void *ret;
+    ret = (void *)malloc_cursor;
+    malloc_cursor += size;
+    return ret;
+    
+}
 
 void _get_free_pages()
 {

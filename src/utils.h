@@ -56,7 +56,9 @@ char* int2string(uint32_t n);
 char* int2hex(uint64_t value);
 
 uint32_t strlen(const char* str);
-
+char* remove_nl(char* str);
+char* strtok(char* str, const char* delim);
+uint16_t strcspn(const char* ch1, const char* ch2);
 bool strEql(const char* str1, const char* str2);
 extern void stack_dump();
 

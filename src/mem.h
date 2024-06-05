@@ -24,6 +24,7 @@ static inline bool bitmap_test(const void *bitmap, size_t bit) {
 void kmem_init();
 void* kalloc(uint64_t size);
 void kfree(void* ptr);
+void *malloc(size_t size);
 
 void memdumps(void *location, uint64_t size);
 void memdumpx32(void *location, uint64_t size);

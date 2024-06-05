@@ -41,7 +41,6 @@ void kmain(void) {
     kmem_init();
     init_acpi();
     __asm__("sti");
-
     while(1) {
         __asm__("nop");
     }

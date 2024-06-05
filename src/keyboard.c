@@ -151,14 +151,11 @@ void keyboard_handler(){
         apic_eoi();
         return;
     }
-    //add to buffer
-    if(tobuffer){
-        buffer[buff_len] = ch;
-        buff_len++;
-    }
-    else{
-        //send to terminal
-        printf("{c}",ch);
+    buffer[buff_len] = ch;
+    buff_len++;
+    printf("{c}",ch);
+    if(ch == '\n'){
+        cmd(buffer,buff_len);
     }
     apic_eoi();
 }

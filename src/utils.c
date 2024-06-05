@@ -2,6 +2,7 @@
 #include "flanterm/flanterm.h"
 #include "flanterm/backends/fb.h"
 #include <stdarg.h>
+#include "types.h"
 #define MAX_INT_SIZE 128
 
 #define FORMAT_LENTGH       1
@@ -212,10 +213,48 @@ char* int2hex(uint64_t value) {
     return &buf[i+1];
 }
 
+
+char* strtok(char* str, const char* delim){
+    static char* pos = NULL;
+    if(str != NULL) pos = str;
+    if(pos == NULL || pos == '\0') return NULL;
+    uint16_t len = strcspn(pos, delim);
+    char* token = pos;
+    pos += len;
+    if(*pos != '\0')
+        *pos++ = '\0';
+    
+    return token;
+}
+
+uint16_t strcspn(const char* ch1, const char* ch2){
+    uint16_t len = 0;
+    while(*ch1){
+        const char* tmp = ch2;
+        while(*tmp){
+            if(*ch1 == *tmp) return len;
+            tmp++;
+        }
+        ++len;
+        ++ch1;
+    }
+    return len;
+}
+
 uint32_t strlen(const char* str) {
     uint32_t len = 0;
     while(str[len] != '\0') len++;
     return len;
+}
+
+char* remove_nl(char* str) {
+    for(int i = 0; i < strlen(str); i++) {
+        if(str[i] == '\n') {
+            str[i] = '\0';
+            break;
+        }
+    }
+    return str;
 }
 
 bool strEql(const char* str1, const char* str2) {
