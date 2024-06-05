@@ -23,6 +23,8 @@ typedef struct{
     bool present;
 } __attribute((packed))madt_ics_t;
 
+extern uint64_t apic_timer_ticks;
+
 void get_madt_tables(madt_t *madt);
 uint32_t ioapic_read(madt_ioapic_t *pApic, uint8_t reg);
 void ioapic_write(madt_ioapic_t *pApic, uint8_t reg, uint32_t data);

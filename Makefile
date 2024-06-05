@@ -12,10 +12,12 @@ CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel -fc
 LDFLAGS = -T linker.ld -melf_x86_64
 ASFLAGS = -g -F dwarf -f elf64
 
-#c files
-C_SOURCES = $(wildcard src/flanterm/*.c) $(wildcard src/flanterm/backends/*.c) $(wildcard src/*.c) 
+#c files in all directories and subdirectories
+C_SOURCES = $(shell find src -name '*.c')
+#C_SOURCES = $(wildcard src/flanterm/*.c) $(wildcard src/flanterm/backends/*.c) $(wildcard src/*.c) 
 #assembly files
-ASM_SOURCES = $(wildcard src/*.asm) 
+ASM_SOURCES = $(shell find src -name '*.asm')
+#ASM_SOURCES = $(wildcard src/*.asm) 
 
 files = $(C_SOURCES) $(ASM_SOURCES)
 # Object files
@@ -47,9 +49,11 @@ boot.bin: $(OBJ)
 
 #compile all asm files
 obj/%.o: src/%.asm
+	mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) -o $@ $<
 #compile all c files
 obj/%.o: src/%.c
+	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

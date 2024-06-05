@@ -3,6 +3,7 @@
 #include "acpi.h"
 #include "cpu.h"
 #include "utils.h"
+#include "mem.h"
 bool capsOn, capsLock;
 
 
@@ -154,8 +155,19 @@ void keyboard_handler(){
     buffer[buff_len] = ch;
     buff_len++;
     printf("{c}",ch);
+    if(ch == '\b'){
+        buffer[buff_len] = '\0';
+        buff_len--;
+        buffer[buff_len] = '\0';
+        buff_len--;
+        //erase the character
+        printf("{c}",'\b');
+    }
     if(ch == '\n'){
         cmd(buffer,buff_len);
+        memset(&buffer,'\0',sizeof(char)*256);
+        buff_len = 0;
     }
+
     apic_eoi();
 }

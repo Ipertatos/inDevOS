@@ -164,12 +164,13 @@ void apic_eoi(){
 void apic_asleep(int ms){
     int curcnt = apic_timer_ticks;
     while(apic_timer_ticks - curcnt < ms){
-        asm("nop");
+        
     }
 }
 
 void apic_timer(){
     apic_timer_ticks++;
+    printf("timer++");
     apic_eoi();
 }
 
@@ -270,7 +271,7 @@ void calibrate_timer(madt_t *madt){
     lapic_address= (uint32_t)madt->lapicaddr;
     apic_write(lapic_address,LAPIC_TIMERDIV_REG,3); //divisor 16
     apic_write(lapic_address,LAPIC_INITCNT_REG,0xFFFFFFFF);
-    pmt_delay(50000);
+    pmt_delay(5000);
     apic_write(lapic_address,LAPIC_TIMERDIV_REG,0x10000); //0x10000 = masked, sdm
     uint32_t calibarion = 0xffffffff - apic_read(lapic_address, LAPIC_CURCNT_REG);
     apic_write(lapic_address,LAPIC_LVTTIMER_REG,172 | LAPIC_PERIODIC);
@@ -283,7 +284,7 @@ void init_apic(madt_t *madt){
     
     printf("apic: MADT tables listed through{n}");
     printf("apic: writing to SIV register{n}");
-        hpet_init();
+    hpet_init();
     lapic_addr = madt->lapicaddr;
     uint32_t spurius_reg = apic_read((void*)madt->lapicaddr, LAPIC_SIVR_REG);
     printf("madt lapic adr: 0x{xn}", lapic_addr);

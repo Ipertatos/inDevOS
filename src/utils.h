@@ -26,6 +26,8 @@ struct flanterm_context *ft_ctx;
 
 struct flanterm_context *initFB();
 
+extern uint32_t msfromboot;
+
 const unsigned char* get_bitmap_for_char(char c);
 
 void putpixel(uint64_t x, uint64_t y,uint32_t color);

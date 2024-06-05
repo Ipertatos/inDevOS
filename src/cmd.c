@@ -1,8 +1,7 @@
 #include "cmd.h"
 #include "utils.h"
 #include "mem.h"
-
-char** tokens;
+#include "usoft/info.h"
 
 void cmd(char* cmd, uint64_t len){
     
@@ -13,11 +12,19 @@ void cmd(char* cmd, uint64_t len){
         clear();
     }
     else if(strEql(token, "echo")){
-        while ((token = strtok(NULL, " ")) != ""){
-            printf("{s} ", token);
+        token = strtok(NULL, " ");
+        while (!strEql((token), "\0")){
+            printf("{s}", token);
+            token = strtok(NULL, " ");
+            if(!strEql(token, "\0")){
+                printf(" ");
+            }
         }
     }
-   
+    else if(strEql(token, "neofetch"))
+    {
+        print_info();
+    }
 }
 
 void clear(){
