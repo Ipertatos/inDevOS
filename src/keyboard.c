@@ -10,6 +10,7 @@ bool capsOn, capsLock;
 char buffer[256];
 uint32_t buff_len = 0;
 bool tobuffer = true;
+bool execute = false;
 
 const uint32_t UNKNOWN = 0xFFFFFFFF,
                ESC = 0xFFFFFFFF - 1,
@@ -160,13 +161,10 @@ void keyboard_handler(){
         buff_len--;
         buffer[buff_len] = '\0';
         buff_len--;
-        //erase the character
-        printf("{c}",'\b');
+
     }
     if(ch == '\n'){
-        cmd(buffer,buff_len);
-        memset(&buffer,'\0',sizeof(char)*256);
-        buff_len = 0;
+        execute = true;
     }
 
     apic_eoi();

@@ -33,7 +33,7 @@ uint32_t apic_read(void* apic_base, uint32_t reg);
 void apic_write(void* apic_base, uint32_t reg, uint32_t data);
 void apic_send_inter(void* apic_base, uint8_t apic, uint8_t vector);
 void apic_eoi();
-void apic_asleep();
+void apic_asleep(int ms);
 void apic_timer();
 void ioapic_configure_entry(uint64_t* addr, uint8_t reg, uint64_t val);
 void ioapic_redirect_irq(uint32_t lapic_id, uint8_t irq, uint8_t vector, bool status);

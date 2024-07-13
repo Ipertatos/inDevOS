@@ -14,7 +14,7 @@
 
 
 static volatile LIMINE_BASE_REVISION(1);
-
+uint8_t buffer_len;
 
 void kmain(void) {
     //printk("Kernel started\n");
@@ -42,6 +42,12 @@ void kmain(void) {
     init_acpi();
     __asm__("sti");
     while(1) {
+        if(execute) {
+            cmd(buffer,buffer_len);
+            memset(&buffer,'\0',sizeof(char)*256);
+            buffer_len = 0;
+            execute = true;
+        }
         __asm__("nop");
     }
 

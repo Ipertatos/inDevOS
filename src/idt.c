@@ -1,4 +1,5 @@
 #include "idt.h"
+#include "hpet.h"
 #include "apic.h"
 #include "utils.h"
 #include "keyboard.h"
@@ -39,7 +40,7 @@ extern void isr30();
 extern void isr31();
 extern void isr32();
 extern void isr33();
-
+extern void isr35();
 void initIDT() {
     idtr.limit = (uint16_t)sizeof(idt_entry_t) * 256 - 1;
     idtr.base = (uint64_t)&idt_entries[0];
@@ -78,6 +79,7 @@ void initIDT() {
     setIdtGate(31, isr31, 0x8E);
     setIdtGate(32, isr32, 0x8E);//LAPIC timer
     setIdtGate(33, isr33, 0x8E); //PS/2 keyboard
+    setIdtGate(35, isr35, 0x8E); //HPET timer
 
     __asm__ __volatile__("lidtq %0" : : "m"(idtr));
     __asm__ __volatile__("sti");
@@ -132,6 +134,12 @@ char* exception_messages[] = {
     "Reserved"
 };
 
+void handle_timer(){
+    hpet_isr();
+    hpet_ack();
+    apic_eoi();
+}
+
 void isr_handler(registers_t* r) {
     if(r->int_no < 32) {
         printf(exception_messages[r->int_no]);
@@ -143,8 +151,11 @@ void isr_handler(registers_t* r) {
         __asm__ volatile ("cli");
         __asm__ volatile ("hlt");
     }
-    if(r->int_no == 32){
+    if(r->int_no == 35){
         apic_timer();
+    }
+    if(r->int_no == 32){
+        handle_timer();
     }
     if(r->int_no == 33){
         keyboard_handler();

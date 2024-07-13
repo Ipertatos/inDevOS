@@ -164,13 +164,12 @@ void apic_eoi(){
 void apic_asleep(int ms){
     int curcnt = apic_timer_ticks;
     while(apic_timer_ticks - curcnt < ms){
-        
+        __asm__ ("nop");
     }
 }
 
 void apic_timer(){
     apic_timer_ticks++;
-    printf("timer++");
     apic_eoi();
 }
 
@@ -301,6 +300,7 @@ void init_apic(madt_t *madt){
     //asm("sti");
     ps2_int_init();
     log_success("IOAPIC initialized");
+    apic_eoi();
 }
 
 void int_apic_ap(){

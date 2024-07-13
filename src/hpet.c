@@ -26,7 +26,9 @@ volatile uint64_t *hpet_main_cnt = 0;
 
 uint64_t hpet_freq;
 volatile uint64_t _ticks;
+uint64_t tiks;
 
+bool lock = false;
 
 uint64_t* _timer_config_reg(uint32_t n)
 {
@@ -94,4 +96,65 @@ void hpet_init(){
     *timer_cfg |= (1 << 2); // enable the interrupt
     ioapic_redirect_irq(bsp_lapic_id,(uint8_t)32,(uint8_t)0,true);
     _ticks = 0;
+}
+
+void hpet_one_shot(uint64_t ms){
+    hpet_reset();
+    *hpet_main_cnt = 0;
+    volatile uint64_t *timer_cfg = _timer_config_reg(0);
+    *timer_cfg &= ~(1 << 3); // set to one-shot mode
+
+    volatile uint64_t *timer_comp = _timer_comparator_reg(0);
+    *timer_comp = (uint64_t)((hpet_freq /1000) * ms);
+    *timer_cfg |= (1 << 2); // enable the interrupt
+    hpet_enable();
+}
+
+inline void hpet_disable(){
+    hpet_regs->config &= ~1;
+}
+
+inline void hpet_enable(){
+    hpet_regs->config |= 1;
+}
+
+void hpet_reset(){
+    hpet_disable();
+    _ticks = 0;
+}
+
+void hpet_ack(){
+    hpet_regs->int_status &= ~((uint64_t)1);
+}
+
+void hpet_sleep(uint64_t ms){
+    hpet_one_shot(ms);
+    while(_ticks != ms);
+    hpet_disable();
+}
+
+void hpet_sleep_counter(uint64_t ms){
+    hpet_disable();
+    volatile uint64_t *timer_config = _timer_config_reg(0);
+    *timer_config &= ~(1 << 2);      // Disable timer 0 interrupts.
+
+    *hpet_main_cnt = 0;
+    uint64_t limit = (uint64_t)((hpet_freq / 1000) * ms);
+
+    hpet_enable();
+    while (*hpet_main_cnt < limit);
+    hpet_disable();
+}
+
+uint64_t hpet_get_ticks(){
+    while(lock){};
+    return tiks;
+}
+
+void hpet_isr()
+{
+    lock = true;
+    _ticks++;
+    tiks++;
+    lock = false;
 }

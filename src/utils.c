@@ -1,6 +1,7 @@
 #include "utils.h"
 #include "flanterm/flanterm.h"
 #include "flanterm/backends/fb.h"
+#include "hpet.h"
 #include <stdarg.h>
 #include "types.h"
 #define MAX_INT_SIZE 128
@@ -165,7 +166,8 @@ void printhex(struct flanterm_context *ft_ctx, uint64_t num){
 
 void log_panic(char *msg){
     printf("{k}kern_panic: {ksn}", ANSI_COLOR_RED, ANSI_COLOR_RESET, msg);
-    __asm__ volatile ("cli; hlt"); // Completely hangs the computer
+    __asm__ volatile ("cli"); 
+    __asm__ volatile ("hlt");
 }
 
 void log_err(char *msg){
@@ -284,3 +286,9 @@ void dump_str(char *stack) {
     printf("\n");
 }
 
+void wait(uint64_t ms){
+    uint64_t curticks = _ticks;
+    while(_ticks - curticks < ms){
+        asm("nop");
+    }
+}
