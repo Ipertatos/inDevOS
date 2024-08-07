@@ -13,6 +13,8 @@
 #include "cpu.h"    
 #include "pci.h"    
 #include "nvme.h"
+#include "sound.h"
+#include "paratrooper.h"
 static volatile LIMINE_BASE_REVISION(1);
 uint8_t buffer_len;
 
@@ -43,7 +45,8 @@ void kmain(void) {
     pci_init();
 
     nvme_init();   
-
+    //beep();
+    PlayWAV(44100, fsize, file);
     __asm__("sti");
     while(1) {
         if(execute) {
