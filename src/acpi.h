@@ -213,11 +213,23 @@ typedef struct {
 } __attribute((packed)) ics_list_t;
 
 
+typedef struct {
+    sdt_t desc;
+    char reserved1[8];
+    uint64_t base_addr;
+    uint16_t seg_group;
+    uint8_t start_bus;
+    uint8_t end_bus;
+    uint32_t reserved2;
+}__attribute((packed)) mcfg_entry;
+
 
 void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt);
 void init_acpi(void);
 void pmt_delay(uint64_t us);
 fadt_t *fetch_fadt();
+
+extern mcfg_entry *mcfg;
 
 extern hpet_t *hpet;
 extern madt_ioapic_t *ioapic_list[];

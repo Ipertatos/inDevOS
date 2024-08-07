@@ -7,6 +7,8 @@
 
 
 void print_info(){
-    printf("Uptime: {d} ms{n}", hpet_get_ticks());
+    printf("OS Name: inDevOS{n}");
+    printf("OS Version: 0.0.1{n}");
     printf("CPU Name: {s}{n}", cpu_name());
+    printf("Uptime: {d} m{n}", hpet_get_ticks() /60);
 }

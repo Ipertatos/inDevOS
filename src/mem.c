@@ -1,15 +1,41 @@
+/*
+    BloreOS - Operating System
+    Copyright (C) 2023 Martin Blore
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+/*
+    This is the physical memory manager, dealing with physical available memory only.
+*/
+#include "stdint.h"
+#include "stdarg.h"
+#include "stddef.h"
 #include "mem.h"
-#include "utils.h"
 #include "limine.h"
-#include "macros.h"
+#include "bitmap.h"
+#include "math.h"
+#include "atomic.h"
+spinlock_t lock = {0};
+
+/* The maximum number of pages of available RAM across the entire memory map */
 uint64_t max_pages_available;
 
-uint64_t total_mem_bytes;
+uint64_t total_memory_bytes;
 
 volatile struct limine_memmap_request memmap_request = {
     .id = LIMINE_MEMMAP_REQUEST,
-    .revision = 0
-};
+    .revision = 0};
 
 volatile struct limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST,
@@ -19,25 +45,50 @@ volatile struct limine_hhdm_request hhdm_request = {
 volatile struct limine_memmap_response *memmap;
 volatile struct limine_hhdm_response *hhdm;
 
+/* Highest memory location found from all memory map entries */
 uint64_t highest_address = 0;
+
+/* Lowest memory location found from all memory map entries */
 uint64_t lowest_address = 0;
 
+/*
+    Number of pages found between the lowest and highest memory locations
+    reported in the memory map entries.
+*/
 static uint64_t num_pages_in_map = 0;
 
-static uint8_t *bitmap = NULL;
+/*
+    The page bitmap tracks all pages in the entire memory map from lowest and highest points
+    in the memory map. A bit value of 0 marks a free page.
+*/
+static uint8_t *page_bitmap = NULL;
 
+/* The location in virtual memory to the higher-half */
 uint64_t vmm_higher_half_offset = 0;
 
+/*
+    The cursor tracks the last page index where we last allocated memory from.
+    To save finding pages, we allocate forwards from this and loop back around
+    if we go past the last page.
+*/
 uint64_t allocation_cursor = 0;
+
 uint64_t num_pages_available = 0;
 
-uint64_t malloc_cursor = 0;
-
-struct PageEntry{
-    uint32_t pages_allocated;
+// The PageEntry helps us determine how pages our allocations reserve when they do a kalloc.
+// This helps know how many pages to free when we come to free that memory.
+// At 4 bytes per entry, the cost of this metadata is approx. 2MB for a 2GB system.
+struct PageEntry {
+    uint32_t pages_allocated;  // Number of pages allocated starting at this entry.
 } __attribute__((packed));
 
+// Contains a PageEntry item per page in memory.
 struct PageEntry* entry_map;
+
+// GCC and Clang reserve the right to generate calls to the following
+// 4 functions even if they are not directly called.
+// Implement them as the C specification mandates.
+// DO NOT remove or rename these functions, or stuff will eventually break!
 void *memcpy(void *dest, const void *src, size_t n)
 {
     uint8_t *pdest = (uint8_t *)dest;
@@ -102,41 +153,53 @@ int memcmp(const void *s1, const void *s2, size_t n)
     return 0;
 }
 
-//malloc
-void *malloc(size_t size)
+/*
+ * Prints the state of the bitmap at the specified indices.
+*/
+void _print_bitmap(uint64_t start, uint64_t len)
 {
-    void *ret;
-    ret = (void *)malloc_cursor;
-    malloc_cursor += size;
-    return ret;
-    
+    printf("Bitmap (%d-%d): ", start, start+len);
+    for (uint64_t i = start; i < start+len; i++) {
+        printf(bitmap_test(page_bitmap, i) ? "1" : "0");
+    }
+    printf("\n");
 }
 
+/*
+ * Walks the memory map entries, setting the state of the bitmap with what it finds as usable memory. 
+*/
 void _get_free_pages()
 {
-    printf("Getting free pages{n}");
-    for(uint64_t i = 0; i < memmap->entry_count; i++)
-    {
+    printf("Searching for free memory pages...\n");
+
+    // So we have a memory map allocated and its all full. Let's walk through the memory map entries again
+    // and start making pages available.
+    for (size_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *entry = memmap->entries[i];
-        if(entry->type != LIMINE_MEMMAP_USABLE)
+
+        if (entry->type != LIMINE_MEMMAP_USABLE) {
             continue;
-       
+        }
+
+        // Find the page this entry refers to in our bitmap.
         uint64_t start_bit = (entry->base - lowest_address) / PAGE_SIZE;
-        uint64_t end_bit = entry->length / PAGE_SIZE;
-        for(uint64_t j = start_bit; j < end_bit; j++)
-        {
-            if(bitmap[j / 8] & (1 << (j % 8)))
-                continue;
-            bitmap[j / 8] |= (1 << (j % 8));
+        uint64_t pages_free = entry->length / PAGE_SIZE;
+
+        // Marks all the pages as free for the size of this memory map entry.
+        for (uint64_t i = start_bit; i < start_bit + pages_free; i++) {
+            bitmap_off(page_bitmap, i);
             num_pages_available++;
         }
     }
 }
 
+/*
+ * Finds memory to store the entry map, allocates it, and store a pointer to it.
+*/
 void _create_entry_map()
 {
-uint64_t map_size = ALIGN_UP(sizeof(struct PageEntry) * num_pages_in_map, PAGE_SIZE);
-    printf("PageEntry Size: {d} bytes{n}", map_size);
+    uint64_t map_size = ALIGN_UP(sizeof(struct PageEntry) * num_pages_in_map, PAGE_SIZE);
+    printf("PageEntry Size: %lu bytes\n", map_size);
 
     for (size_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *entry = memmap->entries[i];
@@ -157,7 +220,7 @@ uint64_t map_size = ALIGN_UP(sizeof(struct PageEntry) * num_pages_in_map, PAGE_S
             max_pages_available -= (map_size / PAGE_SIZE);
             break;
         }
-    }    
+    }
 }
 
 void _create_page_bitmap()
@@ -166,9 +229,9 @@ void _create_page_bitmap()
     // The block size for the bitmap aligns to the page size even though we might not need that much.
     uint64_t bitmap_size = ALIGN_UP(num_pages_in_map / 8, PAGE_SIZE);
 
-    printf("Page Bitmap Size: {d} Kib{n}", bitmap_size / 1024);
+    printf("Page Bitmap Size: %lu Kib\n", bitmap_size / 1024);
 
-    printf("Locating space for bitmap...{n}");
+    printf("Locating space for bitmap...\n");
     
     // Now we know how big our page map needs to be, let's find a spare place in memory
     // to keep it.
@@ -183,10 +246,10 @@ void _create_page_bitmap()
         if (entry->length >= bitmap_size) {
             // We've got a spot, lets point there.
             // We have to use the HHDM offset to correctly point to this physical place in virtual memory.
-            bitmap = (uint8_t*)(entry->base + vmm_higher_half_offset);
+            page_bitmap = (uint8_t*)(entry->base + vmm_higher_half_offset);
 
             // Now set all the bits to 1 in the map to mark everything as taken to start with.
-            memset(bitmap, 0xFF, bitmap_size);
+            memset(page_bitmap, 0xFF, bitmap_size);
 
             // Change the values in the limine map as this part of mem is now permanently allocated to our kernel.
             entry->length -= bitmap_size;
@@ -197,13 +260,11 @@ void _create_page_bitmap()
     }
 }
 
-
 void _init_stats()
 {
     memmap = memmap_request.response;
     hhdm = hhdm_request.response;
     vmm_higher_half_offset = hhdm->offset;
-    printf("-----------HHDM Offset: {x}{n}", vmm_higher_half_offset);
 
     // Gather some stats about the memory map so we know how big we need to make our
     // page bitmap.
@@ -211,7 +272,7 @@ void _init_stats()
         struct limine_memmap_entry *entry = memmap->entries[i];
 
         if (entry->type == LIMINE_MEMMAP_USABLE) {
-            total_mem_bytes += entry->length;
+            total_memory_bytes += entry->length;
 
             // In this entry, how many pages are there?
             max_pages_available += entry->length / PAGE_SIZE;
@@ -243,7 +304,7 @@ inline uint64_t _get_page_from_addr(void* addr)
 void _reserve_pages(uint64_t startPage, uint64_t pages)
 {
     for (uint64_t i = startPage; i < startPage + pages; i++) {
-        bitmap[i / 8] |= (1 << (i % 8));
+        bitmap_on(page_bitmap, i);
     }
 }
 
@@ -258,6 +319,8 @@ void _reserve_pages(uint64_t startPage, uint64_t pages)
 */
 void* kalloc(size_t numBytes)
 {
+    spinlock_lock(&lock);
+
     uint64_t pages_to_alloc = DIV_ROUNDUP(numBytes, PAGE_SIZE);
     uint64_t start_alloc_page = 0;
     uint64_t allocated_pages = 0;
@@ -267,7 +330,7 @@ void* kalloc(size_t numBytes)
 
     // Try and allocate pages starting from the cursor.
     while(true) {
-        page_state = bitmap_test(bitmap, allocation_cursor);
+        page_state = bitmap_test(page_bitmap, allocation_cursor);
 
         if (!allocating) {
             if (!page_state) {
@@ -301,7 +364,8 @@ void* kalloc(size_t numBytes)
             entry_map[start_alloc_page].pages_allocated = allocated_pages;
 
             num_pages_available -= allocated_pages;
-            return (void*)(lowest_address + (start_alloc_page * PAGE_SIZE) + vmm_higher_half_offset);
+            spinlock_unlock(&lock);
+            return _get_addr_from_page(start_alloc_page);
         }
 
         // Forward the cursor and bounds check.
@@ -324,8 +388,9 @@ void* kalloc(size_t numBytes)
     }
 
     // Failed to allocate getting this far.
+    spinlock_unlock(&lock);
 
-    printf("PMM Allocation failed.{n}");
+    printf("PMM Allocation failed.\n");
 
     return NULL;
 }
@@ -335,20 +400,20 @@ void* kalloc(size_t numBytes)
 */
 void kmem_init()
 {
-    printf("Initialzing PMM...{n}");
+    printf("Initialzing PMM...\n");
 
     _init_stats();
 
-    printf("Total Memory: {d} Mib{n}", total_mem_bytes / 1024 / 1024);
-    printf("Total Map Pages: {d}{n}", num_pages_in_map);
-    printf("Total Pages Available: {d}{n}", max_pages_available);
-    printf("Lowest Memory Addr: 0x{x}{n}", lowest_address);
+    printf("Total Memory: %lu Mib\n", total_memory_bytes / 1024 / 1024);
+    printf("Total Map Pages: %lu\n", num_pages_in_map);
+    printf("Total Pages Available: %lu\n", max_pages_available);
+    printf("Lowest Memory Addr: 0x%X\n", lowest_address);
     
     _create_page_bitmap();
     _create_entry_map();
     _get_free_pages();
 
-    printf("PMM initialized.{n}");
+    printf("PMM initialized.\n");
 }
 
 /*
@@ -356,22 +421,28 @@ void kmem_init()
 */
 void kfree(void *ptr)
 {
+    spinlock_lock(&lock);
 
-    uint64_t page_index = ((uint64_t)ptr - lowest_address - vmm_higher_half_offset) / PAGE_SIZE;
+    uint64_t page_index = _get_page_from_addr(ptr);
     
     if (page_index >= max_pages_available) {
-        printf("*FATAL*: Page index lookup resulted in out of bounds value of {d} from address 0x{x}.{n}", page_index, ptr);
-        while(1) __asm__("hlt");
+        printf("*FATAL*: Page index lookup resulted in out of bounds value of %lu from address 0x%X.\n", page_index, ptr);
+        while (1)
+        {
+            __asm__("hlt");
+        }
+        
     }
 
     // Turn off all the bits for all of the pages that were allocated.
     for (uint64_t i = page_index; i < page_index + entry_map[page_index].pages_allocated; i++) {
-        bitmap[i / 8] &= ~(1 << (i % 8));
+        bitmap_off(page_bitmap, i);
     }
 
     // Update the entry.
     entry_map[page_index].pages_allocated = 0;
 
+    spinlock_unlock(&lock);
 }
 
 // Dumps contents of the specified memory location in char format.
@@ -382,7 +453,7 @@ void memdumps(void *location, uint64_t len_bytes)
         printf("%c", *chLocation++);
     }
     
-    printf("{n}");
+    printf("\n");
 }
 
 void memdumpx32(void *location, uint64_t len_bytes)
@@ -392,7 +463,7 @@ void memdumpx32(void *location, uint64_t len_bytes)
         printf("0x%X ", *data++);
     }
     
-    printf("{n}");
+    printf("\n");
 }
 
 void memdumpx64(void *location, uint64_t len_bytes)
@@ -402,5 +473,5 @@ void memdumpx64(void *location, uint64_t len_bytes)
         printf("0x%X ", *data++);
     }
     
-    printf("{n}");
+    printf("\n");
 }

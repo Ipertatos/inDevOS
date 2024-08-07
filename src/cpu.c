@@ -1,6 +1,7 @@
 #include "cpu.h"
 #include "limine.h"
 #include "apic.h"
+#include "mem.h"
 #include "utils.h"
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
@@ -54,6 +55,7 @@ char* cpu_name() {
     memcpy(cpu_name + 32, regs, sizeof(regs));
 
     cpu_name[48] = '\0';
-    char* temp = cpu_name;
-    return temp;
+    char* temp = kalloc(sizeof(char) * 49);
+    temp = &cpu_name[0];
+    return &cpu_name[0];
 }

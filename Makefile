@@ -62,9 +62,9 @@ clean:
 	mkdir obj/flanterm/backends
 
 run: os.iso
-	qemu-system-x86_64 os.iso -m 1G
+	qemu-system-x86_64 os.iso -m 1G -M q35
 
 debug: os.iso
-	qemu-system-x86_64 -s -S os.iso -d int -M smm=off
+	qemu-system-x86_64 -s -S os.iso -d int -M smm=off -M q35
 
 .PHONY: all clean

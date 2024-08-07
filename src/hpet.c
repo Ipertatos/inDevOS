@@ -28,7 +28,7 @@ uint64_t hpet_freq;
 volatile uint64_t _ticks;
 uint64_t tiks;
 
-bool lock = false;
+bool llock = false;
 
 uint64_t* _timer_config_reg(uint32_t n)
 {
@@ -147,14 +147,14 @@ void hpet_sleep_counter(uint64_t ms){
 }
 
 uint64_t hpet_get_ticks(){
-    while(lock){};
+    while(llock){};
     return tiks;
 }
 
 void hpet_isr()
 {
-    lock = true;
+    llock = true;
     _ticks++;
     tiks++;
-    lock = false;
+    llock = false;
 }

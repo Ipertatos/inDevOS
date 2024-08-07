@@ -7,6 +7,7 @@ xsdt_t *xsdt;
 fadt_t *fadt;
 madt_t *madt;
 hpet_t *hpet;
+mcfg_entry *mcfg;
 
 #define PMT_TIMER_FREQ 3579545 // 3.579545 MHz
 
@@ -36,6 +37,9 @@ fadt_t *fetch_fadt(){
     return find_acpi_table("FACP",rsdt,xsdt);
 }
 
+mcfg_entry *fetch_mcfg(){
+    return find_acpi_table("MCFG",rsdt,xsdt);
+}
 
 void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
     int usexsdt;
@@ -89,6 +93,11 @@ void init_acpi(void){
 
     if(hpet == NULL)
         log_panic("HPET table not found");
+
+    mcfg = find_acpi_table("MCFG",rsdt,xsdt); // MCFG - sig for MCFG table
+
+    if(mcfg == NULL)
+        log_panic("MCFG table not found");
 
     // Enable ACPI
     init_apic(madt);

@@ -11,8 +11,8 @@
 #include "hpet.h"
 #include "mem.h"
 #include "cpu.h"    
-
-
+#include "pci.h"    
+#include "nvme.h"
 static volatile LIMINE_BASE_REVISION(1);
 uint8_t buffer_len;
 
@@ -40,6 +40,10 @@ void kmain(void) {
     cpu_init();
     kmem_init();
     init_acpi();
+    pci_init();
+
+    nvme_init();   
+
     __asm__("sti");
     while(1) {
         if(execute) {
