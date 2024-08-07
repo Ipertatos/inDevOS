@@ -1,7 +1,7 @@
 # Variables
 
 #use local cross compiler
-CC = /home/ipertatos/opt/cross/bin/x86_64-elf-gcc
+CC = ~/opt/cross/bin/x86_64-elf-gcc
 
 #CC = gcc
 LD = ld
