@@ -62,7 +62,7 @@ clean:
 	mkdir obj/flanterm/backends
 
 run: os.iso
-	qemu-system-x86_64 os.iso -m 1G -M q35
+	qemu-system-x86_64 os.iso -m 1G -M q35 -audiodev pa,id=speaker -machine pcspk-audiodev=speaker
 
 debug: os.iso
 	qemu-system-x86_64 -s -S os.iso -d int -M smm=off -M q35
