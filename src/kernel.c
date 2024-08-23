@@ -15,6 +15,7 @@
 #include "nvme.h"
 #include "sound.h"
 #include "paratrooper.h"
+#include "rtl8169.h"
 static volatile LIMINE_BASE_REVISION(1);
 uint8_t buffer_len;
 
@@ -46,8 +47,9 @@ void kmain(void) {
 
     nvme_init();   
     //beep();
-    PlayWAV(44100, fsize, file);
     __asm__("sti");
+    //PlayWAV(44100, fsize, file);
+    //rtl8169_init();
     while(1) {
         if(execute) {
             cmd(buffer,buffer_len);

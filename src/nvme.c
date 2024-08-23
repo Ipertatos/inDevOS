@@ -24,16 +24,16 @@ void nvme_init(){
     }
 
     uint32_t base_high = pci_device_read(dev, 0x14, 4);
-    printf("NVMe: Base High: 0x{X}{n}", base_high);
+    printf("NVMe: Base High: 0x{x}{n}", base_high);
 
     uint32_t base_low = bar0 & 0xfffffff0;
     uint64_t bar0_base_addr = base_low;
     bar0_base_addr |= ((uint64_t)base_high) << 32;
 
     uint32_t len = ~(size_low & ~0b1111) + 1;
-    printf("NVMe: Length: 0x{X}{n}", len);
+    printf("NVMe: Length: 0x{x}{n}", len);
 
-    printf("NVMe: Base Low: 0x{X}{n}", base_low);
+    printf("NVMe: Base Low: 0x{x}{n}", base_low);
 
     printf("NVMe: Initialized{n}");
 }

@@ -21,6 +21,7 @@ const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
         case 0x02:
             switch (sub_class_code){
                 case 0x00:
+                    printf("PCI: {x}:{xn}", class_code, sub_class_code);
                     return "Network Controller - Ethernet Controller";
                 default:
                     printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);

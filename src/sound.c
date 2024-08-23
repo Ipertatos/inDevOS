@@ -47,14 +47,28 @@ void test_sound() {
     
 }
 void PlayWAV(uint32_t sample_rate, uint32_t file_size, uint8_t* file_data) {
-    uint32_t i;
+    
+    uint32_t Div;
+    uint8_t tmp;
 
-    // Enable digitized sound
-    for (i = 0; i < file_size; i++) {
-        //hpet_sleep_counter((1193181 / sample_rate));
-        //play_sound(file_data[i] | 3);
-        printf("{d}",file_data[i]);
+    // Set the PIT to the desired frequency
+    Div = 1193180 / sample_rate;
+    outb(0x43, 0x36);
+    outb(0x42, (uint8_t) (Div) );
+    outb(0x42, (uint8_t) (Div >> 8));
+
+    uint32_t i;
+    tmp = inb(0x61);
+    if (tmp != (tmp | 3)) {
+        outb(0x61, tmp | 3);
     }
+
+    for (i = 0; i < file_size; i++) {
+            // And play the sound using the PC speaker
+        outb(0x42,file_data[i]);
+        __asm__ __volatile__("hlt");
+    }
+    printf("stopped playing sound{n}");
     // Disable digitized sound
     nosound();
 }
