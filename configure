@@ -1,3 +1,14 @@
-#! /bin/bash
+#!/bin/bash
 
-apt install gcc make nasm xorriso
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit
+fi
+
+echo "Updating package list..."
+apt update
+
+echo "Installing dependencies..."
+apt install -y gcc nasm make xorriso
+
+echo "All dependencies installed successfully!"
