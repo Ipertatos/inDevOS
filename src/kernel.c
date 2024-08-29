@@ -55,7 +55,7 @@ void kmain(void) {
             cmd(buffer,buffer_len);
             memset(&buffer,'\0',sizeof(char)*256);
             buffer_len = 0;
-            execute = true;
+            execute = false;
         }
         __asm__("nop");
     }

@@ -1,8 +1,11 @@
 # Variables
 
 #use local cross compiler
-CC = ~/opt/cross/bin/x86_64-elf-gcc
-
+ifeq ($(wildcard ~/opt/cross/bin/x86_64-elf-gcc),~/opt/cross/bin/x86_64-elf-gcc)
+    CC = ~/opt/cross/bin/x86_64-elf-gcc
+else
+    CC = gcc
+endif
 #CC = gcc
 LD = ld
 AS = nasm

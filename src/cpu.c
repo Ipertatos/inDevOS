@@ -54,8 +54,11 @@ char* cpu_name() {
     );
     memcpy(cpu_name + 32, regs, sizeof(regs));
 
-    cpu_name[48] = '\0';
+    cpu_name[49] = '\0';
     char* temp = kalloc(sizeof(char) * 49);
-    temp = &cpu_name[0];
-    return &cpu_name[0];
+    //write cpu_name to temp
+    for (int i = 0; i < 49; i++) {
+        temp[i] = cpu_name[i];
+    }
+    return temp;
 }

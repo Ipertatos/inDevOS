@@ -218,6 +218,12 @@ char* int2hex(uint64_t value) {
 
 char* strtok(char* str, const char* delim){
     static char* pos = NULL;
+
+    if(delim == NULL ){
+        pos = NULL;
+        return NULL;
+    }
+
     if(str != NULL) pos = str;
     if(pos == NULL || pos == '\0') return NULL;
     uint16_t len = strcspn(pos, delim);

@@ -4,8 +4,9 @@
 #include "usoft/info.h"
 
 void cmd(char* cmd, uint64_t len){
-    
-    char* token = strtok(cmd, " ");
+    //reset strtok
+    char* tmp = strtok(NULL, " ");
+    char* token = strtok(cmd, " ");     
     token = remove_nl(token);
     //the first token is the command
     if(strEql(token, "clear")){
@@ -25,6 +26,7 @@ void cmd(char* cmd, uint64_t len){
     {
         print_info();
     }
+    strtok(NULL, NULL);
 }
 
 void clear(){
