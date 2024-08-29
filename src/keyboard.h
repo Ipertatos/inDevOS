@@ -4,7 +4,7 @@
 #include "pic.h"
 #include "idt.h"
 extern char buffer[256];
-extern uint8_t buffer_len;
+extern uint32_t buff_len;
 extern bool tobuffer;
 
 extern bool execute;

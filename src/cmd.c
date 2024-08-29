@@ -26,12 +26,22 @@ void cmd(char* cmd, uint64_t len){
     {
         print_info();
     }
+    else if(strEql(token, "timertest")){
+        timer_test();
+    }
     strtok(NULL, NULL);
 }
 
 void clear(){
-    for(int i = 0; i < 80; i++){
-        printf("{n}");
-    }
-    
+    ft_ctx->clear(ft_ctx, false);
+}
+
+void timer_test(){
+    uint64_t start = hpet_get_ticks();
+    uint64_t t = hpet_get_ticks();
+    while(t - start < 1000){
+        printf("{dn}",t - start);
+        t = hpet_get_ticks();
+    };
+    printf("Timer test passed\n");
 }

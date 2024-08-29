@@ -17,7 +17,6 @@
 #include "paratrooper.h"
 #include "rtl8169.h"
 static volatile LIMINE_BASE_REVISION(1);
-uint8_t buffer_len;
 
 void kmain(void) {
     //printk("Kernel started\n");
@@ -52,9 +51,9 @@ void kmain(void) {
     //rtl8169_init();
     while(1) {
         if(execute) {
-            cmd(buffer,buffer_len);
+            cmd(buffer,buff_len);
             memset(&buffer,'\0',sizeof(char)*256);
-            buffer_len = 0;
+            buff_len = 0;
             execute = false;
         }
         __asm__("nop");
