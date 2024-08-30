@@ -33,7 +33,7 @@ void cmd(char* cmd, uint64_t len){
 }
 
 void clear(){
-    ft_ctx->clear(ft_ctx, false);
+    ft_ctx->clear(ft_ctx, true);
 }
 
 void timer_test(){

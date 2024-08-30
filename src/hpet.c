@@ -4,6 +4,7 @@
 #include "apic.h"
 #include "cpu.h"
 #include "mem.h"
+#include "atomic.h"
 #define FEMTOSECS_PER_SEC 1000000000000000LL
 
 #define HPET_REG_MAIN_CNT           0x0F0
@@ -24,11 +25,11 @@ volatile uint64_t *base_addr = 0;
 volatile struct hpet_regs *hpet_regs = 0;
 volatile uint64_t *hpet_main_cnt = 0;
 
+spinlock_t hpet_lock;
 uint64_t hpet_freq;
 volatile uint64_t _ticks;
 uint64_t tiks;
 
-bool llock = false;
 
 uint64_t* _timer_config_reg(uint32_t n)
 {
@@ -147,14 +148,18 @@ void hpet_sleep_counter(uint64_t ms){
 }
 
 uint64_t hpet_get_ticks(){
-    while(llock){};
-    return tiks;
+    spinlock_lock(&hpet_lock);
+    __asm__ __volatile__("cli");
+    int tmp = tiks;
+    __asm__ __volatile__("sti");
+    spinlock_unlock(&hpet_lock);
+    return tmp;
 }
 
 void hpet_isr()
 {
-    llock = true;
+    spinlock_lock(&hpet_lock);
     _ticks++;
     tiks++;
-    llock = false;
+    spinlock_unlock(&hpet_lock);
 }

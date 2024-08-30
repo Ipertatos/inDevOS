@@ -156,12 +156,12 @@ void keyboard_handler(){
     buffer[buff_len] = ch;
     buff_len++;
     printf("{c}",ch);
-    if(ch == '\b'){
+    if(ch == '\b' && buff_len > 0){
         buffer[buff_len] = '\0';
         buff_len--;
         buffer[buff_len] = '\0';
         buff_len--;
-
+        printf(" \b");
     }
     if(ch == '\n'){
         execute = true;
