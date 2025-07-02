@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "registers.h"
 #include "mem.h"
+#include "apic.h"
 rsdt_t *rsdt;
 xsdt_t *xsdt;
 fadt_t *fadt;

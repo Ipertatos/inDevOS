@@ -1,6 +1,7 @@
 #include "pci.h"
 #include "acpi.h"
 #include "mem.h"
+#include "serial.h"
 
 struct pci_device *pci_devices[32];
 uint8_t pci_device_count = 0;
@@ -10,6 +11,8 @@ const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
     switch(class_code){
         case 0x01:
             switch(sub_class_code){
+                case 0x01:
+                    return "Mass Storage Controller - IDE Interface";
                 case 0x06:
                     return "Mass Storage Controller - Serial ATA Controller";
                 case 0x08:
@@ -77,7 +80,15 @@ uint32_t pci_mm_read(uint8_t bus, uint8_t device, uint8_t function, uint8_t offs
 
 // read from pci configuration for a pci device
 uint32_t pci_device_read(struct pci_device *dev, uint32_t offset, uint8_t size){
-    return pci_mm_read(dev->bus, dev->device, dev->function, offset, size);
+    if (dev == NULL) {
+        printf("PCI: pci_device_read called with NULL device{n}");
+        DEBUG_SERIAL("PCI: pci_device_read called with NULL device\n");
+        return 0;
+    }
+    uint32_t result = pci_mm_read(dev->bus, dev->device, dev->function, offset, size);
+    DEBUG_SERIAL("PCI: reading from offset 0x%x from bus=%d, device=%d, func=%d, result=0x%x\n", 
+                 offset, dev->bus, dev->device, dev->function, result);
+    return result;
 }
 
 //write to pci configuration for a pci device
@@ -164,7 +175,24 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
     dev->header_type = header_type;
     dev->address = mcfg->base_addr + vmm_higher_half_offset + ((bus - mcfg->start_bus) << 20 | device << 15 | function << 12);
 
-    printf("PCI: {sn}", dev->description);
+    printf("PCI: {s} (Class {x:02}:{x:02}){n}", dev->description, classcode, subclass);
+    DEBUG_SERIAL("PCI: %s (Class %02x:%02x) at bus=%d, device=%d, func=%d\n", 
+                 dev->description, classcode, subclass, bus, device, function);
+    
+    // Debug storage controllers
+    if (classcode == 0x01) {
+        printf("PCI: Storage device created - bus={d}, device={d}, func={d}{n}", 
+               dev->bus, dev->device, dev->function);
+        DEBUG_SERIAL("PCI: Storage device created - bus=%d, device=%d, func=%d\n", 
+                     dev->bus, dev->device, dev->function);
+        
+        // For SATA controllers, also read and log BAR5
+        if (subclass == 0x06) {
+            uint32_t bar5_low = pci_device_read(dev, 0x24, 4);
+            uint32_t bar5_high = pci_device_read(dev, 0x28, 4);
+            DEBUG_SERIAL("PCI: SATA BAR5 - low=0x%x, high=0x%x\n", bar5_low, bar5_high);
+        }
+    }
 }
 
 /*

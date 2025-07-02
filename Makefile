@@ -10,7 +10,7 @@ endif
 LD = ld
 AS = nasm
 
-CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel -fcommon
+CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel -fcommon -DDEBUG_PRINT
  #-Wall -Wextra
 LDFLAGS = -T linker.ld -melf_x86_64
 ASFLAGS = -g -F dwarf -f elf64
@@ -65,7 +65,7 @@ clean:
 	mkdir obj/flanterm/backends
 
 run: os.iso
-	qemu-system-x86_64 os.iso -smp 1 -m 1G -M q35 -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -net nic,model=rtl8139
+	qemu-system-x86_64 -boot d -cdrom os.iso -smp 1 -m 1G -M q35 -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -net nic,model=rtl8139 -drive file=nvme_disk.img,format=raw,index=1,media=disk -serial file:serial.log
 
 debug: os.iso
 	qemu-system-x86_64 -s -S os.iso -d int -M q35 -smp 1

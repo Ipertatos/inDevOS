@@ -13,12 +13,20 @@
 #include "cpu.h"    
 #include "pci.h"    
 #include "nvme.h"
+#include "ide.h"
+#include "ahci.h"
 #include "sound.h"
 #include "paratrooper.h"
 #include "rtl8169.h"
+#include "storage.h"
+#include "serial.h"
 static volatile LIMINE_BASE_REVISION(1);
 
 void kmain(void) {
+    // Initialize serial port first for debugging
+    serial_init();
+    DEBUG_SERIAL("Serial debug initialized\n");
+    
     //printk("Kernel started\n");
 
     if(LIMINE_BASE_REVISION_SUPPORTED == false) {
@@ -45,6 +53,14 @@ void kmain(void) {
     pci_init();
 
     nvme_init();   
+    ide_init();
+    ahci_init();
+    
+    // Initialize storage and filesystem
+    printk(ft_ctx,"Initializing storage subsystem\n");
+    storage_init();
+    storage_init_ramdisk();
+    
     //beep();
     __asm__("sti");
     //PlayWAV(44100, fsize, file);

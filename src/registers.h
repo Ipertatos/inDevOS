@@ -16,6 +16,8 @@ void outw(uint16_t port, uint16_t value);
 uint32_t inl(uint16_t port);
 void outl(uint16_t port, uint32_t value);
 
+void io_wait();
+
 typedef struct {
     uint64_t rdi, rsi, rbp, rbx, rdx, rcx, rax;
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;

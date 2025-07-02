@@ -1,5 +1,6 @@
 #include "gdt.h"
 #include "utils.h"
+#include "mem.h"
 
 #define GDTSEGMENTS 7 // 6 + 1 - TSS takes up 2
 

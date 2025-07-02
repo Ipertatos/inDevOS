@@ -1,0 +1,28 @@
+Serial debug initialized
+PCI: Bridge - Host Bridge (Class 06:00) at bus=0, device=0, func=0
+PCI: Display Controller - VGA Compatible Controller (Class 03:00) at bus=0, device=1, func=0
+PCI: Network Controller - Ethernet Controller (Class 02:00) at bus=0, device=2, func=0
+PCI: Bridge - ISA Bridge (Class 06:01) at bus=0, device=31, func=0
+PCI: Mass Storage Controller - Serial ATA Controller (Class 01:06) at bus=0, device=31, func=2
+PCI: Storage device created - bus=0, device=31, func=2
+PCI: reading from offset 0x24 from bus=0, device=31, func=2, result=0xfeb92000
+PCI: reading from offset 0x28 from bus=0, device=31, func=2, result=0x0
+PCI: SATA BAR5 - low=0xfeb92000, high=0x0
+PCI: Serial Bus Controller - USB Controller (Class 0c:05) at bus=0, device=31, func=3
+AHCI: Starting AHCI initialization
+AHCI: Found SATA controller at bus 0, device 31, func 2
+PCI: reading from offset 0x24 from bus=0, device=31, func=2, result=0xfeb92000
+PCI: reading from offset 0x28 from bus=0, device=31, func=2, result=0x0
+AHCI: BAR5 registers - low: 0xfeb92000, high: 0x0
+AHCI: BAR5 physical: 0xfeb92000, virtual: 0xfeb92000
+PCI: reading from offset 0x4 from bus=0, device=31, func=2, result=0x107
+AHCI: 6 ports, implemented mask: 0x3f
+AHCI: Basic controller detection successful
+AHCI: Port 0 is implemented
+AHCI: Registering basic SATA device
+AHCI: Registered as storage device 0
+storage_init: Before init - device_count=1
+storage_init: Preserving 1 existing devices
+storage_init: After init - device_count=1
+storage_init_ramdisk: Creating ramdisk as device 1
+show_storage_devices: device_count=2

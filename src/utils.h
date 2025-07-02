@@ -2,8 +2,8 @@
 
 #include "types.h"
 #include "limine.h"
-#include "flanterm/flanterm.h"
-#include "flanterm/backends/fb.h"
+#include "flanterm/src/flanterm.h"
+#include "flanterm/src/flanterm_backends/fb.h"
 
 
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -22,7 +22,7 @@ typedef struct position{
 extern volatile struct limine_framebuffer_request fb_rq;
 extern struct limine_framebuffer *fb;
 
-struct flanterm_context *ft_ctx;
+extern struct flanterm_context *ft_ctx;
 
 struct flanterm_context *initFB();
 
@@ -68,3 +68,5 @@ void dump_hex(char *stack);
 void dump_str(char *stack);
 
 void call(char* buffer, uint32_t buff_len);
+
+void clear_screen();
