@@ -174,12 +174,12 @@ int ide_register_storage() {
     ide_device->pci_dev = ide_ctrl.pci_dev;
     ide_device->base_address = ide_ctrl.base_port;
     
-    // Simple string copy
+    // Properly initialize the name field
+    memset(ide_device->name, 0, sizeof(ide_device->name));
     const char *name = "IDE Drive";
     for (int i = 0; i < 31 && name[i] != '\0'; i++) {
         ide_device->name[i] = name[i];
     }
-    ide_device->name[31] = '\0';
     
     storage_device_count++;
     

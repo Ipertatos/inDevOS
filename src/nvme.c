@@ -143,12 +143,13 @@ int nvme_register_storage() {
     nvme_device->is_initialized = true;
     nvme_device->pci_dev = nvme_ctrl.pci_dev;
     nvme_device->base_address = nvme_ctrl.bar0_base;
-    // Simple string copy
+    
+    // Properly initialize the name field
+    memset(nvme_device->name, 0, sizeof(nvme_device->name));
     const char *name = "NVMe SSD";
     for (int i = 0; i < 31 && name[i] != '\0'; i++) {
         nvme_device->name[i] = name[i];
     }
-    nvme_device->name[31] = '\0';
     
     storage_device_count++;
     

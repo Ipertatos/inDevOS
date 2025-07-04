@@ -65,7 +65,7 @@ clean:
 	mkdir obj/flanterm/backends
 
 run: os.iso
-	qemu-system-x86_64 -boot d -cdrom os.iso -smp 1 -m 1G -M q35 -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -net nic,model=rtl8139 -drive file=nvme_disk.img,format=raw,index=1,media=disk -serial file:serial.log
+	qemu-system-x86_64 -boot d -cdrom os.iso -smp 1 -m 1G -M q35 -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -net nic,model=rtl8139 -drive file=sata_disk.img,format=raw,index=0 -drive file=nvme_disk.img,format=raw,index=1,media=disk -serial file:serial.log
 
 debug: os.iso
 	qemu-system-x86_64 -s -S os.iso -d int -M q35 -smp 1

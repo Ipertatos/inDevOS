@@ -130,8 +130,10 @@ int fat32_seek(fat32_file_t *file, uint32_t position);
 
 // Directory operations
 int fat32_list_directory(const char *path, fat32_dir_list_t *entries, uint32_t max_entries);
-int fat32_create_directory(const char *path);
+int fat32_create_directory(const char *dirname);
 int fat32_delete_file(const char *filename);
+int fat32_create_file(const char *filename);
+int fat32_file_exists(const char *filename);
 
 // Utility functions
 uint32_t fat32_cluster_to_sector(fat32_fs_t *fs, uint32_t cluster);

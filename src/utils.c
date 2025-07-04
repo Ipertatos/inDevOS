@@ -8,6 +8,7 @@
 #include "types.h"
 #include "limine.h"
 #include "mem.h"
+#include "serial.h"
 #define MAX_INT_SIZE 128
 
 #define FORMAT_LENTGH       1
@@ -287,6 +288,8 @@ void printch(struct flanterm_context *ft_ctx,char c) {
     if(ft_ctx != NULL) {
         flanterm_write(ft_ctx,&c,1);
     }
+    // Also output to serial
+    serial_putc(c);
 }
 
 void printstr(struct flanterm_context *ft_ctx, char *str)
@@ -296,6 +299,10 @@ void printstr(struct flanterm_context *ft_ctx, char *str)
         if(len > 0) {
             flanterm_write(ft_ctx,str,len);
         }
+    }
+    // Also output to serial
+    if(str != NULL) {
+        serial_puts(str);
     }
 }
 

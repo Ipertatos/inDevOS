@@ -162,18 +162,23 @@ int fat32_mount(uint8_t storage_device_id) {
     
     // Load FAT table
     uint32_t fat_size_bytes = boot->fat_size_32 * boot->bytes_per_sector;
+    printf("fat32: Allocating FAT table - {d} sectors, {d} bytes{n}", boot->fat_size_32, fat_size_bytes);
     fat32_filesystem.fat_table = kalloc(fat_size_bytes);
     if (!fat32_filesystem.fat_table) {
         printf("fat32: Failed to allocate FAT table{n}");
         return -1;
     }
+    printf("fat32: FAT table allocated successfully{n}");
     
+    printf("fat32: Reading FAT sectors - start: {d}, count: {d}{n}", 
+           fat32_filesystem.fat_start_sector, boot->fat_size_32);
     if (storage_read_sectors(storage_device_id, fat32_filesystem.fat_start_sector, 
                            boot->fat_size_32, fat32_filesystem.fat_table) != 0) {
         printf("fat32: Failed to read FAT table{n}");
         kfree(fat32_filesystem.fat_table);
         return -1;
     }
+    printf("fat32: FAT table read successfully{n}");
     
     fat32_filesystem.is_mounted = true;
     printf("fat32: Filesystem mounted successfully{n}");
@@ -278,29 +283,58 @@ fat32_file_t* fat32_open(const char *filename, const char *mode) {
         return NULL;
     }
     
-    // Simple implementation: search root directory only
-    fat32_dir_list_t entries[64];
-    int entry_count = fat32_list_directory("/", entries, 64);
-    
-    for (int i = 0; i < entry_count; i++) {
-        if (strEql(entries[i].name, filename)) {
-            // Found the file
-            file->in_use = true;
-            file->file_size = entries[i].size;
-            file->file_position = 0;
-            file->attributes = entries[i].attributes;
-            file->filesystem = &fat32_filesystem;
-            memmove(file->filename, filename, strlen(filename) + 1);
-            
-            // Find first cluster (simplified - would need to read directory entry properly)
-            file->first_cluster = 2; // Placeholder
-            file->current_cluster = file->first_cluster;
-            
-            printf("fat32: Opened file '{s}' (size: {d} bytes){n}", filename, file->file_size);
-            return file;
-        }
+    // Search for file in root directory with proper cluster extraction
+    uint32_t dir_cluster = fat32_filesystem.root_dir_cluster;
+    void *cluster_buffer = kalloc(fat32_filesystem.bytes_per_cluster);
+    if (!cluster_buffer) {
+        printf("fat32: Failed to allocate cluster buffer{n}");
+        return NULL;
     }
     
+    while (dir_cluster != FAT32_CLUSTER_END) {
+        if (fat32_read_cluster(&fat32_filesystem, dir_cluster, cluster_buffer) != 0) {
+            kfree(cluster_buffer);
+            return NULL;
+        }
+        
+        fat32_dir_entry_t *dir_entries = (fat32_dir_entry_t*)cluster_buffer;
+        uint32_t entries_per_cluster = fat32_filesystem.bytes_per_cluster / sizeof(fat32_dir_entry_t);
+        
+        for (uint32_t i = 0; i < entries_per_cluster; i++) {
+            fat32_dir_entry_t *entry = &dir_entries[i];
+            
+            if (entry->name[0] == 0x00) break; // End of directory
+            if (entry->name[0] == 0xE5) continue; // Deleted entry
+            if ((entry->attr & FAT32_ATTR_LFN) == FAT32_ATTR_LFN) continue; // LFN entry
+            if (entry->attr & FAT32_ATTR_VOLUME_ID) continue; // Volume label
+            
+            char formatted_name[256];
+            fat32_format_83_filename(entry->name, formatted_name);
+            
+            if (strEql(formatted_name, filename)) {
+                // Found the file
+                file->in_use = true;
+                file->file_size = entry->file_size;
+                file->file_position = 0;
+                file->attributes = entry->attr;
+                file->filesystem = &fat32_filesystem;
+                memmove(file->filename, filename, strlen(filename) + 1);
+                
+                // Extract first cluster from directory entry
+                file->first_cluster = ((uint32_t)entry->first_cluster_hi << 16) | entry->first_cluster_lo;
+                file->current_cluster = file->first_cluster;
+                
+                kfree(cluster_buffer);
+                printf("fat32: Opened file '{s}' (size: {d} bytes, cluster: {d}){n}", 
+                       filename, file->file_size, file->first_cluster);
+                return file;
+            }
+        }
+        
+        dir_cluster = fat32_get_next_cluster(&fat32_filesystem, dir_cluster);
+    }
+    
+    kfree(cluster_buffer);
     printf("fat32: File '{s}' not found{n}", filename);
     return NULL;
 }
@@ -320,8 +354,59 @@ int fat32_read(fat32_file_t *file, void *buffer, uint32_t size) {
         return -1;
     }
     
-    printf("fat32: Read operation not fully implemented yet{n}");
-    return 0; // Placeholder
+    if (file->file_position >= file->file_size) {
+        return 0; // EOF
+    }
+    
+    // Limit read size to remaining bytes in file
+    uint32_t remaining_bytes = file->file_size - file->file_position;
+    if (size > remaining_bytes) {
+        size = remaining_bytes;
+    }
+    
+    uint32_t bytes_read = 0;
+    uint8_t *output_buffer = (uint8_t*)buffer;
+    
+    // Allocate cluster buffer
+    void *cluster_buffer = kalloc(file->filesystem->bytes_per_cluster);
+    if (!cluster_buffer) {
+        printf("fat32: Failed to allocate cluster buffer for read{n}");
+        return -1;
+    }
+    
+    while (bytes_read < size && file->current_cluster != FAT32_CLUSTER_END) {
+        // Read current cluster
+        if (fat32_read_cluster(file->filesystem, file->current_cluster, cluster_buffer) != 0) {
+            printf("fat32: Failed to read cluster {d}{n}", file->current_cluster);
+            kfree(cluster_buffer);
+            return -1;
+        }
+        
+        // Calculate position within cluster
+        uint32_t cluster_offset = file->file_position % file->filesystem->bytes_per_cluster;
+        uint32_t bytes_in_cluster = file->filesystem->bytes_per_cluster - cluster_offset;
+        uint32_t bytes_to_copy = size - bytes_read;
+        
+        if (bytes_to_copy > bytes_in_cluster) {
+            bytes_to_copy = bytes_in_cluster;
+        }
+        
+        // Copy data from cluster buffer to output buffer
+        memmove(output_buffer + bytes_read, 
+                (uint8_t*)cluster_buffer + cluster_offset, 
+                bytes_to_copy);
+        
+        bytes_read += bytes_to_copy;
+        file->file_position += bytes_to_copy;
+        
+        // Move to next cluster if we've read the entire current cluster
+        if (cluster_offset + bytes_to_copy >= file->filesystem->bytes_per_cluster) {
+            file->current_cluster = fat32_get_next_cluster(file->filesystem, file->current_cluster);
+        }
+    }
+    
+    kfree(cluster_buffer);
+    return bytes_read;
 }
 
 int fat32_write(fat32_file_t *file, const void *buffer, uint32_t size) {
@@ -340,4 +425,50 @@ int fat32_seek(fat32_file_t *file, uint32_t position) {
     
     file->file_position = position;
     return 0;
+}
+
+// Create an empty file (for touch command)
+int fat32_create_file(const char *filename) {
+    // Extremely minimal implementation to avoid page faults
+    printf("fat32: create file called{n}");
+    return -1;
+}
+
+// Create a directory (for mkdir command)  
+int fat32_create_directory(const char *dirname) {
+    if (!fat32_is_mounted()) {
+        printf("fat32: Filesystem not mounted{n}");
+        return -1;
+    }
+    
+    printf("fat32: Directory creation not fully implemented - would create '{s}'{n}", dirname);
+    return -1; // TODO: Implement directory creation
+}
+
+// Delete a file (for rm command)
+int fat32_delete_file(const char *filename) {
+    if (!fat32_is_mounted()) {
+        printf("fat32: Filesystem not mounted{n}");
+        return -1;
+    }
+    
+    printf("fat32: File deletion not fully implemented - would delete '{s}'{n}", filename);
+    return -1; // TODO: Implement file deletion
+}
+
+// Get file information
+int fat32_file_exists(const char *filename) {
+    if (!fat32_is_mounted()) {
+        return 0;
+    }
+    
+    fat32_dir_list_t entries[64];
+    int entry_count = fat32_list_directory("/", entries, 64);
+    
+    for (int i = 0; i < entry_count; i++) {
+        if (strEql(entries[i].name, filename)) {
+            return 1; // File exists
+        }
+    }
+    return 0; // File doesn't exist
 } 

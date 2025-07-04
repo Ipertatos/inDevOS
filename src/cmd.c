@@ -55,6 +55,59 @@ void cmd(char* cmd, uint64_t len){
     else if(strEql(token, "storage")){
         show_storage_devices();
     }
+    else if(strEql(token, "cat")){
+        token = strtok(NULL, " ");
+        if (token == NULL) {
+            printf("Usage: cat <filename>{n}");
+        } else {
+            cat_file(token);
+        }
+    }
+    else if(strEql(token, "touch")){
+        token = strtok(NULL, " ");
+        if (token == NULL) {
+            printf("Usage: touch <filename>{n}");
+        } else {
+            touch_file(token);
+        }
+    }
+    else if(strEql(token, "mkdir")){
+        token = strtok(NULL, " ");
+        if (token == NULL) {
+            printf("Usage: mkdir <dirname>{n}");
+        } else {
+            make_directory(token);
+        }
+    }
+    else if(strEql(token, "rm")){
+        token = strtok(NULL, " ");
+        if (token == NULL) {
+            printf("Usage: rm <filename>{n}");
+        } else {
+            remove_file(token);
+        }
+    }
+    else if(strEql(token, "cp")){
+        char *source = strtok(NULL, " ");
+        char *dest = strtok(NULL, " ");
+        if (source == NULL || dest == NULL) {
+            printf("Usage: cp <source> <destination>{n}");
+        } else {
+            copy_file(source, dest);
+        }
+    }
+    else if(strEql(token, "mv")){
+        char *source = strtok(NULL, " ");
+        char *dest = strtok(NULL, " ");
+        if (source == NULL || dest == NULL) {
+            printf("Usage: mv <source> <destination>{n}");
+        } else {
+            move_file(source, dest);
+        }
+    }
+    else if(strEql(token, "dir")){
+        list_files(); // dir is an alias for ls
+    }
     else if(strEql(token, "help")){
         show_help();
     }
@@ -219,6 +272,95 @@ void show_help(){
     printf("  storage    - Show storage devices{n}");
     printf("  mount <id> - Mount FAT32 filesystem from device ID{n}");
     printf("  unmount    - Unmount the filesystem{n}");
-    printf("  ls         - List files and directories{n}");
+    printf("  ls / dir   - List files and directories{n}");
     printf("  fsinfo     - Show filesystem information{n}");
+    printf("  cat <file> - Display file contents{n}");
+    printf("  touch <file> - Create empty file{n}");
+    printf("  mkdir <dir>  - Create directory{n}");
+    printf("  rm <file>    - Remove file{n}");
+    printf("  cp <src> <dst> - Copy file{n}");
+    printf("  mv <src> <dst> - Move/rename file{n}");
+}
+
+// File I/O command implementations
+
+void cat_file(const char *filename) {
+    if (!fat32_is_mounted()) {
+        printf("No filesystem mounted. Use 'mount' command first.{n}");
+        return;
+    }
+    
+    printf("Reading file: {s}{n}", filename);
+    
+    fat32_file_t *file = fat32_open(filename, "r");
+    if (!file) {
+        printf("Failed to open file '{s}'{n}", filename);
+        return;
+    }
+    
+    // Read and display file contents in chunks
+    char buffer[1024];
+    int bytes_read;
+    
+    while ((bytes_read = fat32_read(file, buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[bytes_read] = '\0'; // Null terminate for printf
+        printf("{s}", buffer);
+    }
+    printf("{n}");
+    
+    fat32_close(file);
+}
+
+void touch_file(const char *filename) {
+    printf("touch_file called{n}");
+    fat32_create_file(filename);
+    printf("touch_file done{n}");
+}
+
+void make_directory(const char *dirname) {
+    if (!fat32_is_mounted()) {
+        printf("No filesystem mounted. Use 'mount' command first.{n}");
+        return;
+    }
+    
+    if (fat32_create_directory(dirname) == 0) {
+        printf("Created directory '{s}'{n}", dirname);
+    } else {
+        printf("Failed to create directory '{s}'{n}", dirname);
+    }
+}
+
+void remove_file(const char *filename) {
+    if (!fat32_is_mounted()) {
+        printf("No filesystem mounted. Use 'mount' command first.{n}");
+        return;
+    }
+    
+    printf("Attempting to remove file '{s}'...{n}", filename);
+    
+    if (fat32_delete_file(filename) == 0) {
+        printf("Removed file '{s}'{n}", filename);
+    } else {
+        printf("Failed to remove file '{s}' (not fully implemented yet){n}", filename);
+    }
+}
+
+void copy_file(const char *source, const char *dest) {
+    if (!fat32_is_mounted()) {
+        printf("No filesystem mounted. Use 'mount' command first.{n}");
+        return;
+    }
+    
+    printf("File copy not fully implemented yet{n}");
+    printf("Would copy '{s}' to '{s}'{n}", source, dest);
+}
+
+void move_file(const char *source, const char *dest) {
+    if (!fat32_is_mounted()) {
+        printf("No filesystem mounted. Use 'mount' command first.{n}");
+        return;
+    }
+    
+    printf("File move not fully implemented yet{n}");
+    printf("Would move '{s}' to '{s}'{n}", source, dest);
 }

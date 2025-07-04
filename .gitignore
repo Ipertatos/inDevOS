@@ -12,3 +12,8 @@ testo.txt
 testo
 obj/
 limine
+nvme_disk.img
+sata_disk.img
+serial.log
+test.txt
+test2.txt

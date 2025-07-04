@@ -54,12 +54,15 @@ storage_ops_t storage_ops = {
 void storage_init() {
     DEBUG_SERIAL("storage_init: Before init - device_count=%d\n", storage_device_count);
     
-    // Only initialize if not already initialized (preserve existing devices)
+    // Always ensure uninitialized entries are zeroed
+    for (uint8_t i = storage_device_count; i < MAX_STORAGE_DEVICES; i++) {
+        memset(&storage_devices[i], 0, sizeof(storage_device_t));
+    }
+    
     if (storage_device_count == 0) {
-        memset(storage_devices, 0, sizeof(storage_devices));
         DEBUG_SERIAL("storage_init: Clearing storage devices array\n");
     } else {
-        DEBUG_SERIAL("storage_init: Preserving %d existing devices\n", storage_device_count);
+        DEBUG_SERIAL("storage_init: Preserving %d existing devices, clearing remaining slots\n", storage_device_count);
     }
     
     printf("storage: Initializing storage subsystem{n}");
@@ -131,8 +134,10 @@ void storage_init_ramdisk() {
     *(uint32_t*)(boot_sector + 32) = RAMDISK_SECTORS;
     
     // FAT32 specific fields
-    // FAT size (sectors per FAT)
-    *(uint32_t*)(boot_sector + 36) = (RAMDISK_SECTORS / 128); // Rough estimate
+    // FAT size (sectors per FAT) - more conservative calculation
+    // Each FAT entry is 4 bytes, so for RAMDISK_SECTORS we need (RAMDISK_SECTORS * 4) bytes
+    // But let's use a smaller, safer size for now: 32 sectors = 16KB
+    *(uint32_t*)(boot_sector + 36) = 32;
     
     // Extended flags
     *(uint16_t*)(boot_sector + 40) = 0;
@@ -172,7 +177,7 @@ void storage_init_ramdisk() {
     memmove(ramdisk_data, boot_sector, SECTOR_SIZE);
     
     // Initialize FAT table (2 copies)
-    uint32_t fat_size_sectors = (RAMDISK_SECTORS / 128);
+    uint32_t fat_size_sectors = 32; // Match the value we set in boot sector
     uint32_t fat_start_sector = 32; // Reserved sectors
     
     // Clear FAT area
@@ -214,7 +219,10 @@ void storage_init_ramdisk() {
     dev->is_initialized = true;
     dev->pci_dev = NULL;
     dev->base_address = (uint64_t)ramdisk_data;
-    memmove(dev->name, "RAM Disk", 9);
+    
+    // Properly initialize the name field
+    memset(dev->name, 0, sizeof(dev->name));
+    memmove(dev->name, "RAM Disk", 8);
     
     printf("storage: RAM disk initialized ({d} MB, {d} sectors){n}", 
            RAMDISK_SIZE_MB, RAMDISK_SECTORS);

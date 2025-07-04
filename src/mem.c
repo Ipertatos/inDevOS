@@ -26,6 +26,7 @@
 #include "bitmap.h"
 #include "math.h"
 #include "atomic.h"
+#include "serial.h"
 spinlock_t lock = {0};
 
 /* The maximum number of pages of available RAM across the entire memory map */
@@ -264,7 +265,22 @@ void _init_stats()
 {
     memmap = memmap_request.response;
     hhdm = hhdm_request.response;
-    vmm_higher_half_offset = hhdm->offset;
+    
+    // Debug HHDM setup
+    printf("HHDM Debug: hhdm_request.response = 0x{x}{n}", (uint64_t)hhdm);
+    if (hhdm) {
+        printf("HHDM Debug: hhdm->offset = 0x{x}{n}", hhdm->offset);
+        vmm_higher_half_offset = hhdm->offset;
+        
+        // Serial debug with working format
+        serial_printf("HHDM: response=0x%x, offset=0x%x%08x\n", 
+                     (uint32_t)hhdm, 
+                     (uint32_t)(hhdm->offset >> 32), (uint32_t)hhdm->offset);
+    } else {
+        printf("HHDM Debug: hhdm is NULL - using fallback offset{n}");
+        vmm_higher_half_offset = 0xFFFF800000000000ULL;  // Standard higher half offset
+        serial_printf("HHDM: NULL response, using fallback 0xFFFF800000000000\n");
+    }
 
     // Gather some stats about the memory map so we know how big we need to make our
     // page bitmap.

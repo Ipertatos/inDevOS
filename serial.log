@@ -1,14 +1,88 @@
 Serial debug initialized
+[KERNEL] Initializing Interrupts
+[KERNEL] IDT initialized
+[KERNEL] Checking APIC
+cpu: bsp lapic id: 
+cpu: cpu count: 
+Initialzing PMM...
+HHDM Debug: hhdm_request.response = 0x
+HHDM Debug: hhdm->offset = 0x
+HHDM: response=0x3ff47000, offset=0xffff8000%08x
+Total Memory:  Mib
+Total Map Pages: 
+Total Pages Available: 
+Lowest Memory Addr: 0x
+Page Bitmap Size:  Kib
+Locating space for bitmap...
+PageEntry Size:  bytes
+Searching for free memory pages...
+PMM initialized.
+acpi: looking for table with signature 'APIC'
+acpi: Found table with signature 'APIC'
+acpi: looking for table with signature 'FACP'
+acpi: Found table with signature 'FACP'
+acpi: looking for table with signature 'HPET'
+acpi: Found table with signature 'HPET'
+acpi: looking for table with signature 'MCFG'
+acpi: Found table with signature 'MCFG'
+apic: found cpu: 
+ISO OVERRIDE:  -> .
+ISO OVERRIDE:  -> .
+ISO OVERRIDE:  -> .
+ISO OVERRIDE:  -> .
+ISO OVERRIDE:  -> .
+apic: MADT tables listed through
+apic: writing to SIV register
+hpet: initializing
+hpet: acpi config:
+    hpet comparator count: 
+    hpet counter size: 
+    hpet minimum tick: 
+    hpet legacy replacement: 
+hpet: capabilities: 
+    hpet num timers: 
+    hpet legacy route capable: 
+    hpet 64-bit counter: 
+    hpet tick period: 
+    hpet freq: 
+hpet: config: 
+    hpet legacy replacement route: 
+    hpet overall enable: 
+hpet: timer 0 allowed interrupt routing: 111111110000000100000100
+hpet: timer 0 periodic: 
+hpet: timer 0 64-bit: 
+I/O APIC using override from  to .
+Applied I/O APIC redirect: Vector , GSI .
+}madt lapic adr: 0x
+[32mkern_success: [0mLAPIC initialized
+[36mkern_info: [0mInitializing PS/2 keyboard
+Applied I/O APIC redirect: Vector , GSI .
+}ps2: configured IOAPIC redirection entry
+[32mkern_success: [0mPS/2 keyboard initialized
+[32mkern_success: [0mIOAPIC initialized
+PCI: Bridge - Host Bridge (Class :)
 PCI: Bridge - Host Bridge (Class 06:00) at bus=0, device=0, func=0
+PCI: Display Controller - VGA Compatible Controller (Class :)
 PCI: Display Controller - VGA Compatible Controller (Class 03:00) at bus=0, device=1, func=0
+PCI: :
+PCI: Network Controller - Ethernet Controller (Class :)
 PCI: Network Controller - Ethernet Controller (Class 02:00) at bus=0, device=2, func=0
+PCI: Bridge - ISA Bridge (Class :)
 PCI: Bridge - ISA Bridge (Class 06:01) at bus=0, device=31, func=0
+PCI: Mass Storage Controller - Serial ATA Controller (Class :)
 PCI: Mass Storage Controller - Serial ATA Controller (Class 01:06) at bus=0, device=31, func=2
+PCI: Storage device created - bus=, device=, func=
 PCI: Storage device created - bus=0, device=31, func=2
 PCI: reading from offset 0x24 from bus=0, device=31, func=2, result=0xfeb92000
 PCI: reading from offset 0x28 from bus=0, device=31, func=2, result=0x0
 PCI: SATA BAR5 - low=0xfeb92000, high=0x0
+PCI: Serial Bus Controller - USB Controller (Class :)
 PCI: Serial Bus Controller - USB Controller (Class 0c:05) at bus=0, device=31, func=3
+PCI: Found  PCI devices.
+PCI: Initialized.
+NVMe: Device not found.
+IDE: Starting IDE initialization
+IDE: No IDE controller found (class 01:01)
 AHCI: Starting AHCI initialization
 AHCI: Found SATA controller at bus 0, device 31, func 2
 PCI: reading from offset 0x24 from bus=0, device=31, func=2, result=0xfeb92000
@@ -19,10 +93,99 @@ PCI: reading from offset 0x4 from bus=0, device=31, func=2, result=0x107
 AHCI: 6 ports, implemented mask: 0x3f
 AHCI: Basic controller detection successful
 AHCI: Port 0 is implemented
-AHCI: Registering basic SATA device
+AHCI: Using port 0 with default size
+AHCI: Registering SATA device with lazy initialization
 AHCI: Registered as storage device 0
+[KERNEL] Initializing storage subsystem
 storage_init: Before init - device_count=1
-storage_init: Preserving 1 existing devices
+storage_init: Preserving 1 existing devices, clearing remaining slots
+storage: Initializing storage subsystem
 storage_init: After init - device_count=1
+storage: FAT32 layout - FAT start: , Data start: , Root at: 
 storage_init_ramdisk: Creating ramdisk as device 1
+storage: RAM disk initialized ( MB,  sectors)
+Basic command test:
+1. Running 'help' command:
+Available commands:
+  help       - Show this help message
+  clear      - Clear the screen
+  echo <msg> - Echo a message
+  neofetch   - Show system information
+  timertest  - Test the timer subsystem
+  storage    - Show storage devices
+  mount <id> - Mount FAT32 filesystem from device ID
+  unmount    - Unmount the filesystem
+  ls / dir   - List files and directories
+  fsinfo     - Show filesystem information
+  cat <file> - Display file contents
+  touch <file> - Create empty file
+  mkdir <dir>  - Create directory
+  rm <file>    - Remove file
+  cp <src> <dst> - Copy file
+  mv <src> <dst> - Move/rename file
+
+2. Running 'storage' command:
 show_storage_devices: device_count=2
+Storage Devices:
+ID  Name                     Sectors      Size
+--  ----------------------   ----------   --------
+show_storage_devices: device[0]: initialized=1, name='SATA Drive', sectors=2097152
+  SATA Drive       MB
+show_storage_devices: device[1]: initialized=1, name='RAM Disk', sectors=32768
+  RAM Disk       MB
+
+Total devices: 
+
+File I/O commands available but need debugging.
+You can manually test: mount, ls, touch, mkdir, cat, rm, cp, mv
+storage
+show_storage_devices: device_count=2
+Storage Devices:
+ID  Name                     Sectors      Size
+--  ----------------------   ----------   --------
+show_storage_devices: device[0]: initialized=1, name='SATA Drive', sectors=2097152
+  SATA Drive       MB
+show_storage_devices: device[1]: initialized=1, name='RAM Disk', sectors=32768
+  RAM Disk       MB
+
+Total devices: 
+moi unt 0
+Mounting FAT32 filesystem from device ...
+AHCI: Reading  sectors from LBA 
+AHCI: Lazy initializing port 
+AHCI: Initializing port 
+AHCI: Port  SSTS=0x, DET=0x
+AHCI: Device detected on port  (DET=0x)
+AHCI INIT: CmdList V=0x1200000 P=0x1200000, FIS V=0x1201000 P=0x1201000
+AHCI INIT: CmdTable V=0x1202000 P=0x1202000
+AHCI: Port  initialized successfully
+AHCI IDENTIFY: buffer V=0x1203000 P=0x1203000
+AHCI: IDENTIFY command timeout on port 
+AHCI: Using default drive size for port 
+AHCI: Port  CMD register: 0x
+AHCI: Starting command engine for port 
+AHCI: FIS setup - LBA:, count:, cmd:0x
+AHCI: Setting up PRDT - buffer V:0x, P:0x, bytes:
+AHCI: PRDT buffer P=0x3ff3fd4c, bytes=512
+AHCI: Before command - TFD:0x, CMD:0x, IS:0x
+AHCI: Issuing command to slot 0
+AHCI: Waiting for command completion (CI=0x)
+AHCI: Command completed successfully
+fat32: Filesystem layout:
+  Bytes per sector: 
+  Sectors per cluster: 
+  FAT start sector: 
+  Data start sector: 
+  Root directory cluster: 
+fat32: Allocating FAT table -  sectors,  bytes
+fat32: FAT table allocated successfully
+fat32: Reading FAT sectors - start: , count: 
+AHCI: Reading  sectors from LBA 
+AHCI: Port  CMD register: 0x
+AHCI: FIS setup - LBA:, count:, cmd:0x
+AHCI: Setting up PRDT - buffer V:0x, P:0x, bytes:
+AHCI: PRDT buffer P=0x1204000, bytes=806912
+AHCI: Before command - TFD:0x, CMD:0x, IS:0x
+AHCI: Issuing command to slot 0Page fault
+Exception. System Halted
+Error code: 

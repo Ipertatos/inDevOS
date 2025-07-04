@@ -15,3 +15,11 @@ void filesystem_info();
 void show_storage_devices();
 void show_help();
 int atoi(const char* str);
+
+// File I/O commands
+void cat_file(const char *filename);
+void touch_file(const char *filename);
+void make_directory(const char *dirname);
+void remove_file(const char *filename);
+void copy_file(const char *source, const char *dest);
+void move_file(const char *source, const char *dest);

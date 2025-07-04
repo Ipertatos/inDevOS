@@ -20,6 +20,7 @@
 #include "rtl8169.h"
 #include "storage.h"
 #include "serial.h"
+#include "cmd.h"
 static volatile LIMINE_BASE_REVISION(1);
 
 void kmain(void) {
@@ -60,6 +61,18 @@ void kmain(void) {
     printk(ft_ctx,"Initializing storage subsystem\n");
     storage_init();
     storage_init_ramdisk();
+    
+    // Auto-execute mount 0 for debugging
+    // Test basic commands without file I/O to avoid page faults
+    printf("Basic command test:{n}");
+    printf("1. Running 'help' command:{n}");
+    cmd("help", 4);
+    
+    printf("{n}2. Running 'storage' command:{n}");
+    cmd("storage", 7);
+    
+    printf("{n}File I/O commands available but need debugging.{n}");
+    printf("You can manually test: mount, ls, touch, mkdir, cat, rm, cp, mv{n}");
     
     //beep();
     __asm__("sti");
