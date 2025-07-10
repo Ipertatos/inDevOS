@@ -2,9 +2,11 @@
 #include "nvme.h"
 #include "mem.h"
 #include "utils.h"
+#include "atomic.h"
 
 static nvme_controller_t nvme_ctrl = {0};
 static uint8_t nvme_storage_device_id = 0xFF;
+static spinlock_t nvme_lock = {0};
 
 // Helper functions for register access
 static uint32_t nvme_read_reg32(uint32_t offset) {
@@ -45,11 +47,11 @@ static int nvme_wait_ready(bool ready) {
 void nvme_init() {
     struct pci_device* dev = pci_find_device(0x01, 0x08);
     if (dev == NULL) {
-        printf("NVMe: Device not found.{n}");
+        printf("NVMe: Device not found.\n");
         return;
     }
     
-    printf("NVMe: Found device at bus {d}, device {d}, func {d}{n}", 
+    printf("NVMe: Found device at bus %d, device %d, func %d\n", 
            dev->bus, dev->device, dev->function);
     
     nvme_ctrl.pci_dev = dev;
@@ -64,7 +66,7 @@ void nvme_init() {
     
     if ((bar0_low & 0x6) == 0x4) { // 64-bit BAR
         nvme_ctrl.bar0_base |= ((uint64_t)bar0_high) << 32;
-        printf("NVMe: Using 64-bit addressing{n}");
+        printf("NVMe: Using 64-bit addressing\n");
     }
     
     // Get BAR size
@@ -73,7 +75,7 @@ void nvme_init() {
     pci_device_write(dev, 0x10, 4, bar0_low);
     nvme_ctrl.bar0_size = ~(size_mask & 0xFFFFFFF0) + 1;
     
-    printf("NVMe: BAR0 base: 0x{x}, size: 0x{x}{n}", 
+    printf("NVMe: BAR0 base: 0x%x, size: 0x%x\n", 
            nvme_ctrl.bar0_base, nvme_ctrl.bar0_size);
     
     // Enable bus mastering and memory space
@@ -85,11 +87,11 @@ void nvme_init() {
     uint64_t cap = nvme_read_reg64(NVME_REG_CAP);
     nvme_ctrl.max_queue_entries = ((cap & 0xFFFF) + 1);
     
-    printf("NVMe: Max queue entries: {d}{n}", nvme_ctrl.max_queue_entries);
+    printf("NVMe: Max queue entries: %d\n", nvme_ctrl.max_queue_entries);
     
     // Read version
     uint32_t version = nvme_read_reg32(NVME_REG_VS);
-    printf("NVMe: Version {d}.{d}.{d}{n}", 
+    printf("NVMe: Version %d.%d.%d\n", 
            (version >> 16) & 0xFF, (version >> 8) & 0xFF, version & 0xFF);
     
     // Disable controller first
@@ -99,7 +101,7 @@ void nvme_init() {
     
     // Wait for controller to be disabled
     if (nvme_wait_ready(false) != 0) {
-        printf("NVMe: Timeout waiting for controller disable{n}");
+        printf("NVMe: Timeout waiting for controller disable\n");
         return;
     }
     
@@ -113,8 +115,8 @@ void nvme_init() {
     nvme_ctrl.namespace_count = 1; // Assume 1 namespace for simplicity
     nvme_ctrl.namespace_size = 2097152; // 1GB in 512-byte sectors
     
-    printf("NVMe: Basic initialization complete{n}");
-    printf("NVMe: Namespace size: {d} sectors (512 bytes each){n}", nvme_ctrl.namespace_size);
+    printf("NVMe: Basic initialization complete\n");
+    printf("NVMe: Namespace size: %d sectors (512 bytes each)\n", nvme_ctrl.namespace_size);
     
     // Register with storage subsystem
     nvme_register_storage();
@@ -130,7 +132,7 @@ int nvme_register_storage() {
     extern uint8_t storage_device_count;
     
     if (storage_device_count >= MAX_STORAGE_DEVICES) {
-        printf("NVMe: No free storage device slots{n}");
+        printf("NVMe: No free storage device slots\n");
         return -1;
     }
     
@@ -153,7 +155,7 @@ int nvme_register_storage() {
     
     storage_device_count++;
     
-    printf("NVMe: Registered as storage device {d}{n}", nvme_storage_device_id);
+    printf("NVMe: Registered as storage device %d\n", nvme_storage_device_id);
     return 0;
 }
 
@@ -164,13 +166,13 @@ int nvme_storage_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sect
     }
     
     if (lba + sector_count > nvme_ctrl.namespace_size) {
-        printf("NVMe: Read beyond device bounds{n}");
+        printf("NVMe: Read beyond device bounds\n");
         return -1;
     }
     
     // For now, just return success but fill with pattern data
     // In a real implementation, this would use NVMe command queues
-    printf("NVMe: Simulated read of {d} sectors from LBA {d}{n}", sector_count, lba);
+    printf("NVMe: Simulated read of %u sectors from LBA %llu\n", sector_count, (unsigned long long)lba);
     
     // Fill buffer with a recognizable pattern that includes LBA info
     uint32_t *buf32 = (uint32_t*)buffer;
@@ -187,13 +189,13 @@ int nvme_storage_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sec
     }
     
     if (lba + sector_count > nvme_ctrl.namespace_size) {
-        printf("NVMe: Write beyond device bounds{n}");
+        printf("NVMe: Write beyond device bounds\n");
         return -1;
     }
     
     // For now, just return success
     // In a real implementation, this would use NVMe command queues
-    printf("NVMe: Simulated write of {d} sectors to LBA {d}{n}", sector_count, lba);
+    printf("NVMe: Simulated write of %u sectors to LBA %llu\n", sector_count, (unsigned long long)lba);
     
     return 0;
 }
@@ -204,17 +206,35 @@ int nvme_storage_flush(storage_device_t *dev) {
     }
     
     // For now, just return success
-    printf("NVMe: Simulated flush{n}");
+    printf("NVMe: Simulated flush\n");
     return 0;
 }
 
 // Legacy functions for compatibility (if needed elsewhere)
-int nvme_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer) {
-    extern storage_device_t storage_devices[MAX_STORAGE_DEVICES];
-    if (device_id >= MAX_STORAGE_DEVICES || device_id != nvme_storage_device_id) {
+int nvme_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
+    spinlock_lock(&nvme_lock);
+    if (!nvme_ctrl.initialized || !dev || !buffer) {
+        printf("NVMe: Invalid parameters for read\n");
+        spinlock_unlock(&nvme_lock);
         return -1;
     }
-    return nvme_storage_read_sectors(&storage_devices[device_id], lba, sector_count, buffer);
+    printf("NVMe: Reading %d sectors from LBA %llu\n", sector_count, lba);
+    if (nvme_wait_ready(true) != 0) {
+        printf("NVMe: Controller not ready for read\n");
+        spinlock_unlock(&nvme_lock);
+        return -1;
+    }
+    // ... existing command setup ...
+    // Issue command
+    // Wait for completion
+    if (nvme_wait_ready(true) != 0) {
+        printf("NVMe: Controller not ready after read\n");
+        spinlock_unlock(&nvme_lock);
+        return -1;
+    }
+    // ... error checks ...
+    spinlock_unlock(&nvme_lock);
+    return 0;
 }
 
 int nvme_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer) {

@@ -40,6 +40,7 @@ SECTIONS
  
     .data : {
         *(.data .data.*)
+        KEEP(*(.limine_reqs))
     } :data
 
     .dynamic : {

@@ -34,6 +34,8 @@
 #define AHCI_PORT_SACT      0x34    // Serial ATA Active
 #define AHCI_PORT_CI        0x38    // Command Issue
 
+// Port Interrupt Status bits
+#define AHCI_PORT_IS_TFES   (1 << 30)  // Task File Error Status
 // Port Command and Status bits
 #define AHCI_PORT_CMD_ST    (1 << 0)   // Start
 #define AHCI_PORT_CMD_SUD   (1 << 1)   // Spin-up Device
@@ -132,6 +134,7 @@ typedef struct {
     void *cmd_list[32];         // Command list for each port
     void *fis_base[32];         // FIS base for each port
     void *cmd_table[32];        // Command table for each port
+    uint8_t active_port;        // Port we actually use for transfers
 } ahci_controller_t;
 
 // Function declarations

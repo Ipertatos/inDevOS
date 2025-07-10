@@ -4,13 +4,29 @@
 #include "cpu.h"
 #include "utils.h"
 #include "mem.h"
-bool capsOn, capsLock;
+#include "atomic.h"
+#include "debug.h"
+#include "serial.h"
+#include "term.h"
 
+bool capsOn, capsLock;
 
 char buffer[256];
 uint32_t buff_len = 0;
 bool tobuffer = true;
 bool execute = false;
+
+// Spinlock to protect keyboard state and buffer with canaries for corruption detection
+static uint64_t canary_before = 0xDEADBEEFCAFEBABE;
+static spinlock_t keyboard_lock = {0};
+static uint64_t canary_after = 0xFEEDFACEDEADC0DE;
+
+// Safe interrupt-context echo queue
+#define ECHO_QUEUE_SIZE 256
+static char echo_queue[ECHO_QUEUE_SIZE];
+static volatile uint32_t echo_head = 0;
+static volatile uint32_t echo_tail = 0;
+static volatile bool echo_pending = false;
 
 const uint32_t UNKNOWN = 0xFFFFFFFF,
                ESC = 0xFFFFFFFF - 1,
@@ -68,6 +84,21 @@ UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,
 UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,
 UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN
 };
+
+// Check if there are characters to echo
+bool keyboard_has_echo_pending(void) {
+    return echo_pending;
+}
+
+// Safe interrupt-context echo - just queue characters for main thread
+static void safe_echo_char(char c) {
+    uint32_t next_head = (echo_head + 1) % ECHO_QUEUE_SIZE;
+    if (next_head != echo_tail) {
+        echo_queue[echo_head] = c;
+        echo_head = next_head;
+        echo_pending = true;
+    }
+}
 
 void keyboard_init(){
     capsOn = false;
@@ -146,26 +177,106 @@ char ps2_translate2ascii(uint16_t scancode){
 }
 
 void keyboard_handler(){
+    // Note: Removed DEBUG_ENTER/EXIT macros as they use printf() which is unsafe in interrupt context
+    spinlock_lock(&keyboard_lock);
+    
     uint16_t scancode = inb(0x60);
+    // Use serial output for debugging in interrupt context instead of printf
+    // serial_printf("Keyboard scancode: 0x%02x\n", scancode);
     
     char ch = ps2_translate2ascii(scancode);
     if(ch == 0){
+        spinlock_unlock(&keyboard_lock);
         apic_eoi();
         return;
     }
-    buffer[buff_len] = ch;
-    buff_len++;
-    printf("{c}",ch);
+    
+    // Protect buffer operations
+    if(buff_len < sizeof(buffer) - 1) {
+        buffer[buff_len] = ch;
+        buff_len++;
+    }
+    
+    // Queue character for safe echo on main thread (avoids double-printing)
+    safe_echo_char(ch);
+    
     if(ch == '\b' && buff_len > 0){
         buffer[buff_len] = '\0';
         buff_len--;
-        buffer[buff_len] = '\0';
-        buff_len--;
-        printf(" \b");
+        if(buff_len > 0) {
+            buffer[buff_len] = '\0';
+            buff_len--;
+        }
+        serial_puts(" \b");
+        safe_echo_char(' ');   // Queue backspace sequence for main thread
+        safe_echo_char('\b');
     }
+    
     if(ch == '\n'){
         execute = true;
     }
 
+    spinlock_unlock(&keyboard_lock);
     apic_eoi();
+}
+
+// Safe accessor functions
+bool keyboard_get_execute(void) {
+    // Disable interrupts and save flags to prevent interrupt re-entry while we
+    // are holding the keyboard_lock.  If an interrupt were to fire here it
+    // would use the same stack and could overwrite our local variables,
+    // leading to corruption (observed as a page-fault at 0x246).
+    uint64_t irq_flags = irq_save();
+
+    spinlock_lock(&keyboard_lock);
+    bool result = execute;
+    spinlock_unlock(&keyboard_lock);
+
+    irq_restore(irq_flags);
+    return result;
+}
+
+char* keyboard_get_buffer(void) {
+    // Return a pointer to the buffer - caller must use keyboard_lock if needed
+    // This is safe for read-only access since buffer is static
+    return buffer;
+}
+
+uint32_t keyboard_get_buffer_length(void) {
+    uint64_t irq_flags = irq_save();
+    spinlock_lock(&keyboard_lock);
+    uint32_t result = buff_len;
+    spinlock_unlock(&keyboard_lock);
+    irq_restore(irq_flags);
+    return result;
+}
+
+void keyboard_clear_execute(void) {
+    uint64_t irq_flags = irq_save();
+    spinlock_lock(&keyboard_lock);
+    execute = false;
+    spinlock_unlock(&keyboard_lock);
+    irq_restore(irq_flags);
+}
+
+void keyboard_clear_buffer(void) {
+    uint64_t irq_flags = irq_save();
+    spinlock_lock(&keyboard_lock);
+    memset(buffer, '\0', sizeof(buffer));
+    buff_len = 0;
+    execute = false;
+    spinlock_unlock(&keyboard_lock);
+    irq_restore(irq_flags);
+}
+
+// Process queued echo characters (called from main thread)
+void keyboard_process_echo(void) {
+    while (echo_tail != echo_head) {
+        char c = echo_queue[echo_tail];
+        echo_tail = (echo_tail + 1) % ECHO_QUEUE_SIZE;
+        
+        // Safe printf call from main thread context
+        printf("%c", c);
+    }
+    echo_pending = false;
 }

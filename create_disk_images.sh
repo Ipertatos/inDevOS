@@ -1,40 +1,31 @@
 #!/bin/bash
 
-# Script to create and format disk images as FAT32
+# Simplified: create raw FAT-32 images (no partition table)
+# Useful when the OS mounts the block device itself rather than partitions.
 
-set -e  # Exit on any error
+set -e
 
-# Configuration
 NVME_SIZE="256M"
 SATA_SIZE="100M"
 NVME_IMG="nvme_disk.img"
 SATA_IMG="sata_disk.img"
 
-echo "Creating disk images..."
+create_raw_fat32() {
+    local img=$1
+    local size=$2
+    local label=$3
 
-# Create NVME disk image
-echo "Creating ${NVME_IMG} (${NVME_SIZE})..."
-dd if=/dev/zero of="${NVME_IMG}" bs=1M count=256 status=progress
+    echo "Creating $img ($size, raw FAT32)..."
+    dd if=/dev/zero of="$img" bs=$size count=1 status=progress
 
-# Create SATA disk image  
-echo "Creating ${SATA_IMG} (${SATA_SIZE})..."
-dd if=/dev/zero of="${SATA_IMG}" bs=1M count=100 status=progress
+    echo "Formatting $img as FAT32 ..."
+    # Associate a loop-device then mkfs on the whole disk (no partitions)
+    LOOPDEV=$(losetup --show -f "$img")
+    mkfs.fat -F 32 -n "$label" "$LOOPDEV"
+    losetup -d "$LOOPDEV"
+}
 
-echo "Formatting disk images as FAT32..."
+create_raw_fat32 "$NVME_IMG" "$NVME_SIZE" "NVME_RAW"
+create_raw_fat32 "$SATA_IMG" "$SATA_SIZE" "SATA_RAW"
 
-# Format NVME disk as FAT32
-echo "Formatting ${NVME_IMG} as FAT32..."
-mkfs.fat -F 32 -n "NVME_DISK" "${NVME_IMG}"
-
-# Format SATA disk as FAT32
-echo "Formatting ${SATA_IMG} as FAT32..."
-mkfs.fat -F 32 -n "SATA_DISK" "${SATA_IMG}"
-
-echo "Done! Both disk images created and formatted as FAT32:"
-echo "  - ${NVME_IMG}: ${NVME_SIZE} (FAT32, label: NVME_DISK)"
-echo "  - ${SATA_IMG}: ${SATA_SIZE} (FAT32, label: SATA_DISK)"
-
-# Verify the filesystems
-echo ""
-echo "Filesystem information:"
-file "${NVME_IMG}" "${SATA_IMG}" 
+echo "Completed. Images are raw FAT32 with labels NVME_RAW and SATA_RAW." 

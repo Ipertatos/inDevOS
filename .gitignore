@@ -17,3 +17,9 @@ sata_disk.img
 serial.log
 test.txt
 test2.txt
+*.exe
+*.bin
+*.elf
+*.raw
+*.wav
+*.log

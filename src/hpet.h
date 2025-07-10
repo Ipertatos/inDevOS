@@ -2,7 +2,7 @@
 
 #include "types.h"
 
-volatile uint64_t _ticks;
+// _ticks is now internal and atomic - use hpet_get_ticks() to access
 
 void hpet_init();
 void hpet_enable();

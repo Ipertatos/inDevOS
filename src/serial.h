@@ -2,6 +2,10 @@
 #define SERIAL_H
 
 #include "types.h"
+#include <stdbool.h>
+
+// Global flag (defined in kernel.c) controlling whether serial output is enabled.
+extern bool serial_enabled;
 
 void serial_init(void);
 void serial_putc(char c);

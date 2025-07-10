@@ -73,6 +73,6 @@ typedef struct {
 // Function declarations
 void nvme_init();
 int nvme_register_storage();
-int nvme_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer);
+int nvme_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
 int nvme_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer);
 int nvme_flush(uint8_t device_id);

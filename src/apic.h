@@ -23,7 +23,7 @@ typedef struct{
     bool present;
 } __attribute((packed))madt_ics_t;
 
-extern uint64_t apic_timer_ticks;
+// apic_timer_ticks is now internal and atomic - use apic_asleep() to wait
 
 void get_madt_tables(madt_t *madt);
 uint32_t ioapic_read(madt_ioapic_t *pApic, uint8_t reg);
@@ -36,7 +36,7 @@ void apic_eoi();
 void apic_asleep(int ms);
 void apic_timer();
 void ioapic_configure_entry(uint64_t* addr, uint8_t reg, uint64_t val);
-void ioapic_redirect_irq(uint32_t lapic_id, uint8_t irq, uint8_t vector, bool status);
+void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool status);
 madt_ioapic_t* find_gsi(int leg_pin);
 void ps2_int_init();
 void calibrate_timer(madt_t *madt);

@@ -23,3 +23,4 @@ void make_directory(const char *dirname);
 void remove_file(const char *filename);
 void copy_file(const char *source, const char *dest);
 void move_file(const char *source, const char *dest);
+void nigg();

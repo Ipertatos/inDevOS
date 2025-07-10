@@ -3,6 +3,7 @@
 #include "registers.h"
 #include "mem.h"
 #include "apic.h"
+#include "term.h"
 rsdt_t *rsdt;
 xsdt_t *xsdt;
 fadt_t *fadt;
@@ -45,7 +46,7 @@ mcfg_entry *fetch_mcfg(){
 void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
     int usexsdt;
     int entries;
-    printf("acpi: looking for table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
+    printf("acpi: looking for table with signature '%c%c%c%c'\n", sig[0], sig[1], sig[2], sig[3]);
     if(!xsdt){
         usexsdt = 0;
         entries = (rsdt->header.length - 36) / 4;
@@ -62,11 +63,11 @@ void *find_acpi_table(char sig[4], rsdt_t *rsdt, xsdt_t *xsdt){
 
         if(!memcmp(header->signature,sig,4))
         {
-            printf("acpi: Found table with signature '{cccc}'{n}", sig[0], sig[1], sig[2], sig[3]);
+            printf("acpi: Found table with signature '%c%c%c%c'\n", sig[0], sig[1], sig[2], sig[3]);
             return (void*)header;
         }
     }
-    printf("acpi: Table '{s}' not found{n}", sig);
+    printf("acpi: Table '%s' not found\n", sig);
     return NULL;
 }
 

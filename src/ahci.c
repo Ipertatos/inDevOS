@@ -4,6 +4,7 @@
 #include "mem.h"
 #include "utils.h"
 #include "serial.h"
+#include "atomic.h"
 
 static ahci_controller_t ahci_ctrl = {0};
 static uint8_t ahci_storage_device_id = 0xFF;
@@ -12,6 +13,8 @@ static uint8_t ahci_storage_device_id = 0xFF;
 static uint8_t ahci_global_cmd_list[1024] __attribute__((aligned(1024)));
 static uint8_t ahci_global_fis[256] __attribute__((aligned(256)));
 static uint8_t ahci_global_cmd_table[128] __attribute__((aligned(128)));
+
+static spinlock_t ahci_lock = {0};
 
 // Helper functions for register access
 static uint32_t ahci_read_reg32(uint32_t offset) {
@@ -66,19 +69,19 @@ static int ahci_port_wait_ready(uint8_t port) {
 
 // Initialize a single AHCI port
 static int ahci_init_port(uint8_t port) {
-    printf("AHCI: Initializing port {d}{n}", port);
+    printf("AHCI: Initializing port %d\n", port);
     
     // Check if device is present (be lenient for QEMU)
     uint32_t ssts = ahci_read_port_reg32(port, AHCI_PORT_SSTS);
     uint32_t det = ssts & AHCI_PORT_SSTS_DET_MASK;
-    printf("AHCI: Port {d} SSTS=0x{x}, DET=0x{x}{n}", port, ssts, det);
+    printf("AHCI: Port %d SSTS=0x%x, DET=0x%x\n", port, ssts, det);
     
     // Be more lenient - accept any detection state except "no device"
     if (det == 0) {
-        printf("AHCI: No device detected on port {d}{n}", port);
+        printf("AHCI: No device detected on port %d\n", port);
         return -1;
     }
-    printf("AHCI: Device detected on port {d} (DET=0x{x}){n}", port, det);
+    printf("AHCI: Device detected on port %d (DET=0x%x)\n", port, det);
     
     // Stop port operations
     uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
@@ -95,7 +98,7 @@ static int ahci_init_port(uint8_t port) {
     }
     
     if (timeout <= 0) {
-        printf("AHCI: Port {d} failed to stop{n}", port);
+        printf("AHCI: Port %d failed to stop\n", port);
         return -1;
     }
     
@@ -103,7 +106,7 @@ static int ahci_init_port(uint8_t port) {
     // Command list: 32 entries * 32 bytes = 1KB, aligned to 1KB
     ahci_ctrl.cmd_list[port] = kalloc(1024);
     if (!ahci_ctrl.cmd_list[port]) {
-        printf("AHCI: Failed to allocate command list for port {d}{n}", port);
+        printf("AHCI: Failed to allocate command list for port %d\n", port);
         return -1;
     }
     memset(ahci_ctrl.cmd_list[port], 0, 1024);
@@ -111,18 +114,18 @@ static int ahci_init_port(uint8_t port) {
     // FIS: 256 bytes, aligned to 256 bytes
     ahci_ctrl.fis_base[port] = kalloc(256);
     if (!ahci_ctrl.fis_base[port]) {
-        printf("AHCI: Failed to allocate FIS for port {d}{n}", port);
+        printf("AHCI: Failed to allocate FIS for port %d\n", port);
         return -1;
     }
     memset(ahci_ctrl.fis_base[port], 0, 256);
     
-    // Command table: 128 bytes per entry, we'll use just one
-    ahci_ctrl.cmd_table[port] = kalloc(128);
+    // Command table: allocate 256 bytes to satisfy 128-byte alignment requirement
+    ahci_ctrl.cmd_table[port] = kalloc(256);
     if (!ahci_ctrl.cmd_table[port]) {
-        printf("AHCI: Failed to allocate command table for port {d}{n}", port);
+        printf("AHCI: Failed to allocate command table for port %d\n", port);
         return -1;
     }
-    memset(ahci_ctrl.cmd_table[port], 0, 128);
+    memset(ahci_ctrl.cmd_table[port], 0, 256);
     
     // Set command list and FIS base addresses - convert virtual to physical
     uint64_t cmd_list_virt = (uint64_t)ahci_ctrl.cmd_list[port];
@@ -153,30 +156,30 @@ static int ahci_init_port(uint8_t port) {
     // Clear port interrupt status
     ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
     
-    // Enable FIS receive
+    // Enable FIS receive (FRE) and power up / spin up (POD | SUD)
     cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-    cmd |= AHCI_PORT_CMD_FRE;
+    cmd |= AHCI_PORT_CMD_FRE | AHCI_PORT_CMD_POD | AHCI_PORT_CMD_SUD;
+    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+
+    // Finally start the command engine (ST)
+    cmd |= AHCI_PORT_CMD_ST;
     ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
     
-    // Power up and spin up device
-    cmd |= AHCI_PORT_CMD_POD | AHCI_PORT_CMD_SUD;
-    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
-    
-    printf("AHCI: Port {d} initialized successfully{n}", port);
+    printf("AHCI: Port %d initialized successfully\n", port);
     return 0;
 }
 
 // Issue IDENTIFY command to get drive capacity
 static int ahci_identify_drive(uint8_t port) {
     if (ahci_port_wait_ready(port) != 0) {
-        printf("AHCI: Port {d} not ready for IDENTIFY{n}", port);
+        printf("AHCI: Port %d not ready for IDENTIFY\n", port);
         return -1;
     }
     
     // Allocate buffer for identify data
     uint16_t *identify_buffer = kalloc(512);
     if (!identify_buffer) {
-        printf("AHCI: Failed to allocate identify buffer{n}");
+        printf("AHCI: Failed to allocate identify buffer\n");
         return -1;
     }
     memset(identify_buffer, 0, 512);
@@ -224,7 +227,7 @@ static int ahci_identify_drive(uint8_t port) {
     }
     
     if (timeout <= 0) {
-        printf("AHCI: IDENTIFY command timeout on port {d}{n}", port);
+        printf("AHCI: IDENTIFY command timeout on port %d\n", port);
         kfree(identify_buffer);
         return -1;
     }
@@ -238,7 +241,7 @@ static int ahci_identify_drive(uint8_t port) {
     }
     
     if (sectors == 0) {
-        printf("AHCI: Drive on port {d} reports 0 sectors{n}", port);
+        printf("AHCI: Drive on port %d reports 0 sectors\n", port);
         kfree(identify_buffer);
         return -1;
     }
@@ -246,7 +249,7 @@ static int ahci_identify_drive(uint8_t port) {
     ahci_ctrl.port_sectors[port] = sectors;
     uint32_t size_mb = (sectors * 512) / (1024 * 1024);
     
-    printf("AHCI: Port {d} capacity: {d} sectors ({d} MB){n}", port, sectors, size_mb);
+    printf("AHCI: Port %d capacity: %d sectors (%d MB)\n", port, sectors, size_mb);
     
     kfree(identify_buffer);
     return 0;
@@ -310,36 +313,39 @@ void ahci_init() {
     DEBUG_SERIAL("AHCI: %d ports, implemented mask: 0x%x\n", 
                  ahci_ctrl.num_ports, ahci_ctrl.ports_implemented);
     
-    // For now, just register a basic device without full port initialization
-    // TODO: Implement full port initialization later
-    DEBUG_SERIAL("AHCI: Basic controller detection successful\n");
-    
-    // Simplified port setup - just register a basic device for now
-    if (pi != 0) {
-        // Find first implemented port and assume it works
-        for (uint8_t port = 0; port < 32; port++) {
-            if (pi & (1 << port)) {
-                DEBUG_SERIAL("AHCI: Port %d is implemented\n", port);
-                
-                // For now, assume a reasonable drive size and mark as initialized
-                // We'll do lazy initialization when actually reading
-                ahci_ctrl.port_sectors[port] = 2097152; // 1GB default
-                ahci_ctrl.initialized = true;
-                
-                DEBUG_SERIAL("AHCI: Using port %d with default size\n", port);
-                break;
-            }
+    DEBUG_SERIAL("AHCI: Beginning per-port initialization\n");
+
+    bool port_found = false;
+    for (uint8_t port = 0; port < 32; port++) {
+        if (!(pi & (1 << port))) {
+            continue; // not implemented
         }
-        
-        if (ahci_ctrl.initialized) {
-            DEBUG_SERIAL("AHCI: Registering SATA device with lazy initialization\n");
-            ahci_register_storage();
-        } else {
-            DEBUG_SERIAL("AHCI: No ports implemented\n");
+
+        DEBUG_SERIAL("AHCI: Attempting to init port %d\n", port);
+        if (ahci_init_port(port) != 0) {
+            continue; // failed
         }
-    } else {
-        DEBUG_SERIAL("AHCI: No ports implemented\n");
+
+        if (ahci_identify_drive(port) != 0) {
+            printf("AHCI: IDENTIFY failed on port %d – skipping\n", port);
+            continue;
+        }
+
+        // Successful port
+        ahci_ctrl.active_port = port;
+        port_found = true;
+        break;
     }
+
+    if (!port_found) {
+        printf("AHCI: No usable ports found – aborting init\n");
+        return;
+    }
+
+    ahci_ctrl.initialized = true;
+
+    // Register SATA storage device with proper size
+    ahci_register_storage();
 }
 
 int ahci_register_storage() {
@@ -395,247 +401,284 @@ int ahci_register_storage() {
 
 // AHCI DMA read implementation
 int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
+    spinlock_lock(&ahci_lock);
     if (!ahci_ctrl.initialized || !dev || !buffer) {
-        printf("AHCI: Invalid parameters for read{n}");
+        printf("AHCI: Invalid parameters for read\n");
+        spinlock_unlock(&ahci_lock);
         return -1;
     }
-    
-    printf("AHCI: Reading {d} sectors from LBA {d}{n}", sector_count, lba);
-    
-    // Find the port for this device (for now, use port 0)
-    uint8_t port = 0;
-    
-    // Find first implemented port
-    for (uint8_t p = 0; p < 32; p++) {
-        if (ahci_ctrl.ports_implemented & (1 << p)) {
-            port = p;
-            break;
-        }
-    }
-    
-    // Lazy initialization - set up port structures if not already done
-    if (!ahci_ctrl.cmd_list[port]) {
-        printf("AHCI: Lazy initializing port {d}{n}", port);
-        if (ahci_init_port(port) != 0) {
-            printf("AHCI: Port {d} initialization failed, trying minimal setup{n}", port);
-            
-            // Minimal setup - use kalloc'd memory which has proper HHDM mapping
-            ahci_ctrl.cmd_list[port] = kalloc(1024);
-            ahci_ctrl.fis_base[port] = kalloc(256);
-            ahci_ctrl.cmd_table[port] = kalloc(128);
-            
-            if (!ahci_ctrl.cmd_list[port] || !ahci_ctrl.fis_base[port] || !ahci_ctrl.cmd_table[port]) {
-                printf("AHCI: Failed to allocate minimal setup buffers{n}");
-                return -1;
-            }
-            
-            // Touch the memory to ensure pages are mapped and writable
-            printf("AHCI: Testing buffer writability...{n}");
-            memset(ahci_ctrl.cmd_list[port], 0, 1024);
-            memset(ahci_ctrl.fis_base[port], 0, 256);
-            memset(ahci_ctrl.cmd_table[port], 0, 128);
-            printf("AHCI: Buffer initialization complete{n}");
-            
-            // Get virtual addresses
-            uint64_t cmd_list_virt = (uint64_t)ahci_ctrl.cmd_list[port];
-            uint64_t fis_virt = (uint64_t)ahci_ctrl.fis_base[port];
-            uint64_t cmd_table_virt = (uint64_t)ahci_ctrl.cmd_table[port];
-            
-            // Convert to physical addresses using HHDM offset
-            uint64_t cmd_list_phys = cmd_list_virt - vmm_higher_half_offset;
-            uint64_t fis_phys = fis_virt - vmm_higher_half_offset;
-            uint64_t cmd_table_phys = cmd_table_virt - vmm_higher_half_offset;
-            
-            printf("AHCI: Kalloc buffer setup (HHDM offset: 0x{x}):{n}", vmm_higher_half_offset);
-            printf("  CmdList: V=0x{x}, P=0x{x} (aligned: {s}){n}", 
-                   cmd_list_virt, cmd_list_phys, (cmd_list_phys & 1023) ? "NO" : "YES");
-            printf("  FIS: V=0x{x}, P=0x{x} (aligned: {s}){n}", 
-                   fis_virt, fis_phys, (fis_phys & 255) ? "NO" : "YES");
-            
-            // Additional serial debug with proper format
-            serial_printf("AHCI: HHDM high=0x%x low=0x%x, CmdList P=0x%x, FIS P=0x%x\n", 
-                         (uint32_t)(vmm_higher_half_offset >> 32), (uint32_t)vmm_higher_half_offset,
-                         (uint32_t)cmd_list_phys, (uint32_t)fis_phys);
-            
-            // Setup port registers with PHYSICAL addresses
-            ahci_write_port_reg32(port, AHCI_PORT_CLB, (uint32_t)cmd_list_phys);
-            ahci_write_port_reg32(port, AHCI_PORT_CLBU, (uint32_t)(cmd_list_phys >> 32));
-            ahci_write_port_reg32(port, AHCI_PORT_FB, (uint32_t)fis_phys);
-            ahci_write_port_reg32(port, AHCI_PORT_FBU, (uint32_t)(fis_phys >> 32));
-            
-            // Setup basic command header
-            ahci_cmd_header_t *cmd_header = (ahci_cmd_header_t*)ahci_ctrl.cmd_list[port];
-            cmd_header->ctba = (uint32_t)cmd_table_phys;
-            cmd_header->ctbau = (uint32_t)(cmd_table_phys >> 32);
-            
-            printf("  CmdTable: V=0x{x}, P=0x{x} (aligned: {s}){n}", 
-                   cmd_table_virt, cmd_table_phys, (cmd_table_phys & 127) ? "NO" : "YES");
-            
-            // Enable FIS receive only (don't start command engine yet)
-            uint32_t cmd_reg = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-            printf("  Initial CMD reg: 0x%x{n}", cmd_reg);
-            
-            cmd_reg |= AHCI_PORT_CMD_FRE;  // Only enable FIS receive
-            ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd_reg);
-            
-            // Wait for FIS receive to be running
-            int timeout = 1000;
-            while (timeout-- && !(ahci_read_port_reg32(port, AHCI_PORT_CMD) & AHCI_PORT_CMD_FR)) {
-                // Wait for FR bit
-            }
-            
-            uint32_t cmd_after = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-            printf("  After FRE CMD reg: 0x%x (FR running: {s}){n}", 
-                   cmd_after, (cmd_after & AHCI_PORT_CMD_FR) ? "YES" : "NO");
-            
-            printf("AHCI: Minimal setup complete for port {d}{n}", port);
-        } else {
-            // Try to identify the drive for real capacity
-            if (ahci_identify_drive(port) == 0) {
-                printf("AHCI: Port {d} drive identified successfully{n}", port);
-            } else {
-                printf("AHCI: Using default drive size for port {d}{n}", port);
-            }
-        }
-    }
-    
-    // Verify port is ready for commands
-    uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-    printf("AHCI: Port {d} CMD register: 0x{x}{n}", port, cmd);
-    if (!(cmd & AHCI_PORT_CMD_ST)) {
-        printf("AHCI: Starting command engine for port {d}{n}", port);
-        cmd |= AHCI_PORT_CMD_ST;
-        ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
-    }
-    
-    if (ahci_port_wait_ready(port) != 0) {
-        printf("AHCI: Port {d} not ready for read{n}", port);
+    printf("AHCI: Reading %d sectors starting at LBA %llu\n", sector_count, lba);
+
+    uint8_t port = ahci_ctrl.active_port;
+
+    uint32_t sectors_remaining = sector_count;
+    uint8_t *buf_ptr = (uint8_t*)buffer;
+
+    // Allocate a bounce buffer guaranteed to be physically contiguous (32 sectors max)
+    const uint16_t MAX_SECTORS_PER_OP = 32;
+    void *dma_bounce = kalloc(MAX_SECTORS_PER_OP * 512);
+    if (!dma_bounce) {
+        printf("AHCI: Failed to allocate DMA bounce buffer\n");
+        spinlock_unlock(&ahci_lock);
         return -1;
     }
-    
-    // Check bounds
-    if (lba + sector_count > ahci_ctrl.port_sectors[port]) {
-        printf("AHCI: Read beyond drive capacity{n}");
-        return -1;
-    }
-    
-    // Setup command table
-    ahci_cmd_table_t *cmd_table = (ahci_cmd_table_t*)ahci_ctrl.cmd_table[port];
-    memset(cmd_table, 0, sizeof(ahci_cmd_table_t));
-    
-    // Setup READ DMA EXT FIS
-    fis_reg_h2d_t *fis = (fis_reg_h2d_t*)cmd_table->cfis;
-    fis->fis_type = FIS_TYPE_REG_H2D;
-    fis->c = 1; // Command
-    fis->command = ATA_CMD_READ_DMA_EXT;
-    
-    // Set LBA (48-bit)
-    fis->lba0 = (uint8_t)(lba & 0xFF);
-    fis->lba1 = (uint8_t)((lba >> 8) & 0xFF);
-    fis->lba2 = (uint8_t)((lba >> 16) & 0xFF);
-    fis->lba3 = (uint8_t)((lba >> 24) & 0xFF);
-    fis->lba4 = (uint8_t)((lba >> 32) & 0xFF);
-    fis->lba5 = (uint8_t)((lba >> 40) & 0xFF);
-    
-    // Set device register (LBA mode)
-    fis->device = 0x40; // LBA mode
-    
-    // Set sector count (16-bit)
-    fis->countl = (uint8_t)(sector_count & 0xFF);
-    fis->counth = (uint8_t)((sector_count >> 8) & 0xFF);
-    
-    printf("AHCI: FIS setup - LBA:{d}, count:{d}, cmd:0x{x}{n}", lba, sector_count, ATA_CMD_READ_DMA_EXT);
-    
-    // Setup PRDT (Physical Region Descriptor Table)
-    uint32_t bytes_to_read = sector_count * 512;
-    uint64_t buffer_virt = (uint64_t)buffer;
-    uint64_t buffer_phys = buffer_virt - vmm_higher_half_offset;
-    
-    printf("AHCI: Setting up PRDT - buffer V:0x{x}, P:0x{x}, bytes:{d}{n}", 
-           buffer_virt, buffer_phys, bytes_to_read);
-    
-    // Serial debug with proper format
-    serial_printf("AHCI: PRDT buffer P=0x%x, bytes=%d\n", (uint32_t)buffer_phys, bytes_to_read);
-    
-    cmd_table->prdt_entry[0].dba = (uint32_t)buffer_phys;
-    cmd_table->prdt_entry[0].dbau = (uint32_t)(buffer_phys >> 32);
-    cmd_table->prdt_entry[0].dbc = bytes_to_read - 1; // Byte count minus 1
-    cmd_table->prdt_entry[0].i = 1; // Interrupt on completion
-    
-    // Setup command header
-    ahci_cmd_header_t *cmd_header = (ahci_cmd_header_t*)ahci_ctrl.cmd_list[port];
-    cmd_header->cfl = sizeof(fis_reg_h2d_t) / 4; // FIS length in DWORDS
-    cmd_header->w = 0; // Read (not write)
-    cmd_header->prdtl = 1; // One PRDT entry
-    cmd_header->prdbc = 0; // Will be filled by hardware
-    
-    // Clear any pending interrupts
-    ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
-    
-    // Show final register state before issuing command
-    uint32_t tfd_before = ahci_read_port_reg32(port, AHCI_PORT_TFD);
-    uint32_t cmd_before = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-    uint32_t is_before = ahci_read_port_reg32(port, AHCI_PORT_IS);
-    printf("AHCI: Before command - TFD:0x%x, CMD:0x%x, IS:0x%x{n}", 
-           tfd_before, cmd_before, is_before);
-    
-    // Issue command
-    printf("AHCI: Issuing command to slot 0{n}");
-    ahci_write_port_reg32(port, AHCI_PORT_CI, 1); // Issue command slot 0
-    
-    // Wait for command completion
-    int timeout = 10000;
-    printf("AHCI: Waiting for command completion (CI=0x{x}){n}", ahci_read_port_reg32(port, AHCI_PORT_CI));
-    
-    while (timeout--) {
-        uint32_t ci = ahci_read_port_reg32(port, AHCI_PORT_CI);
-        if (!(ci & 1)) { // Command completed
-            printf("AHCI: Command completed successfully{n}");
-            break;
-        }
-        
-        // Check for errors
-        uint32_t is = ahci_read_port_reg32(port, AHCI_PORT_IS);
-        if (is & 0x7D800000) { // Error bits
-            printf("AHCI: Read command error - IS: 0x{x}, TFD: 0x{x}{n}", 
-                   is, ahci_read_port_reg32(port, AHCI_PORT_TFD));
+
+    while (sectors_remaining > 0) {
+        uint16_t sectors_this = (sectors_remaining > MAX_SECTORS_PER_OP) ? MAX_SECTORS_PER_OP : (uint16_t)sectors_remaining; // up to 32 sectors per op
+
+        if (ahci_port_wait_ready(port) != 0) {
+            printf("AHCI: Port %d not ready for read\n", port);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
             return -1;
         }
-        
-        // Debug output every 2000 iterations to reduce spam
-        if (timeout % 2000 == 0) {
-            printf("AHCI: Still waiting... CI=0x{x}, IS=0x{x}, timeout={d}{n}", 
-                   ci, is, timeout);
+
+        // Ensure slot 0 is free
+        int slot_timeout = 100000;
+        while (slot_timeout-- && (ahci_read_port_reg32(port, AHCI_PORT_CI) & 1)) {
+            // Busy wait until previous command clears
         }
-    }
-    
-    if (timeout <= 0) {
-        uint32_t ci = ahci_read_port_reg32(port, AHCI_PORT_CI);
-        uint32_t is = ahci_read_port_reg32(port, AHCI_PORT_IS);
+        if (slot_timeout <= 0) {
+            printf("AHCI: Timeout waiting for free command slot (read)\n");
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Setup command table
+        ahci_cmd_table_t *cmd_table = (ahci_cmd_table_t*)ahci_ctrl.cmd_table[port];
+        memset(cmd_table, 0, sizeof(ahci_cmd_table_t));
+
+        // Setup PRDT - convert virtual to physical for DMA buffer (bounce buffer)
+        uint64_t buf_virt = (uint64_t)dma_bounce;
+        extern uint64_t vmm_higher_half_offset;
+        uint64_t buf_phys = buf_virt - vmm_higher_half_offset;
+
+        cmd_table->prdt_entry[0].dba = (uint32_t)buf_phys;
+        cmd_table->prdt_entry[0].dbau = (uint32_t)(buf_phys >> 32);
+        cmd_table->prdt_entry[0].dbc = (sectors_this * 512) - 1; // byte count = N*512 -1
+        cmd_table->prdt_entry[0].i = 1;
+
+        // Setup the command FIS
+        fis_reg_h2d_t *fis = (fis_reg_h2d_t*)cmd_table->cfis;
+        memset(fis, 0, sizeof(fis_reg_h2d_t));
+        fis->fis_type = FIS_TYPE_REG_H2D;
+        fis->c = 1; // command
+        fis->command = ATA_CMD_READ_DMA_EXT;
+        fis->device = 1 << 6; // LBA mode
+
+        uint64_t lba_tmp = lba;
+        fis->lba0 = (uint8_t)(lba_tmp & 0xFF);
+        fis->lba1 = (uint8_t)((lba_tmp >> 8) & 0xFF);
+        fis->lba2 = (uint8_t)((lba_tmp >> 16) & 0xFF);
+        fis->lba3 = (uint8_t)((lba_tmp >> 24) & 0xFF);
+        fis->lba4 = (uint8_t)((lba_tmp >> 32) & 0xFF);
+        fis->lba5 = (uint8_t)((lba_tmp >> 40) & 0xFF);
+
+        fis->countl = (uint8_t)(sectors_this & 0xFF);
+        fis->counth = (uint8_t)((sectors_this >> 8) & 0xFF);
+
+        // Setup command header
+        ahci_cmd_header_t *cmd_header = (ahci_cmd_header_t*)ahci_ctrl.cmd_list[port];
+        uint64_t cmd_table_phys = ((uint64_t)ahci_ctrl.cmd_table[port]) - vmm_higher_half_offset;
+        memset(cmd_header, 0, sizeof(ahci_cmd_header_t));
+        cmd_header->cfl = sizeof(fis_reg_h2d_t) / 4; // 20 bytes /4 =5
+        cmd_header->w = 0; // read
+        cmd_header->p = 0;
+        cmd_header->prdtl = 1;
+        cmd_header->ctba = (uint32_t)cmd_table_phys;
+        cmd_header->ctbau = (uint32_t)(cmd_table_phys >> 32);
+
+        // Clear port interrupt status before issuing
+        ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
+
+        // Issue command in slot 0
+        ahci_write_port_reg32(port, AHCI_PORT_CI, 1);
+
+        // Wait for completion
+        int timeout = 100000;
+        while (timeout--) {
+            uint32_t ci = ahci_read_port_reg32(port, AHCI_PORT_CI);
+            if ((ci & 1) == 0) break;
+        }
+
+        if (timeout <= 0) {
+            printf("AHCI: Read timeout – port %d\n", port);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Check interrupt status for TFES
+        uint32_t pis = ahci_read_port_reg32(port, AHCI_PORT_IS);
+        if (pis & AHCI_PORT_IS_TFES) {
+            printf("AHCI: Read TFES error, IS=0x%x\n", pis);
+            ahci_write_port_reg32(port, AHCI_PORT_IS, AHCI_PORT_IS_TFES); // clear
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+ 
+        // Check for errors
         uint32_t tfd = ahci_read_port_reg32(port, AHCI_PORT_TFD);
-        uint32_t cmd_reg = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-        printf("AHCI: Read command timeout - CI=0x{x}, IS=0x{x}, TFD=0x{x}, CMD=0x{x}{n}", 
-               ci, is, tfd, cmd_reg);
-        
-        // Serial debug with proper format
-        serial_printf("AHCI: TIMEOUT - CI=0x%x, IS=0x%x, TFD=0x%x, CMD=0x%x\n", 
-                     ci, is, tfd, cmd_reg);
-        return -1;
+        if (tfd & 0x1) { // ERR bit
+            printf("AHCI: Read error, TFD=0x%x\n", tfd);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Copy data from bounce buffer to caller's buffer
+        memmove(buf_ptr, dma_bounce, sectors_this * 512);
+
+        // Advance pointers/counters
+        lba += sectors_this;
+        buf_ptr += sectors_this * 512;
+        sectors_remaining -= sectors_this;
     }
-    
-    // Check if transfer completed successfully
-    uint32_t is = ahci_read_port_reg32(port, AHCI_PORT_IS);
-    if (is & 0x7D800000) { // Error bits
-        printf("AHCI: Read completed with errors - IS: 0x{x}{n}", is);
-        return -1;
-    }
-    
+
+    kfree(dma_bounce);
+
+    spinlock_unlock(&ahci_lock);
     return 0;
 }
 
 int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer) {
-    printf("AHCI: Write not yet implemented{n}");
-    return -1; // TODO: Implement DMA write
+    spinlock_lock(&ahci_lock);
+    if (!ahci_ctrl.initialized || !dev || !buffer) {
+        printf("AHCI: Invalid parameters for write\n");
+        spinlock_unlock(&ahci_lock);
+        return -1;
+    }
+
+    printf("AHCI: Writing %d sectors starting at LBA %llu\n", sector_count, lba);
+
+    uint8_t port = ahci_ctrl.active_port;
+
+    uint32_t sectors_remaining = sector_count;
+    const uint8_t *buf_ptr = (const uint8_t*)buffer;
+
+    const uint16_t MAX_SECTORS_PER_OP = 32;
+    void *dma_bounce = kalloc(MAX_SECTORS_PER_OP * 512);
+    if (!dma_bounce) {
+        printf("AHCI: Failed to allocate DMA bounce buffer (write)\n");
+        spinlock_unlock(&ahci_lock);
+        return -1;
+    }
+
+    while (sectors_remaining > 0) {
+        uint16_t sectors_this = (sectors_remaining > MAX_SECTORS_PER_OP) ? MAX_SECTORS_PER_OP : (uint16_t)sectors_remaining;
+
+        // Copy from caller buffer into DMA bounce
+        memmove(dma_bounce, buf_ptr, sectors_this * 512);
+
+        // Ensure slot 0 is free
+        int slot_timeout = 100000;
+        while (slot_timeout-- && (ahci_read_port_reg32(port, AHCI_PORT_CI) & 1)) {}
+        if (slot_timeout <= 0) {
+            printf("AHCI: Timeout waiting for free command slot (write)\n");
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        if (ahci_port_wait_ready(port) != 0) {
+            printf("AHCI: Port %d not ready for write\n", port);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Setup command table
+        ahci_cmd_table_t *cmd_table = (ahci_cmd_table_t*)ahci_ctrl.cmd_table[port];
+        memset(cmd_table, 0, sizeof(ahci_cmd_table_t));
+
+        // PRDT entry pointing to bounce buffer
+        uint64_t buf_virt = (uint64_t)dma_bounce;
+        extern uint64_t vmm_higher_half_offset;
+        uint64_t buf_phys = buf_virt - vmm_higher_half_offset;
+
+        cmd_table->prdt_entry[0].dba = (uint32_t)buf_phys;
+        cmd_table->prdt_entry[0].dbau = (uint32_t)(buf_phys >> 32);
+        cmd_table->prdt_entry[0].dbc = (sectors_this * 512) - 1;
+        cmd_table->prdt_entry[0].i = 1;
+
+        // Setup FIS for write
+        fis_reg_h2d_t *fis = (fis_reg_h2d_t*)cmd_table->cfis;
+        memset(fis, 0, sizeof(fis_reg_h2d_t));
+        fis->fis_type = FIS_TYPE_REG_H2D;
+        fis->c = 1;
+        fis->command = ATA_CMD_WRITE_DMA_EXT;
+        fis->device = 1 << 6; // LBA mode
+
+        uint64_t lba_tmp = lba;
+        fis->lba0 = (uint8_t)(lba_tmp & 0xFF);
+        fis->lba1 = (uint8_t)((lba_tmp >> 8) & 0xFF);
+        fis->lba2 = (uint8_t)((lba_tmp >> 16) & 0xFF);
+        fis->lba3 = (uint8_t)((lba_tmp >> 24) & 0xFF);
+        fis->lba4 = (uint8_t)((lba_tmp >> 32) & 0xFF);
+        fis->lba5 = (uint8_t)((lba_tmp >> 40) & 0xFF);
+
+        fis->countl = (uint8_t)(sectors_this & 0xFF);
+        fis->counth = (uint8_t)((sectors_this >> 8) & 0xFF);
+
+        // Command header
+        ahci_cmd_header_t *cmd_header = (ahci_cmd_header_t*)ahci_ctrl.cmd_list[port];
+        uint64_t cmd_table_phys = ((uint64_t)ahci_ctrl.cmd_table[port]) - vmm_higher_half_offset;
+        memset(cmd_header, 0, sizeof(ahci_cmd_header_t));
+        cmd_header->cfl = sizeof(fis_reg_h2d_t) / 4;
+        cmd_header->w = 1; // write
+        cmd_header->p = 0;
+        cmd_header->prdtl = 1;
+        cmd_header->ctba = (uint32_t)cmd_table_phys;
+        cmd_header->ctbau = (uint32_t)(cmd_table_phys >> 32);
+
+        // Clear interrupt status, issue command
+        ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
+        ahci_write_port_reg32(port, AHCI_PORT_CI, 1);
+
+        // Wait for completion
+        int timeout = 100000;
+        while (timeout--) {
+            uint32_t ci = ahci_read_port_reg32(port, AHCI_PORT_CI);
+            if ((ci & 1) == 0) break;
+        }
+
+        if (timeout <= 0) {
+            printf("AHCI: Write timeout – port %d\n", port);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Check TFES
+        uint32_t pis = ahci_read_port_reg32(port, AHCI_PORT_IS);
+        if (pis & AHCI_PORT_IS_TFES) {
+            printf("AHCI: Write TFES error, IS=0x%x\n", pis);
+            ahci_write_port_reg32(port, AHCI_PORT_IS, AHCI_PORT_IS_TFES);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Check errors
+        uint32_t tfd = ahci_read_port_reg32(port, AHCI_PORT_TFD);
+        if (tfd & 0x1) {
+            printf("AHCI: Write error, TFD=0x%x\n", tfd);
+            kfree(dma_bounce);
+            spinlock_unlock(&ahci_lock);
+            return -1;
+        }
+
+        // Advance
+        lba += sectors_this;
+        buf_ptr += sectors_this * 512;
+        sectors_remaining -= sectors_this;
+    }
+
+    kfree(dma_bounce);
+    spinlock_unlock(&ahci_lock);
+    return 0;
 }
 
 int ahci_flush(storage_device_t *dev) {

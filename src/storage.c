@@ -2,6 +2,10 @@
 #include "utils.h"
 #include "mem.h"
 #include "serial.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "atomic.h"
 
 storage_device_t storage_devices[MAX_STORAGE_DEVICES];
 uint8_t storage_device_count = 0;
@@ -11,18 +15,20 @@ uint8_t storage_device_count = 0;
 #define RAMDISK_SECTORS (RAMDISK_SIZE_MB * 1024 * 1024 / SECTOR_SIZE)
 static uint8_t *ramdisk_data = NULL;
 
+static spinlock_t storage_lock = {0};
+
 // Storage operations for RAM disk
 static int ramdisk_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
     if (!ramdisk_data || lba + sector_count > RAMDISK_SECTORS) {
-        printf("storage: Read beyond bounds - LBA {d} + count {d} > max {d}{n}", 
-               lba, sector_count, RAMDISK_SECTORS);
+        printf("storage: Read beyond bounds - LBA %llu + count %u > max %u\n", 
+               (unsigned long long)lba, sector_count, RAMDISK_SECTORS);
         return -1;
     }
     
     uint64_t offset = lba * SECTOR_SIZE;
     uint32_t bytes_to_read = sector_count * SECTOR_SIZE;
     
-    // Debug: printf("storage: Reading {d} sectors from LBA {d}{n}", sector_count, lba);
+    // Debug: printf("storage: Reading %u sectors from LBA %llu\n", sector_count, (unsigned long long)lba);
     
     memmove(buffer, ramdisk_data + offset, bytes_to_read);
     return 0;
@@ -65,20 +71,20 @@ void storage_init() {
         DEBUG_SERIAL("storage_init: Preserving %d existing devices, clearing remaining slots\n", storage_device_count);
     }
     
-    printf("storage: Initializing storage subsystem{n}");
+    printf("storage: Initializing storage subsystem\n");
     DEBUG_SERIAL("storage_init: After init - device_count=%d\n", storage_device_count);
 }
 
 void storage_init_ramdisk() {
     if (storage_device_count >= MAX_STORAGE_DEVICES) {
-        printf("storage: Maximum storage devices reached{n}");
+        printf("storage: Maximum storage devices reached\n");
         return;
     }
     
     // Allocate RAM disk
     ramdisk_data = kalloc(RAMDISK_SIZE_MB * 1024 * 1024);
     if (!ramdisk_data) {
-        printf("storage: Failed to allocate RAM disk{n}");
+        printf("storage: Failed to allocate RAM disk\n");
         return;
     }
     
@@ -206,7 +212,7 @@ void storage_init_ramdisk() {
     memset(ramdisk_data + (root_cluster_sector * SECTOR_SIZE), 0, 
            sectors_per_cluster * SECTOR_SIZE);
     
-    printf("storage: FAT32 layout - FAT start: {d}, Data start: {d}, Root at: {d}{n}",
+    printf("storage: FAT32 layout - FAT start: %d, Data start: %d, Root at: %d\n",
            fat_start_sector, data_start_sector, root_cluster_sector);
     
     // Initialize storage device
@@ -224,7 +230,7 @@ void storage_init_ramdisk() {
     memset(dev->name, 0, sizeof(dev->name));
     memmove(dev->name, "RAM Disk", 8);
     
-    printf("storage: RAM disk initialized ({d} MB, {d} sectors){n}", 
+    printf("storage: RAM disk initialized (%d MB, %d sectors)\n", 
            RAMDISK_SIZE_MB, RAMDISK_SECTORS);
 }
 
@@ -238,30 +244,29 @@ storage_device_t* storage_get_device(uint8_t device_id) {
 }
 
 int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer) {
+    spinlock_lock(&storage_lock);
     storage_device_t *dev = storage_get_device(device_id);
     if (!dev) {
+        spinlock_unlock(&storage_lock);
         return -1;
     }
-    
-    // Dispatch to appropriate driver based on device type
+    printf("storage: read_sectors dev=%p lba=%llu count=%u\n", dev, lba, sector_count);
+    int result = -1;
     if (dev->pci_dev == NULL) {
-        // RAM disk
-        return storage_ops.read_sectors(dev, lba, sector_count, buffer);
+        result = storage_ops.read_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x01) {
-        // IDE device
         extern int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
-        return ide_read_sectors(dev, lba, sector_count, buffer);
+        result = ide_read_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x06) {
-        // SATA device
         extern int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
-        return ahci_read_sectors(dev, lba, sector_count, buffer);
+        result = ahci_read_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
-        // NVMe device
         extern int nvme_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
-        return nvme_read_sectors(dev, lba, sector_count, buffer);
+        result = nvme_read_sectors(dev, lba, sector_count, buffer);
     }
-    
-    return -1; // Unsupported device type
+    printf("storage: read_sectors result=%d\n", result);
+    spinlock_unlock(&storage_lock);
+    return result;
 }
 
 int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer) {
@@ -316,4 +321,35 @@ int storage_flush(uint8_t device_id) {
     }
     
     return -1; // Unsupported device type
+}
+
+// Helper: Parse MBR and return first FAT32 partition LBA (0 if not found)
+uint32_t find_first_fat32_partition_lba(uint8_t device_id) {
+    uint8_t *mbr = kalloc(512);
+    if (!mbr) {
+        printf("storage: Failed to allocate buffer for MBR\n");
+        return 0;
+    }
+
+    memset(mbr, 0, 512);
+    if (storage_read_sectors(device_id, 0, 1, mbr) != 0) {
+        printf("storage: Failed to read MBR for partition scan\n");
+        kfree(mbr);
+        return 0;
+    }
+    // Partition table starts at offset 446
+    for (int i = 0; i < 4; ++i) {
+        uint8_t *entry = mbr + 446 + i * 16;
+        uint8_t part_type = entry[4];
+        uint32_t lba = entry[8] | (entry[9] << 8) | (entry[10] << 16) | (entry[11] << 24);
+        printf("storage: Partition %d type=0x%02x lba=%u\n", i, part_type, lba);
+        if (part_type == 0x0B || part_type == 0x0C) {
+            printf("storage: Found FAT32 partition at LBA %u\n", lba);
+            kfree(mbr);
+            return lba;
+        }
+    }
+    printf("storage: No FAT32 partition found in MBR\n");
+    kfree(mbr);
+    return 0;
 } 

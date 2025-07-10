@@ -4,6 +4,7 @@
 #include "mem.h"
 #include "utils.h"
 #include "atomic.h"
+#include <string.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 volatile struct limine_smp_request smp_request = {
@@ -11,10 +12,10 @@ volatile struct limine_smp_request smp_request = {
     .revision = 0,
     .flags = 0
 };
-uint32_t bsp_lapic_id;
+uint32_t bsp_lapic_id = 0;
 uint64_t cpu_count;
 
-spinlock_t cpu_lock;
+spinlock_t cpu_lock = {0};
 
 volatile uint64_t _cpus_awake = 1;
 
@@ -22,17 +23,25 @@ void _cpu_awake(struct limine_smp_info *smp_info)
 {
     spinlock_lock(&cpu_lock);
     _cpus_awake++;
-    printf("cpu: cpu {dn} is awake", smp_info->processor_id);
+    printf("cpu: cpu %llu is awake\n", (unsigned long long)smp_info->processor_id);
     spinlock_unlock(&cpu_lock);
     __asm__("hlt");
 }
 
 void cpu_init()
 {
+    if (smp_request.response == NULL) {
+        // SMP not provided by bootloader – assume single-CPU BSP only.
+        bsp_lapic_id = 0;
+        cpu_count = 1;
+        printf("cpu: SMP response missing – falling back to 1 CPU\n");
+        return;
+    }
+
     bsp_lapic_id = smp_request.response->bsp_lapic_id;
     cpu_count = smp_request.response->cpu_count;
-    printf("cpu: bsp lapic id: {dn}", bsp_lapic_id);
-    printf("cpu: cpu count: {dn}", cpu_count);
+    printf("cpu: bsp lapic id: %llu\n", (unsigned long long)bsp_lapic_id);
+    printf("cpu: cpu count: %llu\n", (unsigned long long)cpu_count);
     for (uint64_t i = 0; i < cpu_count; i++) {
         if (i == bsp_lapic_id) {
             continue;
@@ -68,6 +77,13 @@ char* cpu_name() {
 
     cpu_name[49] = '\0';
     char* temp = kalloc(sizeof(char) * 49);
+    
+    // Check if allocation was successful
+    if (temp == NULL) {
+        printf("cpu: Failed to allocate memory for CPU name\n");
+        return NULL;
+    }
+    
     //write cpu_name to temp
     for (int i = 0; i < 49; i++) {
         temp[i] = cpu_name[i];

@@ -18,16 +18,16 @@ const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
                 case 0x08:
                     return "Mass Storage Controller - Non-Volatile Memory Controller";
                 default:
-                    printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);
+                    printf("PCI: %d:%d not found\n", class_code, sub_class_code);
                     return "Unknown Device";
             }
         case 0x02:
             switch (sub_class_code){
                 case 0x00:
-                    printf("PCI: {x}:{xn}", class_code, sub_class_code);
+                    printf("PCI: %x:%x\n", class_code, sub_class_code);
                     return "Network Controller - Ethernet Controller";
                 default:
-                    printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);
+                    printf("PCI: %d:%d not found\n", class_code, sub_class_code);
                     return "Unknown Device";
             }
         case 0x03:
@@ -35,7 +35,7 @@ const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
                 case 0x00:
                     return "Display Controller - VGA Compatible Controller";
                 default:
-                    printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);
+                    printf("PCI: %d:%d not found\n", class_code, sub_class_code);
                     return "Unknown Device";
             }
         case 0x06:
@@ -45,7 +45,7 @@ const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
                 case 0x01:
                     return "Bridge - ISA Bridge";
                 default:
-                    printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);
+                    printf("PCI: %d:%d not found\n", class_code, sub_class_code);
                     return "Unknown Device";
             }
         case 0x0C:
@@ -53,11 +53,11 @@ const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
                 case 0x05:
                     return "Serial Bus Controller - USB Controller";
                 default:
-                    printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);
+                    printf("PCI: %d:%d not found\n", class_code, sub_class_code);
                     return "Unknown Device";
             }
     }
-    printf("PCI: {d}:{d} not found{n}", class_code, sub_class_code);
+    printf("PCI: %d:%d not found\n", class_code, sub_class_code);
     return "Unknown Device";
 }
 
@@ -81,7 +81,7 @@ uint32_t pci_mm_read(uint8_t bus, uint8_t device, uint8_t function, uint8_t offs
 // read from pci configuration for a pci device
 uint32_t pci_device_read(struct pci_device *dev, uint32_t offset, uint8_t size){
     if (dev == NULL) {
-        printf("PCI: pci_device_read called with NULL device{n}");
+        printf("PCI: pci_device_read called with NULL device\n");
         DEBUG_SERIAL("PCI: pci_device_read called with NULL device\n");
         return 0;
     }
@@ -164,6 +164,14 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
     uint8_t progif = pci_mm_read_prog_if(bus, device, function);
     // Create the new device and store it in the device list.
     struct pci_device *dev = kalloc(sizeof(struct pci_device));//kalloc(sizeof(struct pci_device));
+    
+    // Check if allocation was successful
+    if (dev == NULL) {
+        printf("PCI: Failed to allocate memory for PCI device\n");
+        DEBUG_SERIAL("PCI: Failed to allocate memory for PCI device\n");
+        return;
+    }
+    
     pci_devices[pci_device_count++] = dev;
     dev->class_code = classcode;
     dev->subclass_code = subclass;
@@ -175,13 +183,13 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
     dev->header_type = header_type;
     dev->address = mcfg->base_addr + vmm_higher_half_offset + ((bus - mcfg->start_bus) << 20 | device << 15 | function << 12);
 
-    printf("PCI: {s} (Class {x:02}:{x:02}){n}", dev->description, classcode, subclass);
+    printf("PCI: %s (Class %002x:%002x)\n", dev->description, classcode, subclass);
     DEBUG_SERIAL("PCI: %s (Class %02x:%02x) at bus=%d, device=%d, func=%d\n", 
                  dev->description, classcode, subclass, bus, device, function);
     
     // Debug storage controllers
     if (classcode == 0x01) {
-        printf("PCI: Storage device created - bus={d}, device={d}, func={d}{n}", 
+        printf("PCI: Storage device created - bus=%d, device=%d, func=%d\n", 
                dev->bus, dev->device, dev->function);
         DEBUG_SERIAL("PCI: Storage device created - bus=%d, device=%d, func=%d\n", 
                      dev->bus, dev->device, dev->function);
@@ -236,8 +244,8 @@ void scan_all_buses()
 void pci_init()
 {
     scan_all_buses();
-    printf("PCI: Found {d} PCI devices.{n}", pci_device_count);
-    printf("PCI: Initialized.{n}");
+    printf("PCI: Found %d PCI devices.\n", pci_device_count);
+    printf("PCI: Initialized.\n");
 }
 
 /*

@@ -34,7 +34,7 @@ void beep() {
     hpet_sleep_counter(100);
     nosound();
     hpet_sleep_counter(10);
-    printf("stopped beeping{n}");
+    printf("stopped beeping\n");
 }
 
 void test_sound() {
@@ -68,7 +68,7 @@ void PlayWAV(uint32_t sample_rate, uint32_t file_size, uint8_t* file_data) {
         outb(0x42,file_data[i]);
         __asm__ __volatile__("hlt");
     }
-    printf("stopped playing sound{n}");
+    printf("stopped playing sound\n");
     // Disable digitized sound
     nosound();
 }

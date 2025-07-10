@@ -27,6 +27,8 @@
 #include "math.h"
 #include "atomic.h"
 #include "serial.h"
+#include "debug.h"
+#include "term.h"
 spinlock_t lock = {0};
 
 /* The maximum number of pages of available RAM across the entire memory map */
@@ -267,17 +269,16 @@ void _init_stats()
     hhdm = hhdm_request.response;
     
     // Debug HHDM setup
-    printf("HHDM Debug: hhdm_request.response = 0x{x}{n}", (uint64_t)hhdm);
+    printf("HHDM Debug: hhdm_request.response = %p\n", hhdm);
     if (hhdm) {
-        printf("HHDM Debug: hhdm->offset = 0x{x}{n}", hhdm->offset);
+        printf("HHDM Debug: hhdm->offset = 0x%llx\n", hhdm->offset);
         vmm_higher_half_offset = hhdm->offset;
         
         // Serial debug with working format
-        serial_printf("HHDM: response=0x%x, offset=0x%x%08x\n", 
-                     (uint32_t)hhdm, 
-                     (uint32_t)(hhdm->offset >> 32), (uint32_t)hhdm->offset);
+        serial_printf("HHDM: response=%p, offset=0x%llx\n", 
+                     hhdm, hhdm->offset);
     } else {
-        printf("HHDM Debug: hhdm is NULL - using fallback offset{n}");
+        printf("HHDM Debug: hhdm is NULL - using fallback offset\n");
         vmm_higher_half_offset = 0xFFFF800000000000ULL;  // Standard higher half offset
         serial_printf("HHDM: NULL response, using fallback 0xFFFF800000000000\n");
     }
@@ -416,17 +417,23 @@ void* kalloc(size_t numBytes)
 */
 void kmem_init()
 {
+    // NOTE: Removed DEBUG macros as they call printf() which is unsafe during early init
     printf("Initialzing PMM...\n");
 
+    // Use serial debug instead of printf-based DEBUG macros during early init
+    DEBUG_SERIAL("Initializing memory statistics\n");
     _init_stats();
 
     printf("Total Memory: %lu Mib\n", total_memory_bytes / 1024 / 1024);
     printf("Total Map Pages: %lu\n", num_pages_in_map);
     printf("Total Pages Available: %lu\n", max_pages_available);
-    printf("Lowest Memory Addr: 0x%X\n", lowest_address);
+    printf("Lowest Memory Addr: 0x%llx\n", lowest_address);
     
+    DEBUG_SERIAL("Creating page bitmap\n");
     _create_page_bitmap();
+    DEBUG_SERIAL("Creating entry map\n");
     _create_entry_map();
+    DEBUG_SERIAL("Getting free pages\n");
     _get_free_pages();
 
     printf("PMM initialized.\n");
@@ -442,7 +449,7 @@ void kfree(void *ptr)
     uint64_t page_index = _get_page_from_addr(ptr);
     
     if (page_index >= max_pages_available) {
-        printf("*FATAL*: Page index lookup resulted in out of bounds value of %lu from address 0x%X.\n", page_index, ptr);
+        printf("*FATAL*: Page index lookup resulted in out of bounds value of %lu from address %p.\n", page_index, ptr);
         while (1)
         {
             __asm__("hlt");
@@ -476,7 +483,7 @@ void memdumpx32(void *location, uint64_t len_bytes)
 {
     uint32_t *data = (uint32_t*)location;
     for (uint64_t i = 0; i < (len_bytes / 4); i++) {
-        printf("0x%X ", *data++);
+        printf("0x%08x ", *data++);
     }
     
     printf("\n");
@@ -486,7 +493,7 @@ void memdumpx64(void *location, uint64_t len_bytes)
 {
     uint64_t *data = (uint64_t*)location;
     for (uint64_t i = 0; i < (len_bytes / 8); i++) {
-        printf("0x%X ", *data++);
+        printf("0x%016llx ", *data++);
     }
     
     printf("\n");

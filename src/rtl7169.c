@@ -14,14 +14,21 @@ uint64_t rx_buffer;
 
 void rtl8169_init(){
     struct pci_device *dev = pci_find_device(0x02,0x00);
+    
+    // Check if device was found
+    if (dev == NULL) {
+        printf("RTL8139: RTL8139 device not found (pci_find_device returned NULL).\n");
+        return;
+    }
+    
     printf("RTL8139: Checking for RTL8139 device.\n");
-    printf("{x}:{xn}",pci_device_read(dev,pci_reg0_offset,2),pci_device_read(dev,pci_reg0_offset+2,2));
+    printf("%x:%x\n", pci_device_read(dev, pci_reg0_offset, 2), pci_device_read(dev, pci_reg0_offset + 2, 2));
     if(pci_device_read(dev,pci_reg0_offset,2) == RTL8169_VENDOR_ID && pci_device_read(dev,pci_reg0_offset+2,2) == RTL8169_DEVICE_ID){
-        printf("{d}:{d}", dev->bus, dev->device);
+        printf("%d:%d\n", dev->bus, dev->device);
     }
     else{
         printf("RTL8139: RTL8139 device not found.\n");
-        return 0;
+        return;
     }
     //enable the device
     outb(dev->address + 0x52, 0x0);

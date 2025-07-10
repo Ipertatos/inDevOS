@@ -4,9 +4,11 @@
 #include "registers.h"
 #include "mem.h"
 #include "utils.h"
+#include "atomic.h"
 
 static ide_controller_t ide_ctrl = {0};
 static uint8_t ide_storage_device_id = 0xFF;
+static spinlock_t ide_lock = {0};
 
 // Helper functions for I/O operations
 static uint8_t ide_read_reg(uint8_t reg) {
@@ -67,7 +69,7 @@ static int ide_wait_data() {
 // Identify IDE drive to get capacity
 static int ide_identify_drive() {
     if (ide_wait_ready() != 0) {
-        printf("IDE: Drive not ready for identify{n}");
+        printf("IDE: Drive not ready for identify\n");
         return -1;
     }
     
@@ -79,7 +81,7 @@ static int ide_identify_drive() {
     
     // Wait for data
     if (ide_wait_data() != 0) {
-        printf("IDE: IDENTIFY command failed{n}");
+        printf("IDE: IDENTIFY command failed\n");
         return -1;
     }
     
@@ -91,26 +93,26 @@ static int ide_identify_drive() {
     uint32_t sectors = identify_data[60] | (identify_data[61] << 16);
     
     if (sectors == 0) {
-        printf("IDE: Drive reports 0 sectors{n}");
+        printf("IDE: Drive reports 0 sectors\n");
         return -1;
     }
     
     ide_ctrl.sectors = sectors;
     uint32_t size_mb = (sectors * 512) / (1024 * 1024);
     
-    printf("IDE: Drive capacity: {d} sectors ({d} MB){n}", sectors, size_mb);
+    printf("IDE: Drive capacity: %d sectors (%d MB)\n", sectors, size_mb);
     return 0;
 }
 
 void ide_init() {
-    printf("IDE: Starting IDE initialization{n}");
+    printf("IDE: Starting IDE initialization\n");
     struct pci_device* dev = pci_find_device(0x01, 0x01);
     if (dev == NULL) {
-        printf("IDE: No IDE controller found (class 01:01){n}");
+        printf("IDE: No IDE controller found (class 01:01)\n");
         return;
     }
     
-    printf("IDE: Found IDE controller at bus {d}, device {d}, func {d}{n}", 
+    printf("IDE: Found IDE controller at bus %d, device %d, func %d\n", 
            dev->bus, dev->device, dev->function);
     
     ide_ctrl.pci_dev = dev;
@@ -123,11 +125,11 @@ void ide_init() {
     if ((bar0 & 0xFFFFFFFC) == 0 || (bar0 & 0xFFFFFFFC) == 1) {
         ide_ctrl.base_port = 0x1F0;  // Primary IDE legacy base
         ide_ctrl.ctrl_port = 0x3F6;  // Primary IDE control
-        printf("IDE: Using legacy I/O addresses (0x1F0){n}");
+        printf("IDE: Using legacy I/O addresses (0x1F0)\n");
     } else {
         ide_ctrl.base_port = bar0 & 0xFFFFFFFC;
         ide_ctrl.ctrl_port = (bar1 & 0xFFFFFFFC) + 2;
-        printf("IDE: Using PCI BAR addresses (0x{x}){n}", ide_ctrl.base_port);
+        printf("IDE: Using PCI BAR addresses (0x%x)\n", ide_ctrl.base_port);
     }
     
     // Enable bus mastering and I/O space
@@ -139,12 +141,12 @@ void ide_init() {
     ide_ctrl.drive = 0; // Master drive
     
     if (ide_identify_drive() != 0) {
-        printf("IDE: Failed to identify drive{n}");
+        printf("IDE: Failed to identify drive\n");
         return;
     }
     
     ide_ctrl.initialized = true;
-    printf("IDE: Controller initialized successfully{n}");
+    printf("IDE: Controller initialized successfully\n");
     
     // Register with storage subsystem
     ide_register_storage();
@@ -160,7 +162,7 @@ int ide_register_storage() {
     extern uint8_t storage_device_count;
     
     if (storage_device_count >= MAX_STORAGE_DEVICES) {
-        printf("IDE: No free storage device slots{n}");
+        printf("IDE: No free storage device slots\n");
         return -1;
     }
     
@@ -183,17 +185,27 @@ int ide_register_storage() {
     
     storage_device_count++;
     
-    printf("IDE: Registered as storage device {d}{n}", ide_storage_device_id);
+    printf("IDE: Registered as storage device %d\n", ide_storage_device_id);
     return 0;
 }
 
 int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
-    if (!ide_ctrl.initialized || dev->device_id != ide_storage_device_id) {
+    spinlock_lock(&ide_lock);
+    if (!ide_ctrl.initialized || !dev || !buffer) {
+        printf("IDE: Invalid parameters for read\n");
+        spinlock_unlock(&ide_lock);
+        return -1;
+    }
+    printf("IDE: Reading %d sectors from LBA %d\n", sector_count, lba);
+    if (ide_wait_ready() != 0) {
+        printf("IDE: Controller not ready for read\n");
+        spinlock_unlock(&ide_lock);
         return -1;
     }
     
     if (lba + sector_count > ide_ctrl.sectors) {
-        printf("IDE: Read beyond drive capacity{n}");
+        printf("IDE: Read beyond drive capacity\n");
+        spinlock_unlock(&ide_lock);
         return -1;
     }
     
@@ -201,11 +213,6 @@ int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count,
     
     for (uint32_t i = 0; i < sector_count; i++) {
         uint32_t current_lba = lba + i;
-        
-        if (ide_wait_ready() != 0) {
-            printf("IDE: Drive not ready for read{n}");
-            return -1;
-        }
         
         // Select drive and set LBA mode
         ide_write_reg(IDE_REG_DRIVE, IDE_DRIVE_MASTER | 0x40 | ((current_lba >> 24) & 0x0F));
@@ -219,7 +226,8 @@ int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count,
         
         // Wait for data
         if (ide_wait_data() != 0) {
-            printf("IDE: Read sector {d} failed{n}", current_lba);
+            printf("IDE: Read sector %d failed\n", current_lba);
+            spinlock_unlock(&ide_lock);
             return -1;
         }
         
@@ -227,6 +235,7 @@ int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count,
         ide_read_data(buf + (i * 256), 256);
     }
     
+    spinlock_unlock(&ide_lock);
     return 0;
 }
 
@@ -236,7 +245,7 @@ int ide_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
     }
     
     if (lba + sector_count > ide_ctrl.sectors) {
-        printf("IDE: Write beyond drive capacity{n}");
+        printf("IDE: Write beyond drive capacity\n");
         return -1;
     }
     
@@ -246,7 +255,7 @@ int ide_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
         uint32_t current_lba = lba + i;
         
         if (ide_wait_ready() != 0) {
-            printf("IDE: Drive not ready for write{n}");
+            printf("IDE: Drive not ready for write\n");
             return -1;
         }
         
@@ -262,7 +271,7 @@ int ide_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
         
         // Wait for drive ready
         if (ide_wait_data() != 0) {
-            printf("IDE: Write sector {d} failed{n}", current_lba);
+            printf("IDE: Write sector %d failed\n", current_lba);
             return -1;
         }
         

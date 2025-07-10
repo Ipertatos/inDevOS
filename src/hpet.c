@@ -5,6 +5,8 @@
 #include "cpu.h"
 #include "mem.h"
 #include "atomic.h"
+#include "serial.h"
+#include "term.h"
 #define FEMTOSECS_PER_SEC 1000000000000000LL
 
 #define HPET_REG_MAIN_CNT           0x0F0
@@ -25,10 +27,10 @@ volatile uint64_t *base_addr = 0;
 volatile struct hpet_regs *hpet_regs = 0;
 volatile uint64_t *hpet_main_cnt = 0;
 
-spinlock_t hpet_lock;
+spinlock_t hpet_lock = {0};
 uint64_t hpet_freq;
-volatile uint64_t _ticks;
-uint64_t tiks;
+static atomic_t _ticks = {0};
+static atomic_t tiks = {0};
 
 
 uint64_t* _timer_config_reg(uint32_t n)
@@ -52,51 +54,51 @@ static inline void hpet_write(uint64_t offset, uint64_t val)
 }
 
 void hpet_init(){
-    printf("hpet: initializing{n}");
-    printf("hpet: acpi config:{n}");
-    printf("    hpet comparator count: {d}{n}", hpet->comparator_count);
-    printf("    hpet counter size: {d}{n}", hpet->counter_size);
-    printf("    hpet minimum tick: {d}{n}", hpet->minimum_tick);
-    printf("    hpet legacy replacement: {d}{n}", hpet->legacy_replacement);
+    serial_puts("hpet: initializing\n");
+    serial_puts("hpet: acpi config:\n");
+    serial_printf("    hpet comparator count: %d\n", hpet->comparator_count);
+    serial_printf("    hpet counter size: %d\n", hpet->counter_size);
+    serial_printf("    hpet minimum tick: %d\n", hpet->minimum_tick);
+    serial_printf("    hpet legacy replacement: %d\n", hpet->legacy_replacement);
 
     base_addr = (uint64_t*)(hpet->address.Address + vmm_higher_half_offset);
 
     hpet_regs = (volatile struct hpet_regs*)base_addr;
     hpet_main_cnt = (volatile uint64_t*)((char*)base_addr + HPET_REG_MAIN_CNT);
 
-    printf("hpet: capabilities: {n}");
+    serial_puts("hpet: capabilities:\n");
     uint64_t numTimers = (hpet_regs->capabilities >> 8) & 0x1F;
-    printf("    hpet num timers: {d}{n}", numTimers);
-    printf("    hpet legacy route capable: {d}{n}", (hpet_regs->capabilities >> 15) & 1);
-    printf("    hpet 64-bit counter: {d}{n}", (hpet_regs->capabilities >> 13) & 1);
+    serial_printf("    hpet num timers: %d\n", (int)numTimers);
+    serial_printf("    hpet legacy route capable: %d\n", (int)((hpet_regs->capabilities >> 15) & 1));
+    serial_printf("    hpet 64-bit counter: %d\n", (int)((hpet_regs->capabilities >> 13) & 1));
     uint32_t tick_period  = (uint32_t)(hpet_regs->capabilities >> 32);
-    printf("    hpet tick period: {d}{n}", tick_period);
+    serial_printf("    hpet tick period: %d\n", tick_period);
 
     hpet_freq = FEMTOSECS_PER_SEC / tick_period;
-    printf("    hpet freq: {d}{n}", hpet_freq);
+    serial_printf("    hpet freq: %lld\n", hpet_freq);
 
-    printf("hpet: config: {n}");
+    serial_puts("hpet: config:\n");
     uint8_t legacy_replacement_route = (hpet_regs->config >> 1) & 1;
-    printf("    hpet legacy replacement route: {d}{n}", legacy_replacement_route);
-    printf("    hpet overall enable: {d}{n}", hpet_regs->config & 1);
+    serial_printf("    hpet legacy replacement route: %d\n", legacy_replacement_route);
+    serial_printf("    hpet overall enable: %d\n", (int)(hpet_regs->config & 1));
 
     //configure the main counter
     volatile uint64_t *timer_cfg = _timer_config_reg(0);
 
     uint32_t routing_caps = (uint32_t)(*timer_cfg >> 32);
-    printf("hpet: timer 0 allowed interrupt routing: ");
-    printbin(ft_ctx,routing_caps);
-    printf("{n}");    
+    serial_puts("hpet: timer 0 allowed interrupt routing: ");
+    serial_printf("0x%08x\n", routing_caps);
 
-    printf("hpet: timer 0 periodic: {d}{n}", (*timer_cfg >> 4) & 1);
-    printf("hpet: timer 0 64-bit: {d}{n}", (*timer_cfg >> 5) & 1);
+    serial_printf("hpet: timer 0 periodic: %d\n", (int)((*timer_cfg >> 4) & 1));
+    serial_printf("hpet: timer 0 64-bit: %d\n", (int)((*timer_cfg >> 5) & 1));
 
     uint8_t selected_ioapic_input = 0;
     *timer_cfg |= (selected_ioapic_input << 9);
     *timer_cfg |= (1 << 3); 
     *timer_cfg |= (1 << 2); // enable the interrupt
-    ioapic_redirect_irq(bsp_lapic_id,(uint8_t)32,(uint8_t)0,true);
-    _ticks = 0;
+    ioapic_redirect_irq(bsp_lapic_id,(uint8_t)35,(uint8_t)0,true);
+    atomic_set(&_ticks, 0);
+    atomic_set(&tiks, 0);
 }
 
 void hpet_one_shot(uint64_t ms){
@@ -121,7 +123,7 @@ inline void hpet_enable(){
 
 void hpet_reset(){
     hpet_disable();
-    _ticks = 0;
+    atomic_set(&_ticks, 0);
 }
 
 void hpet_ack(){
@@ -130,7 +132,7 @@ void hpet_ack(){
 
 void hpet_sleep(uint64_t ms){
     hpet_one_shot(ms);
-    while(_ticks != ms);
+    while(atomic_get(&_ticks) != ms);
     hpet_disable();
 }
 
@@ -148,18 +150,11 @@ void hpet_sleep_counter(uint64_t ms){
 }
 
 uint64_t hpet_get_ticks(){
-    spinlock_lock(&hpet_lock);
-    __asm__ __volatile__("cli");
-    int tmp = tiks;
-    __asm__ __volatile__("sti");
-    spinlock_unlock(&hpet_lock);
-    return tmp;
+    return atomic_get(&tiks);
 }
 
 void hpet_isr()
 {
-    spinlock_lock(&hpet_lock);
-    _ticks++;
-    tiks++;
-    spinlock_unlock(&hpet_lock);
+    atomic_inc(&_ticks);
+    atomic_inc(&tiks);
 }

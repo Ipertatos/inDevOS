@@ -7,3 +7,5 @@
 void onIrq0(registers_t *r);
 
 void initTimer();
+
+uint64_t get_ticks(void);

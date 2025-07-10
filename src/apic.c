@@ -6,6 +6,8 @@
 #include "keyboard.h"
 #include "hpet.h"
 #include "types.h"
+#include "atomic.h"
+#include "serial.h"
 #define LAPIC_ID_REG        0x20            // lapic id register
 #define LAPIC_VERSION_REG   0x30            // lapic version register
  
@@ -45,7 +47,7 @@ uint64_t *ioapic_address;
 extern madt_t *madt;
 extern uint64_t vmm_higher_half_offset;
 
-uint64_t apic_timer_ticks;
+static atomic_t apic_timer_ticks = {0};
 
 madt_ics_t ics_arr[128];
 
@@ -58,16 +60,20 @@ void add_ioapic(madt_ioapic_t *pIOApic)
     for (int i = 0; i < 128; i++) {
         if (ioapic_list[i] == NULL) {
             ioapic_list[i] = pIOApic;
+            DEBUG_SERIAL("Added IOAPIC %d: ID=%d, GSI base=%d, addr=0x%x\n");
+            serial_printf("Added IOAPIC %d: ID=%d, GSI base=%d, addr=0x%x\n", 
+                         i, pIOApic->ioapicID, pIOApic->gsi, pIOApic->ioapicaddr);
             return;
         }
     }
+    DEBUG_SERIAL("ERROR: IOAPIC list full!\n");
 }
 
 void add_iso(madt_iso_t *pISO)
 {
     for (int i = 0; i < 128; i++) {
         if (iso_list[i] == NULL) {
-            printf("ISO OVERRIDE: {d} -> {d}.{n}", pISO->source, pISO->gsi);
+            serial_printf("ISO OVERRIDE: %d -> %d.\n", pISO->source, pISO->gsi);
             iso_list[i] = pISO;
             return;
         }
@@ -89,7 +95,7 @@ void get_madt_tables(madt_t *madt)
             if(plapic->flags == 0){
                 break;
             }else {
-                printf("apic: found cpu: {dn}", plapic->apicID);
+                serial_printf("apic: found cpu: %d\n", plapic->apicID);
                 ics_arr[i].address = (uint64_t*)cur_ics;
                 ics_arr[i].type = cur_ics->entry_type;
                 ics_arr[i].apic_id = plapic->apicID;
@@ -124,6 +130,10 @@ void get_madt_tables(madt_t *madt)
 }
 
 uint32_t ioapic_read(madt_ioapic_t *pApic, const uint8_t reg){
+    if (pApic == NULL) {
+        serial_puts("ERROR: ioapic_read called with NULL pApic\n");
+        return 0;
+    }
 
     uint64_t ioapicptr = (uint64_t)pApic->ioapicaddr + vmm_higher_half_offset;
     *(volatile uint32_t*)(ioapicptr) = reg;
@@ -133,6 +143,11 @@ uint32_t ioapic_read(madt_ioapic_t *pApic, const uint8_t reg){
 
 
 void ioapic_write(madt_ioapic_t *pApic, uint8_t reg, uint32_t data){
+    if (pApic == NULL) {
+        serial_puts("ERROR: ioapic_write called with NULL pApic\n");
+        return;
+    }
+    
     uint64_t ioapicptr = (uint64_t)pApic->ioapicaddr + vmm_higher_half_offset;
     *(volatile uint32_t*)(ioapicptr) = reg;
     *(volatile uint32_t*)(ioapicptr + 0x10) = data;
@@ -162,14 +177,14 @@ void apic_eoi(){
 }
 
 void apic_asleep(int ms){
-    int curcnt = apic_timer_ticks;
-    while(apic_timer_ticks - curcnt < ms){
+    uint64_t curcnt = atomic_get(&apic_timer_ticks);
+    while(atomic_get(&apic_timer_ticks) - curcnt < ms){
         __asm__ ("nop");
     }
 }
 
 void apic_timer(){
-    apic_timer_ticks++;
+    atomic_inc(&apic_timer_ticks);
     apic_eoi();
 }
 
@@ -188,7 +203,7 @@ void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool st
 
         // Does this override entry affect the IRQ we want to redirect?
         if (irq == pISO->source) {
-            printf("I/O APIC using override from {d} to {d}.\n", irq, pISO->gsi);
+            serial_printf("I/O APIC using override from %d to %d.\n", irq, pISO->gsi);
             _ioapic_redirect_gsi(lapic_id, vector, pISO->gsi, pISO->flags, status);
             return;
         }
@@ -199,22 +214,41 @@ void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool st
 }
 static uint64_t ioapic_max_gsi(struct madt_ioapic_t *pIOApic)
 {
+    if (pIOApic == NULL) {
+        serial_puts("ERROR: ioapic_max_gsi called with NULL pIOApic\n");
+        return 0;
+    }
+    
     uint64_t max = (ioapic_read(pIOApic, 0x01) & 0xFF0000) >> 16;
     return max;
 }
 madt_ioapic_t* find_gsi(int leg_pin){
+    DEBUG_SERIAL("Looking for IOAPIC for GSI %d\n");
+    serial_printf("Looking for IOAPIC for GSI %d\n", leg_pin);
+    
     for(int i = 0; i < 128; i++){ //no reason to have more than 64 ics entries
         madt_ioapic_t *pIOApic = ioapic_list[i];
 
         if(pIOApic == NULL){
+            DEBUG_SERIAL("End of IOAPIC list at index %d\n");
+            serial_printf("End of IOAPIC list at index %d\n", i);
             return NULL;
         }
 
-        if(leg_pin >= pIOApic->gsi && leg_pin < pIOApic->gsi + ioapic_max_gsi(pIOApic)){
+        DEBUG_SERIAL("Checking IOAPIC %d: GSI range %d-%d\n");
+        uint64_t max_gsi = ioapic_max_gsi(pIOApic);
+        serial_printf("Checking IOAPIC %d: GSI range %d-%d\n", 
+                     i, pIOApic->gsi, pIOApic->gsi + max_gsi);
+
+        if(leg_pin >= pIOApic->gsi && leg_pin < pIOApic->gsi + max_gsi){
+            DEBUG_SERIAL("Found IOAPIC for GSI %d\n");
+            serial_printf("Found IOAPIC for GSI %d\n", leg_pin);
             return pIOApic;
         }
 
     }
+    DEBUG_SERIAL("No IOAPIC found for GSI %d\n");
+    serial_printf("No IOAPIC found for GSI %d\n", leg_pin);
     return NULL; //no IOAPIC found, return the legacy pin
 }
 
@@ -222,6 +256,12 @@ madt_ioapic_t* find_gsi(int leg_pin){
 void _ioapic_redirect_gsi(uint32_t lapic_id, uint8_t vector, uint8_t gsi, uint16_t flags, bool status)
 {
     madt_ioapic_t *pIOApic = find_gsi(gsi);
+    
+    if (pIOApic == NULL) {
+        DEBUG_SERIAL("ERROR: No IOAPIC found for GSI %d\n");
+        serial_printf("ERROR: No IOAPIC found for GSI %d\n", gsi);
+        return;
+    }
 
     uint64_t redirect = vector;
 
@@ -250,20 +290,21 @@ void _ioapic_redirect_gsi(uint32_t lapic_id, uint8_t vector, uint8_t gsi, uint16
     ioapic_write(pIOApic, io_redirect_table_reg, (uint32_t)redirect);
     ioapic_write(pIOApic, io_redirect_table_reg + 1, (uint32_t)(redirect >> 32));
 
-    printf("Applied I/O APIC redirect: Vector {d}, GSI {d}.{n}}", vector, gsi);
+    serial_printf("Applied I/O APIC redirect: Vector %d, GSI %d.\n", vector, gsi);
 }
 
 
 //we can do ps2 here
 void ps2_int_init(){
-    log_info("Initializing PS/2 keyboard");
-    keyboard_init();//TODO
+    DEBUG_SERIAL("Initializing PS/2 keyboard\n");
+    // NOTE: Removed keyboard_init() call from here - it's called separately in kernel.c
+    // keyboard_init();
 
     //_ioapic_redirect_gsi
 
 
-    printf("ps2: configured IOAPIC redirection entry{n}");
-    log_success("PS/2 keyboard initialized");
+    DEBUG_SERIAL("ps2: configured IOAPIC redirection entry\n");
+    DEBUG_SERIAL("PS/2 keyboard initialized\n");
 } 
 
 void calibrate_timer(madt_t *madt){
@@ -273,7 +314,7 @@ void calibrate_timer(madt_t *madt){
     pmt_delay(5000);
     apic_write(lapic_address,LAPIC_TIMERDIV_REG,0x10000); //0x10000 = masked, sdm
     uint32_t calibarion = 0xffffffff - apic_read(lapic_address, LAPIC_CURCNT_REG);
-    apic_write(lapic_address,LAPIC_LVTTIMER_REG,172 | LAPIC_PERIODIC);
+    apic_write(lapic_address,LAPIC_LVTTIMER_REG,32 | LAPIC_PERIODIC);
     apic_write(lapic_address, LAPIC_TIMERDIV_REG,0x3); // 16
     apic_write(lapic_address, LAPIC_INITCNT_REG,calibarion);
 }
@@ -281,14 +322,14 @@ void init_apic(madt_t *madt){
     asm("cli");
     get_madt_tables(madt);
     
-    printf("apic: MADT tables listed through{n}");
-    printf("apic: writing to SIV register{n}");
+    serial_puts("apic: MADT tables listed through\n");
+    serial_puts("apic: writing to SIV register\n");
     hpet_init();
     lapic_addr = madt->lapicaddr;
     uint32_t spurius_reg = apic_read((void*)madt->lapicaddr, LAPIC_SIVR_REG);
-    printf("madt lapic adr: 0x{xn}", lapic_addr);
+    serial_printf("madt lapic adr: 0x%llx\n", lapic_addr);
     apic_write((void*)madt->lapicaddr, LAPIC_SIVR_REG,spurius_reg | (0x100));
-    log_success("LAPIC initialized");
+    DEBUG_SERIAL("LAPIC initialized\n");
     calibrate_timer(madt);
    // for(int i=0 ; i != ((ioapic_read(ioapic_list[0],IOAPICVER_REG) >> 16)&0xFF); i++){
     //    ioapic_configure_entry(ioapic_address[0],i,1<<16);
@@ -299,7 +340,7 @@ void init_apic(madt_t *madt){
 
     //asm("sti");
     ps2_int_init();
-    log_success("IOAPIC initialized");
+    DEBUG_SERIAL("IOAPIC initialized\n");
     apic_eoi();
 }
 
