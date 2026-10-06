@@ -2,6 +2,41 @@
 #include "types.h"
 #include "utils.h"
 
+/* ================================================================
+ * Unified kernel logging (klog)
+ *
+ * One API for all kernel log output instead of mixed printf /
+ * serial_printf calls. Every message always goes to the serial port
+ * (when enabled); messages at or below the console level also go to
+ * the terminal once it is ready (klog_console_ready()).
+ * ================================================================ */
+#define KLOG_ERR    0   /* unrecoverable / data-loss class problems  */
+#define KLOG_WARN   1   /* unexpected but survivable                 */
+#define KLOG_INFO   2   /* normal boot / state-change messages       */
+#define KLOG_DEBUG  3   /* verbose; compiled in, filtered at runtime */
+
+void klog(int level, const char *fmt, ...);
+void klog_set_console_level(int level);
+void klog_console_ready(void);
+
+#define klog_err(fmt, ...)   klog(KLOG_ERR,   fmt, ##__VA_ARGS__)
+#define klog_warn(fmt, ...)  klog(KLOG_WARN,  fmt, ##__VA_ARGS__)
+#define klog_info(fmt, ...)  klog(KLOG_INFO,  fmt, ##__VA_ARGS__)
+#define klog_debug(fmt, ...) klog(KLOG_DEBUG, fmt, ##__VA_ARGS__)
+
+/* Hot-path tracing: program loads and filesystem operations.
+ *
+ * These messages are genuinely useful when something goes wrong, but there is
+ * one per open/create/delete plus a dozen per program launch, and each console
+ * write costs 15-40 ms under emulation - they dominated program start-up time
+ * and flooded the screen while programs were printing.  Off by default;
+ * `trace on` in the shell turns them on (serial + console). */
+extern bool ktrace_enabled;
+void ktrace_set(bool on);
+
+#define ktrace(fmt, ...) \
+    do { if (ktrace_enabled) klog(KLOG_DEBUG, fmt, ##__VA_ARGS__); } while (0)
+
 // Function entry debugging
 #ifdef DEBUG
     #define DEBUG_ENTER() printf("DEBUG: Entering %s()\n", __func__)

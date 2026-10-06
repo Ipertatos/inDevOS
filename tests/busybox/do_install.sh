@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+cd /mnt/c/osproj
+IMG=sata_disk.img
+BB=tests/busybox/build/busybox.exe
+ls -la "$BB" "$IMG"
+mdir -i "$IMG" ::/bin >/dev/null 2>&1 || mmd -i "$IMG" ::/bin </dev/null || true
+mcopy -o -i "$IMG" "$BB" ::/bin/busybox.exe
+mcopy -o -i "$IMG" "$BB" ::/busybox.exe
+mdir -i "$IMG" ::/bin | grep -i busy
+echo OK

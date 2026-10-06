@@ -1,6 +1,11 @@
 #include "sound.h"
 #include "hpet.h"
 #include "utils.h"
+
+// Include low-level port I/O functions
+extern void outb(uint16_t port, uint8_t value);
+extern uint8_t inb(uint16_t port);
+
 wav_header wav;
 
 static void play_sound(uint32_t nFrequence) {

@@ -1,25 +1,35 @@
-boot.bin
-os.iso
-obj/*.o
-.vscode
-iso/
-src/idt.o
-src/kernel.o
-hexembed
-hexembed.c
-test.c
-testo.txt
-testo
+# Build artifacts
 obj/
-limine
-nvme_disk.img
-sata_disk.img
-serial.log
-test.txt
-test2.txt
-*.exe
+iso/
+iso_full/
+*.o
+*.d
 *.bin
+*.iso
+*.sym
+kernel.sym
+src/kernel_symtab.c
+
+# User app build outputs
+*.exe
 *.elf
-*.raw
-*.wav
+
+# Disk images (created locally via create_disk_images.sh)
+*.img
+
+# Logs / traces
 *.log
+trace.json
+
+# Editor / local
+.vscode/
+
+# Local QEMU / scenario artifacts
+.shots/
+shot*.png
+_zoom-*.png
+doom.speedscope.json
+*.speedscope.json
+
+# Vendored Lua (fetched by scripts/fetch_lua.sh)
+third_party/lua-5.4/

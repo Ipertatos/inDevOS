@@ -1,23 +1,67 @@
-name: C/C++ CI
+name: Build & Boot Test
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "test" ]
   pull_request:
     branches: [ "master" ]
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
-    - name: make
-      run: make
-    - name: make run
-      run: make run
-    - name: make clean
-      run: make clean
+      with:
+        submodules: true
+
+    - name: Install toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          gcc nasm xorriso python3 qemu-system-x86 mtools curl
+
+    - name: Build limine host tool
+      run: make -C limine
+
+    - name: Build kernel
+      run: make kernel_final.bin -j"$(nproc)"
+
+    - name: Build ISO
+      run: make os.iso
+
+    - name: Boot smoke test (headless QEMU)
+      run: |
+        truncate -s 64M sata_disk.img
+        truncate -s 64M nvme_disk.img
+        set +e
+        timeout 45 qemu-system-x86_64 \
+          -boot d -cdrom os.iso -smp 4 -m 1G -M q35 \
+          -cpu qemu64,+smep,+smap,+nx \
+          -netdev user,id=net0 -device rtl8139,netdev=net0 \
+          -drive file=sata_disk.img,format=raw,index=0,snapshot=on \
+          -drive file=nvme_disk.img,format=raw,index=1,media=disk,snapshot=on \
+          -device virtio-vga,xres=1920,yres=1080 \
+          -display none -no-reboot \
+          -serial file:serial-ci.log
+        qrc=$?
+        set -e
+        echo "--- serial output (tail) ---"
+        tail -80 serial-ci.log || true
+        # 124 = timeout (expected: the guest has no shutdown in this smoke test)
+        if [ "$qrc" -ne 0 ] && [ "$qrc" -ne 124 ]; then
+          echo "QEMU exited with $qrc"
+          exit 1
+        fi
+        test -s serial-ci.log
+
+    - name: Validate boot output
+      run: bash scripts/validate_boot_expect.sh serial-ci.log
+
+    - name: Upload serial log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: serial-ci-log
+        path: serial-ci.log
+        if-no-files-found: ignore

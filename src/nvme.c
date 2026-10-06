@@ -45,6 +45,8 @@ static int nvme_wait_ready(bool ready) {
 }
 
 void nvme_init() {
+    if (nvme_ctrl.initialized)
+        return;
     struct pci_device* dev = pci_find_device(0x01, 0x08);
     if (dev == NULL) {
         printf("NVMe: Device not found.\n");
@@ -110,16 +112,11 @@ void nvme_init() {
          NVME_CC_SHN_NONE | NVME_CC_IOSQES_64 | NVME_CC_IOCQES_16;
     nvme_write_reg32(NVME_REG_CC, cc);
     
-    // For now, skip admin queue setup and just mark as basic init complete
-    nvme_ctrl.initialized = true;
-    nvme_ctrl.namespace_count = 1; // Assume 1 namespace for simplicity
-    nvme_ctrl.namespace_size = 2097152; // 1GB in 512-byte sectors
-    
-    printf("NVMe: Basic initialization complete\n");
-    printf("NVMe: Namespace size: %d sectors (512 bytes each)\n", nvme_ctrl.namespace_size);
-    
-    // Register with storage subsystem
-    nvme_register_storage();
+    /* Do not claim a working disk: admin/IO queues were never set up and
+     * CC.EN is still clear. Registering here used to make storage.c treat
+     * pattern-filled "reads" as real NVMe data. */
+    nvme_ctrl.initialized = false;
+    printf("NVMe: probe only — queues not implemented, not registering storage\n");
 }
 
 int nvme_register_storage() {
@@ -170,17 +167,11 @@ int nvme_storage_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sect
         return -1;
     }
     
-    // For now, just return success but fill with pattern data
-    // In a real implementation, this would use NVMe command queues
-    printf("NVMe: Simulated read of %u sectors from LBA %llu\n", sector_count, (unsigned long long)lba);
-    
-    // Fill buffer with a recognizable pattern that includes LBA info
-    uint32_t *buf32 = (uint32_t*)buffer;
-    for (uint32_t i = 0; i < (sector_count * 512) / 4; i++) {
-        buf32[i] = (uint32_t)(lba + (i / 128)) ^ 0xDEADBEEF; // Different pattern per sector
-    }
-    
-    return 0;
+    (void)lba;
+    (void)sector_count;
+    (void)buffer;
+    printf("NVMe: read not implemented (no I/O queues)\n");
+    return -1;
 }
 
 int nvme_storage_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer) {
@@ -193,11 +184,11 @@ int nvme_storage_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sec
         return -1;
     }
     
-    // For now, just return success
-    // In a real implementation, this would use NVMe command queues
-    printf("NVMe: Simulated write of %u sectors to LBA %llu\n", sector_count, (unsigned long long)lba);
-    
-    return 0;
+    (void)lba;
+    (void)sector_count;
+    (void)buffer;
+    printf("NVMe: write not implemented (no I/O queues)\n");
+    return -1;
 }
 
 int nvme_storage_flush(storage_device_t *dev) {
@@ -205,36 +196,17 @@ int nvme_storage_flush(storage_device_t *dev) {
         return -1;
     }
     
-    // For now, just return success
-    printf("NVMe: Simulated flush\n");
-    return 0;
+    printf("NVMe: flush not implemented\n");
+    return -1;
 }
 
 // Legacy functions for compatibility (if needed elsewhere)
 int nvme_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
-    spinlock_lock(&nvme_lock);
-    if (!nvme_ctrl.initialized || !dev || !buffer) {
-        printf("NVMe: Invalid parameters for read\n");
-        spinlock_unlock(&nvme_lock);
-        return -1;
-    }
-    printf("NVMe: Reading %d sectors from LBA %llu\n", sector_count, lba);
-    if (nvme_wait_ready(true) != 0) {
-        printf("NVMe: Controller not ready for read\n");
-        spinlock_unlock(&nvme_lock);
-        return -1;
-    }
-    // ... existing command setup ...
-    // Issue command
-    // Wait for completion
-    if (nvme_wait_ready(true) != 0) {
-        printf("NVMe: Controller not ready after read\n");
-        spinlock_unlock(&nvme_lock);
-        return -1;
-    }
-    // ... error checks ...
-    spinlock_unlock(&nvme_lock);
-    return 0;
+    (void)dev;
+    (void)lba;
+    (void)sector_count;
+    (void)buffer;
+    return -1;
 }
 
 int nvme_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer) {

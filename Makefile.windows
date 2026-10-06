@@ -1,0 +1,129 @@
+# Windows-specific Makefile for inDevOS
+# Use with MSYS2 MINGW64 environment
+
+# Compiler settings for MSYS2
+CC = gcc
+LD = ld
+PYTHON = python3
+
+# Windows-specific QEMU path (adjust if needed)
+QEMU = qemu-system-x86_64
+QEMU_FLAGS = -boot d -cdrom os.iso -smp 1 -m 1G -M q35 \
+			-drive file=sata_disk.img,format=raw,index=0 \
+			-drive file=nvme_disk.img,format=raw,index=1,media=disk \
+			-serial file:serial.log
+
+# Build flags (same as Linux version)
+CFLAGS = -g -m64 -ffreestanding -fno-pie -mgeneral-regs-only -mcmodel=kernel -fcommon -DDEBUG_PRINT -Iflanterm -Iflanterm/backends -msse2
+
+# Lua configuration
+ifdef ENABLE_LUA
+CFLAGS += -DENABLE_LUA -Ithird_party/lua-5.4/src -DLUA_FLOAT_TYPE=LUA_FLOAT_DOUBLE
+endif
+
+LDFLAGS = -T linker.ld -melf_x86_64
+SRCDIR = src
+OBJDIR = obj
+
+# Source files
+SOURCES = $(wildcard $(SRCDIR)/*.c) $(wildcard $(SRCDIR)/usoft/*.c)
+ASMSOURCES = $(wildcard $(SRCDIR)/*.asm)
+
+# Lua sources (if enabled)
+ifdef ENABLE_LUA
+LUA_SRCDIR = third_party/lua-5.4/src
+LUA_SOURCES = lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c \
+              llex.c lmem.c lobject.c lopcodes.c lparser.c lstate.c lstring.c \
+              ltable.c ltm.c lundump.c lvm.c lzio.c lauxlib.c lstrlib.c \
+              ltablib.c lmathlib.c
+LUA_OBJECTS = $(LUA_SOURCES:.c=.o)
+LUA_OBJECTS_FULL = $(addprefix $(OBJDIR)/lua/,$(LUA_OBJECTS))
+endif
+
+# Object files
+OBJECTS = $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+ASMOBJECTS = $(ASMSOURCES:$(SRCDIR)/%.asm=$(OBJDIR)/%.o)
+
+.PHONY: all clean run lua_objects
+
+all: kernel_final.bin
+
+# Lua compilation (Windows-specific)
+ifdef ENABLE_LUA
+lua_objects: $(LUA_OBJECTS_FULL)
+	@echo "Lua compilation complete"
+
+$(OBJDIR)/lua/%.o: $(LUA_SRCDIR)/%.c
+	@mkdir -p $(OBJDIR)/lua
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(LUA_OBJECTS_FULL): | $(OBJDIR)/lua
+$(OBJDIR)/lua:
+	mkdir -p $(OBJDIR)/lua
+endif
+
+# Object compilation
+$(OBJDIR)/%.o: $(SRCDIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(OBJDIR)/%.o: $(SRCDIR)/%.asm
+	@mkdir -p $(dir $@)
+	nasm -f elf64 -o $@ $<
+
+# Kernel linking
+ifdef ENABLE_LUA
+boot.bin: $(OBJECTS) $(ASMOBJECTS) lua_objects
+else
+boot.bin: $(OBJECTS) $(ASMOBJECTS)
+endif
+	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(ASMOBJECTS) $(LUA_OBJECTS_FULL)
+
+# Symbol table generation
+kernel.sym: boot.bin
+	nm -n boot.bin | grep ' [tT] ' > kernel.sym
+
+$(SRCDIR)/kernel_symtab.c: kernel.sym
+	$(PYTHON) symtab_gen.py < kernel.sym > $(SRCDIR)/kernel_symtab.c
+
+$(OBJDIR)/kernel_symtab.o: $(SRCDIR)/kernel_symtab.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Final kernel
+ifdef ENABLE_LUA
+kernel_final.bin: $(OBJECTS) $(ASMOBJECTS) $(OBJDIR)/kernel_symtab.o lua_objects
+else
+kernel_final.bin: $(OBJECTS) $(ASMOBJECTS) $(OBJDIR)/kernel_symtab.o
+endif
+	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(ASMOBJECTS) $(LUA_OBJECTS_FULL) $(OBJDIR)/kernel_symtab.o
+
+# ISO creation (Windows - requires xorriso from MSYS2)
+os.iso: kernel_final.bin
+	mkdir -p iso/boot/limine
+	cp kernel_final.bin iso/boot/boot.bin
+	cp limine.cfg limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso/boot/limine/
+	mkdir -p iso/EFI/BOOT
+	cp limine/BOOTX64.EFI iso/EFI/BOOT/
+	cp limine/BOOTIA32.EFI iso/EFI/BOOT/
+	xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
+	        -no-emul-boot -boot-load-size 4 -boot-info-table \
+	        --efi-boot boot/limine/limine-uefi-cd.bin \
+	        -efi-boot-part --efi-boot-image --protective-msdos-label \
+	        iso -o os.iso
+	limine/limine.exe bios-install os.iso
+
+# Run target (Windows-specific)
+run: os.iso
+	$(QEMU) $(QEMU_FLAGS)
+
+# Clean target
+clean:
+	rm -rf $(OBJDIR) boot.bin kernel_final.bin os.iso kernel.sym $(SRCDIR)/kernel_symtab.c
+	rm -rf iso/
+
+# Create directories
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
+# Ensure object directory exists
+$(OBJECTS) $(ASMOBJECTS): | $(OBJDIR)

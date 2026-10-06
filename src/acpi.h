@@ -229,7 +229,14 @@ void init_acpi(void);
 void pmt_delay(uint64_t us);
 fadt_t *fetch_fadt();
 
+/* ACPI power management */
+void acpi_shutdown(void);
+void acpi_reboot(void);
+void acpi_power_init(void);
+bool acpi_s5_available(void);
+
 extern mcfg_entry *mcfg;
+extern fadt_t *fadt;
 
 extern hpet_t *hpet;
 extern madt_ioapic_t *ioapic_list[];

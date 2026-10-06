@@ -24,6 +24,11 @@ typedef struct {
 } __attribute__((packed)) idtr_t;
 
 void initIDT(void);
+void idt_load_current(void);
 void setIdtGate(uint8_t num, void* base, uint8_t flags);
+void setIdtGateIST(uint8_t num, void* base, uint8_t flags, uint8_t ist);
 
 void isr_handler(registers_t* r);
+
+/** @brief Verify SMAP faults on a user page and the audit path recovers. */
+void smap_selftest(void);

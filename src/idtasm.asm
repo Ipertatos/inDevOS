@@ -53,10 +53,22 @@ ISR_NOERRCODE 31
 ISR_NOERRCODE 32
 ISR_NOERRCODE 33
 ISR_NOERRCODE 35
+ISR_NOERRCODE 43
+ISR_NOERRCODE 44
+ISR_NOERRCODE 45
+ISR_NOERRCODE 46
+ISR_NOERRCODE 47
+ISR_NOERRCODE 48
 ISR_NOERRCODE 128
 ISR_NOERRCODE 177
 
+; IPI vectors for SMP
+ISR_NOERRCODE 253  ; IPI_VECTOR_RESCHEDULE (0xFD)
+ISR_NOERRCODE 254  ; IPI_VECTOR_TLB_FLUSH  (0xFE)
+ISR_NOERRCODE 255  ; IPI_VECTOR_PANIC      (0xFF)
+
 extern isr_handler
+extern syscall_asm_handler
 isr_common_stub:
     push r15
     push r14
@@ -73,6 +85,7 @@ isr_common_stub:
     push rbp
     push rsi
     push rdi
+    cld                     ; C code (rep movs/stos in memcpy) requires DF=0
     mov rdi, rsp
     call isr_handler
 

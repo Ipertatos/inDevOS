@@ -14,6 +14,7 @@ typedef struct storage_device {
     struct pci_device *pci_dev;
     uint64_t base_address;
     char name[32];
+    bool optical; /* ATAPI CD/DVD. Never an install target. */
 } storage_device_t;
 
 // Storage device operations
@@ -29,10 +30,15 @@ extern storage_ops_t storage_ops;
 
 // Function declarations
 void storage_init();
+int storage_find_boot_device(void);
 storage_device_t* storage_get_device(uint8_t device_id);
 int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer);
 int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer);
 int storage_flush(uint8_t device_id);
 
 // Simple block device emulation (using memory for now)
-void storage_init_ramdisk(); 
+void storage_init_ramdisk();
+
+// Block cache statistics
+void storage_cache_stats(void);
+void storage_bcache_invalidate_all(void);

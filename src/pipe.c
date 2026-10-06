@@ -1,0 +1,194 @@
+/**
+ * @file pipe.c
+ * @brief Kernel pipe implementation for inter-process communication
+ *
+ * Implements unidirectional data channels using circular buffers.
+ * Pipes are the fundamental IPC mechanism in Unix-like systems.
+ */
+
+#include "pipe.h"
+#include "mem.h"
+#include "serial.h"
+#include "utils.h"
+#include "string.h"
+#include "../include/indevos_errno.h"
+
+/** @brief Global pipe table */
+static pipe_t pipe_table[MAX_PIPES];
+
+/** @brief Lock for pipe table allocation */
+static spinlock_t pipe_table_lock = {0};
+
+void pipe_init(void) {
+    memset(pipe_table, 0, sizeof(pipe_table));
+    serial_puts("pipe: subsystem initialized\n");
+}
+
+pipe_t* pipe_create(void) {
+    spinlock_lock(&pipe_table_lock);
+
+    /* Find a free slot in the pipe table */
+    pipe_t *pipe = NULL;
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (!pipe_table[i].active) {
+            pipe = &pipe_table[i];
+            break;
+        }
+    }
+
+    if (!pipe) {
+        spinlock_unlock(&pipe_table_lock);
+        serial_puts("pipe: no free pipe slots\n");
+        return NULL;
+    }
+
+    /* Allocate the circular buffer */
+    pipe->buffer = (uint8_t *)kalloc(PIPE_BUF_SIZE);
+    if (!pipe->buffer) {
+        spinlock_unlock(&pipe_table_lock);
+        serial_puts("pipe: failed to allocate buffer\n");
+        return NULL;
+    }
+
+    memset(pipe->buffer, 0, PIPE_BUF_SIZE);
+    pipe->buf_size  = PIPE_BUF_SIZE;
+    pipe->read_pos  = 0;
+    pipe->write_pos = 0;
+    pipe->count     = 0;
+    pipe->lock      = (spinlock_t){0};
+    pipe->readers   = 1;
+    pipe->writers   = 1;
+    pipe->active    = true;
+
+    spinlock_unlock(&pipe_table_lock);
+
+    serial_puts("pipe: created new pipe\n");
+    return pipe;
+}
+
+void pipe_destroy(pipe_t *pipe) {
+    if (!pipe || !pipe->active) return;
+
+    spinlock_lock(&pipe_table_lock);
+
+    if (pipe->buffer) {
+        kfree(pipe->buffer);
+        pipe->buffer = NULL;
+    }
+
+    pipe->active    = false;
+    pipe->buf_size  = 0;
+    pipe->read_pos  = 0;
+    pipe->write_pos = 0;
+    pipe->count     = 0;
+    pipe->readers   = 0;
+    pipe->writers   = 0;
+
+    spinlock_unlock(&pipe_table_lock);
+
+    serial_puts("pipe: destroyed pipe\n");
+}
+
+int pipe_read(pipe_t *pipe, void *buf, size_t count) {
+    if (!pipe || !pipe->active || !buf) return -1;
+
+    spinlock_lock(&pipe->lock);
+
+    if (pipe->count == 0) {
+        spinlock_unlock(&pipe->lock);
+        /* If no writers remain, this is EOF */
+        if (pipe->writers == 0) return 0;
+        return -EAGAIN;
+    }
+
+    /* Read as many bytes as available, up to the requested count */
+    uint32_t to_read = (count < pipe->count) ? (uint32_t)count : pipe->count;
+    uint8_t *dst = (uint8_t *)buf;
+
+    for (uint32_t i = 0; i < to_read; i++) {
+        dst[i] = pipe->buffer[pipe->read_pos];
+        pipe->read_pos = (pipe->read_pos + 1) % pipe->buf_size;
+    }
+    pipe->count -= to_read;
+
+    spinlock_unlock(&pipe->lock);
+    return (int)to_read;
+}
+
+int pipe_write(pipe_t *pipe, const void *buf, size_t count) {
+    if (!pipe || !pipe->active || !buf) return -1;
+
+    /* If there are no readers, writing is an error (broken pipe) */
+    if (pipe->readers == 0) return -1;
+
+    spinlock_lock(&pipe->lock);
+
+    uint32_t space = pipe->buf_size - pipe->count;
+    if (space == 0) {
+        spinlock_unlock(&pipe->lock);
+        return -EAGAIN;
+    }
+
+    /* Write as many bytes as fit */
+    uint32_t to_write = (count < space) ? (uint32_t)count : space;
+    const uint8_t *src = (const uint8_t *)buf;
+
+    for (uint32_t i = 0; i < to_write; i++) {
+        pipe->buffer[pipe->write_pos] = src[i];
+        pipe->write_pos = (pipe->write_pos + 1) % pipe->buf_size;
+    }
+    pipe->count += to_write;
+
+    spinlock_unlock(&pipe->lock);
+    return (int)to_write;
+}
+
+void pipe_close_read(pipe_t *pipe) {
+    if (!pipe || !pipe->active) return;
+
+    spinlock_lock(&pipe->lock);
+    if (pipe->readers > 0) pipe->readers--;
+    bool should_destroy = (pipe->readers == 0 && pipe->writers == 0);
+    spinlock_unlock(&pipe->lock);
+
+    if (should_destroy) {
+        pipe_destroy(pipe);
+    }
+}
+
+void pipe_close_write(pipe_t *pipe) {
+    if (!pipe || !pipe->active) return;
+
+    spinlock_lock(&pipe->lock);
+    if (pipe->writers > 0) pipe->writers--;
+    bool should_destroy = (pipe->readers == 0 && pipe->writers == 0);
+    spinlock_unlock(&pipe->lock);
+
+    if (should_destroy) {
+        pipe_destroy(pipe);
+    }
+}
+
+void pipe_fork_dup_reader(pipe_t *pipe) {
+    if (!pipe || !pipe->active) return;
+    spinlock_lock(&pipe->lock);
+    pipe->readers++;
+    spinlock_unlock(&pipe->lock);
+}
+
+void pipe_fork_dup_writer(pipe_t *pipe) {
+    if (!pipe || !pipe->active) return;
+    spinlock_lock(&pipe->lock);
+    pipe->writers++;
+    spinlock_unlock(&pipe->lock);
+}
+
+int pipe_available(pipe_t *pipe) {
+    if (!pipe || !pipe->active) return -1;
+
+    spinlock_lock(&pipe->lock);
+    int avail = (int)pipe->count;
+    spinlock_unlock(&pipe->lock);
+
+    return avail;
+}

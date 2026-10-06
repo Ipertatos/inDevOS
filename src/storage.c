@@ -1,11 +1,191 @@
 #include "storage.h"
+#include "limine.h"
 #include "utils.h"
 #include "mem.h"
 #include "serial.h"
 #include <stdint.h>
 #include <stdbool.h>
-#include <string.h>
+#include "string.h"
 #include "atomic.h"
+
+// ============================================================================
+// LRU Block Cache
+// ============================================================================
+// Transparent write-through cache for disk sectors.  Caches up to
+// BCACHE_CAPACITY sectors keyed by (device_id, lba).  Uses a hash table
+// for O(1) lookup and a doubly-linked LRU list for eviction.
+
+/* Doom (and other apps) re-read WAD lumps via lseek+read after PU_CACHE
+ * purges. 128 KB was far too small and thrashed on every miss → AHCI.
+ * 8192 sectors = 4 MB covers shareware DOOM.WAD hot working set. */
+#define BCACHE_CAPACITY     8192        /* max cached sectors (~4 MB) */
+#define BCACHE_HASH_BUCKETS 1024        /* hash table size (power of 2) */
+
+typedef struct bcache_entry {
+    uint8_t  device_id;
+    uint64_t lba;
+    bool     valid;
+    bool     dirty;                     /* for future write-back mode */
+    uint8_t  data[SECTOR_SIZE];
+
+    /* LRU doubly-linked list */
+    struct bcache_entry *lru_prev;
+    struct bcache_entry *lru_next;
+
+    /* Hash chain */
+    struct bcache_entry *hash_next;
+} bcache_entry_t;
+
+static struct {
+    bcache_entry_t  entries[BCACHE_CAPACITY];
+    bcache_entry_t *hash[BCACHE_HASH_BUCKETS];
+    bcache_entry_t *lru_head;           /* most recently used */
+    bcache_entry_t *lru_tail;           /* least recently used */
+    int             count;              /* number of valid entries */
+    int             free_hint;          /* rolling start index for free-slot search */
+    uint64_t        hits;
+    uint64_t        misses;
+    bool            enabled;
+} bcache;
+
+static uint32_t bcache_hash(uint8_t dev, uint64_t lba) {
+    uint64_t key = ((uint64_t)dev << 56) ^ lba;
+    return (uint32_t)((key * 2654435761ULL) >> 32) & (BCACHE_HASH_BUCKETS - 1);
+}
+
+static void bcache_init(void) {
+    memset(&bcache, 0, sizeof(bcache));
+    bcache.enabled = true;
+    serial_printf("[bcache] Block cache initialized (%u sectors, %u KB)\n",
+                  (unsigned)BCACHE_CAPACITY,
+                  (unsigned)(BCACHE_CAPACITY * SECTOR_SIZE / 1024));
+}
+
+/* Remove entry from the LRU list (does NOT remove from hash) */
+static void bcache_lru_remove(bcache_entry_t *e) {
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else              bcache.lru_head = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else              bcache.lru_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+
+/* Push entry to the head of the LRU list (most recently used) */
+static void bcache_lru_push_front(bcache_entry_t *e) {
+    e->lru_prev = NULL;
+    e->lru_next = bcache.lru_head;
+    if (bcache.lru_head) bcache.lru_head->lru_prev = e;
+    bcache.lru_head = e;
+    if (!bcache.lru_tail) bcache.lru_tail = e;
+}
+
+/* Look up a cached sector.  Returns NULL on miss. */
+static bcache_entry_t* bcache_lookup(uint8_t dev, uint64_t lba) {
+    uint32_t h = bcache_hash(dev, lba);
+    for (bcache_entry_t *e = bcache.hash[h]; e; e = e->hash_next) {
+        if (e->valid && e->device_id == dev && e->lba == lba) {
+            /* Move to front of LRU */
+            bcache_lru_remove(e);
+            bcache_lru_push_front(e);
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* Insert (or update) a sector in the cache */
+static void bcache_insert(uint8_t dev, uint64_t lba, const void *data) {
+    if (!bcache.enabled) return;
+
+    /* Already cached?  Update in place. */
+    bcache_entry_t *e = bcache_lookup(dev, lba);
+    if (e) {
+        memcpy(e->data, data, SECTOR_SIZE);
+        return;
+    }
+
+    /* Need a free entry.  If cache is full, evict LRU tail. */
+    if (bcache.count >= BCACHE_CAPACITY) {
+        e = bcache.lru_tail;
+        if (!e) return;
+
+        /* Remove from hash chain */
+        uint32_t oh = bcache_hash(e->device_id, e->lba);
+        bcache_entry_t **pp = &bcache.hash[oh];
+        while (*pp && *pp != e) pp = &(*pp)->hash_next;
+        if (*pp) *pp = e->hash_next;
+
+        bcache_lru_remove(e);
+        e->valid = false;
+        bcache.count--;
+    } else {
+        /* Find an unused entry starting from a rolling hint.  Scanning from
+         * index 0 on every insert made filling the cache quadratic (the FAT
+         * load alone inserts thousands of sectors). */
+        e = NULL;
+        for (int k = 0; k < BCACHE_CAPACITY; k++) {
+            int idx = bcache.free_hint + k;
+            if (idx >= BCACHE_CAPACITY) idx -= BCACHE_CAPACITY;
+            if (!bcache.entries[idx].valid) {
+                e = &bcache.entries[idx];
+                bcache.free_hint = (idx + 1 >= BCACHE_CAPACITY) ? 0 : idx + 1;
+                break;
+            }
+        }
+        if (!e) return;  /* should not happen */
+    }
+
+    /* Populate entry */
+    e->device_id = dev;
+    e->lba       = lba;
+    e->valid     = true;
+    e->dirty     = false;
+    memcpy(e->data, data, SECTOR_SIZE);
+
+    /* Insert into hash chain */
+    uint32_t h = bcache_hash(dev, lba);
+    e->hash_next = bcache.hash[h];
+    bcache.hash[h] = e;
+
+    /* Push to LRU front */
+    bcache_lru_push_front(e);
+    bcache.count++;
+}
+
+/* Invalidate a range of sectors (after write-through) */
+static void bcache_invalidate(uint8_t dev, uint64_t lba, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        bcache_entry_t *e = bcache_lookup(dev, lba + i);
+        if (e) {
+            uint32_t h = bcache_hash(dev, lba + i);
+            bcache_entry_t **pp = &bcache.hash[h];
+            while (*pp && *pp != e) pp = &(*pp)->hash_next;
+            if (*pp) *pp = e->hash_next;
+            bcache_lru_remove(e);
+            e->valid = false;
+            bcache.count--;
+        }
+    }
+}
+
+void storage_bcache_invalidate_all(void) {
+    for (uint32_t i = 0; i < BCACHE_CAPACITY; i++) {
+        bcache_entry_t *e = &bcache.entries[i];
+        if (!e->valid) continue;
+        uint32_t h = bcache_hash(e->device_id, e->lba);
+        bcache_entry_t **pp = &bcache.hash[h];
+        while (*pp && *pp != e) pp = &(*pp)->hash_next;
+        if (*pp) *pp = e->hash_next;
+        bcache_lru_remove(e);
+        e->valid = false;
+        e->dirty = false;
+        e->hash_next = NULL;
+        if (bcache.count) bcache.count--;
+    }
+    bcache.lru_head = bcache.lru_tail = NULL;
+}
+
+// ============================================================================
 
 storage_device_t storage_devices[MAX_STORAGE_DEVICES];
 uint8_t storage_device_count = 0;
@@ -16,6 +196,12 @@ uint8_t storage_device_count = 0;
 static uint8_t *ramdisk_data = NULL;
 
 static spinlock_t storage_lock = {0};
+
+/* Batched sequential reads. IDE BMIDE READ DMA EXT takes up to 1024 sectors
+ * (512 KiB) in one PRDT. PIO fallback and AHCI still split inside the driver
+ * (AHCI bounce is 128 sectors). */
+#define STORAGE_HW_READ_MAX_SECTORS 1024
+static uint8_t storage_seq_hw_buf[STORAGE_HW_READ_MAX_SECTORS * SECTOR_SIZE];
 
 // Storage operations for RAM disk
 static int ramdisk_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
@@ -72,6 +258,7 @@ void storage_init() {
     }
     
     printf("storage: Initializing storage subsystem\n");
+    bcache_init();
     DEBUG_SERIAL("storage_init: After init - device_count=%d\n", storage_device_count);
 }
 
@@ -139,11 +326,21 @@ void storage_init_ramdisk() {
     // Total sectors (32-bit)
     *(uint32_t*)(boot_sector + 32) = RAMDISK_SECTORS;
     
-    // FAT32 specific fields
-    // FAT size (sectors per FAT) - more conservative calculation
-    // Each FAT entry is 4 bytes, so for RAMDISK_SECTORS we need (RAMDISK_SECTORS * 4) bytes
-    // But let's use a smaller, safer size for now: 32 sectors = 16KB
-    *(uint32_t*)(boot_sector + 36) = 32;
+    /* FAT size: 4 bytes per cluster. Reserved=32, SPC=8. Solve fat_sectors. */
+    {
+        uint32_t reserved = 32;
+        uint32_t spc = 8;
+        uint32_t fat_sectors = 32;
+        for (int iter = 0; iter < 8; iter++) {
+            uint32_t data = RAMDISK_SECTORS - reserved - 2 * fat_sectors;
+            uint32_t clusters = data / spc;
+            uint32_t needed = ((clusters + 2) * 4 + SECTOR_SIZE - 1) / SECTOR_SIZE;
+            if (needed == fat_sectors)
+                break;
+            fat_sectors = needed ? needed : 1;
+        }
+        *(uint32_t*)(boot_sector + 36) = fat_sectors;
+    }
     
     // Extended flags
     *(uint16_t*)(boot_sector + 40) = 0;
@@ -243,14 +440,10 @@ storage_device_t* storage_get_device(uint8_t device_id) {
     return NULL;
 }
 
-int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer) {
-    spinlock_lock(&storage_lock);
-    storage_device_t *dev = storage_get_device(device_id);
-    if (!dev) {
-        spinlock_unlock(&storage_lock);
-        return -1;
-    }
-    printf("storage: read_sectors dev=%p lba=%llu count=%u\n", dev, lba, sector_count);
+/* Internal: read sectors directly from hardware (no cache) */
+static int storage_read_sectors_hw(storage_device_t *dev, uint8_t device_id,
+                                   uint64_t lba, uint32_t sector_count, void *buffer) {
+    (void)device_id;
     int result = -1;
     if (dev->pci_dev == NULL) {
         result = storage_ops.read_sectors(dev, lba, sector_count, buffer);
@@ -264,36 +457,93 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
         extern int nvme_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
         result = nvme_read_sectors(dev, lba, sector_count, buffer);
     }
-    printf("storage: read_sectors result=%d\n", result);
+    return result;
+}
+
+int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer) {
+    spinlock_lock(&storage_lock);
+    storage_device_t *dev = storage_get_device(device_id);
+    if (!dev) {
+        spinlock_unlock(&storage_lock);
+        return -1;
+    }
+
+    uint8_t *dst = (uint8_t *)buffer;
+    int result = 0;
+
+    for (uint32_t i = 0; i < sector_count; ) {
+        bcache_entry_t *hit = bcache_lookup(device_id, lba + i);
+        if (hit) {
+            memcpy(dst + i * SECTOR_SIZE, hit->data, SECTOR_SIZE);
+            bcache.hits++;
+            i++;
+            continue;
+        }
+
+        bcache.misses++;
+        uint32_t n = 1;
+        while (i + n < sector_count && n < STORAGE_HW_READ_MAX_SECTORS) {
+            if (bcache_lookup(device_id, lba + i + n))
+                break;
+            n++;
+        }
+
+        int r = storage_read_sectors_hw(dev, device_id, lba + i, n, storage_seq_hw_buf);
+        if (r != 0) {
+            result = r;
+            break;
+        }
+
+        for (uint32_t j = 0; j < n; j++) {
+            const uint8_t *src = storage_seq_hw_buf + j * SECTOR_SIZE;
+            memcpy(dst + (i + j) * SECTOR_SIZE, src, SECTOR_SIZE);
+            bcache_insert(device_id, lba + i + j, src);
+        }
+        i += n;
+    }
+
     spinlock_unlock(&storage_lock);
     return result;
 }
 
 int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer) {
+    spinlock_lock(&storage_lock);
     storage_device_t *dev = storage_get_device(device_id);
     if (!dev) {
+        spinlock_unlock(&storage_lock);
         return -1;
     }
     
+    int result = -1;
     // Dispatch to appropriate driver based on device type
     if (dev->pci_dev == NULL) {
-        // RAM disk
-        return storage_ops.write_sectors(dev, lba, sector_count, buffer);
+        result = storage_ops.write_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x01) {
-        // IDE device
         extern int ide_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
-        return ide_write_sectors(dev, lba, sector_count, buffer);
+        result = ide_write_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x06) {
-        // SATA device
         extern int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
-        return ahci_write_sectors(dev, lba, sector_count, buffer);
+        result = ahci_write_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
-        // NVMe device
         extern int nvme_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
-        return nvme_write_sectors(dev, lba, sector_count, buffer);
+        result = nvme_write_sectors(dev, lba, sector_count, buffer);
     }
-    
-    return -1; // Unsupported device type
+
+    /* Write-through for small writes. Format and file-copy runs are hundreds
+     * of sectors of zeros or payload; inserting each one evicts the cache
+     * and does not help the installer. Drop any cached copies instead. */
+    if (result == 0 && bcache.enabled) {
+        if (sector_count > 8) {
+            bcache_invalidate(device_id, lba, sector_count);
+        } else {
+            const uint8_t *src = (const uint8_t *)buffer;
+            for (uint32_t i = 0; i < sector_count; i++)
+                bcache_insert(device_id, lba + i, src + i * SECTOR_SIZE);
+        }
+    }
+
+    spinlock_unlock(&storage_lock);
+    return result;
 }
 
 int storage_flush(uint8_t device_id) {
@@ -352,4 +602,126 @@ uint32_t find_first_fat32_partition_lba(uint8_t device_id) {
     printf("storage: No FAT32 partition found in MBR\n");
     kfree(mbr);
     return 0;
-} 
+}
+
+void storage_cache_stats(void) {
+    uint64_t total = bcache.hits + bcache.misses;
+    uint32_t pct = total ? (uint32_t)(bcache.hits * 100 / total) : 0;
+    printf("Block cache: %d/%d entries, hits=%llu misses=%llu (%u%% hit rate)\n",
+           bcache.count, BCACHE_CAPACITY,
+           (unsigned long long)bcache.hits,
+           (unsigned long long)bcache.misses, pct);
+}
+
+__attribute__((used, aligned(8), section(".limine_reqs")))
+static volatile struct limine_kernel_file_request boot_file_request = {
+    .id = LIMINE_KERNEL_FILE_REQUEST,
+    .revision = 0
+};
+
+static int boot_dev_cached = -2;
+
+/* The live disk is the one Limine loaded the kernel from, not the largest
+ * FAT32 volume. Optical boot (Hyper-V DVD on the second IDE channel) must
+ * win over a hard disk that happens to be device 0. */
+int storage_find_boot_device(void) {
+    const struct limine_file *file = NULL;
+    uint8_t i;
+    int optical = -1;
+    int optical_fat = -1;
+    int optical_sig = -1;
+    int disk_sig = -1;
+    uint32_t want;
+    int chosen;
+    const char *why;
+
+    if (boot_dev_cached != -2)
+        return boot_dev_cached;
+
+    if (boot_file_request.response && boot_file_request.response->kernel_file)
+        file = boot_file_request.response->kernel_file;
+    want = file ? file->mbr_disk_id : 0;
+
+    for (i = 0; i < storage_device_count; i++) {
+        storage_device_t *dev = &storage_devices[i];
+        uint8_t sec[512];
+        int got;
+        uint32_t sig = 0;
+        int fat = 0;
+        int part;
+        if (!dev->is_initialized || dev->pci_dev == NULL)
+            continue;
+        got = storage_read_sectors(dev->device_id, 0, 1, sec) == 0 &&
+              sec[510] == 0x55 && sec[511] == 0xAA;
+        if (got) {
+            sig = (uint32_t)sec[440] |
+                  ((uint32_t)sec[441] << 8) |
+                  ((uint32_t)sec[442] << 16) |
+                  ((uint32_t)sec[443] << 24);
+            for (part = 0; part < 4; part++) {
+                uint8_t typ = sec[446 + part * 16 + 4];
+                uint32_t lba = (uint32_t)sec[446 + part * 16 + 8] |
+                               ((uint32_t)sec[446 + part * 16 + 9] << 8) |
+                               ((uint32_t)sec[446 + part * 16 + 10] << 16) |
+                               ((uint32_t)sec[446 + part * 16 + 11] << 24);
+                if ((typ == 0x0B || typ == 0x0C) && lba)
+                    fat = 1;
+            }
+        }
+        if (dev->optical) {
+            if (optical < 0)
+                optical = dev->device_id;
+            if (fat && optical_fat < 0)
+                optical_fat = dev->device_id;
+            if (got && want && sig == want)
+                optical_sig = dev->device_id;
+        } else if (got && want && sig == want && disk_sig < 0) {
+            disk_sig = dev->device_id;
+        }
+    }
+
+    chosen = -1;
+    why = "none";
+    if (file && file->media_type == LIMINE_MEDIA_TYPE_OPTICAL) {
+        if (optical_sig >= 0) {
+            chosen = optical_sig;
+            why = "Limine optical boot, MBR id match";
+        } else if (optical_fat >= 0) {
+            chosen = optical_fat;
+            why = "Limine optical boot, FAT32 DVD";
+        } else if (optical >= 0) {
+            chosen = optical;
+            why = "Limine optical boot, ATAPI device";
+        } else {
+            why = "Limine optical boot, but no ATAPI DVD was found";
+        }
+    } else if (want && disk_sig >= 0) {
+        chosen = disk_sig;
+        why = "Limine MBR disk id";
+    } else if (want && optical_sig >= 0) {
+        chosen = optical_sig;
+        why = "Limine MBR disk id on DVD";
+    } else if (!file && optical_fat >= 0) {
+        chosen = optical_fat;
+        why = "FAT32 DVD (Limine reported no kernel file)";
+    } else if (storage_device_count > 0) {
+        chosen = 0;
+        why = "no Limine disk id; device 0";
+    }
+
+    if (file) {
+        printf("storage: Limine boot file media=%u (0=disk 1=optical) mbr_id=%08x\n",
+               file->media_type, file->mbr_disk_id);
+    } else {
+        printf("storage: Limine did not report the kernel file\n");
+    }
+    if (chosen >= 0) {
+        storage_device_t *d = storage_get_device((uint8_t)chosen);
+        printf("storage: boot disk is device %d (%s) [%s]\n",
+               chosen, d ? d->name : "?", why);
+    } else {
+        printf("storage: boot disk not found (%s)\n", why);
+    }
+    boot_dev_cached = chosen;
+    return chosen;
+}

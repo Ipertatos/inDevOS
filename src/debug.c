@@ -2,6 +2,64 @@
 #include "mem.h"
 #include "utils.h"
 #include "atomic.h"
+#include "serial.h"
+#include "stdio.h"
+#include <stdarg.h>
+
+/* ================================================================
+ * Unified kernel logging (klog)
+ * ================================================================ */
+
+static int klog_console_level = KLOG_INFO;
+static bool klog_console_is_ready = false;
+
+/* Hot-path tracing (program loads + filesystem operations).  Off by default;
+ * see the comment on ktrace() in debug.h. */
+bool ktrace_enabled = false;
+
+void ktrace_set(bool on) {
+    ktrace_enabled = on;
+    /* Tracing is for watching a load happen, so echo it to the console as well
+     * as the serial log while it is on. */
+    klog_set_console_level(on ? KLOG_DEBUG : KLOG_INFO);
+}
+
+static const char *klog_prefix[4] = { "E", "W", "I", "D" };
+
+void klog_set_console_level(int level) {
+    if (level < KLOG_ERR) level = KLOG_ERR;
+    if (level > KLOG_DEBUG) level = KLOG_DEBUG;
+    klog_console_level = level;
+}
+
+/* Call once the terminal/framebuffer is initialized; before that, klog
+ * output goes to the serial port only (printf is unsafe pre-term_init). */
+void klog_console_ready(void) {
+    klog_console_is_ready = true;
+}
+
+void klog(int level, const char *fmt, ...) {
+    if (level < KLOG_ERR) level = KLOG_ERR;
+    if (level > KLOG_DEBUG) level = KLOG_DEBUG;
+
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    /* Serial gets everything (cheap, and the smoke tests parse it). */
+    if (serial_enabled) {
+        serial_puts("[");
+        serial_puts(klog_prefix[level]);
+        serial_puts("] ");
+        serial_puts(buf);
+    }
+
+    if (klog_console_is_ready && level <= klog_console_level) {
+        printf("%s", buf);
+    }
+}
 
 // Simple allocation tracker
 #define MAX_ALLOCATIONS 1024

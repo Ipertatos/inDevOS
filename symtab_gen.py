@@ -3,6 +3,8 @@ import sys
 print('#include "kernel_symtab.h"')
 print('const symbol_t kernel_symbols[] = {')
 
+seen_names = set()
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -14,8 +16,9 @@ for line in sys.stdin:
         symbol_type = parts[1]
         name = parts[2]
         
-        # Only include text symbols (functions)
-        if symbol_type in ['t', 'T']:
+        # Only include text symbols (functions); skip duplicate names
+        if symbol_type in ['t', 'T'] and name not in seen_names:
+            seen_names.add(name)
             print(f'    {{0x{addr}, "{name}"}},')
 
 print('};')

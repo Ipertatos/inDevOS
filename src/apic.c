@@ -5,9 +5,14 @@
 #include "msr.h"
 #include "keyboard.h"
 #include "hpet.h"
+#include "pic.h"
 #include "types.h"
 #include "atomic.h"
 #include "serial.h"
+
+// Forward declarations for internal functions
+static void _ioapic_redirect_gsi(uint32_t lapic_id, uint8_t vector, uint8_t gsi, uint16_t flags, bool status);
+static uint64_t ioapic_max_gsi(madt_ioapic_t *pIOApic);
 #define LAPIC_ID_REG        0x20            // lapic id register
 #define LAPIC_VERSION_REG   0x30            // lapic version register
  
@@ -96,7 +101,7 @@ void get_madt_tables(madt_t *madt)
                 break;
             }else {
                 serial_printf("apic: found cpu: %d\n", plapic->apicID);
-                ics_arr[i].address = (uint64_t*)cur_ics;
+                ics_arr[i].address = cur_ics;
                 ics_arr[i].type = cur_ics->entry_type;
                 ics_arr[i].apic_id = plapic->apicID;
                 ics_arr[i].present = true;
@@ -108,15 +113,15 @@ void get_madt_tables(madt_t *madt)
         case 1:
             ;
             madt_ioapic_t *ioapic = (madt_ioapic_t*)cur_ics;
-            ics_arr[i].address = (uint64_t*)cur_ics;
+            ics_arr[i].address = cur_ics;
             ics_arr[i].type = cur_ics->entry_type;
             i++;
-            ioapic_address = (uint64_t*)ioapic->ioapicaddr;
+            ioapic_address = (uint64_t*)(uintptr_t)ioapic->ioapicaddr;
             add_ioapic((madt_ioapic_t*)cur_ics);
             break;
         case 2:
             ;
-            ics_arr[i].address = (uint64_t*)cur_ics;
+            ics_arr[i].address = cur_ics;
             ics_arr[i].type = cur_ics->entry_type;
             add_iso((madt_iso_t*)cur_ics);
             i++;
@@ -185,12 +190,15 @@ void apic_asleep(int ms){
 
 void apic_timer(){
     atomic_inc(&apic_timer_ticks);
+    hpet_keepalive();
     apic_eoi();
 }
 
-void ioapic_configure_entry(uint64_t* addr, uint8_t reg, uint64_t val){
-    ioapic_write(addr, IOAPICREDTBL_REG(reg), (uint32_t)val);
-    ioapic_write(addr, IOAPICREDTBL_REG(reg) + 1, (uint32_t)(val >> 32));
+void ioapic_configure_entry(madt_ioapic_t *pIOApic, uint8_t reg, uint64_t val){
+    if (!pIOApic)
+        return;
+    ioapic_write(pIOApic, IOAPICREDTBL_REG(reg), (uint32_t)val);
+    ioapic_write(pIOApic, IOAPICREDTBL_REG(reg) + 1, (uint32_t)(val >> 32));
 }
 
 void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool status){
@@ -212,15 +220,16 @@ void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool st
     // No overrides.
     _ioapic_redirect_gsi(lapic_id, vector, irq, 0, status);
 }
-static uint64_t ioapic_max_gsi(struct madt_ioapic_t *pIOApic)
+static uint64_t ioapic_max_gsi(madt_ioapic_t *pIOApic)
 {
     if (pIOApic == NULL) {
         serial_puts("ERROR: ioapic_max_gsi called with NULL pIOApic\n");
         return 0;
     }
     
+    /* Bits 16:23 are the last redirection index, not the entry count. */
     uint64_t max = (ioapic_read(pIOApic, 0x01) & 0xFF0000) >> 16;
-    return max;
+    return max + 1;
 }
 madt_ioapic_t* find_gsi(int leg_pin){
     DEBUG_SERIAL("Looking for IOAPIC for GSI %d\n");
@@ -286,11 +295,21 @@ void _ioapic_redirect_gsi(uint32_t lapic_id, uint8_t vector, uint8_t gsi, uint16
     // Get the location inside the redirect table for the GSI.
     uint32_t io_redirect_table_reg = (gsi - pIOApic->gsi) * 2 + 16;
 
-    // The high and low of the table entry get written in 2 seperate write commands.
-    ioapic_write(pIOApic, io_redirect_table_reg, (uint32_t)redirect);
+    /* Intel SDM recommended sequence: program the high half (destination) FIRST
+     * while the entry is still effectively masked (mask bit was set in previous
+     * state or is being written below), then program the low half last (which
+     * unmasks). Writing low-then-high opens a small window where an IRQ can be
+     * delivered to a stale destination. */
     ioapic_write(pIOApic, io_redirect_table_reg + 1, (uint32_t)(redirect >> 32));
+    ioapic_write(pIOApic, io_redirect_table_reg, (uint32_t)redirect);
 
-    serial_printf("Applied I/O APIC redirect: Vector %d, GSI %d.\n", vector, gsi);
+    /* Read back and verify */
+    uint32_t lo = ioapic_read(pIOApic, io_redirect_table_reg);
+    uint32_t hi = ioapic_read(pIOApic, io_redirect_table_reg + 1);
+    serial_printf("Applied I/O APIC redirect: Vector %d, GSI %d. Readback: lo=0x%08x hi=0x%08x (mask=%d, dest=%u)\n",
+                  vector, gsi, lo, hi,
+                  (lo >> 16) & 1,
+                  (hi >> 24) & 0xFF);
 }
 
 
@@ -307,41 +326,118 @@ void ps2_int_init(){
     DEBUG_SERIAL("PS/2 keyboard initialized\n");
 } 
 
+#define LAPIC_CALIBRATION_US       5000U
+#define LAPIC_SCHED_PERIOD_US       500U
+
+static uint32_t lapic_calibrated_count = 0; /* ticks per LAPIC_CALIBRATION_US with divisor 16 */
+
 void calibrate_timer(madt_t *madt){
-    lapic_address= (uint32_t)madt->lapicaddr;
-    apic_write(lapic_address,LAPIC_TIMERDIV_REG,3); //divisor 16
-    apic_write(lapic_address,LAPIC_INITCNT_REG,0xFFFFFFFF);
-    pmt_delay(5000);
-    apic_write(lapic_address,LAPIC_TIMERDIV_REG,0x10000); //0x10000 = masked, sdm
-    uint32_t calibarion = 0xffffffff - apic_read(lapic_address, LAPIC_CURCNT_REG);
-    apic_write(lapic_address,LAPIC_LVTTIMER_REG,32 | LAPIC_PERIODIC);
-    apic_write(lapic_address, LAPIC_TIMERDIV_REG,0x3); // 16
-    apic_write(lapic_address, LAPIC_INITCNT_REG,calibarion);
+    lapic_address = (uint32_t*)(uintptr_t)madt->lapicaddr;
+
+    /* Mask the LVT timer first so it can't fire while we're calibrating. */
+    apic_write(lapic_address, LAPIC_LVTTIMER_REG, 0x10000); /* masked */
+    apic_write(lapic_address, LAPIC_TIMERDIV_REG, 0x3);     /* divisor 16 */
+    apic_write(lapic_address, LAPIC_INITCNT_REG, 0xFFFFFFFF);
+
+    /* Sample for 5 ms via the ACPI PM timer. */
+    pmt_delay(LAPIC_CALIBRATION_US);
+
+    /* Stop the LAPIC counter by masking the LVT (writing the mask bit to the
+     * LVT register, NOT the divide register — the previous code wrote 0x10000
+     * to LAPIC_TIMERDIV_REG which silently corrupted the divisor and left the
+     * timer running while we sampled). */
+    apic_write(lapic_address, LAPIC_LVTTIMER_REG, 0x10000); /* masked */
+
+    uint32_t calibarion = 0xFFFFFFFF - apic_read(lapic_address, LAPIC_CURCNT_REG);
+    lapic_calibrated_count = calibarion; /* ticks per LAPIC_CALIBRATION_US with divisor 16 */
+
+    apic_write(lapic_address, LAPIC_TIMERDIV_REG, 0x3);     /* divisor 16 */
+    apic_write(lapic_address, LAPIC_LVTTIMER_REG, 32 | LAPIC_PERIODIC);
+    apic_write(lapic_address, LAPIC_INITCNT_REG, calibarion);
 }
+
 void init_apic(madt_t *madt){
     asm("cli");
     get_madt_tables(madt);
     
     serial_puts("apic: MADT tables listed through\n");
+
+    /* The legacy 8259 PIC is left in BIOS-default state at boot. With LAPIC
+     * LINT0 still in ExtINT mode it will happily deliver legacy IRQs (e.g.
+     * IRQ 12 -> mouse) using the BIOS-programmed vector base, which is not
+     * present in our IDT. Those interrupts are then silently lost (the IRQ
+     * never reaches mouse_handler), which is exactly the failure mode where
+     * the desktop cursor draws but never moves. Remap the PIC vectors out of
+     * the exception range and mask every line so the IOAPIC is the sole
+     * delivery path. */
+    pic_remap(0x20, 0x28);
+    pic_disable();
+    /* IMCR: switch the legacy pair from PIC (virtual wire) to the I/O APIC.
+     * QEMU ignores ports 0x22/0x23. Some Hyper-V Gen 1 chipsets keep IRQ1 on
+     * the 8259, which we just masked, so the keyboard IRQ never reaches the
+     * IOAPIC redirection entry. */
+    outb(0x22, 0x70);
+    outb(0x23, 0x01);
+    serial_puts("apic: legacy 8259 PIC remapped (0x20/0x28) and masked\n");
+
     serial_puts("apic: writing to SIV register\n");
     hpet_init();
-    lapic_addr = madt->lapicaddr;
-    uint32_t spurius_reg = apic_read((void*)madt->lapicaddr, LAPIC_SIVR_REG);
+    lapic_addr = (uint32_t*)(uintptr_t)madt->lapicaddr;
+    uint32_t spurius_reg = apic_read(lapic_addr, LAPIC_SIVR_REG);
     serial_printf("madt lapic adr: 0x%llx\n", lapic_addr);
-    apic_write((void*)madt->lapicaddr, LAPIC_SIVR_REG,spurius_reg | (0x100));
+    apic_write(lapic_addr, LAPIC_SIVR_REG,spurius_reg | (0x100));
+
+    /* Mask LINT0/LINT1 on the BSP. After reset LINT0 is ExtINT (PIC) and
+     * LINT1 is NMI; with the PIC disabled there is nothing useful to deliver
+     * via LINT0, and we don't want a stray ExtINT handshake either. */
+    apic_write(lapic_addr, LAPIC_LVT_LINT0, 0x10000); /* masked */
+    apic_write(lapic_addr, LAPIC_LVT_LINT1, 0x10000); /* masked */
+    serial_puts("apic: BSP LINT0/LINT1 masked\n");
+
     DEBUG_SERIAL("LAPIC initialized\n");
     calibrate_timer(madt);
-   // for(int i=0 ; i != ((ioapic_read(ioapic_list[0],IOAPICVER_REG) >> 16)&0xFF); i++){
-    //    ioapic_configure_entry(ioapic_address[0],i,1<<16);
-    //}
 
-    apic_write(lapic_addr, LAPIC_INITCNT_REG,0);
-    apic_write(lapic_addr, LAPIC_LVTTIMER_REG, 0x10000);
+    /* Keep timer disabled during early boot; kernel_main will call
+     * apic_enable_timer() once all subsystems are up.  The calibrated
+     * count is already saved in lapic_calibrated_count by calibrate_timer. */
+    apic_write(lapic_addr, LAPIC_INITCNT_REG, 0);
+    apic_write(lapic_addr, LAPIC_LVTTIMER_REG, 0x10000); /* masked */
 
-    //asm("sti");
     ps2_int_init();
     DEBUG_SERIAL("IOAPIC initialized\n");
     apic_eoi();
+}
+
+/* Re-enable the LAPIC periodic timer (vector 32).
+ * This is called after all boot initialisation to provide a reliable
+ * heartbeat that wakes the CPU from HLT even if HPET is absent or
+ * misbehaving (common on Proxmox / bare-metal KVM).                 */
+void apic_enable_timer(void) {
+    if (!lapic_addr) return;
+
+    /* Use the calibration value from init_apic.
+     * calibrate_timer() measures LAPIC ticks over LAPIC_CALIBRATION_US
+     * and stores that value for later scaling. */
+    uint32_t count = lapic_calibrated_count;
+    if (count == 0 || count == 0xFFFFFFFF) {
+        serial_printf("apic: WARNING: timer calibration unavailable, skipping LAPIC timer\n");
+        return;
+    }
+
+    /* The calibrated count is ticks-per-5ms. Scale it down to the
+     * scheduler timer period. Nanosecond-class interrupts are not
+     * practical here: one context switch already costs far more than
+     * a few ns, and a count near 1 can starve the kernel in IRQs. */
+    uint64_t scaled_count = ((uint64_t)count * LAPIC_SCHED_PERIOD_US) /
+                            LAPIC_CALIBRATION_US;
+    uint32_t timer_count = (uint32_t)(scaled_count ? scaled_count : 1);
+
+    apic_write(lapic_addr, LAPIC_TIMERDIV_REG, 0x3);     /* divide by 16    */
+    apic_write(lapic_addr, LAPIC_LVTTIMER_REG, 32 | LAPIC_PERIODIC); /* vector 32, periodic, unmasked */
+    apic_write(lapic_addr, LAPIC_INITCNT_REG, timer_count);
+
+    serial_printf("apic: LAPIC timer enabled, periodic ~%uus (count=%u)\n",
+                  LAPIC_SCHED_PERIOD_US, timer_count);
 }
 
 void int_apic_ap(){

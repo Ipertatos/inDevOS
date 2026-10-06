@@ -1,5 +1,5 @@
 [submodule "flanterm"]
-path = src/flanterm
+path = flanterm
 url = https://github.com/mintsuki/flanterm
 
 [submodule "limine"]

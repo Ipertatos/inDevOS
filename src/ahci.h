@@ -53,6 +53,7 @@
 #define ATA_CMD_READ_DMA_EXT    0x25
 #define ATA_CMD_WRITE_DMA_EXT   0x35
 #define ATA_CMD_IDENTIFY        0xEC
+#define ATA_CMD_FLUSH_CACHE_EXT 0xEA
 
 // FIS Types
 #define FIS_TYPE_REG_H2D    0x27    // Register FIS - Host to Device
@@ -134,12 +135,31 @@ typedef struct {
     void *cmd_list[32];         // Command list for each port
     void *fis_base[32];         // FIS base for each port
     void *cmd_table[32];        // Command table for each port
+    void *dma_bounce;           // Reused DMA buffer (kalloc'd at init)
     uint8_t active_port;        // Port we actually use for transfers
 } ahci_controller_t;
 
+// AHCI interrupt vector
+#define AHCI_IRQ_VECTOR 48
+
+// Interrupt status bits we care about
+#define AHCI_PORT_IS_DHRS   (1 << 0)   // Device to Host Register FIS
+#define AHCI_PORT_IS_PSS    (1 << 1)   // PIO Setup FIS
+#define AHCI_PORT_IS_DSS    (1 << 2)   // DMA Setup FIS
+#define AHCI_PORT_IS_SDBS   (1 << 3)   // Set Device Bits FIS
+#define AHCI_PORT_IS_DPS    (1 << 5)   // Descriptor Processed
+
+// Port interrupt enable mask (for normal operation)
+#define AHCI_PORT_IE_NORMAL (AHCI_PORT_IS_DHRS | AHCI_PORT_IS_PSS | \
+                             AHCI_PORT_IS_DSS  | AHCI_PORT_IS_SDBS | \
+                             AHCI_PORT_IS_TFES)
+
 // Function declarations
-void ahci_init();
-int ahci_register_storage();
-int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
-int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
-int ahci_flush(storage_device_t *dev); 
+void ahci_init(void);
+int  ahci_register_storage(void);
+int  ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
+int  ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
+int  ahci_flush(storage_device_t *dev);
+
+// Interrupt handler – called from IDT dispatcher
+void ahci_handle_interrupt(void);

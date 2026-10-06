@@ -16,7 +16,7 @@ static inline void spinlock_unlock(spinlock_t *lock) __attribute__((always_inlin
 static inline void spinlock_lock(spinlock_t *lock) {
     while (__sync_lock_test_and_set(&lock->lock, 1)) {
         while (lock->lock) {
-            __asm__ __volatile__("nop");
+            __asm__ __volatile__("pause");
         }
     }
 }
@@ -25,9 +25,46 @@ static inline void spinlock_unlock(spinlock_t *lock) {
     __sync_lock_release(&lock->lock);
 }
 
+/*
+ * Per-CPU preemption disable.  While this CPU's counter is non-zero the
+ * local timer/IPI will not switch threads.  A global counter used to
+ * freeze every core whenever the BSP held a klock (VFS, FAT, net).
+ */
+#define PREEMPT_MAX_CPUS 16
+extern volatile uint32_t preempt_count_cpu[PREEMPT_MAX_CPUS];
+uint32_t smp_cpu_index_fast(void);
+
+static inline void preempt_disable(void) {
+    uint32_t c = smp_cpu_index_fast();
+    if (c >= PREEMPT_MAX_CPUS) c = 0;
+    __atomic_add_fetch(&preempt_count_cpu[c], 1, __ATOMIC_ACQUIRE);
+}
+
+static inline void preempt_enable(void) {
+    uint32_t c = smp_cpu_index_fast();
+    if (c >= PREEMPT_MAX_CPUS) c = 0;
+    __atomic_sub_fetch(&preempt_count_cpu[c], 1, __ATOMIC_RELEASE);
+}
+
+/*
+ * Sleep-free subsystem lock for thread context (not IRQ handlers).
+ * Disabling preemption first means the holder can never be switched out
+ * while a Ring-3 thread spins in a syscall (those are not preemptible),
+ * which would otherwise deadlock the BSP.
+ */
+static inline void klock(spinlock_t *lock) {
+    preempt_disable();
+    spinlock_lock(lock);
+}
+
+static inline void kunlock(spinlock_t *lock) {
+    spinlock_unlock(lock);
+    preempt_enable();
+}
+
 // Atomic operations
 static inline void atomic_set(atomic_t *atom, uint64_t value) {
-    __sync_lock_test_and_set(&atom->value, value);
+    __atomic_store_n(&atom->value, value, __ATOMIC_SEQ_CST);
 }
 
 static inline uint64_t atomic_get(atomic_t *atom) {

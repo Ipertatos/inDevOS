@@ -1,9 +1,4 @@
 #pragma once
 
-#define DIV_ROUNDUP(val, div) (((val) + (div) - 1) / (div))
-
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-
-#define ALIGN_UP(val, align) (((val) + (align) - 1) / (align)) * (align)
+/* MIN/MAX/ALIGN_UP/DIV_ROUNDUP live in macros.h (single definition). */
+#include "macros.h"

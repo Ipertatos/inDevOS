@@ -17,7 +17,7 @@
 
 #define MAX_FILENAME_LEN 255
 #define MAX_PATH_LEN 1024
-#define MAX_OPEN_FILES 32
+#define FAT32_MAX_OPEN_FILES 32
 
 // FAT32 Boot Sector structure
 typedef struct __attribute__((packed)) {
@@ -51,6 +51,17 @@ typedef struct __attribute__((packed)) {
     char volume_label[11];
     char fs_type[8];
 } fat32_boot_sector_t;
+
+// FSInfo Structure
+typedef struct __attribute__((packed)) {
+    uint32_t lead_signature; // 0x41615252
+    uint8_t reserved1[480];
+    uint32_t struct_signature; // 0x61417272
+    uint32_t free_count;
+    uint32_t next_free;
+    uint8_t reserved2[12];
+    uint32_t trail_signature; // 0xAA550000
+} fat32_fsinfo_t;
 
 // FAT32 Directory Entry
 typedef struct __attribute__((packed)) {
@@ -89,7 +100,7 @@ typedef struct {
     uint32_t sectors_per_cluster;
     uint32_t bytes_per_cluster;
     uint32_t root_dir_cluster;
-    uint32_t *fat_table;
+    uint32_t *fat_table; /* NULL when mounted: FAT is demand-cached, not resident */
     bool is_mounted;
 } fat32_fs_t;
 
@@ -100,6 +111,7 @@ typedef struct {
     uint32_t file_size;
     uint32_t file_position;
     uint32_t first_cluster;
+    uint32_t parent_dir_cluster;   // cluster of directory containing this entry
     char filename[MAX_FILENAME_LEN];
     uint8_t attributes;
     fat32_fs_t *filesystem;
@@ -114,12 +126,15 @@ typedef struct {
 } fat32_dir_list_t;
 
 extern fat32_fs_t fat32_filesystem;
-extern fat32_file_t open_files[MAX_OPEN_FILES];
+extern fat32_file_t open_files[FAT32_MAX_OPEN_FILES];
 
 // Function declarations
 int fat32_mount(uint8_t storage_device_id);
 void fat32_unmount();
 bool fat32_is_mounted();
+
+// Formatting
+int fat32_format(uint8_t device_id, const char *label);
 
 // File operations
 fat32_file_t* fat32_open(const char *filename, const char *mode);
@@ -132,8 +147,25 @@ int fat32_seek(fat32_file_t *file, uint32_t position);
 int fat32_list_directory(const char *path, fat32_dir_list_t *entries, uint32_t max_entries);
 int fat32_create_directory(const char *dirname);
 int fat32_delete_file(const char *filename);
+/** Remove directory only if it contains no entries other than . and .. (returns -ENOTEMPTY otherwise). */
+int fat32_remove_empty_directory(const char *path);
+/** Rename/move within the mounted FAT32 volume (same or cross dir). */
+int fat32_rename(const char *oldpath, const char *newpath);
 int fat32_create_file(const char *filename);
+int fat32_truncate_file(const char *filename);
 int fat32_file_exists(const char *filename);
+
+// Path resolution – resolve a full path to its parent directory cluster
+// and extract the basename.  Returns 0 on success, -1 if any intermediate
+// component is not found or is not a directory.
+int fat32_resolve_path(const char *path, uint32_t *out_dir_cluster,
+                       char *out_basename, uint32_t basename_max);
+
+/* List contents of a directory cluster. Must be called with fat32_lock held
+ * (fat32_list_directory does this); do not lock again inside. */
+int fat32_list_directory_cluster(uint32_t dir_cluster,
+                                 fat32_dir_list_t *entries,
+                                 uint32_t max_entries);
 
 // Utility functions
 uint32_t fat32_cluster_to_sector(fat32_fs_t *fs, uint32_t cluster);
@@ -141,4 +173,4 @@ uint32_t fat32_get_next_cluster(fat32_fs_t *fs, uint32_t cluster);
 int fat32_read_cluster(fat32_fs_t *fs, uint32_t cluster, void *buffer);
 int fat32_write_cluster(fat32_fs_t *fs, uint32_t cluster, const void *buffer);
 void fat32_parse_83_filename(const char *long_name, char *short_name);
-void fat32_format_83_filename(const char *short_name, char *formatted_name); 
+void fat32_format_83_filename(const char *short_name, char *formatted_name);

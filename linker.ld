@@ -47,10 +47,14 @@ SECTIONS
         *(.dynamic)
     } :data :dynamic
 
+    . = ALIGN(8);
+    __bss_start = .;
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
     } :data
+    . = ALIGN(8);
+    __bss_end = .;
 
     data_end_addr = .;
 
