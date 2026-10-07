@@ -465,6 +465,7 @@ static void keyboard_process_byte(uint16_t scancode){
      * this console is affected. */
     if (left_ctrl_pressed && ch == 'c') {
         uint64_t now = hpet_get_ticks();
+        serial_printf("kbd: Ctrl+C scancode path (terminate_flag)\n");
         if (vc->terminate_flag) {
             uint64_t elapsed_ms = now - vc->last_ctrlc_tick;
             if (elapsed_ms < CTRLC_DOUBLE_PRESS_WINDOW_MS) {

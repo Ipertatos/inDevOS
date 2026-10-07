@@ -284,6 +284,17 @@ typedef struct process {
     uint32_t signal_sa_flags[NSIG];
     uint32_t pending_signals;           // Bitmask of pending signals
     uint32_t blocked_signals;           // Bitmask of blocked signals
+    uint32_t pgid;                      // Process group ID
+    uint32_t sid;                       // Session ID
+    /* Saved user context for signal delivery / rt_sigreturn.
+     * Full GPR set from the live syscall/IRQ frame — never a global scratch. */
+    uint64_t sig_saved_r15, sig_saved_r14, sig_saved_r13, sig_saved_r12;
+    uint64_t sig_saved_rbp, sig_saved_rbx;
+    uint64_t sig_saved_r9, sig_saved_r8, sig_saved_r10; /* a6,a5,a4 */
+    uint64_t sig_saved_rip, sig_saved_rsp, sig_saved_rflags;
+    uint64_t sig_saved_rax, sig_saved_rdi, sig_saved_rsi, sig_saved_rdx;
+    bool     sig_in_handler;
+    uint64_t sig_restorer[NSIG];
 
     mode_t file_umask;                  // process umask (default 022)
     uint64_t mmap_anon_next;            // hint for MAP_ANONYMOUS placement
@@ -312,7 +323,20 @@ typedef struct process {
     uint64_t fork_saved_user_rip;
     uint64_t fork_saved_user_rsp;
     uint64_t fork_saved_user_rflags;
-    void *fork_user_frame; /* linux_syscall_frame_t * while fork in flight */
+    /* By-value snapshot of parent GPRs at clone/fork — NEVER a pointer into
+     * the per-CPU syscall kstack (that frame is overwritten on the next IRQ). */
+    uint64_t fork_saved_r15, fork_saved_r14, fork_saved_r13, fork_saved_r12;
+    uint64_t fork_saved_rbp, fork_saved_rbx;
+    uint64_t fork_saved_r9, fork_saved_r8, fork_saved_r10;
+    uint64_t fork_saved_rdx, fork_saved_rsi, fork_saved_rdi;
+    int fork_saved_gprs_valid;
+    /* SMP: newest fork child held BLOCKED past fork SYSRET. */
+    void *fork_pending_release; /* thread_t * */
+    /* Prior held child: kept BLOCKED until wait/exit (with newest).
+     * Both pipeline sides become runnable together. */
+    void *fork_release_at_exit; /* thread_t * */
+    /* 1 => skip releasing fork_pending_release on this syscall exit. */
+    int fork_defer_release;
 
     /* Non-NULL when spawned via exec_spawn (preemptively scheduled Ring-3).
      * sys_exit uses thread-based cleanup instead of longjmp. */
@@ -324,6 +348,7 @@ typedef struct process {
     /* Linux ABI layer (linux_syscall.c).  linux_abi is set the first time the
      * process enters the kernel through the SYSCALL instruction. */
     bool     linux_abi;
+    bool     clone_shared_vm;           /* CLONE_VM: do not destroy shared pml4 */
     uint64_t linux_clear_child_tid;     /* set_tid_address() pointer */
     /* Saved termios flags for Linux TCGETS/TCSETS (ash raw mode). */
     uint32_t linux_ti_iflag;
@@ -333,6 +358,12 @@ typedef struct process {
     uint8_t  linux_ti_cc[19];
     bool     linux_ti_valid;
     char     linux_exe_path[256];       /* absolute path of current image */
+
+    /* In-place execve: after exec_replace(), LX_execve rewrites the SYSCALL
+     * frame to jump to exec_entry_rip/rsp instead of nesting exec_file. */
+    bool     exec_replaced;
+    uint64_t exec_entry_rip;
+    uint64_t exec_entry_rsp;
 } process_t;
 
 /** @brief Virtual memory layout for processes */
@@ -465,6 +496,20 @@ void syscall_set_kernel_stack(uint64_t rsp);
 __attribute__((noreturn))
 void enter_usermode(uint64_t entry_rip, uint64_t user_rsp);
 
-#endif // SYSCALL_H
 
 int sys_mprotect(void *addr, size_t length, int prot);
+int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
+              uint64_t child_tidptr, uint64_t tls);
+int sys_getpgid(pid_t pid);
+int sys_setpgid(pid_t pid, pid_t pgid);
+int sys_setsid(void);
+
+void fork_release_pending(process_t *p);
+void fork_release_after_syscall(process_t *p);
+void fork_child_zombie_exit(int status);
+int process_deliver_signals(process_t *proc, void *linux_frame);
+void process_kill_pgid(uint32_t pgid, int signum);
+void process_set_fg_pgid(uint32_t pgid);
+uint32_t process_get_fg_pgid(void);
+
+#endif // SYSCALL_H

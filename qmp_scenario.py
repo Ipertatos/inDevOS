@@ -66,8 +66,8 @@ class Qmp:
                 k = QCODE.get(ch, ch)
                 keys = k if isinstance(k, list) else [k]
             self.cmd("send-key", {"keys": [{"type": "qcode", "data": x} for x in keys],
-                                  "hold-time": 40})
-            time.sleep(0.08)
+                                  "hold-time": 80})
+            time.sleep(0.28)
 
     def shot(self, name):
         path = f"{prefix}-{name}.png"
@@ -85,11 +85,11 @@ def main():
         elif kind == "type":
             # Send a newline first: the shell sometimes swallows the first
             # keystroke that arrives while it is printing the prompt.
-            q.cmd("send-key", {"keys": [{"type": "qcode", "data": "ret"}], "hold-time": 40})
-            time.sleep(0.4)
+            q.cmd("send-key", {"keys": [{"type": "qcode", "data": "ret"}], "hold-time": 80})
+            time.sleep(1.2)
             print(f"[{time.monotonic() - t0:7.1f}s] type: {arg}")
             q.type_text(arg + "\n")
-            time.sleep(0.6)
+            time.sleep(1.5)
         elif kind == "raw":
             # Type without pressing Enter (for Tab-completion tests).
             print(f"[{time.monotonic() - t0:7.1f}s] raw: {arg}")

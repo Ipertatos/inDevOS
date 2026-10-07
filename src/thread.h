@@ -57,6 +57,23 @@ typedef struct thread {
     struct process *owner_process;  // Owning process (NULL for kernel threads)
     uint32_t home_cpu;              // Run-queue owner
     uint64_t fs_base;               // IA32_FS_BASE (user TLS, Linux ABI arch_prctl)
+    /* Per-thread live SYSCALL/INT80 user frame. Captured on EVERY entry
+     * before dispatch. Fork/clone snapshots FROM HERE by value — never from
+     * a process-global stash a sibling could clear mid-spawn. */
+    uint64_t sc_user_rip;
+    uint64_t sc_user_rsp;
+    uint64_t sc_user_rflags;
+    uint64_t sc_r15, sc_r14, sc_r13, sc_r12;
+    uint64_t sc_rbp, sc_rbx;
+    uint64_t sc_r9, sc_r8, sc_r10, sc_rdx, sc_rsi, sc_rdi;
+    int      sc_frame_valid;
+    /* SMP: 1 while this thread's context is live on some CPU. Set at
+     * switch-in; cleared (deferred) only after the outgoing CPU has left
+     * this thread's stack. Pickers never dequeue an on_cpu thread. */
+    volatile int on_cpu;
+    /* 1 = user thread parked in-kernel (wait/sleep) — preemptible with a
+     * ring-0 frame; 2 = BSP boot thread (ash) parked in sys_wait. */
+    volatile int kwait;
 } thread_t;
 
 /* FS base is per thread: Linux/musl programs point it at their TLS block with
@@ -101,6 +118,18 @@ void thread_destroy(thread_t *thread);
 void thread_yield(void);
 void thread_sleep(uint64_t milliseconds);
 void thread_wake(thread_t *thread);
+/* on_cpu handoff (see thread_t.on_cpu). */
+void sched_oncpu_set(thread_t *t);
+void sched_oncpu_defer_clear(thread_t *t);
+void sched_oncpu_flush(void);
+void sched_oncpu_forget(thread_t *t);
+/* Lost-wakeup wait helpers (hold scheduler_lock via scheduler_irq_*). */
+void scheduler_irq_lock(uint64_t *flags);
+void scheduler_irq_unlock(uint64_t flags);
+void thread_block_current_unlocked(void);
+void thread_unblock_current_running_unlocked(void);
+void thread_wake_blocked_unlocked(thread_t *thread);
+void scheduler_kick_thread(thread_t *thread);
 void thread_set_priority(thread_t *thread, thread_priority_t priority);
 
 // Scheduler functions

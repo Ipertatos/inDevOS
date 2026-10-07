@@ -19,6 +19,16 @@ static pipe_t pipe_table[MAX_PIPES];
 /** @brief Lock for pipe table allocation */
 static spinlock_t pipe_table_lock = {0};
 
+
+/* Wake a thread blocked on this pipe (reader or writer). */
+static void pipe_wake_slot(void **slot) {
+    if (!slot || !*slot) return;
+    extern void thread_wake(void *thr);
+    void *t = *slot;
+    *slot = NULL;
+    thread_wake(t);
+}
+
 void pipe_init(void) {
     memset(pipe_table, 0, sizeof(pipe_table));
     serial_puts("pipe: subsystem initialized\n");
@@ -59,6 +69,8 @@ pipe_t* pipe_create(void) {
     pipe->readers   = 1;
     pipe->writers   = 1;
     pipe->active    = true;
+    pipe->waiting_reader = NULL;
+    pipe->waiting_writer = NULL;
 
     spinlock_unlock(&pipe_table_lock);
 
@@ -90,14 +102,19 @@ void pipe_destroy(pipe_t *pipe) {
 }
 
 int pipe_read(pipe_t *pipe, void *buf, size_t count) {
-    if (!pipe || !pipe->active || !buf) return -1;
+    if (!pipe || !buf) return -1;
 
     spinlock_lock(&pipe->lock);
+    if (!pipe->active || !pipe->buffer) {
+        spinlock_unlock(&pipe->lock);
+        return -1;
+    }
 
     if (pipe->count == 0) {
+        int writers = pipe->writers;
         spinlock_unlock(&pipe->lock);
         /* If no writers remain, this is EOF */
-        if (pipe->writers == 0) return 0;
+        if (writers == 0) return 0;
         return -EAGAIN;
     }
 
@@ -110,18 +127,26 @@ int pipe_read(pipe_t *pipe, void *buf, size_t count) {
         pipe->read_pos = (pipe->read_pos + 1) % pipe->buf_size;
     }
     pipe->count -= to_read;
-
+    void *ww = pipe->waiting_writer;
+    pipe->waiting_writer = NULL;
     spinlock_unlock(&pipe->lock);
+    if (ww) { extern void thread_wake(void *); thread_wake(ww); }
     return (int)to_read;
 }
 
 int pipe_write(pipe_t *pipe, const void *buf, size_t count) {
-    if (!pipe || !pipe->active || !buf) return -1;
-
-    /* If there are no readers, writing is an error (broken pipe) */
-    if (pipe->readers == 0) return -1;
+    if (!pipe || !buf) return -EPIPE;
 
     spinlock_lock(&pipe->lock);
+    if (!pipe->active || !pipe->buffer) {
+        spinlock_unlock(&pipe->lock);
+        return -EPIPE;
+    }
+    /* Broken pipe: no readers left (pipe object stays alive while writers>0). */
+    if (pipe->readers == 0) {
+        spinlock_unlock(&pipe->lock);
+        return -EPIPE;
+    }
 
     uint32_t space = pipe->buf_size - pipe->count;
     if (space == 0) {
@@ -129,7 +154,6 @@ int pipe_write(pipe_t *pipe, const void *buf, size_t count) {
         return -EAGAIN;
     }
 
-    /* Write as many bytes as fit */
     uint32_t to_write = (count < space) ? (uint32_t)count : space;
     const uint8_t *src = (const uint8_t *)buf;
 
@@ -138,10 +162,13 @@ int pipe_write(pipe_t *pipe, const void *buf, size_t count) {
         pipe->write_pos = (pipe->write_pos + 1) % pipe->buf_size;
     }
     pipe->count += to_write;
-
+    void *wr = pipe->waiting_reader;
+    pipe->waiting_reader = NULL;
     spinlock_unlock(&pipe->lock);
+    if (wr) { extern void thread_wake(void *); thread_wake(wr); }
     return (int)to_write;
 }
+
 
 void pipe_close_read(pipe_t *pipe) {
     if (!pipe || !pipe->active) return;
@@ -149,12 +176,21 @@ void pipe_close_read(pipe_t *pipe) {
     spinlock_lock(&pipe->lock);
     if (pipe->readers > 0) pipe->readers--;
     bool should_destroy = (pipe->readers == 0 && pipe->writers == 0);
+    void *ww = pipe->waiting_writer;
+    void *wr = pipe->waiting_reader;
+    if (pipe->readers == 0) {
+        pipe->waiting_writer = NULL;
+        pipe->waiting_reader = NULL;
+    }
     spinlock_unlock(&pipe->lock);
+    if (ww) { extern void thread_wake(void *); thread_wake(ww); }
+    if (wr) { extern void thread_wake(void *); thread_wake(wr); }
 
     if (should_destroy) {
         pipe_destroy(pipe);
     }
 }
+
 
 void pipe_close_write(pipe_t *pipe) {
     if (!pipe || !pipe->active) return;
@@ -162,12 +198,21 @@ void pipe_close_write(pipe_t *pipe) {
     spinlock_lock(&pipe->lock);
     if (pipe->writers > 0) pipe->writers--;
     bool should_destroy = (pipe->readers == 0 && pipe->writers == 0);
+    void *wr = pipe->waiting_reader;
+    void *ww = pipe->waiting_writer;
+    if (pipe->writers == 0) {
+        pipe->waiting_reader = NULL;
+        pipe->waiting_writer = NULL;
+    }
     spinlock_unlock(&pipe->lock);
+    if (wr) { extern void thread_wake(void *); thread_wake(wr); }
+    if (ww) { extern void thread_wake(void *); thread_wake(ww); }
 
     if (should_destroy) {
         pipe_destroy(pipe);
     }
 }
+
 
 void pipe_fork_dup_reader(pipe_t *pipe) {
     if (!pipe || !pipe->active) return;
@@ -191,4 +236,17 @@ int pipe_available(pipe_t *pipe) {
     spinlock_unlock(&pipe->lock);
 
     return avail;
+}
+
+void pipe_set_waiting_reader(pipe_t *pipe, void *thr) {
+    if (!pipe || !pipe->active) return;
+    spinlock_lock(&pipe->lock);
+    pipe->waiting_reader = thr;
+    spinlock_unlock(&pipe->lock);
+}
+void pipe_set_waiting_writer(pipe_t *pipe, void *thr) {
+    if (!pipe || !pipe->active) return;
+    spinlock_lock(&pipe->lock);
+    pipe->waiting_writer = thr;
+    spinlock_unlock(&pipe->lock);
 }

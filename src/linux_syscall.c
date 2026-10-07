@@ -99,6 +99,14 @@ extern void fb_console_get_size(uint32_t *cols, uint32_t *rows);
 #define ERANGE 34
 #endif
 
+/* clone flags (linux/sched.h) */
+#define CLONE_VM             0x00000100ULL
+#define CLONE_VFORK          0x00004000ULL
+#define CLONE_SETTLS         0x00080000ULL
+#define CLONE_PARENT_SETTID  0x00100000ULL
+#define CLONE_CHILD_CLEARTID 0x00200000ULL
+#define CLONE_CHILD_SETTID   0x01000000ULL
+
 /* Linux x86-64 syscall numbers used below */
 enum {
     LX_read = 0, LX_write = 1, LX_open = 2, LX_close = 3, LX_stat = 4,
@@ -674,11 +682,18 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
             return tty ? 0 : -ENOTTY;
         case LX_TIOCGPGRP: {
             if (!tty) return -ENOTTY;
-            int pg = (int)p->pid;
+            int pg = (int)process_get_fg_pgid();
+            if (!pg) pg = (int)p->pgid;
             return lx_put(arg, &pg, sizeof(pg));
         }
-        case LX_TIOCSPGRP:
-            return tty ? 0 : -ENOTTY;
+        case LX_TIOCSPGRP: {
+            if (!tty) return -ENOTTY;
+            int pg = 0;
+            if (lx_get(&pg, arg, sizeof(pg))) return -EFAULT;
+            if (pg < 0) return -EINVAL;
+            process_set_fg_pgid((uint32_t)pg);
+            return 0;
+        }
         case LX_FIONREAD:
         case LX_FIONBIO:
             return sys_ioctl((int)fd, req, arg);
@@ -768,8 +783,11 @@ static long lx_wait4(process_t *p, long pid, int *uwstatus, long options, void *
         bool any = false;
         for (process_t *c = p->child; c; c = c->sibling)
             if (c->is_zombie && (pid <= 0 || (long)c->pid == pid)) { any = true; break; }
-        if (!any) return 0;
+        if (!any)
+            return 0; /* wait-only: empty WNOHANG must NOT release held kids */
     }
+    /* Blocking wait (or WNOHANG with a zombie): wake any held newborns. */
+    fork_release_pending(p);
     long r = sys_wait(uwstatus);
     if (r > 0 && uwstatus) {
         int raw = 0;
@@ -823,6 +841,74 @@ static long lx_enosys(process_t *p, uint64_t nr) {
 /* ------------------------------------------------------------------------ */
 /* Dispatcher                                                               */
 /* ------------------------------------------------------------------------ */
+
+/* Snapshot live syscall frame GPRs into process_t (by value). */
+static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
+    /* Prefer THIS thread's entry stash (written at linux_syscall_dispatch /
+     * int80 entry). Fall back to the live frame if the thread has no stash. */
+    thread_t *thr = scheduler_get_current_thread();
+    uint64_t rip, rsp, rfl;
+    if (thr && thr->sc_frame_valid) {
+        rip = thr->sc_user_rip;
+        rsp = thr->sc_user_rsp;
+        rfl = thr->sc_user_rflags;
+        p->fork_saved_r15 = thr->sc_r15;
+        p->fork_saved_r14 = thr->sc_r14;
+        p->fork_saved_r13 = thr->sc_r13;
+        p->fork_saved_r12 = thr->sc_r12;
+        p->fork_saved_rbp = thr->sc_rbp;
+        p->fork_saved_rbx = thr->sc_rbx;
+        p->fork_saved_r9  = thr->sc_r9;
+        p->fork_saved_r8  = thr->sc_r8;
+        p->fork_saved_r10 = thr->sc_r10;
+        p->fork_saved_rdx = thr->sc_rdx;
+        p->fork_saved_rsi = thr->sc_rsi;
+        p->fork_saved_rdi = thr->sc_rdi;
+        p->fork_saved_gprs_valid = 1;
+        serial_printf("fork: snapshot src=thread pid=%d rip=0x%llx rsp=0x%llx\n",
+                      (int)p->pid, (unsigned long long)rip, (unsigned long long)rsp);
+    } else {
+        rip = fr->user_rip;
+        rsp = fr->user_rsp;
+        rfl = fr->user_rflags;
+        p->fork_saved_r15 = fr->r15;
+        p->fork_saved_r14 = fr->r14;
+        p->fork_saved_r13 = fr->r13;
+        p->fork_saved_r12 = fr->r12;
+        p->fork_saved_rbp = fr->rbp;
+        p->fork_saved_rbx = fr->rbx;
+        p->fork_saved_r9  = fr->a6;
+        p->fork_saved_r8  = fr->a5;
+        p->fork_saved_r10 = fr->a4;
+        p->fork_saved_rdx = fr->a3;
+        p->fork_saved_rsi = fr->a2;
+        p->fork_saved_rdi = fr->a1;
+        p->fork_saved_gprs_valid = 1;
+        serial_printf("fork: snapshot src=frame pid=%d rip=0x%llx rsp=0x%llx\n",
+                      (int)p->pid, (unsigned long long)rip, (unsigned long long)rsp);
+    }
+    p->fork_saved_user_rip = rip;
+    p->fork_saved_user_rsp = rsp;
+    p->fork_saved_user_rflags = rfl;
+    /* Also refresh thread stash from the live frame so nested fork in the
+     * same process always sees this entry's RIP even if process_t was cleared. */
+    if (thr) {
+        thr->sc_user_rip = fr->user_rip;
+        thr->sc_user_rsp = fr->user_rsp;
+        thr->sc_user_rflags = fr->user_rflags;
+        thr->sc_r15 = fr->r15; thr->sc_r14 = fr->r14;
+        thr->sc_r13 = fr->r13; thr->sc_r12 = fr->r12;
+        thr->sc_rbp = fr->rbp; thr->sc_rbx = fr->rbx;
+        thr->sc_r9 = fr->a6; thr->sc_r8 = fr->a5;
+        thr->sc_r10 = fr->a4; thr->sc_rdx = fr->a3;
+        thr->sc_rsi = fr->a2; thr->sc_rdi = fr->a1;
+        thr->sc_frame_valid = 1;
+    }
+    if (!rip)
+        serial_printf("fork: WARNING snapshot user_rip=0 pid=%d nr=%llu\n",
+                      (int)p->pid, (unsigned long long)fr->nr);
+}
+
 static long lx_dispatch(linux_syscall_frame_t *fr) {
     process_t *p = lx_proc();
     const uint64_t nr = fr->nr;
@@ -1130,10 +1216,16 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_setgroups:
         return p->uid == 0 ? 0 : -EPERM;
     case LX_getgroups: return 0;
-    case LX_getpgrp: case LX_getpgid: case LX_getsid:
-        return p->pid;
-    case LX_setpgid: return 0;
-    case LX_setsid:  return p->pid;
+    case LX_getpgrp:
+        return (long)p->pgid;
+    case LX_getpgid:
+        return sys_getpgid((pid_t)(int)a1);
+    case LX_getsid:
+        return a1 == 0 ? (long)p->sid : sys_getpgid((pid_t)(int)a1); /* approx */
+    case LX_setpgid:
+        return sys_setpgid((pid_t)(int)a1, (pid_t)(int)a2);
+    case LX_setsid:
+        return sys_setsid();
     case LX_set_tid_address:
         p->linux_clear_child_tid = a1;
         return p->pid;
@@ -1146,6 +1238,13 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             case LX_ARCH_SET_FS:
                 if (!is_user_address(a2)) return -EPERM;
                 thread_wrfsbase(a2);
+                /* Keep thread_t.fs_base in sync — fork children copy it, and
+                 * context switch restores from thread_t, not only the MSR. */
+                {
+                    thread_t *ct = scheduler_get_current_thread();
+                    if (ct)
+                        ct->fs_base = a2;
+                }
                 return 0;
             case LX_ARCH_GET_FS: {
                 uint64_t v = thread_rdfsbase();
@@ -1154,62 +1253,213 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             default:
                 return -EINVAL;     /* GS base: not saved across switches */
         }
-    case LX_fork: case LX_vfork: {
-        /* Stash user RIP/RSP/RFLAGS and the frame pointer on the process so
-         * sys_fork can re-arm them when the vfork parent resumes (the child
-         * returns through this frame first; later child syscalls must not
-         * leave the parent with RIP=0). */
-        p->fork_saved_user_rip = fr->user_rip;
-        p->fork_saved_user_rsp = fr->user_rsp;
-        p->fork_saved_user_rflags = fr->user_rflags;
-        p->fork_user_frame = fr;
+    case LX_fork: {
+        fork_snapshot_frame(p, fr);
+        p->fork_defer_release = 0;
         return sys_fork();
     }
-    case LX_clone:
-        /* Plain fork-style clone(SIGCHLD) only; threads need CLONE_VM. */
-        if ((a1 & ~0xffULL) == 0)
-            return sys_fork();
-        return lx_enosys(p, nr);
+    case LX_vfork: {
+        /* vfork == clone(CLONE_VM|CLONE_VFORK|SIGCHLD) */
+        fork_snapshot_frame(p, fr);
+        p->fork_defer_release = 0;
+        serial_printf("vfork: -> clone VM|VFORK|SIGCHLD\n");
+        return sys_clone(CLONE_VM | CLONE_VFORK | 17 /* SIGCHLD */, 0, 0, 0, 0);
+    }
+    case LX_clone: {
+        /* flags, newsp, parent_tid, child_tid, tls (x86-64 Linux ABI) */
+        serial_printf("clone: flags=0x%llx newsp=0x%llx ptid=0x%llx ctid=0x%llx tls=0x%llx\n",
+                      (unsigned long long)a1, (unsigned long long)a2,
+                      (unsigned long long)a3, (unsigned long long)a4,
+                      (unsigned long long)a5);
+        fork_snapshot_frame(p, fr);
+        /* Child stack: honor newsp when non-zero (musl __clone pushes fn/arg). */
+        if (a2)
+            p->fork_saved_user_rsp = a2;
+        p->fork_defer_release = 0;
+        return sys_clone(a1, a2, a3, a4, a5);
+    }
     case LX_execve: {
+        {
+            char pb[96], a0[48], a1b[48], a2b[48];
+            pb[0] = a0[0] = a1b[0] = a2b[0] = 0;
+            if (a1) lx_get(pb, (void *)a1, sizeof(pb) - 1);
+            pb[sizeof(pb) - 1] = 0;
+            if (a2) {
+                uint64_t p0 = 0, p1 = 0, p2 = 0;
+                if (lx_get(&p0, (void *)a2, 8) == 0 && p0)
+                    lx_get(a0, (void *)(uintptr_t)p0, sizeof(a0) - 1);
+                if (lx_get(&p1, (void *)(a2 + 8), 8) == 0 && p1)
+                    lx_get(a1b, (void *)(uintptr_t)p1, sizeof(a1b) - 1);
+                if (lx_get(&p2, (void *)(a2 + 16), 8) == 0 && p2)
+                    lx_get(a2b, (void *)(uintptr_t)p2, sizeof(a2b) - 1);
+                a0[sizeof(a0)-1] = a1b[sizeof(a1b)-1] = a2b[sizeof(a2b)-1] = 0;
+            }
+            serial_printf("linux: execve pid=%d path='%s' argv0='%s' argv1='%s' argv2='%s'\n",
+                          p ? (int)p->pid : -1, pb, a0, a1b, a2b);
+        }
         r = sys_exec((const char *)a1, (char *const *)a2);
         if (r < 0) return r;
-        /* sys_exec ran the new image to completion (no in-place image
-         * replacement yet); a non-fork caller now exits with its status. */
+                /* In-place replace: SYSRET into the new entry (same pid). */
+        if (p && p->exec_replaced) {
+            p->exec_replaced = false;
+            fr->user_rip = p->exec_entry_rip;
+            fr->user_rsp = p->exec_entry_rsp;
+            fr->user_rflags = 0x202; /* IF set */
+            /* Clear argument regs; _start reads argc/argv from the stack. */
+            fr->a1 = fr->a2 = fr->a3 = fr->a4 = fr->a5 = fr->a6 = 0;
+            fr->rbx = fr->rbp = fr->r12 = fr->r13 = fr->r14 = fr->r15 = 0;
+            /* CLONE_VFORK: release parent now that child has a private image. */
+            if (p->fork_parent) {
+                process_t *vp = p->fork_parent;
+                p->fork_parent = NULL;
+                if (vp->sched_thread)
+                    thread_wake((thread_t *)vp->sched_thread);
+                serial_printf("clone: vfork parent woken after exec (child %d)\n",
+                              (int)p->pid);
+            }
+            p->clone_shared_vm = false;
+            return 0;
+        }
+        /* Legacy nested path returned an exit status — terminate. */
         sys_exit((int)(r & 0xff));
         return 0;
     }
     case LX_wait4:   return lx_wait4(p, (long)(int)a1, (int *)a2, (long)a3, (void *)a4);
-    case LX_kill:
-        if ((long)(int)a1 == (long)p->pid || (int)a1 == 0) {
-            if (a2 == 0) return 0;
-            lx_die_by_signal(p, (int)a2);
+    case LX_kill: {
+        /* Queue + deliver (custom handlers / SIG_IGN). Do NOT always
+         * lx_die_by_signal on self — that broke sig_self (SIGUSR1 handler). */
+        if (a2 == 0) {
+            /* Existence / permission check only */
+            if ((long)(int)a1 == (long)p->pid || (int)a1 == 0) return 0;
+            return sys_kill((pid_t)a1, 0);
         }
-        if (a2 == 0) return 0;
-        return sys_kill((pid_t)a1, (int)a2);
+        if ((int)a1 == 0) {
+            /* kill(0, sig): send to caller's process group */
+            process_kill_pgid(p->pgid ? p->pgid : p->pid, (int)a2);
+            if (p && !p->is_running) lx_die_by_signal(p, (int)a2);
+            return 0;
+        }
+        long r = sys_kill((pid_t)a1, (int)a2);
+        /* If we killed ourselves with a fatal default action, exit now. */
+        if (r == 0 && p && !p->is_running)
+            lx_die_by_signal(p, (int)a2);
+        return r;
+    }
     case LX_tkill: case LX_tgkill: {
+        long tid = nr == LX_tkill ? (long)a1 : (long)a2;
         long sig = nr == LX_tkill ? (long)a2 : (long)a3;
         if (sig == 0) return 0;
-        lx_die_by_signal(p, (int)sig);
+        if (tid == (long)p->pid || tid == 0)
+            return sys_kill((pid_t)p->pid, (int)sig);
+        return sys_kill((pid_t)tid, (int)sig);
     }
     case LX_rt_sigaction: {
-        if (a1 < 1 || a1 > 64) return -EINVAL;
-        if ((a1 == 9 || a1 == 19) && a2) return -EINVAL;
+        /* Linux: act/oldact are struct sigaction (handler, flags, restorer, mask).
+         * Map onto our sigaction_ind_t (handler + flags); stash restorer in
+         * signal_sa_flags high bit unused — keep restorer in a per-signal slot
+         * via sa_flags field's companion: we store restorer in pending unused
+         * by using signal_sa_flags as flags only and a parallel restorer array
+         * would be ideal; for now store restorer address in signal_sa_flags if
+         * SA_RESTORER (0x04000000) is set... actually keep flags and use
+         * a side table. Simpler: call sys_sigaction with ind layout built here. */
+        if (a1 < 1 || a1 >= NSIG) return -EINVAL;
+        if ((a1 == 9 || a1 == 19) && a2) return -EINVAL; /* KILL/STOP */
+        typedef struct {
+            uint64_t handler;
+            uint64_t flags;
+            uint64_t restorer;
+            uint64_t mask;
+        } lx_sa_t;
+        /* a4 is sigsetsize (must be 8), NOT sizeof(sigaction). Always
+         * copy the full kernel sigaction (handler,flags,restorer,mask). */
+        if (a4 && a4 != 8) return -EINVAL;
+        lx_sa_t old_lx;
+        memset(&old_lx, 0, sizeof(old_lx));
+        old_lx.handler = (uint64_t)(uintptr_t)p->signal_handlers[a1];
+        old_lx.flags = p->signal_sa_flags[a1];
+        old_lx.restorer = p->sig_restorer[a1];
         if (a3) {
-            uint8_t z[32];
-            memset(z, 0, sizeof(z));
-            if (lx_put((void *)a3, z, sizeof(z))) return -EFAULT;
+            if (lx_put((void *)a3, &old_lx, sizeof(old_lx)))
+                return -EFAULT;
         }
-        return 0;                               /* handlers never invoked */
-    }
-    case LX_rt_sigprocmask:
-        if (a3) {
-            uint64_t z = 0;
-            if (lx_put((void *)a3, &z, sizeof(z))) return -EFAULT;
+        if (a2) {
+            lx_sa_t act;
+            memset(&act, 0, sizeof(act));
+            if (lx_get(&act, (void *)a2, sizeof(act))) return -EFAULT;
+            p->signal_handlers[a1] = (sighandler_t)(uintptr_t)act.handler;
+            p->signal_sa_flags[a1] = (uint32_t)act.flags;
+            p->sig_restorer[a1] = act.restorer;
+            serial_printf("linux: rt_sigaction sig=%d handler=0x%llx flags=0x%x restorer=0x%llx\n",
+                          (int)a1, (unsigned long long)act.handler,
+                          (unsigned)act.flags, (unsigned long long)act.restorer);
         }
         return 0;
+    }
+    case LX_rt_sigprocmask: {
+        /* how, set, oldset, sigsetsize.
+         * Linux sigset bit (N-1) == signal N; our blocked_signals uses bit N. */
+        uint64_t old_lx = ((uint64_t)p->blocked_signals) >> 1;
+        if (a3) {
+            if (lx_put((void *)a3, &old_lx, a4 >= 8 ? 8 : (size_t)a4)) return -EFAULT;
+        }
+        if (a2) {
+            uint64_t s = 0;
+            if (lx_get(&s, (void *)a2, a4 >= 8 ? 8 : (size_t)a4)) return -EFAULT;
+            uint32_t sm = (uint32_t)((s << 1) & 0xFFFFFFFEu); /* linux -> internal */
+            if (a1 == 0) p->blocked_signals |= sm;       /* SIG_BLOCK */
+            else if (a1 == 1) p->blocked_signals &= ~sm; /* SIG_UNBLOCK */
+            else if (a1 == 2) p->blocked_signals = sm;   /* SIG_SETMASK */
+            else return -EINVAL;
+            p->blocked_signals &= ~((1u << 9) | (1u << 19)); /* cannot block KILL/STOP */
+        }
+        return 0;
+    }
     case LX_rt_sigpending: {
-        uint64_t z = 0;
+        uint64_t z = ((uint64_t)p->pending_signals) >> 1; /* internal -> linux */
         return lx_put((void *)a1, &z, sizeof(z));
+    }
+    case LX_rt_sigreturn: {
+        if (!p->sig_in_handler) return 0;
+        p->sig_in_handler = false;
+        /* Restore FULL GPR set into this syscall's live frame. The SYSCALL
+         * epilogue pops r15..rbx and a6..a1 from the frame before sysret/iretq,
+         * so partial restore left handler/callee-saved regs in place and ash
+         * later called sigsetjmp with rdi still holding clone flags (0x11). */
+        fr->r15 = p->sig_saved_r15;
+        fr->r14 = p->sig_saved_r14;
+        fr->r13 = p->sig_saved_r13;
+        fr->r12 = p->sig_saved_r12;
+        fr->rbp = p->sig_saved_rbp;
+        fr->rbx = p->sig_saved_rbx;
+        fr->a6  = p->sig_saved_r9;
+        fr->a5  = p->sig_saved_r8;
+        fr->a4  = p->sig_saved_r10;
+        fr->a3  = p->sig_saved_rdx;
+        fr->a2  = p->sig_saved_rsi;
+        fr->a1  = p->sig_saved_rdi;
+        fr->user_rip = p->sig_saved_rip;
+        fr->user_rsp = p->sig_saved_rsp;
+        fr->user_rflags = p->sig_saved_rflags | 0x200ULL; /* IF */
+        return (long)p->sig_saved_rax;
+    }
+    case LX_rt_sigsuspend: {
+        /* Replace mask, wait for an unblocked pending signal, restore, EINTR.
+         * Ash uses this after pipelines; leaving it -ENOSYS hung the suite. */
+        uint32_t old = p->blocked_signals;
+        if (a1) {
+            uint64_t s = 0;
+            size_t n = a2 >= 8 ? 8 : (size_t)a2;
+            if (n == 0) n = 8;
+            if (lx_get(&s, (void *)a1, n)) return -EFAULT;
+            uint32_t sm = (uint32_t)((s << 1) & 0xFFFFFFFEu);
+            p->blocked_signals = sm & ~((1u << 9) | (1u << 19));
+        }
+        for (int i = 0; i < 500; i++) {
+            if (p->pending_signals & ~p->blocked_signals) break;
+            ktime_yield_until(ktime_deadline_ms(5));
+        }
+        p->blocked_signals = old;
+        return -EINTR;
     }
     case LX_sigaltstack:
         if (a2) {
@@ -1477,7 +1727,44 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
 uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
     process_t *p = lx_proc();
 
+    /* Every SYSCALL entry: stash live user RIP/RSP/RFLAGS/GPRs into THIS
+     * thread before any dispatch. Nested fork reads these by value. */
+    {
+        thread_t *thr = scheduler_get_current_thread();
+        /* Boot-thread ash has owner_process==NULL. Pin while lx_proc() still
+         * names a live usermode process (before a child-exit poisons the
+         * global to kernel/parent). Later get_current_process() uses owner. */
+        if (thr) {
+            if (thr->owner_process) {
+                process_t *op = (process_t *)thr->owner_process;
+                if (op && op->is_usermode && !op->is_zombie)
+                    p = op;
+            } else if (p && p->is_usermode && !p->is_zombie && p->pid != 0) {
+                thr->owner_process = (struct process *)p;
+                if (!p->sched_thread)
+                    p->sched_thread = thr;
+            }
+        }
+        if (thr) {
+            thr->sc_user_rip = f->user_rip;
+            thr->sc_user_rsp = f->user_rsp;
+            thr->sc_user_rflags = f->user_rflags;
+            thr->sc_r15 = f->r15; thr->sc_r14 = f->r14;
+            thr->sc_r13 = f->r13; thr->sc_r12 = f->r12;
+            thr->sc_rbp = f->rbp; thr->sc_rbx = f->rbx;
+            thr->sc_r9 = f->a6; thr->sc_r8 = f->a5;
+            thr->sc_r10 = f->a4; thr->sc_rdx = f->a3;
+            thr->sc_rsi = f->a2; thr->sc_rdi = f->a1;
+            thr->sc_frame_valid = 1;
+        }
+    }
+
+    /* CR3 re-sync is done inside process_deliver_signals (and fork paths),
+     * not on every SYSCALL -- boot-thread ash has owner_process==NULL so
+     * lx_proc() can briefly name the wrong process under SMP. */
+
     if (p && !p->linux_abi) {
+
         p->linux_abi = true;
         serial_printf("linux: PID %u entered the Linux syscall ABI (first nr=%llu)\n",
                       p->pid, (unsigned long long)f->nr);
@@ -1487,11 +1774,36 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
      * minus graceful SIGINT delivery: Linux signal handlers never run yet). */
     if (get_terminate_flag() && get_program_running()) {
         set_terminate_flag(false);
-        serial_printf("linux: PID %u interrupted (Ctrl+C)\n", p ? p->pid : 0);
-        sys_exit(128 + SIGINT);
+        uint32_t fg = process_get_fg_pgid();
+        if (!fg && p) fg = p->pgid ? p->pgid : p->pid;
+        serial_printf("linux: Ctrl+C -> SIGINT pgid %u\n", fg);
+        process_kill_pgid(fg, SIGINT);
+        if (p && !p->is_running)
+            return 0;
     }
 
     long r = lx_dispatch(f);
+
+    /* Deliver pending custom / default signals before SYSRET.
+     * Stash syscall return in sig_saved_rax so rt_sigreturn restores it
+     * (else write()-after-SIGPIPE returns n=0 instead of -EPIPE). */
+    if (p && p->is_running) {
+        /* Do not clobber sig_saved_rax while already in a handler — nested
+         * syscalls (ash during SIGCHLD) would corrupt the outer return and
+         * break pipelines / sigreturn. */
+        if (!p->sig_in_handler)
+            p->sig_saved_rax = (uint64_t)r;
+        /* defer_sig_on_fork: delivering SIGCHLD into ash on fork/clone return
+         * races with COW + held kids and has GPF'd right after PIPEOK 6.
+         * Leave pending; next non-fork syscall delivers. */
+        if (f->nr != (uint64_t)LX_fork && f->nr != (uint64_t)LX_clone &&
+            f->nr != (uint64_t)LX_vfork)
+            process_deliver_signals(p, f);
+    }
+
+    /* Wake pipeline pair after signals so writer SIGCHLD is not delivered
+     * mid-fork-return (ash exit_group 255). */
+    fork_release_after_syscall(p);
 
     if (linux_syscall_trace)
         serial_printf("linux: [%u] nr=%llu (%llx, %llx, %llx) = %ld\n",

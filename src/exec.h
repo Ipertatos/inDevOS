@@ -80,6 +80,12 @@ extern bool exec_did_swapgs;
  * The caller is NOT blocked; the child runs when the scheduler picks it. */
 int exec_spawn(const char *filename, char *const argv[]);
 
+/* Replace the calling process image in place (same pid).  On success sets
+ * proc->exec_replaced and exec_entry_{rip,rsp}; caller SYSRETs into the new
+ * image.  Returns 0 or -errno.  Does not nest and does not allocate a new
+ * process slot. Kernel stack of @proc is preserved. */
+int exec_replace(process_t *proc, const char *filename, char *const argv[]);
+
 /* Called by sys_exit() for spawned (thread-scheduled) processes.
  * Cleans up and lets the scheduler pick the next thread.  Does NOT return. */
 __attribute__((noreturn))

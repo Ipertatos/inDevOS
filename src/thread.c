@@ -161,6 +161,8 @@ thread_t* thread_create(const char *name, void (*entry)(void*), void *arg,
     /* Synthetic iretq frame so the timer/IPI path can start this
      * kernel thread at thread_start_asm without a cooperative switch. */
     thread->has_saved_context = true;
+    thread->on_cpu = 0;
+    thread->kwait = 0;
     
     // Initialize FPU/SSE state with a clean copy
     fpu_get_default_state(thread->fxsave_area);
@@ -248,6 +250,8 @@ void thread_destroy(thread_t *thread) {
         ctx = ctx->next;
     }
     
+    sched_oncpu_forget(thread);
+
     // Free stack
     if (thread->stack_base) {
         kfree((void*)thread->stack_base);
@@ -443,18 +447,14 @@ void scheduler_detach_thread(thread_t *thread) {
  * corrupting the list and silently losing threads. Caller holds the lock. */
 static thread_t *_rq_pop_any(per_cpu_t *cpu) {
     for (int p = THREAD_NUM_PRIORITIES - 1; p >= 0; p--) {
-        thread_t *thread = cpu->ready_queue[p];
-        if (!thread)
-            continue;
-        cpu->ready_queue[p] = thread->next;
-        if (thread->next)
-            thread->next->prev = NULL;
-        else
-            cpu->ready_queue_tail[p] = NULL;
-        thread->next = NULL;
-        thread->prev = NULL;
-        rq_note_del(cpu);
-        return thread;
+        for (thread_t *thread = cpu->ready_queue[p]; thread; thread = thread->next) {
+            /* Never dequeue a thread whose context is still live on a CPU. */
+            if (__atomic_load_n(&thread->on_cpu, __ATOMIC_ACQUIRE))
+                continue;
+            _queue_unlink(thread, &cpu->ready_queue[p], &cpu->ready_queue_tail[p]);
+            rq_note_del(cpu);
+            return thread;
+        }
     }
     return NULL;
 }
@@ -500,6 +500,8 @@ static thread_t* _scheduler_get_next_kernel_thread_unlocked(void) {
         for (int p = THREAD_NUM_PRIORITIES - 1; p >= 0; p--) {
             for (thread_t *t = cpu_data[c].ready_queue[p]; t; t = t->next) {
                 if (t->owner_process)
+                    continue;
+                if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE))
                     continue;
                 _queue_unlink(t, &cpu_data[c].ready_queue[p],
                               &cpu_data[c].ready_queue_tail[p]);
@@ -601,6 +603,7 @@ static thread_t *_pick_from_cpu(per_cpu_t *cpu, bool want_user, bool kernel_ok,
     for (int p = THREAD_NUM_PRIORITIES - 1; p >= 0; p--) {
         for (thread_t *t = cpu->ready_queue[p]; t; t = t->next) {
             if (t == idle) continue;
+            if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) continue;
             if (t == kmain && !allow_kmain) continue;
             if (want_user) {
                 if (!t->owner_process) continue;
@@ -668,6 +671,84 @@ thread_t* scheduler_pick_preempt_thread(void) {
     return picked;
 }
 
+/* ---------------- on_cpu handoff ---------------- */
+static thread_t *volatile oncpu_pending[MAX_CPUS];
+
+static inline uint32_t oncpu_cpu_idx(void) {
+    per_cpu_t *me = smp_get_current_cpu();
+    uint32_t i = me ? me->cpu_id : 0;
+    return i < MAX_CPUS ? i : 0;
+}
+
+void sched_oncpu_set(thread_t *t) {
+    if (t)
+        __atomic_store_n(&t->on_cpu, 1, __ATOMIC_SEQ_CST);
+}
+
+/* Clear the previously switched-out thread of THIS CPU. Only call while
+ * executing on a different thread's stack than the pending one. */
+void sched_oncpu_flush(void) {
+    uint64_t f = irq_save();
+    uint32_t i = oncpu_cpu_idx();
+    thread_t *t = oncpu_pending[i];
+    if (t) {
+        oncpu_pending[i] = NULL;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        __atomic_store_n(&t->on_cpu, 0, __ATOMIC_RELEASE);
+    }
+    irq_restore(f);
+}
+
+void sched_oncpu_defer_clear(thread_t *t) {
+    uint64_t f = irq_save();
+    uint32_t i = oncpu_cpu_idx();
+    thread_t *old = oncpu_pending[i];
+    if (old && old != t) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        __atomic_store_n(&old->on_cpu, 0, __ATOMIC_RELEASE);
+    }
+    oncpu_pending[i] = t;
+    irq_restore(f);
+}
+
+/* Thread memory is about to be freed: drop any deferred clear for it. */
+void sched_oncpu_forget(thread_t *t) {
+    if (!t) return;
+    for (uint32_t i = 0; i < MAX_CPUS; i++) {
+        thread_t *exp = t;
+        __atomic_compare_exchange_n((thread_t **)&oncpu_pending[i], &exp, (thread_t *)NULL,
+                                    false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+}
+
+/* Park a thread blocked in-kernel IN PLACE (no cooperative switch). User
+ * threads' coop context is never resumed by the preempt path (it restores
+ * saved_regs), so a coop switch resumed them at a stale ring-3 frame
+ * (nest_fork replayed fork). The timer may preempt us here with a valid
+ * ring-0 frame (kwait != 0). Wake: BLOCKED/SLEEPING -> READY. */
+static void thread_kwait_current(thread_t *cur, int kind) {
+    uint64_t rf;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rf) :: "memory");
+    __atomic_store_n(&cur->kwait, kind, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int s = (int)__atomic_load_n(&cur->state, __ATOMIC_ACQUIRE);
+        if (s != (int)THREAD_BLOCKED && s != (int)THREAD_SLEEPING)
+            break;
+        __asm__ volatile("sti; hlt" ::: "memory");
+    }
+    __atomic_store_n(&cur->kwait, 0, __ATOMIC_SEQ_CST);
+    uint64_t f = irq_save();
+    spinlock_lock(&global_scheduler.scheduler_lock);
+    if (cur->state == THREAD_READY || cur->state == THREAD_RUNNING) {
+        _scheduler_remove_thread_unlocked(cur);
+        cur->state = THREAD_RUNNING;
+    }
+    spinlock_unlock(&global_scheduler.scheduler_lock);
+    irq_restore(f);
+    if (!(rf & 0x200))
+        __asm__ volatile("cli" ::: "memory");
+}
+
 // Yield current thread
 void thread_yield(void) {
     if (!global_scheduler.scheduler_running) {
@@ -675,6 +756,22 @@ void thread_yield(void) {
     }
     
     thread_t *current = scheduler_get_current_thread();
+    /* User threads never cooperatively switch (their coop context is not
+     * what the preempt path resumes). Blocked/sleeping: park in place.
+     * Plain RUNNING yield from a user thread in-kernel: just relax. */
+    if (current && current->owner_process) {
+        if (current->state != THREAD_RUNNING)
+            thread_kwait_current(current, 1);
+        else
+            __asm__ volatile("pause" ::: "memory");
+        return;
+    }
+    /* BSP boot thread running ash, blocked in sys_wait: same. */
+    if (current && current->state == THREAD_BLOCKED &&
+        current == smp_get_bsp_boot_thread()) {
+        thread_kwait_current(current, 2);
+        return;
+    }
     /* Kernel threads only — see scheduler_get_next_kernel_thread(). */
     thread_t *next = scheduler_get_next_kernel_thread();
 
@@ -777,17 +874,68 @@ void thread_sleep(uint64_t milliseconds) {
 
 // Wake up a thread (front-of-queue: explicit wakeups are latency-sensitive)
 void thread_wake(thread_t *thread) {
-    if (!thread || thread->state != THREAD_SLEEPING) {
+    /* No-op-safe: only SLEEPING (pipe/timed) or BLOCKED (wait/hold) -> READY.
+     * Never touch READY/RUNNING (avoids double-enqueue / runqueue corruption). */
+    if (!thread ||
+        (thread->state != THREAD_SLEEPING && thread->state != THREAD_BLOCKED)) {
         return;
     }
 
     uint64_t flags = irq_save();
     spinlock_lock(&global_scheduler.scheduler_lock);
+    if (thread->state != THREAD_SLEEPING && thread->state != THREAD_BLOCKED) {
+        spinlock_unlock(&global_scheduler.scheduler_lock);
+        irq_restore(flags);
+        return;
+    }
     _scheduler_remove_thread_unlocked(thread);
     thread->state = THREAD_READY;
     _scheduler_add_thread_front_unlocked(thread);
     spinlock_unlock(&global_scheduler.scheduler_lock);
     irq_restore(flags);
+    scheduler_kick_home_cpu(thread);
+}
+
+void scheduler_irq_lock(uint64_t *flags) {
+    *flags = irq_save();
+    spinlock_lock(&global_scheduler.scheduler_lock);
+}
+
+void scheduler_irq_unlock(uint64_t flags) {
+    spinlock_unlock(&global_scheduler.scheduler_lock);
+    irq_restore(flags);
+}
+
+void thread_block_current_unlocked(void) {
+    thread_t *cur = scheduler_get_current_thread();
+    if (!cur)
+        return;
+    _scheduler_remove_thread_unlocked(cur);
+    cur->state = THREAD_BLOCKED;
+}
+
+void thread_unblock_current_running_unlocked(void) {
+    thread_t *cur = scheduler_get_current_thread();
+    if (!cur)
+        return;
+    _scheduler_remove_thread_unlocked(cur);
+    cur->state = THREAD_RUNNING;
+}
+
+/* Caller holds scheduler_lock. Wait wake: BLOCKED (or SLEEPING) -> READY. */
+void thread_wake_blocked_unlocked(thread_t *thread) {
+    if (!thread)
+        return;
+    if (thread->state == THREAD_SLEEPING)
+        thread->sleep_until = 0;
+    if (thread->state != THREAD_SLEEPING && thread->state != THREAD_BLOCKED)
+        return;
+    _scheduler_remove_thread_unlocked(thread);
+    thread->state = THREAD_READY;
+    _scheduler_add_thread_front_unlocked(thread);
+}
+
+void scheduler_kick_thread(thread_t *thread) {
     scheduler_kick_home_cpu(thread);
 }
 
@@ -890,9 +1038,17 @@ void thread_switch(thread_t *from, thread_t *to) {
     /* Per-thread FS base (user TLS) */
     thread_switch_fs(from, to);
 
+    /* on_cpu: mark incoming live; outgoing is cleared only after this CPU
+     * has left its stack (next flush on this CPU). */
+    sched_oncpu_set(to);
+    if (from && from != to)
+        sched_oncpu_defer_clear(from);
+
     // Perform the context switch
     // from_ctx can be NULL for the first switch (nothing to save)
     thread_switch_asm(from_ctx, to_ctx);
+    /* Resumed on our own stack: the thread that switched to us is off-CPU. */
+    sched_oncpu_flush();
     
     // When we return here, we've been switched back to this thread
 }

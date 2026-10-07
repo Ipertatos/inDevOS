@@ -11,6 +11,7 @@
 #include "tty.h"
 #include "lua_runtime.h"
 #include "syscall.h"
+#include "../include/indevos_errno.h"
 #include "vconsole.h"
 #include "users.h"
 #include "kernel_symtab.h"
@@ -432,7 +433,7 @@ int exec_file(const char *filename, char *const argv[]) {
         int i = 1;
         for (int j = 0; filename[j] && i < 255; j++)
             abs_path[i++] = filename[j];
-        abs_path[i] = '\0';
+        abs_path[i] = 0;
         resolved = abs_path;
     }
 
@@ -1345,6 +1346,243 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
 #define SPAWN_USER_CS  0x23   /* 0x20 | RPL=3 */
 #define SPAWN_USER_SS  0x1B   /* 0x18 | RPL=3 */
 
+/* ==================================================================
+ * exec_replace — in-place execve for an already-running usermode process
+ * ==================================================================
+ * Tears down the old user address space, loads a new ELF into a fresh
+ * PML4, keeps the same pid / parent / kernel stack / non-CLOEXEC fds,
+ * resets caught signal handlers to SIG_DFL, and returns the new entry
+ * (rip/rsp) via proc->exec_entry_* so the SYSCALL return path can
+ * SYSRET into the new image (no nested exec_file / no new process slot).
+ *
+ * Must NOT free or replace proc->kernel_stack: we are executing on it.
+ */
+int exec_replace(process_t *proc, const char *filename, char *const argv[]) {
+    if (!proc || !filename)
+        return -EINVAL;
+    if (!proc->is_usermode || !proc->pml4)
+        return -EINVAL;
+
+    exec_current_argv = argv;
+    exec_dbg_reset();
+    exec_dbg_mark("exec_replace");
+
+    if (!vfs_has_root_mount() && !fat32_is_mounted())
+        return -ENOENT;
+
+    char abs_path[256];
+    const char *resolved = filename;
+    if (filename[0] != '/') {
+        abs_path[0] = '/';
+        int i = 1;
+        for (int j = 0; filename[j] && i < 255; j++)
+            abs_path[i++] = filename[j];
+        abs_path[i] = 0;
+        resolved = abs_path;
+    }
+
+    void *image = NULL;
+    uint32_t fsize = 0;
+    int bytes_read = 0;
+    if (vfs_has_root_mount()) {
+        int n = vfs_read_file_alloc(resolved, &image, 0);
+        if (n <= 0 || !image) return -ENOENT;
+        fsize = (uint32_t)n;
+        bytes_read = n;
+    } else {
+        fat32_file_t *file = fat32_open(resolved, "r");
+        if (!file) return -ENOENT;
+        fsize = file->file_size;
+        if (fsize == 0) { fat32_close(file); return -ENOENT; }
+        image = kalloc(fsize);
+        if (!image) { fat32_close(file); return -ENOMEM; }
+        bytes_read = fat32_read(file, image, fsize);
+        fat32_close(file);
+    }
+    if (bytes_read != (int)fsize) {
+        kfree(image);
+        return -EIO;
+    }
+    if (fsize < sizeof(Elf64_Ehdr) || memcmp(image, ELF_MAGIC, 4) != 0) {
+        kfree(image);
+        return -ENOEXEC;
+    }
+    {
+        const char *why = exec_elf_unsupported(image, fsize);
+        if (why) {
+            serial_printf("exec_replace: %s: %s\n", resolved, why);
+            kfree(image);
+            return -ENOEXEC;
+        }
+    }
+
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)image;
+    uint64_t seg_base = UINT64_MAX, seg_end = 0;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_filesz == 0 && ph->p_memsz == 0) continue;
+        if (ph->p_vaddr < seg_base) seg_base = ph->p_vaddr;
+        if (ph->p_vaddr + ph->p_memsz > seg_end) seg_end = ph->p_vaddr + ph->p_memsz;
+    }
+    if (seg_base == UINT64_MAX) { kfree(image); return -ENOEXEC; }
+
+    uint64_t *new_pml4 = vmm_create_address_space();
+    if (!new_pml4) { kfree(image); return -ENOMEM; }
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+        uint64_t sv = ph->p_vaddr & ~0xFFFULL;
+        uint64_t se = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFFULL;
+        uint64_t np = (se - sv) / PAGE_SIZE;
+        uint64_t flags = VMM_PRESENT | VMM_USER;
+        if (ph->p_flags & 0x2) flags |= VMM_WRITABLE;
+        if (!(ph->p_flags & 0x1)) flags |= VMM_NX;
+        for (uint64_t pg = 0; pg < np; pg++) {
+            if (exec_map_segment_page(new_pml4, sv + pg * PAGE_SIZE, flags) != 0) {
+                vmm_destroy_address_space(new_pml4);
+                kfree(image);
+                return -ENOMEM;
+            }
+        }
+        if (ph->p_filesz > 0) {
+            uint8_t *src = (uint8_t *)image + ph->p_offset;
+            uint64_t cv = ph->p_vaddr;
+            uint64_t rem = ph->p_filesz;
+            while (rem > 0) {
+                uint64_t pv = cv & ~0xFFFULL;
+                uint64_t po = cv & 0xFFF;
+                uint64_t phys = vmm_is_mapped_in(new_pml4, pv);
+                if (!phys) break;
+                uint64_t chunk = PAGE_SIZE - po;
+                if (chunk > rem) chunk = rem;
+                memcpy((uint8_t *)phys_to_virt(phys) + po, src, chunk);
+                src += chunk; cv += chunk; rem -= chunk;
+            }
+        }
+    }
+
+    Elf64_Phdr *dyn_ph = NULL;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
+    }
+    if (dyn_ph)
+        exec_apply_relocations(new_pml4, dyn_ph);
+
+    uint64_t ustack_top  = USER_STACK_TOP;
+    uint64_t ustack_base = ustack_top - (USER_STACK_PAGES * PAGE_SIZE);
+    for (uint64_t pg = 0; pg <= USER_STACK_PAGES; pg++) {
+        uint64_t vaddr = (pg == USER_STACK_PAGES) ? ustack_top : ustack_base + pg * PAGE_SIZE;
+        uint64_t frame = vmm_alloc_frame();
+        if (!frame) {
+            vmm_destroy_address_space(new_pml4);
+            kfree(image);
+            return -ENOMEM;
+        }
+        memset(phys_to_virt(frame), 0, PAGE_SIZE);
+        vmm_map_page_in(new_pml4, vaddr, frame,
+                        VMM_PRESENT | VMM_USER | VMM_WRITABLE | VMM_NX);
+    }
+    exec_collect_auxinfo(image);
+    ustack_top = exec_build_abi_stack(new_pml4, ustack_top, resolved);
+    uint64_t entry_rip = eh->e_entry;
+
+    /* Tear down old user AS — switch to kernel first so we don't free CR3. */
+    extern uint64_t *vmm_get_kernel_pml4(void);
+    vmm_switch_address_space(vmm_get_kernel_pml4());
+    if (proc->pml4) {
+        vmm_destroy_address_space(proc->pml4);
+        proc->pml4 = NULL;
+    }
+    while (proc->mmap_regions) {
+        proc_mmap_region_t *r = proc->mmap_regions;
+        proc->mmap_regions = r->next;
+        kfree(r);
+    }
+    exec_free_user_symbols(proc);
+
+    proc->pml4           = new_pml4;
+    proc->user_stack_top = ustack_top;
+    proc->virtual_base   = seg_base;
+    proc->memory_size    = seg_end - seg_base;
+    proc->memory_base    = NULL;
+    proc->brk_start      = (void *)((seg_end + 0xFFF) & ~0xFFFULL);
+    proc->brk_current    = proc->brk_start;
+    proc->mmap_anon_next = ((uint64_t)proc->brk_current + EXEC_MMAP_GAP + PAGE_SIZE - 1) &
+                           ~(uint64_t)(PAGE_SIZE - 1);
+    proc->linux_ti_valid = false;
+    proc->linux_clear_child_tid = 0;
+    kstrncpy(proc->linux_exe_path, resolved, sizeof(proc->linux_exe_path));
+
+    /* Reset caught signal handlers to default; leave SIG_IGN alone.
+     * Also clear sa_restorer — stale ash trampolines must not survive exec
+     * into another applet of the same busybox binary. */
+    for (int s = 1; s < NSIG; s++) {
+        if (proc->signal_handlers[s] != SIG_IGN)
+            proc->signal_handlers[s] = SIG_DFL;
+        proc->signal_sa_flags[s] = 0;
+        proc->sig_restorer[s] = 0;
+    }
+    proc->pending_signals = 0;
+    proc->sig_in_handler = false;
+
+    exec_load_elf_symbols(image, fsize, proc);
+    kfree(image);
+
+    /* Install new address space for this process. */
+    vmm_switch_address_space(new_pml4);
+    if (proc->kernel_stack_top) {
+        gdt_set_kernel_stack(proc->kernel_stack_top);
+        syscall_set_kernel_stack(proc->kernel_stack_top);
+    }
+    exec_set_ring3_active(proc);
+    thread_wrfsbase(0);
+    if (proc->sched_thread) {
+        thread_t *thr = (thread_t *)proc->sched_thread;
+        thr->fs_base = 0;
+        memset(&thr->saved_regs, 0, sizeof(thread_regs_t));
+        thr->saved_regs.rip    = entry_rip;
+        thr->saved_regs.rsp    = ustack_top;
+        thr->saved_regs.rflags = 0x202;
+        thr->saved_regs.cs     = 0x23;
+        thr->saved_regs.ss     = 0x1B;
+        thr->has_saved_context = true;
+    }
+
+    proc->exec_entry_rip = entry_rip;
+    proc->exec_entry_rsp = ustack_top;
+    proc->exec_replaced  = true;
+
+    {
+        const char *a0 = (argv && argv[0]) ? argv[0] : "(null)";
+        const char *a1 = (argv && argv[0] && argv[1]) ? argv[1] : "";
+        const char *a2 = (argv && argv[0] && argv[1] && argv[2]) ? argv[2] : "";
+        serial_printf("exec_replace: PID %d -> '%s' argv0='%s' argv1='%s' argv2='%s' entry=0x%llx rsp=0x%llx\n",
+                      (int)proc->pid, resolved, a0, a1, a2,
+                      (unsigned long long)entry_rip,
+                      (unsigned long long)ustack_top);
+        {
+            const char *tn[3] = {"?", "?", "?"};
+            for (int i = 0; i < 3; i++) {
+                if (!proc->fds[i].in_use) { tn[i] = "closed"; continue; }
+                switch (proc->fds[i].fd_type) {
+                case 1: tn[i] = "pipe_r"; break;
+                case 2: tn[i] = "pipe_w"; break;
+                case 6: tn[i] = "null"; break;
+                case 7: tn[i] = "tty"; break;
+                case 0: tn[i] = "file/cons"; break;
+                default: tn[i] = "other"; break;
+                }
+            }
+            serial_printf("exec_fds: pid=%d fd0=%s fd1=%s fd2=%s\n",
+                          (int)proc->pid, tn[0], tn[1], tn[2]);
+        }
+    }
+    return 0;
+}
+
 int exec_spawn(const char *filename, char *const argv[]) {
     exec_current_argv = argv;
     exec_dbg_reset();
@@ -1360,7 +1598,7 @@ int exec_spawn(const char *filename, char *const argv[]) {
         int i = 1;
         for (int j = 0; filename[j] && i < 255; j++)
             abs_path[i++] = filename[j];
-        abs_path[i] = '\0';
+        abs_path[i] = 0;
         resolved = abs_path;
     }
 

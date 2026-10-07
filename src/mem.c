@@ -27,6 +27,7 @@
 #include "math.h"
 #include "atomic.h"
 #include "serial.h"
+#include "smp.h"
 #include "debug.h"
 #include "term.h"
 spinlock_t lock = {0};
@@ -1086,8 +1087,16 @@ static uint64_t* vmm_clone_table(uint64_t *src, int level) {
                     vmm_page_ref(phys); /* additional dst mapping */
                 }
             } else {
+                /* Shared leaf (RX text, already-COW, etc.): both PTEs own the
+                 * frame. Match writable-COW accounting so one destroy cannot
+                 * free the other's pages. */
                 dst[i] = pte;
-                vmm_page_ref(phys);
+                if (vmm_page_get_ref(phys) == 0) {
+                    vmm_page_ref(phys); /* src */
+                    vmm_page_ref(phys); /* dst */
+                } else {
+                    vmm_page_ref(phys); /* additional dst */
+                }
             }
         } else {
             // Intermediate level: recursively clone the child table
@@ -1115,12 +1124,13 @@ uint64_t* vmm_clone_address_space(uint64_t *src_pml4) {
     if (!src_pml4) return NULL;
     uint64_t *new_pml4 = vmm_clone_table(src_pml4, 4);
 
-    /* Flush parent's TLB because we marked its writable pages as COW (read-only).
-     * A full CR3 reload is the simplest approach. */
+    /* Flush TLB on every CPU and WAIT for ACKs: write-protecting parent PTEs
+     * in place is useless if any CPU keeps a stale writable TLB entry — that
+     * CPU would dirty the shared frame and the sibling would see the writes
+     * (pipe_sigpipe close(read) race, yeshead RIP=0x20). */
     if (new_pml4) {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+        extern void smp_tlb_shootdown(void);
+        smp_tlb_shootdown();
     }
     return new_pml4;
 }
@@ -1143,6 +1153,8 @@ void vmm_switch_address_space(uint64_t *pml4) {
  * Recursively free user-space page table structures.
  * Also releases mapped user physical pages at leaf entries.
  */
+static void vmm_leaf_release(uint64_t phys_addr);
+
 static void vmm_free_table(uint64_t *table, int level) {
     int limit = (level == 4) ? 256 : 512;
 
@@ -1153,7 +1165,7 @@ static void vmm_free_table(uint64_t *table, int level) {
                 (uint64_t*)phys_to_virt(table[i] & PTE_ADDR_MASK),
                 level - 1);
         } else {
-            vmm_page_unref(table[i] & PTE_ADDR_MASK);
+            vmm_leaf_release(table[i] & PTE_ADDR_MASK);
         }
     }
     kfree(table);
@@ -1206,14 +1218,47 @@ void vmm_page_unref(uint64_t phys_addr) {
     do {
         old = vmm_page_refcounts[pfn];
         if (old >= 255) return; /* saturated pages are never freed */
-        if (old <= 1) {
-            if (__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], old, 0)) {
+        /* old==0: already freed or never tracked — do NOT free again.
+         * (Previously old<=1 freed on 0, which double-freed after COW
+         * teardown / wait reap + parent exit → kfree spam.) */
+        if (old == 0)
+            return;
+        if (old == 1) {
+            /* 1→255 (poison), not 1→0: a later leaf_release must not
+             * treat the frame as an untracked ref==0 and free again. */
+            if (__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], 1, 255)) {
                 vmm_free_frame(phys_addr);
                 return;
             }
             continue;
         }
     } while (!__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], old, old - 1));
+}
+
+/* Release a leaf frame from an address space being destroyed.
+ * Refcounted pages: unref (free on last). Untracked (ref 0): free once
+ * and leave ref at 0. */
+static void vmm_leaf_release(uint64_t phys_addr) {
+    if (!phys_addr) return;
+    if (!vmm_page_refcounts) {
+        vmm_free_frame(phys_addr);
+        return;
+    }
+    uint64_t pfn = phys_addr / PAGE_SIZE;
+    if (pfn >= vmm_max_phys_pages) {
+        vmm_free_frame(phys_addr);
+        return;
+    }
+    uint8_t r = vmm_page_refcounts[pfn];
+    if (r >= 255)
+        return; /* already freed / saturated */
+    if (r == 0) {
+        /* Untracked sole mapping: claim with poison, free once. */
+        if (__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], 0, 255))
+            vmm_free_frame(phys_addr);
+        return;
+    }
+    vmm_page_unref(phys_addr);
 }
 
 uint8_t vmm_page_get_ref(uint64_t phys_addr) {

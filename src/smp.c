@@ -382,6 +382,39 @@ void smp_send_ipi_all_except_self(uint8_t vector) {
                (uint32_t)vector | (3 << 18));
 }
 
+
+/* Generational TLB shootdown: wait for every online CPU to flush. */
+static volatile uint32_t tlb_shootdown_acks;
+
+void smp_tlb_shootdown_ack(void) {
+    __sync_fetch_and_add(&tlb_shootdown_acks, 1);
+}
+
+void smp_tlb_shootdown(void) {
+    uint64_t online = cpus_online;
+    if (online <= 1) {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+        return;
+    }
+    tlb_shootdown_acks = 0;
+    __sync_synchronize();
+    smp_send_ipi_all_except_self(IPI_VECTOR_TLB_FLUSH);
+    {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+        smp_tlb_shootdown_ack();
+    }
+    uint32_t need = (uint32_t)online;
+    for (volatile uint64_t spins = 0; tlb_shootdown_acks < need && spins < 10000000ULL; spins++)
+        __asm__ volatile("pause");
+    if (tlb_shootdown_acks < need)
+        serial_printf("smp: TLB shootdown incomplete acks=%u need=%u\n",
+                      tlb_shootdown_acks, need);
+}
+
 void smp_reschedule_cpu(uint32_t cpu_id) {
     if (cpu_id >= MAX_CPUS || !cpu_data[cpu_id].online) return;
     smp_send_ipi(cpu_data[cpu_id].lapic_id, IPI_VECTOR_RESCHEDULE);

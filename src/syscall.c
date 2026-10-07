@@ -101,7 +101,18 @@ int sys_desktop_composite(const void *user_pixels, uint32_t w, uint32_t h);
 
 /** Ensure user page tables are loaded before memcpy to/from user pointers (IRQ may leave kernel CR3). */
 void syscall_uaccess_ensure_user_cr3(void) {
-    process_t *p = exec_user_as_process();
+    /* Prefer get_current_process(): concurrent fork children have linux_abi
+     * and their own pml4, but fork_parent==NULL and exec_ring3_active_proc
+     * may still name the parent. Switching to the parent AS here made
+     * sys_exec copy_from_user see the wrong argv (argc=0) while LX_execve
+     * diag ? which ran before this switch ? still saw busybox/wc/-c.
+     * That produced busybox applet-list spam under wait-only hold. */
+    process_t *p = get_current_process();
+    if (p && p->is_usermode && p->pml4) {
+        vmm_switch_address_space(p->pml4);
+        return;
+    }
+    p = exec_user_as_process();
     if (p && p->is_usermode && p->pml4)
         vmm_switch_address_space(p->pml4);
 }
@@ -125,6 +136,12 @@ int sys_shutdown(int fd, int how);
 // Process management (MAX_PROCESSES comes from kernel_config.h)
 static process_t processes[MAX_PROCESSES];
 static spinlock_t gui_queue_lock = {0};
+static int fork_queue_child_thread(process_t *parent, process_t *child);
+static void fork_release_thread(thread_t *thr);
+void fork_child_zombie_exit(int status);
+void process_fault_kill_current(int signum);
+
+
 static process_t *current_process = NULL;
 static uint32_t next_pid = 1;
 
@@ -249,9 +266,15 @@ process_t* get_current_process(void) {
      * Doom would otherwise see the BSP's kernel/zeus process and fail
      * focus/pid checks (dead keyboard, composite into the wrong window). */
     thread_t *t = scheduler_get_current_thread();
-    if (t && t->owner_process)
-        return (process_t *)t->owner_process;
-    return current_process;
+    if (t && t->owner_process) {
+        process_t *op = (process_t *)t->owner_process;
+        if (op && !op->is_zombie)
+            return op;
+    }
+    /* Skip zombie globals — fork_child_zombie_exit used to leave parent here. */
+    if (current_process && !current_process->is_zombie)
+        return current_process;
+    return current_process; /* may be NULL/kernel; callers check */
 }
 
 /* The root/kernel process (slot 0) — used as fallback owner/current. */
@@ -300,12 +323,176 @@ uint32_t *fd_refcount_create(void) {
     return rc;
 }
 
+static void process_signal_terminate(process_t *proc, int signum);
+
+
+static void handle_pending_signals(process_t *proc);
+static void process_signal_terminate(process_t *proc, int signum);
+
+int process_deliver_signals(process_t *proc, void *linux_frame) {
+    if (!proc || !linux_frame || proc->sig_in_handler) return 0;
+    typedef struct {
+        uint64_t r15, r14, r13, r12, rbp, rbx;
+        uint64_t a6, a5, a4, a3, a2, a1;
+        uint64_t nr, user_rflags, user_rip, user_rsp;
+    } lx_frame_t;
+    lx_frame_t *fr = (lx_frame_t *)linux_frame;
+    for (int signum = 1; signum < NSIG; signum++) {
+        uint32_t bit = 1u << signum;
+        if (!(proc->pending_signals & bit)) continue;
+        if (proc->blocked_signals & bit) continue;
+        sighandler_t handler = proc->signal_handlers[signum];
+        if (handler == SIG_IGN || handler == SIG_ERR) {
+            proc->pending_signals &= ~bit;
+            continue;
+        }
+        if (handler == SIG_DFL) {
+            /* POSIX defaults: SIGCHLD/CONT ignored — never fatal via deliver. */
+            if (signum == SIGCHLD || signum == SIGCONT) {
+                proc->pending_signals &= ~bit;
+                continue;
+            }
+            handle_pending_signals(proc);
+            return 1;
+        }
+        /* Reject non-canonical handlers (e.g. -1 / kernel addrs). */
+        {
+            uint64_t ha = (uint64_t)(uintptr_t)handler;
+            if (ha < 0x10000ULL || (ha >> 47) != 0) {
+                serial_printf("deliver: drop bad handler sig=%d ha=0x%llx\n",
+                              signum, (unsigned long long)ha);
+                proc->pending_signals &= ~bit;
+                if (signum == SIGCHLD || signum == SIGCONT)
+                    continue;
+                process_signal_terminate(proc, signum);
+                return 1;
+            }
+        }
+        /* Require a real SA_RESTORER trampoline — without it, ret from the
+         * handler lands on a fake address and can #PF (RIP=-1 observed). */
+        if (!proc->sig_restorer[signum]) {
+            serial_printf("deliver: defer sig=%d handler=0x%llx (no restorer)\n",
+                          signum, (unsigned long long)(uintptr_t)handler);
+            if (signum == SIGCHLD || signum == SIGCONT) {
+                proc->pending_signals &= ~bit;
+                continue;
+            }
+            /* Leave pending for a later syscall once restorer is installed;
+             * do not invent a restorer from user_rip. */
+            return 0;
+        }
+        proc->pending_signals &= ~bit;
+
+        /* Ensure CR3 is this process before probing user G / pushing restorer. */
+        if (proc->pml4) {
+            extern void vmm_switch_address_space(uint64_t *);
+            vmm_switch_address_space(proc->pml4);
+        }
+
+        /* busybox ash: ash_ptr_to_globals_misc @ 0x4dd680; SIGCHLD path does
+         * cmpq $0,0x168(%rax) (job-control / trap pointer in globals_misc).
+         * PF if G is NULL. Skip like IGN rather than enter the handler. */
+        {
+            uint64_t ash_g = 0;
+            int g_ok = (copy_from_user(&ash_g, (const void *)(uintptr_t)0x4dd680ULL,
+                                       sizeof(ash_g)) == 0);
+            uint64_t ha = (uint64_t)(uintptr_t)handler;
+            serial_printf("deliver: ash_ptr_to_globals_misc %s=0x%llx\n",
+                          g_ok ? "ok" : "FAIL", (unsigned long long)ash_g);
+            if (signum == SIGCHLD && ha == 0x435a5eULL && (!g_ok || ash_g == 0)) {
+                serial_printf("deliver: skip ash SIGCHLD (G null) pid=%d\n",
+                              (int)proc->pid);
+                continue;
+            }
+        }
+
+        /* Snapshot the LIVE frame (this thread's kstack), not a stale stash. */
+        proc->sig_saved_r15 = fr->r15;
+        proc->sig_saved_r14 = fr->r14;
+        proc->sig_saved_r13 = fr->r13;
+        proc->sig_saved_r12 = fr->r12;
+        proc->sig_saved_rbp = fr->rbp;
+        proc->sig_saved_rbx = fr->rbx;
+        proc->sig_saved_r9  = fr->a6;
+        proc->sig_saved_r8  = fr->a5;
+        proc->sig_saved_r10 = fr->a4;
+        proc->sig_saved_rdx = fr->a3;
+        proc->sig_saved_rsi = fr->a2;
+        proc->sig_saved_rdi = fr->a1;
+        /* sig_saved_rax: set by linux_syscall_dispatch to the syscall return. */
+        proc->sig_saved_rip = fr->user_rip;
+        proc->sig_saved_rsp = fr->user_rsp;
+        proc->sig_saved_rflags = fr->user_rflags;
+        proc->sig_in_handler = true;
+        serial_printf("deliver: pid=%d sig=%d handler=0x%llx restorer=0x%llx flags=0x%x "
+                      "frame rip=0x%llx rsp=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                      "rax=0x%llx rflags=0x%llx\n",
+                      (int)proc->pid, signum,
+                      (unsigned long long)(uintptr_t)handler,
+                      (unsigned long long)proc->sig_restorer[signum],
+                      (unsigned)proc->signal_sa_flags[signum],
+                      (unsigned long long)proc->sig_saved_rip,
+                      (unsigned long long)proc->sig_saved_rsp,
+                      (unsigned long long)proc->sig_saved_rdi,
+                      (unsigned long long)proc->sig_saved_rsi,
+                      (unsigned long long)proc->sig_saved_rdx,
+                      (unsigned long long)proc->sig_saved_rax,
+                      (unsigned long long)proc->sig_saved_rflags);
+        serial_printf("deliver: push restorer=0x%llx on user rsp->0x%llx; "
+                      "enter handler rdi=%d (SA_SIGINFO=%d)\n",
+                      (unsigned long long)proc->sig_restorer[signum],
+                      (unsigned long long)((fr->user_rsp & ~0xFULL) - 8),
+                      signum,
+                      (proc->signal_sa_flags[signum] & 0x4) ? 1 : 0);
+
+        uint64_t restorer = proc->sig_restorer[signum];
+        uint64_t rsp = fr->user_rsp & ~0xFULL;
+        rsp -= 8;
+        {
+            if (copy_to_user((void *)(uintptr_t)rsp, &restorer, sizeof(restorer)) != 0) {
+                proc->sig_in_handler = false;
+                process_signal_terminate(proc, signum);
+                return 1;
+            }
+        }
+        fr->user_rsp = rsp;
+        fr->user_rip = (uint64_t)(uintptr_t)handler;
+        /* Handler args: always rdi=signum. For non-SIGINFO clear rsi/rdx so
+         * leftover clone/wait args cannot be mistaken for sa_sigaction ptrs. */
+        fr->a1 = (uint64_t)signum;
+        if (!(proc->signal_sa_flags[signum] & 0x4)) { /* SA_SIGINFO */
+            fr->a2 = 0; /* rsi */
+            fr->a3 = 0; /* rdx */
+        }
+        fr->user_rflags = 0x202;
+        return 1;
+    }
+    return 0;
+}
+
+static void handle_pending_signals(process_t *proc);
+
 static int fd_close_entry(process_t *proc, int fd) {
     if (!proc || fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !proc->fds[fd].in_use) {
         return -EBADF;
     }
 
     file_descriptor_t *fde = &proc->fds[fd];
+    uint8_t ty = fde->fd_type;
+
+    /*
+     * Pipe endpoints: each open FD is one readers/writers credit (fork +
+     * dup both call pipe_fork_dup_*). Always release that credit on close,
+     * even when the fd ref_count is still shared with another process or
+     * dup'd slot. Gating pipe_close on ref_count==1 left writers>0 after
+     * ash pipelines, so wc blocked forever on read (PIPEOK hang).
+     */
+    if (ty == FD_TYPE_PIPE_READ) {
+        pipe_close_read((pipe_t *)fde->file_handle);
+    } else if (ty == FD_TYPE_PIPE_WRITE) {
+        pipe_close_write((pipe_t *)fde->file_handle);
+    }
+
     bool should_free_object = true;
     if (fde->ref_count) {
         if (*fde->ref_count > 1) {
@@ -315,22 +502,19 @@ static int fd_close_entry(process_t *proc, int fd) {
             kfree(fde->ref_count);
         }
     }
+    fde->ref_count = NULL;
 
-    if (should_free_object) {
-        if (fde->fd_type == FD_TYPE_SOCKET) {
+    if (should_free_object && ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) {
+        if (ty == FD_TYPE_SOCKET) {
             kernel_socket_t *sock = (kernel_socket_t *)fde->file_handle;
             if (sock) {
                 kernel_socket_destroy(sock);
             }
-        } else if (fde->fd_type == FD_TYPE_PIPE_READ) {
-            pipe_close_read((pipe_t *)fde->file_handle);
-        } else if (fde->fd_type == FD_TYPE_PIPE_WRITE) {
-            pipe_close_write((pipe_t *)fde->file_handle);
-        } else if (fde->fd_type == FD_TYPE_VFS) {
+        } else if (ty == FD_TYPE_VFS) {
             if (fde->vfs_fd >= 0) {
                 vfs_close(fde->vfs_fd);
             }
-        } else if (fde->fd_type == FD_TYPE_VFS_DIR) {
+        } else if (ty == FD_TYPE_VFS_DIR) {
             if (fde->file_handle) {
                 kfree(fde->file_handle);
             }
@@ -339,6 +523,18 @@ static int fd_close_entry(process_t *proc, int fd) {
 
     free_fd(proc, fd);
     return 0;
+}
+
+
+process_t* process_find_by_pml4(uint64_t *pml4) {
+    if (!pml4) return NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (!processes[i].pid) continue;
+        if (!processes[i].is_usermode) continue;
+        if (processes[i].pml4 == pml4)
+            return &processes[i];
+    }
+    return NULL;
 }
 
 void set_current_process(process_t *proc) {
@@ -368,6 +564,8 @@ process_t* process_alloc(void) {
 
             memset(&processes[i], 0, sizeof(process_t));
             processes[i].pid = next_pid++;
+            processes[i].pgid = processes[i].pid;
+            processes[i].sid  = processes[i].pid;
             memcpy(processes[i].cwd, inherited, in + 1);
             processes[i].is_running = true;
             for (int j = 0; j < NSIG; j++) {
@@ -439,8 +637,41 @@ void process_inherit_fds(process_t *dst, process_t *src) {
     }
 }
 
+
+/* Linux clone(2) flags we honor (subset). */
+#ifndef CLONE_VM
+#define CLONE_VM             0x00000100ULL
+#define CLONE_VFORK          0x00004000ULL
+#define CLONE_SETTLS         0x00080000ULL
+#define CLONE_PARENT_SETTID  0x00100000ULL
+#define CLONE_CHILD_CLEARTID 0x00200000ULL
+#define CLONE_CHILD_SETTID   0x01000000ULL
+#endif
+
+static bool pml4_shared_with_others(uint64_t *pml4, process_t *self) {
+    if (!pml4) return false;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (&processes[i] == self) continue;
+        if (processes[i].pid && processes[i].pml4 == pml4)
+            return true;
+    }
+    return false;
+}
+
 void process_cleanup(process_t *proc) {
     if (!proc) return;
+    if (proc->pml4) {
+        extern uint64_t *vmm_get_kernel_pml4(void);
+        extern void vmm_switch_address_space(uint64_t *);
+        extern void vmm_destroy_address_space(uint64_t *);
+        if (proc->clone_shared_vm || pml4_shared_with_others(proc->pml4, proc)) {
+            proc->pml4 = NULL; /* other sharer still owns the AS */
+        } else {
+            vmm_switch_address_space(vmm_get_kernel_pml4());
+            vmm_destroy_address_space(proc->pml4);
+            proc->pml4 = NULL;
+        }
+    }
 
     for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
         if (proc->fds[i].in_use)
@@ -455,8 +686,15 @@ void process_cleanup(process_t *proc) {
         if (&processes[i] != proc && processes[i].parent == proc) {
             processes[i].parent = NULL;
             processes[i].sibling = NULL;
-            if (processes[i].is_zombie)
+            if (processes[i].is_zombie) {
+                if (processes[i].pml4) {
+                    if (!(processes[i].clone_shared_vm ||
+                          pml4_shared_with_others(processes[i].pml4, &processes[i])))
+                        vmm_destroy_address_space(processes[i].pml4);
+                    processes[i].pml4 = NULL;
+                }
                 memset(&processes[i], 0, sizeof(process_t));
+            }
         }
     }
 
@@ -524,6 +762,29 @@ void syscall_set_kernel_stack(uint64_t rsp) {
  * @param arg5 Fifth argument (reserved)
  * @return System call result or error code
  */
+
+/* INT 0x80 leaves iretq frame at *iframe: RIP, CS, RFLAGS, RSP, SS.
+ * Stash for SYS_FORK so /bin/sh.exe (native ABI) can concurrent-fork. */
+void syscall_stash_int80_fork_frame(uint64_t *iframe) {
+    process_t *p = get_current_process();
+    thread_t *thr = scheduler_get_current_thread();
+    if (!iframe) return;
+    /* Per-thread stash first (nested fork / SMP-safe). */
+    if (thr) {
+        thr->sc_user_rip = iframe[0];
+        thr->sc_user_rflags = iframe[2];
+        thr->sc_user_rsp = iframe[3];
+        thr->sc_frame_valid = 1;
+    }
+    if (!p) return;
+    p->fork_saved_user_rip = iframe[0];
+    p->fork_saved_user_rflags = iframe[2];
+    p->fork_saved_user_rsp = iframe[3];
+    /* No lx GPR snapshot on INT 0x80 — child gets zeroed scratch regs
+     * (native ABI sh is simpler than ash/musl). */
+    p->fork_saved_gprs_valid = 0;
+}
+
 static uint64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                                uint64_t arg3, uint64_t arg4, uint64_t arg5)
 {
@@ -585,6 +846,7 @@ static uint64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t a
         case SYS_GETPID:
             return sys_getpid();
         case SYS_FORK:
+            get_current_process()->fork_defer_release = 0;
             return sys_fork();
         case SYS_EXEC:
             return sys_exec((const char*)arg1, (char*const*)arg2);
@@ -815,6 +1077,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     profiler_syscall_enter(syscall_num);
     uint64_t ret = syscall_dispatch(syscall_num, arg1, arg2, arg3, arg4, arg5);
     profiler_syscall_leave(syscall_num, ret);
+    {
+        process_t *p = get_current_process();
+        fork_release_after_syscall(p);
+    }
     return ret;
 }
 
@@ -822,7 +1088,9 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
 int sys_exit(int status) {
     SERIAL_DEBUG_PRINT(SYSCALL, "sys_exit called with status %d\n", status);
 
-    process_t *proc = current_process;
+    process_t *proc = get_current_process();
+    if (proc)
+        fork_release_pending(proc);
     if (proc) {
         proc->exit_status = status;
         proc->is_running  = false;
@@ -845,7 +1113,14 @@ int sys_exit(int status) {
         __builtin_unreachable();
     }
 
-    /* Spawned (preemptively-scheduled) process: thread-based exit. */
+    /* Concurrent fork child: become a waitable zombie. */
+    if (proc && proc->sched_thread && proc->parent &&
+        proc->parent != &processes[0]) {
+        fork_child_zombie_exit(status);
+        __builtin_unreachable();
+    }
+
+    /* Spawned (preemptively-scheduled) desktop/shell process: thread exit. */
     if (proc && proc->sched_thread) {
         exec_spawned_exit(status);
         __builtin_unreachable();
@@ -918,13 +1193,18 @@ int sys_read(int fd, void *buf, size_t count) {
         for (;;) {
             int n = pipe_read(p, kbuf, count);
             if (n == -EAGAIN) {
-                /* Our fork() is vfork-shaped: the producer ran to completion
-                 * before this reader, but the suspended parent may still hold
-                 * the write end so writers>0 forever. No concurrent user
-                 * writer can run on this thread, so empty == EOF.
-                 * (Avoid spinning on always-READY idle threads.) */
                 kfree(kbuf);
-                return 0;
+                if (global_scheduler.scheduler_running) {
+                    extern thread_t *scheduler_get_current_thread(void);
+                    thread_t *self = scheduler_get_current_thread();
+                    if (self)
+                        pipe_set_waiting_reader(p, self);
+                    thread_sleep(1);
+                } else
+                    return 0;
+                kbuf = kalloc(count);
+                if (!kbuf) return -ENOMEM;
+                continue;
             }
             if (n > 0 && copy_to_user(buf, kbuf, (size_t)n) != 0) {
                 kfree(kbuf);
@@ -937,6 +1217,21 @@ int sys_read(int fd, void *buf, size_t count) {
         return -EISDIR;
     }
     return -EBADF;
+}
+
+
+static const char *fd_type_str(uint8_t t) {
+    switch (t) {
+    case FD_TYPE_FILE: return "file";
+    case FD_TYPE_PIPE_READ: return "pipe_r";
+    case FD_TYPE_PIPE_WRITE: return "pipe_w";
+    case FD_TYPE_SOCKET: return "sock";
+    case FD_TYPE_VFS: return "vfs";
+    case FD_TYPE_VFS_DIR: return "dir";
+    case FD_TYPE_DEV_NULL: return "null";
+    case FD_TYPE_DEV_TTY: return "tty";
+    default: return "other";
+    }
 }
 
 int sys_write(int fd, const void *buf, size_t count) {
@@ -956,7 +1251,27 @@ int sys_write(int fd, const void *buf, size_t count) {
     if (count > 1048576) {
         return -EINVAL;
     }
-    
+
+    /* PIPEOK diag: log first writes on fd0/1/2 per process (n, type, bytes). */
+    {
+        static uint32_t wdiag_pid;
+        static int wdiag_left;
+        if (fd <= 2) {
+            if (wdiag_pid != proc->pid) { wdiag_pid = proc->pid; wdiag_left = 0; /* diag off: was jamming serial 6 */ }
+            if (wdiag_left > 0) {
+                unsigned char peek[8];
+                size_t pn = count < 8 ? count : 8;
+                for (size_t i = 0; i < 8; i++) peek[i] = 0;
+                (void)copy_from_user(peek, buf, pn);
+                serial_printf("write_diag: pid=%d fd=%d type=%s n=%zu b0=%02x b1=%02x b2=%02x\n",
+                              (int)proc->pid, fd, fd_type_str(proc->fds[fd].fd_type),
+                              count,
+                              pn > 0 ? peek[0] : 0, pn > 1 ? peek[1] : 0, pn > 2 ? peek[2] : 0);
+                wdiag_left--;
+            }
+        }
+    }
+
     /* Pipe/file must win over the fd==1/2 console shortcut so dup2(pipe,1)
      * actually redirects (ash pipelines, `> file` via busybox). */
     if (proc->fds[fd].fd_type == FD_TYPE_PIPE_WRITE) {
@@ -971,15 +1286,35 @@ int sys_write(int fd, const void *buf, size_t count) {
         for (;;) {
             int n = pipe_write(pp, kbuf, count);
             if (n == -EAGAIN) {
-                if (proc->fork_parent) {
+                if (global_scheduler.scheduler_running) {
+                    extern thread_t *scheduler_get_current_thread(void);
+                    thread_t *self = scheduler_get_current_thread();
+                    if (self)
+                        pipe_set_waiting_writer(pp, self);
+                    thread_sleep(1);
+                } else {
                     kfree(kbuf);
                     return -EAGAIN;
                 }
-                kfree(kbuf);
-                return -EAGAIN;
+                continue;
             }
             kfree(kbuf);
-            if (n < 0) return -EPIPE;
+            if (n == -EPIPE || n < 0) {
+                serial_printf("write: EPIPE fd=%d readers=%d writers=%d\n",
+                              fd, pp->readers, pp->writers);
+                /* Broken pipe: queue SIGPIPE for delivery on syscall return
+                 * (process_deliver_signals). handle_pending_signals only for
+                 * default terminate — calling it for custom handlers raced
+                 * with SIGCHLD and could skip deliver. */
+                if (!(proc->blocked_signals & (1u << SIGPIPE)) &&
+                    proc->signal_handlers[SIGPIPE] != SIG_IGN) {
+                    proc->pending_signals |= (1u << SIGPIPE);
+                    sighandler_t sh = proc->signal_handlers[SIGPIPE];
+                    if (sh == SIG_DFL || sh == SIG_ERR || !sh)
+                        handle_pending_signals(proc);
+                }
+                return -EPIPE;
+            }
             return n;
         }
     } else if (proc->fds[fd].fd_type == FD_TYPE_VFS) {
@@ -1364,6 +1699,9 @@ int sys_getpid(void) {
 static process_t* allocate_process(void) {
     for (int i = 1; i < MAX_PROCESSES; i++) { // Skip slot 0 (kernel process)
         if (processes[i].pid == 0) {
+            /* Full clear — recycled slots must not keep stale fds/pipe credits
+             * or clone_shared_vm from a prior occupant. */
+            memset(&processes[i], 0, sizeof(process_t));
             return &processes[i];
         }
     }
@@ -1383,8 +1721,12 @@ static void process_release(process_t *proc) {
         proc->kernel_stack = NULL;
     }
     if (proc->pml4 && proc->is_usermode) {
-        vmm_destroy_address_space(proc->pml4);
-        proc->pml4 = NULL;
+        if (proc->clone_shared_vm || pml4_shared_with_others(proc->pml4, proc)) {
+            proc->pml4 = NULL;
+        } else {
+            vmm_destroy_address_space(proc->pml4);
+            proc->pml4 = NULL;
+        }
     }
     proc_mmap_region_t *r = proc->mmap_regions;
     while (r) {
@@ -1403,15 +1745,313 @@ static void process_release(process_t *proc) {
     }
 }
 
-int sys_fork(void) {
-    process_t *parent = current_process;
+
+/* ---- concurrent fork helpers ---- */
+#define FORK_USER_CS  0x23
+#define FORK_USER_SS  0x1B
+
+static int fork_queue_child_thread(process_t *parent, process_t *child) {
+    extern void thread_exit(void);
+    if (!parent->fork_saved_user_rip) {
+        serial_printf("fork: no saved user RIP — cannot concurrent-fork\n");
+        return -EINVAL;
+    }
+    thread_t *thr = thread_create("fork-child", (void (*)(void *))thread_exit,
+                                  NULL, 0, PRIORITY_NORMAL);
+    if (!thr)
+        return -ENOMEM;
+
+    memset(&thr->saved_regs, 0, sizeof(thread_regs_t));
+    thr->saved_regs.rip    = parent->fork_saved_user_rip;
+    thr->saved_regs.rsp    = parent->fork_saved_user_rsp;
+    thr->saved_regs.rflags = parent->fork_saved_user_rflags | 0x200ULL;
+    thr->saved_regs.cs     = FORK_USER_CS;
+    thr->saved_regs.ss     = FORK_USER_SS;
+    thr->saved_regs.rax    = 0; /* fork child return */
+    /* Linux fork preserves all GPRs except rax. Use the by-value snapshot
+     * taken at clone entry — never a pointer into the per-CPU kstack. */
+    if (parent->fork_saved_gprs_valid) {
+        thr->saved_regs.r15 = parent->fork_saved_r15;
+        thr->saved_regs.r14 = parent->fork_saved_r14;
+        thr->saved_regs.r13 = parent->fork_saved_r13;
+        thr->saved_regs.r12 = parent->fork_saved_r12;
+        thr->saved_regs.rbp = parent->fork_saved_rbp;
+        thr->saved_regs.rbx = parent->fork_saved_rbx;
+        thr->saved_regs.r9  = parent->fork_saved_r9;
+        thr->saved_regs.r8  = parent->fork_saved_r8;
+        thr->saved_regs.r10 = parent->fork_saved_r10;
+        thr->saved_regs.rdx = parent->fork_saved_rdx;
+        thr->saved_regs.rsi = parent->fork_saved_rsi;
+        thr->saved_regs.rdi = parent->fork_saved_rdi;
+    }
+    thr->has_saved_context = true;
+    thr->owner_process     = (struct process *)child;
+    /* musl __post_Fork / __errno_location need a live FS base (pthread self).
+     * Prefer HW FS (still parent TLS during this syscall); fall back to the
+     * parent's thread_t.fs_base (kept in sync by ARCH_SET_FS). */
+    {
+        thread_t *pt = scheduler_get_current_thread();
+        uint64_t fs = thread_rdfsbase();
+        if (!fs && pt)
+            fs = pt->fs_base;
+        thr->fs_base = fs;
+        if (!fs)
+            serial_printf("fork: WARNING child PID %d fs_base=0 (TLS missing)\n", (int)child->pid);
+    }
+
+    child->sched_thread = thr;
+    child->fork_parent  = NULL;
+    /* GPRs are now in thr->saved_regs — invalidate the by-value snapshot. */
+    parent->fork_saved_gprs_valid = 0;
+
+    serial_printf("fork: queued child PID %d thr rip=0x%llx rsp=0x%llx "
+                  "rflags=0x%llx rbx=0x%llx rbp=0x%llx (held until wait)\n",
+                  (int)child->pid,
+                  (unsigned long long)thr->saved_regs.rip,
+                  (unsigned long long)thr->saved_regs.rsp,
+                  (unsigned long long)thr->saved_regs.rflags,
+                  (unsigned long long)thr->saved_regs.rbx,
+                  (unsigned long long)thr->saved_regs.rbp);
+    /* Hold BLOCKED until parent blocking-wait/exit. Prior held child moves
+     * to fork_release_at_exit so writer+reader start together at wait.
+     * Never wake early here (that raced PIPEOK / bad busybox argv). */
+    if (parent->fork_pending_release) {
+        if (parent->fork_release_at_exit) {
+            /* Rare 3rd concurrent hold: wake oldest so we do not leak. */
+            serial_printf("fork: 3rd hold ? releasing oldest pending\n");
+            fork_release_thread((thread_t *)parent->fork_release_at_exit);
+        }
+        parent->fork_release_at_exit = parent->fork_pending_release;
+        parent->fork_pending_release = NULL;
+    }
+    thr->state = THREAD_BLOCKED;
+    parent->fork_pending_release = thr;
+    parent->fork_defer_release = 1;
+    return 0;
+}
+
+
+
+static void fork_release_thread(thread_t *thr) {
+    if (!thr || thr->state != THREAD_BLOCKED)
+        return;
+    thr->state = THREAD_READY;
+    scheduler_add_thread(thr);
+}
+
+void fork_release_pending(process_t *p) {
+    if (!p)
+        return;
+    if (p->fork_release_at_exit) {
+        thread_t *prev = (thread_t *)p->fork_release_at_exit;
+        p->fork_release_at_exit = NULL;
+        fork_release_thread(prev);
+    }
+    if (!p->fork_pending_release)
+        return;
+    thread_t *thr = (thread_t *)p->fork_pending_release;
+    p->fork_pending_release = NULL;
+    p->fork_defer_release = 0;
+    if (!thr || thr->state == THREAD_TERMINATED)
+        return;
+    fork_release_thread(thr);
+}
+
+/* Wait-only hold: never wake held kids on fork syscall exit.
+ * Pair sits in fork_release_at_exit + fork_pending_release until parent
+ * blocking wait / WNOHANG-with-zombie (lx_wait4) or exit. Releasing the
+ * pair at fork2 return let kids run before ash closed pipe ends — wc saw
+ * empty stdin and ash raced into a second pipe + GPF. */
+void fork_release_after_syscall(process_t *p) {
+    if (!p)
+        return;
+    /* Burn defer counter only; do not wake. */
+    if (p->fork_pending_release && p->fork_defer_release > 0)
+        p->fork_defer_release--;
+}
+
+void process_fault_kill_current(int signum) {
+    process_t *proc = get_current_process();
+    thread_t *thr = proc ? (thread_t *)proc->sched_thread : NULL;
+    int st = 128 + (signum & 0x7f);
+    if (!proc) return;
+    /*
+     * Concurrent fork child: full zombie path (closes pipe ends, wakes parent).
+     * Never returns — that path hlt-loops after detaching the thread.
+     */
+    if (thr && proc->parent && proc->parent != &processes[0]) {
+        fork_child_zombie_exit(st);
+        __builtin_unreachable();
+    }
+    /* Sync/exec program on boot thread: close fds then mark zombie
+     * (same close-before-zombie rule as fork_child_zombie_exit). */
+    proc->exit_status = st;
+    proc->is_running = false;
+    for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
+        if (proc->fds[i].in_use)
+            fd_close_entry(proc, i);
+    }
+    proc->is_zombie = true;
+    if (proc->parent && proc->parent->sched_thread)
+        thread_wake((thread_t *)proc->parent->sched_thread);
+    if (proc->parent)
+        proc->parent->pending_signals |= (1u << SIGCHLD);
+}
+
+void fork_child_zombie_exit(int status) {
+    /* SMP: never use global current_process — APs overwrite it mid-exit
+     * and we would close the sibling's fds (PIPEOK: PID4 exit zombied PID5). */
+    process_t *proc = get_current_process();
+    thread_t *thr = proc ? (thread_t *)proc->sched_thread : NULL;
+
+    /* If we held a newborn, release it so it is not stuck BLOCKED forever. */
+    if (proc)
+        fork_release_pending(proc);
+
+serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
+                  proc ? (int)proc->pid : -1, status);
+
+    if (proc) {
+        proc->exit_status = status;
+        proc->is_running  = false;
+        /* Close FDs BEFORE is_zombie. Otherwise waitpid on another CPU can
+         * reap and resume the parent while pipe reader/writer credits are
+         * still held — pipe_sigpipe second write then succeeds (n=1 got=0)
+         * instead of EPIPE/SIGPIPE. */
+        for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
+            if (proc->fds[i].in_use)
+                fd_close_entry(proc, i);
+        }
+        /* Do NOT destroy the user AS here. COW pages are still shared with
+         * the parent (and sibling fork children). Freeing now unrefs those
+         * frames and causes parent/sibling stack #PF + kfree double-free
+         * spam. wait()/process_cleanup reaps the AS later. */
+        if (thr) {
+            thr->state = THREAD_TERMINATED;
+            thr->owner_process = NULL;
+            scheduler_detach_thread(thr);
+            proc->sched_thread = NULL;
+        }
+        if (proc->fork_parent) {
+            process_t *vp = proc->fork_parent;
+            proc->fork_parent = NULL;
+            if (vp->sched_thread)
+                thread_wake((thread_t *)vp->sched_thread);
+        }
+        /* Publish is_zombie + wake BLOCKED waiter under scheduler_lock —
+         * same lock sys_wait uses for block-before-scan (lost-wakeup safe).
+         * Wake is no-op unless parent is BLOCKED/SLEEPING (never re-add READY). */
+        {
+            process_t *par = proc->parent;
+            thread_t *pt = (par && par->sched_thread)
+                               ? (thread_t *)par->sched_thread : NULL;
+            uint64_t zf = 0;
+            scheduler_irq_lock(&zf);
+            proc->is_zombie = true;
+            if (pt)
+                thread_wake_blocked_unlocked(pt);
+            scheduler_irq_unlock(zf);
+            if (pt) {
+                serial_printf("fork-child-exit: wake parent=%d (blocked->ready)\n",
+                              (int)par->pid);
+                scheduler_kick_thread(pt);
+            }
+        }
+        if (proc->parent)
+            proc->parent->pending_signals |= (1u << SIGCHLD);
+    }
+
+    /* This CPU hlt-loops — never SYSRET. Do NOT set_current_process(parent):
+     * ash/zeus often run on the BSP boot thread with owner_process==NULL, so
+     * get_current_process() falls back to the global. Pointing it at parent
+     * made nest_fork's exiting grandchild poison the global to nest_fork
+     * (PID 5); ash's next fork then logged "parent 5" with ash RIP 0x4b0e09
+     * and #PF (page not present). Use the kernel process + kernel PML4. */
+    {
+        extern process_t *get_kernel_process(void);
+        extern uint64_t *vmm_get_kernel_pml4(void);
+        process_t *fallback = get_kernel_process();
+        set_current_process(fallback);
+        vmm_switch_address_space(vmm_get_kernel_pml4());
+        exec_set_ring3_active(NULL);
+    }
+
+    __asm__ volatile("sti");
+    for (;;)
+        __asm__ volatile("hlt");
+}
+
+
+
+/*
+ * Shared fork/clone body.
+ * share_vm: CLONE_VM — share parent pml4 (no COW).
+ * Everything else (fds memset+copy, pipe_fork_dup_*, signals, queue,
+ * stash clear) matches classic sys_fork. newsp must already be reflected
+ * in parent->fork_saved_user_rsp when nonzero.
+ * On success returns child pid and sets *out_child; on failure negative errno.
+ */
+static int fork_spawn_child(bool share_vm, process_t **out_child) {
+    /* Must use get_current_process() — the current_process global is
+     * overwritten by every CPU's scheduler (see get_current_process). */
+    process_t *parent = get_current_process();
+    if (!parent)
+        return -EINVAL;
+    /* Pin THIS thread's entry stash by value before any long work
+     * (vmm_clone). process_t->fork_saved_* can be cleared by a sibling
+     * path; thread locals cannot. */
+    thread_t *pthr = scheduler_get_current_thread();
+    uint64_t pinned_rip = 0, pinned_rsp = 0, pinned_rfl = 0;
+    uint64_t pinned_r15=0, pinned_r14=0, pinned_r13=0, pinned_r12=0;
+    uint64_t pinned_rbp=0, pinned_rbx=0;
+    uint64_t pinned_r9=0, pinned_r8=0, pinned_r10=0;
+    uint64_t pinned_rdx=0, pinned_rsi=0, pinned_rdi=0;
+    int pinned_gprs = 0;
+    if (pthr && pthr->sc_frame_valid) {
+        pinned_rip = pthr->sc_user_rip;
+        pinned_rsp = pthr->sc_user_rsp;
+        pinned_rfl = pthr->sc_user_rflags;
+        pinned_r15 = pthr->sc_r15; pinned_r14 = pthr->sc_r14;
+        pinned_r13 = pthr->sc_r13; pinned_r12 = pthr->sc_r12;
+        pinned_rbp = pthr->sc_rbp; pinned_rbx = pthr->sc_rbx;
+        pinned_r9 = pthr->sc_r9; pinned_r8 = pthr->sc_r8;
+        pinned_r10 = pthr->sc_r10; pinned_rdx = pthr->sc_rdx;
+        pinned_rsi = pthr->sc_rsi; pinned_rdi = pthr->sc_rdi;
+        pinned_gprs = 1;
+    } else {
+        pinned_rip = parent->fork_saved_user_rip;
+        pinned_rsp = parent->fork_saved_user_rsp;
+        pinned_rfl = parent->fork_saved_user_rflags;
+        pinned_gprs = parent->fork_saved_gprs_valid;
+        if (pinned_gprs) {
+            pinned_r15 = parent->fork_saved_r15; pinned_r14 = parent->fork_saved_r14;
+            pinned_r13 = parent->fork_saved_r13; pinned_r12 = parent->fork_saved_r12;
+            pinned_rbp = parent->fork_saved_rbp; pinned_rbx = parent->fork_saved_rbx;
+            pinned_r9 = parent->fork_saved_r9; pinned_r8 = parent->fork_saved_r8;
+            pinned_r10 = parent->fork_saved_r10; pinned_rdx = parent->fork_saved_rdx;
+            pinned_rsi = parent->fork_saved_rsi; pinned_rdi = parent->fork_saved_rdi;
+        }
+    }
+    /* Re-materialize onto process_t for fork_queue_child_thread. */
+    parent->fork_saved_user_rip = pinned_rip;
+    parent->fork_saved_user_rsp = pinned_rsp;
+    parent->fork_saved_user_rflags = pinned_rfl;
+    parent->fork_saved_gprs_valid = pinned_gprs;
+    if (pinned_gprs) {
+        parent->fork_saved_r15 = pinned_r15; parent->fork_saved_r14 = pinned_r14;
+        parent->fork_saved_r13 = pinned_r13; parent->fork_saved_r12 = pinned_r12;
+        parent->fork_saved_rbp = pinned_rbp; parent->fork_saved_rbx = pinned_rbx;
+        parent->fork_saved_r9 = pinned_r9; parent->fork_saved_r8 = pinned_r8;
+        parent->fork_saved_r10 = pinned_r10; parent->fork_saved_rdx = pinned_rdx;
+        parent->fork_saved_rsi = pinned_rsi; parent->fork_saved_rdi = pinned_rdi;
+    }
     process_t *child = allocate_process();
 
+    if (out_child)
+        *out_child = NULL;
     if (!child)
         return -ENOMEM;
 
-    /* Field-by-field init instead of wholesale memcpy to avoid aliasing
-     * synchronization-sensitive pointers and stale state. */
     child->pid = next_pid++;
     strcpy(child->cwd, parent->cwd);
     child->brk_start = parent->brk_start;
@@ -1434,59 +2074,87 @@ int sys_fork(void) {
     child->user_stack_top = parent->user_stack_top;
     child->mmap_anon_next = parent->mmap_anon_next;
     child->linux_abi = parent->linux_abi;
+    child->fork_pending_release = NULL;
+    child->fork_release_at_exit = NULL;
+    child->fork_defer_release = 0;
     child->linux_ti_valid = false;
     child->linux_clear_child_tid = 0;
+    child->clone_shared_vm = false;
     kstrncpy(child->linux_exe_path, parent->linux_exe_path,
              sizeof(child->linux_exe_path));
     child->mmap_regions = NULL;
     child->pending_signals = 0;
+    child->pgid = parent->pgid ? parent->pgid : parent->pid;
+    child->sid  = parent->sid  ? parent->sid  : parent->pid;
+    child->sig_in_handler = false;
     child->blocked_signals = parent->blocked_signals;
     for (int i = 0; i < NSIG; i++) {
         child->signal_handlers[i] = parent->signal_handlers[i];
         child->signal_sa_flags[i] = parent->signal_sa_flags[i];
+        child->sig_restorer[i] = parent->sig_restorer[i];
     }
     child->user_symtab = NULL;
     child->user_symtab_count = 0;
     child->user_sym_string_pool = NULL;
 
     if (parent->pml4 && parent->is_usermode) {
-        uint64_t *newpml4 = vmm_clone_address_space(parent->pml4);
-        if (!newpml4) {
-            child->pid = 0;
-            parent->child = child->sibling;
-            return -ENOMEM;
-        }
         uint8_t *ks = (uint8_t *)kalloc(INDEVOS_KSTACK_BYTES);
         if (!ks) {
-            vmm_destroy_address_space(newpml4);
             child->pid = 0;
             parent->child = child->sibling;
+            memset(child, 0, sizeof(process_t));
             return -ENOMEM;
         }
-        child->pml4 = newpml4;
         child->kernel_stack = ks;
         child->kernel_stack_top = (uint64_t)ks + INDEVOS_KSTACK_BYTES;
+        if (share_vm) {
+            child->pml4 = parent->pml4;
+            child->clone_shared_vm = true;
+            parent->clone_shared_vm = true;
+            serial_printf("clone: CLONE_VM share pml4=%p\n", (void *)parent->pml4);
+        } else {
+            uint64_t *newpml4 = vmm_clone_address_space(parent->pml4);
+            if (!newpml4) {
+                kfree(ks);
+                child->kernel_stack = NULL;
+                child->kernel_stack_top = 0;
+                child->pid = 0;
+                parent->child = child->sibling;
+                memset(child, 0, sizeof(process_t));
+                return -ENOMEM;
+            }
+            child->pml4 = newpml4;
+        }
     } else if (parent->kernel_stack) {
         uint8_t *ks = (uint8_t *)kalloc(INDEVOS_KSTACK_BYTES);
         if (!ks) {
             child->pid = 0;
             parent->child = child->sibling;
+            memset(child, 0, sizeof(process_t));
             return -ENOMEM;
         }
         child->kernel_stack = ks;
         child->kernel_stack_top = (uint64_t)ks + INDEVOS_KSTACK_BYTES;
     }
 
-    for (proc_mmap_region_t *r = parent->mmap_regions; r; r = r->next) {
-        proc_mmap_region_t *nr = (proc_mmap_region_t *)kalloc(sizeof(proc_mmap_region_t));
-        if (!nr)
-            continue;
-        nr->virt = r->virt;
-        nr->len = r->len;
-        nr->next = child->mmap_regions;
-        child->mmap_regions = nr;
+    if (!share_vm) {
+        for (proc_mmap_region_t *r = parent->mmap_regions; r; r = r->next) {
+            proc_mmap_region_t *nr = (proc_mmap_region_t *)kalloc(sizeof(proc_mmap_region_t));
+            if (!nr)
+                continue;
+            nr->virt = r->virt;
+            nr->len = r->len;
+            nr->next = child->mmap_regions;
+            child->mmap_regions = nr;
+        }
+    } else {
+        child->mmap_regions = NULL;
     }
 
+    /* Clear slot leftovers — stale in_use pipe fds from a recycled
+     * process_t would otherwise survive (fork only overwrites parent-open
+     * indices) and skew pipe readers/writers credits. */
+    memset(child->fds, 0, sizeof(child->fds));
     for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
         if (!parent->fds[i].in_use)
             continue;
@@ -1494,149 +2162,286 @@ int sys_fork(void) {
         child->fds[i].in_use = true;
         if (child->fds[i].ref_count)
             (*child->fds[i].ref_count)++;
-        if (child->fds[i].fd_type == FD_TYPE_PIPE_READ)
-            pipe_fork_dup_reader((pipe_t *)child->fds[i].file_handle);
-        else if (child->fds[i].fd_type == FD_TYPE_PIPE_WRITE)
-            pipe_fork_dup_writer((pipe_t *)child->fds[i].file_handle);
+        if (child->fds[i].fd_type == FD_TYPE_PIPE_READ) {
+            pipe_t *pp = (pipe_t *)child->fds[i].file_handle;
+            pipe_fork_dup_reader(pp);
+            serial_printf("fork: dup reader fd=%d -> readers=%d writers=%d\n",
+                          i, pp ? pp->readers : -1, pp ? pp->writers : -1);
+        } else if (child->fds[i].fd_type == FD_TYPE_PIPE_WRITE) {
+            pipe_t *pp = (pipe_t *)child->fds[i].file_handle;
+            pipe_fork_dup_writer(pp);
+            serial_printf("fork: dup writer fd=%d -> readers=%d writers=%d\n",
+                          i, pp ? pp->readers : -1, pp ? pp->writers : -1);
+        }
     }
 
     child->fork_parent = NULL;
-    child->fork_user_frame = NULL;
-    child->fork_saved_user_rip = 0;
+    
+    serial_printf("fork: child PID %d from parent %d (vm_share=%d)\n",
+                  (int)child->pid, (int)parent->pid, share_vm ? 1 : 0);
 
-    serial_printf("fork: child PID %d from parent %d\n",
-                  (int)child->pid, (int)parent->pid);
+    /* Re-apply pinned thread stash — process_t may have been cleared during
+     * vmm_clone / FD dup by another path. */
+    parent->fork_saved_user_rip = pinned_rip;
+    parent->fork_saved_user_rsp = pinned_rsp;
+    parent->fork_saved_user_rflags = pinned_rfl;
+    parent->fork_saved_gprs_valid = pinned_gprs;
+    if (pinned_gprs) {
+        parent->fork_saved_r15 = pinned_r15; parent->fork_saved_r14 = pinned_r14;
+        parent->fork_saved_r13 = pinned_r13; parent->fork_saved_r12 = pinned_r12;
+        parent->fork_saved_rbp = pinned_rbp; parent->fork_saved_rbx = pinned_rbx;
+        parent->fork_saved_r9 = pinned_r9; parent->fork_saved_r8 = pinned_r8;
+        parent->fork_saved_r10 = pinned_r10; parent->fork_saved_rdx = pinned_rdx;
+        parent->fork_saved_rsi = pinned_rsi; parent->fork_saved_rdi = pinned_rdi;
+    }
 
-    /*
-     * vfork semantics: the parent suspends while the child runs on the
-     * same kernel thread.  When the child calls exec or exit, it longjmps
-     * back here and the parent gets child_pid as the return value.
-     */
-    int resumed = exec_setjmp((exec_jmpbuf_t *)parent->fork_jmpbuf);
-    if (resumed != 0) {
-        /* Returned from the child's exec/exit longjmp.
-         * 'resumed' is the child PID that was passed to exec_longjmp. */
-        if (parent->kernel_stack_top)
-            syscall_set_kernel_stack(parent->kernel_stack_top);
-        if (parent->pml4)
-            vmm_switch_address_space(parent->pml4);
-        /* Restore Ring-3 identity so #PF/COW use the parent's PML4 again. */
-        exec_set_ring3_active(parent);
-        /* Re-write user RIP/RSP/RFLAGS into the original SYSCALL frame.
-         * Layout must match linux_syscall_frame_t / syscall_entry. */
-        if (parent->fork_user_frame && parent->fork_saved_user_rip) {
-            uint64_t *f = (uint64_t *)parent->fork_user_frame;
-            /* r15..rbx (6), a6..a1 (6), nr (1), rflags, rip, rsp */
-            f[13] = parent->fork_saved_user_rflags;
-            f[14] = parent->fork_saved_user_rip;
-            f[15] = parent->fork_saved_user_rsp;
-            serial_printf("fork: restored user_rip=0x%llx rsp=0x%llx\n",
-                          (unsigned long long)parent->fork_saved_user_rip,
-                          (unsigned long long)parent->fork_saved_user_rsp);
-        } else {
-            serial_printf("fork: WARNING no saved user frame (frame=%p rip=0x%llx)\n",
-                          parent->fork_user_frame,
-                          (unsigned long long)parent->fork_saved_user_rip);
+    if (!parent->fork_saved_user_rip) {
+        /* Linux ABI must always snapshot the live syscall frame before fork.
+         * Taking the setjmp path with rip=0 yields User-mode fault at RIP 0
+         * (PIPEOK ash pipelines). Native INT80 can still use setjmp. */
+        if (parent->linux_abi) {
+            serial_printf("fork: linux_abi missing saved user RIP (pid=%d) — EINVAL\n",
+                          (int)parent->pid);
+            for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
+                if (child->fds[i].in_use)
+                    fd_close_entry(child, i);
+            }
+            if (child->pml4 && !child->clone_shared_vm) {
+                vmm_destroy_address_space(child->pml4);
+                child->pml4 = NULL;
+            } else {
+                child->pml4 = NULL;
+            }
+            if (child->kernel_stack) {
+                kfree(child->kernel_stack);
+                child->kernel_stack = NULL;
+                child->kernel_stack_top = 0;
+            }
+            if (parent->child == child)
+                parent->child = child->sibling;
+            memset(child, 0, sizeof(process_t));
+            return -EINVAL;
         }
-        parent->fork_user_frame = NULL;
-        serial_printf("fork: parent PID %d resumed, child was %d\n",
-                      (int)parent->pid, resumed);
-        return resumed;
+        serial_printf("fork: legacy vfork path (no saved user RIP)\n");
+        child->fork_saved_user_rip = 0;
+        int resumed = exec_setjmp((exec_jmpbuf_t *)parent->fork_jmpbuf);
+        if (resumed != 0) {
+            if (parent->kernel_stack_top)
+                syscall_set_kernel_stack(parent->kernel_stack_top);
+            if (parent->pml4)
+                vmm_switch_address_space(parent->pml4);
+            exec_set_ring3_active(parent);
+            /* Legacy vfork path: GPR snapshot already held by-value. */
+            return resumed;
+        }
+        child->fork_parent = parent;
+        current_process = child;
+        exec_set_ring3_active(child);
+        if (!child->kernel_stack_top ||
+            child->kernel_stack_top == parent->kernel_stack_top) {
+            current_process = parent;
+            exec_set_ring3_active(parent);
+            child->fork_parent = NULL;
+            memset(child, 0, sizeof(process_t));
+            return -ENOMEM;
+        }
+        syscall_set_kernel_stack(child->kernel_stack_top);
+        if (child->pml4)
+            vmm_switch_address_space(child->pml4);
+        if (out_child)
+            *out_child = child;
+        return 0;
     }
 
-    /* First call: hand execution to the child. */
-    child->fork_parent = parent;
-    current_process = child;
-    /* Child's address space is active — #PF must COW against child PTE. */
-    exec_set_ring3_active(child);
-
-    /* Route future syscalls through the child's kernel stack so the
-     * parent's stack (where the setjmp context lives) is preserved. */
-    if (!child->kernel_stack_top) {
-        serial_printf("fork: FATAL child PID %d has no kernel stack\n",
-                      (int)child->pid);
-        current_process = parent;
-        exec_set_ring3_active(parent);
-        child->fork_parent = NULL;
-        return -ENOMEM;
+    {
+        int qr = fork_queue_child_thread(parent, child);
+        if (qr < 0) {
+            serial_printf("fork: queue child failed %d\n", qr);
+            /* Undo pipe credits before dropping the slot. */
+            for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
+                if (child->fds[i].in_use)
+                    fd_close_entry(child, i);
+            }
+            if (child->pml4 && !child->clone_shared_vm) {
+                vmm_destroy_address_space(child->pml4);
+                child->pml4 = NULL;
+            } else {
+                child->pml4 = NULL;
+            }
+            if (child->kernel_stack) {
+                kfree(child->kernel_stack);
+                child->kernel_stack = NULL;
+                child->kernel_stack_top = 0;
+            }
+            if (parent->child == child)
+                parent->child = child->sibling;
+            memset(child, 0, sizeof(process_t));
+            return qr;
+        }
     }
-    if (child->kernel_stack_top == parent->kernel_stack_top) {
-        serial_printf("fork: FATAL shared kernel stack parent=%d child=%d\n",
-                      (int)parent->pid, (int)child->pid);
-        current_process = parent;
-        exec_set_ring3_active(parent);
-        child->fork_parent = NULL;
-        return -ENOMEM;
-    }
-    serial_printf("fork: kstack parent=0x%llx child=0x%llx\n",
-                  (unsigned long long)parent->kernel_stack_top,
-                  (unsigned long long)child->kernel_stack_top);
-    syscall_set_kernel_stack(child->kernel_stack_top);
-    if (child->pml4)
-        vmm_switch_address_space(child->pml4);
 
-    return 0;   /* child sees fork() == 0 */
+    /* Drop THIS thread's entry stash + process copy so the next fork in
+     * this thread must re-capture on its own SYSCALL entry. Never touch
+     * another thread's sc_* fields. */
+    parent->fork_saved_gprs_valid = 0;
+    parent->fork_saved_user_rip = 0;
+    parent->fork_saved_user_rsp = 0;
+    parent->fork_saved_user_rflags = 0;
+    child->fork_saved_user_rip = 0;
+    child->fork_saved_gprs_valid = 0;
+    if (pthr) {
+        pthr->sc_frame_valid = 0;
+        pthr->sc_user_rip = 0;
+        pthr->sc_user_rsp = 0;
+        pthr->sc_user_rflags = 0;
+    }
+
+    if (out_child)
+        *out_child = child;
+    return (int)child->pid;
 }
 
+int sys_fork(void) {
+    /* Plain COW fork — same helper clone(SIGCHLD) uses without CLONE_VM. */
+    return fork_spawn_child(false, NULL);
+}
+
+int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
+              uint64_t child_tidptr, uint64_t tls) {
+    process_t *parent = get_current_process();
+    process_t *child = NULL;
+    bool share_vm = (flags & CLONE_VM) != 0;
+    bool do_vfork = (flags & CLONE_VFORK) != 0;
+
+    serial_printf("clone: flags=0x%llx newsp=0x%llx vm=%d vfork=%d\n",
+                  (unsigned long long)flags, (unsigned long long)newsp,
+                  share_vm ? 1 : 0, do_vfork ? 1 : 0);
+
+    /* Child stack: honor newsp when non-zero (musl __clone pushes fn/arg). */
+    if (newsp)
+        parent->fork_saved_user_rsp = newsp;
+
+    int pid = fork_spawn_child(share_vm, &child);
+    if (pid < 0)
+        return pid;
+    /* Legacy setjmp path returns 0 in the child with child==NULL out — done. */
+    if (!child)
+        return pid;
+
+    if (flags & CLONE_CHILD_CLEARTID)
+        child->linux_clear_child_tid = child_tidptr;
+
+    if (flags & CLONE_SETTLS) {
+        thread_t *thr = (thread_t *)child->sched_thread;
+        if (thr)
+            thr->fs_base = tls;
+    }
+
+    if ((flags & CLONE_PARENT_SETTID) && parent_tidptr) {
+        int tid = (int)child->pid;
+        (void)copy_to_user((void *)parent_tidptr, &tid, sizeof(tid));
+    }
+    if ((flags & CLONE_CHILD_SETTID) && child_tidptr) {
+        int tid = (int)child->pid;
+        (void)copy_to_user((void *)child_tidptr, &tid, sizeof(tid));
+    }
+
+    if (do_vfork) {
+        /* Child was queued BLOCKED with defer; must run while we wait
+         * in-kernel -- release now or this loops forever. */
+        fork_release_pending(parent);
+        child->fork_parent = parent;
+        serial_printf("clone: VFORK parent %d waiting on child %d\n",
+                      (int)parent->pid, (int)child->pid);
+        while (child->fork_parent == parent) {
+            if (child->is_zombie) {
+                child->fork_parent = NULL;
+                break;
+            }
+            thread_sleep(1);
+        }
+        serial_printf("clone: VFORK parent %d resumed (child %d)\n",
+                      (int)parent->pid, (int)child->pid);
+    }
+
+    return pid;
+}
+
+
+
+
+
 int sys_wait(int *status) {
-    process_t *parent = current_process;
-    
+    /* SMP: never use the global current_process — APs overwrite it. */
+    process_t *parent = get_current_process();
+    /* Wake held newborns before blocking. */
+    if (parent)
+        fork_release_pending(parent);
+
     serial_puts("sys_wait called by PID ");
     serial_printf("%d", (int)parent->pid);
     serial_puts("\n");
 
     for (;;) {
-    if (!parent->child)
-        return -ECHILD;
+        if (!parent->child)
+            return -ECHILD;
 
-    // Look for zombie children
-    process_t *child = parent->child;
-    while (child) {
-        if (child->is_zombie) {
-            serial_puts("Found zombie child PID ");
-            serial_printf("%d", (int)child->pid);
-            serial_puts(" with exit status ");
-            serial_printf("%d", child->exit_status);
-            serial_puts("\n");
-            
-            // Copy exit status if requested
-            if (status) {
-                if (copy_to_user(status, &child->exit_status, sizeof(child->exit_status)) != 0) {
-                    return -EFAULT;
-                }
+        /* Lost-wakeup protocol: under scheduler_lock, set BLOCKED THEN scan
+         * for zombies. Child marks is_zombie + wake under the same lock.
+         * If a zombie is found, restore RUNNING and reap; else unlock and
+         * yield (stay BLOCKED until wake: BLOCKED->READY only). */
+        process_t *zombie = NULL;
+        uint64_t wf = 0;
+        scheduler_irq_lock(&wf);
+        thread_block_current_unlocked();
+        for (process_t *c = parent->child; c; c = c->sibling) {
+            if (c->is_zombie) {
+                zombie = c;
+                break;
             }
-            
-            pid_t child_pid = child->pid;
-            
-            // Remove child from parent's child list
-            if (parent->child == child) {
-                parent->child = child->sibling;
-            } else {
-                process_t *prev = parent->child;
-                while (prev && prev->sibling != child) {
-                    prev = prev->sibling;
-                }
-                if (prev) {
-                    prev->sibling = child->sibling;
-                }
+        }
+        if (zombie || !parent->child) {
+            thread_unblock_current_running_unlocked();
+            scheduler_irq_unlock(wf);
+            if (!zombie) {
+                serial_puts("No children left\n");
+                return -ECHILD;
             }
-            
-            process_release(child);
-            memset(child, 0, sizeof(process_t));
-            
-            return child_pid;
+        } else {
+            scheduler_irq_unlock(wf);
+            if (!global_scheduler.scheduler_running)
+                return -ECHILD;
+            /* Park: state is BLOCKED so yield will not re-queue us. */
+            thread_yield();
+            continue;
         }
-        child = child->sibling;
-    }
-    
-        if (!parent->child) {
-            serial_puts("No children left\n");
-            return -ECHILD;
+
+        serial_puts("Found zombie child PID ");
+        serial_printf("%d", (int)zombie->pid);
+        serial_puts(" with exit status ");
+        serial_printf("%d", zombie->exit_status);
+        serial_puts("\n");
+
+        if (status) {
+            if (copy_to_user(status, &zombie->exit_status, sizeof(zombie->exit_status)) != 0)
+                return -EFAULT;
         }
-        if (global_scheduler.scheduler_running)
-            thread_sleep(1);
-        else
-            return -ECHILD;
+
+        pid_t child_pid = zombie->pid;
+
+        if (parent->child == zombie) {
+            parent->child = zombie->sibling;
+        } else {
+            process_t *prev = parent->child;
+            while (prev && prev->sibling != zombie)
+                prev = prev->sibling;
+            if (prev)
+                prev->sibling = zombie->sibling;
+        }
+
+        process_release(zombie);
+        memset(zombie, 0, sizeof(process_t));
+        return child_pid;
     }
 }
 
@@ -1650,7 +2455,7 @@ static void process_signal_terminate(process_t *proc, int signum) {
     proc->exit_status = 128 + signum;
     proc->is_running  = false;
 
-    if (proc == current_process) {
+    if (proc == get_current_process()) {
         proc->is_zombie = true;
         return;
     }
@@ -1697,6 +2502,7 @@ static void handle_pending_signals(process_t *proc) {
                     case SIGINT:
                     case SIGQUIT:
                     case SIGKILL:
+                    case SIGPIPE:
                         // Terminate process
                         serial_puts("Signal causes termination\n");
                         process_signal_terminate(proc, signum);
@@ -1710,8 +2516,9 @@ static void handle_pending_signals(process_t *proc) {
                         return;
                 }
             } else {
-                /* Should not happen: sys_signal rejects custom handlers. */
-                process_signal_terminate(proc, signum);
+                /* Custom handler: leave bit set; deliver on return-to-user
+                 * (see process_deliver_signals). Re-set pending for that path. */
+                proc->pending_signals |= (1u << signum);
                 return;
             }
         }
@@ -1724,7 +2531,7 @@ sighandler_t sys_signal(int signum, sighandler_t handler) {
         return SIG_ERR;
     }
     
-    process_t *proc = current_process;
+    process_t *proc = get_current_process();
     sighandler_t old_handler = proc->signal_handlers[signum];
     
     // Some signals cannot be caught or ignored
@@ -1732,11 +2539,6 @@ sighandler_t sys_signal(int signum, sighandler_t handler) {
         return SIG_ERR;
     }
 
-    /* Custom handlers require a Ring-3 sigreturn trampoline (not implemented). */
-    if (handler != SIG_DFL && handler != SIG_IGN) {
-        return SIG_ERR;
-    }
-    
     proc->signal_handlers[signum] = handler;
     
     serial_puts("Signal ");
@@ -1776,6 +2578,65 @@ int sys_kill(pid_t pid, int signum) {
     
     return 0;
 }
+
+
+int sys_setpgid(pid_t pid, pid_t pgid) {
+    process_t *cur = get_current_process();
+    if (!cur) return -EINVAL;
+    if (pid == 0) pid = (pid_t)cur->pid;
+    if (pgid == 0) pgid = pid;
+    if (pgid < 0) return -EINVAL;
+    process_t *t = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i].pid == (uint32_t)pid &&
+            (processes[i].is_running || processes[i].is_zombie)) {
+            t = &processes[i];
+            break;
+        }
+    }
+    if (!t) return -ESRCH;
+    /* Only self or child. */
+    if (t != cur && t->parent != cur) return -EPERM;
+    t->pgid = (uint32_t)pgid;
+    return 0;
+}
+int sys_getpgid(pid_t pid) {
+    process_t *cur = get_current_process();
+    if (pid == 0) return cur ? (int)cur->pgid : -ESRCH;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i].pid == (uint32_t)pid &&
+            (processes[i].is_running || processes[i].is_zombie))
+            return (int)processes[i].pgid;
+    }
+    return -ESRCH;
+}
+int sys_setsid(void) {
+    process_t *cur = get_current_process();
+    if (!cur) return -EINVAL;
+    /* Fail if already a leader of a group with others — simplified OK. */
+    cur->sid = cur->pid;
+    cur->pgid = cur->pid;
+    return (int)cur->pid;
+}
+
+/* Foreground process group for the console (Ctrl+C target). */
+static uint32_t console_fg_pgid = 0;
+void process_set_fg_pgid(uint32_t pgid) { console_fg_pgid = pgid; }
+uint32_t process_get_fg_pgid(void) {
+    if (console_fg_pgid) return console_fg_pgid;
+    process_t *c = get_current_process();
+    return c ? c->pgid : 0;
+}
+void process_kill_pgid(uint32_t pgid, int signum) {
+    if (!pgid) return;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *t = &processes[i];
+        if (!t->is_running || t->pgid != pgid) continue;
+        t->pending_signals |= (1u << signum);
+        handle_pending_signals(t);
+    }
+}
+
 
 /* Shell helper: list every live entry in the process table (zeus `ps`). */
 void process_list_all(void) {
@@ -1879,7 +2740,8 @@ int sys_exec(const char *pathname, char *const argv[]) {
     if (kpath[0] == '\0')
         return -ENOENT;
 
-    for (int i = 3; i < MAX_OPEN_FILES_SYSCALL; i++) {
+    /* Close all CLOEXEC fds (Linux execve), including 0..2 if marked. */
+    for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
         if (p->fds[i].in_use && p->fds[i].cloexec)
             fd_close_entry(p, i);
     }
@@ -1901,10 +2763,28 @@ int sys_exec(const char *pathname, char *const argv[]) {
         }
     }
     kargv[argc] = NULL;
+    serial_printf("sys_exec: pid=%d path='%s' argc=%d a0='%s' a1='%s' a2='%s'\n",
+                  p ? (int)p->pid : -1, kpath, argc,
+                  argc > 0 ? kargv[0] : "",
+                  argc > 1 ? kargv[1] : "",
+                  argc > 2 ? kargv[2] : "");
     char resolved[256];
     exec_resolve_path(p, kpath, resolved, sizeof(resolved));
-    /* Nested sync exec (e.g. vfork child running wc) must not clobber the
-     * outer ash/busybox exec_return_ctx or the next exec_file panics. */
+
+    /*
+     * In-place image replacement for an already-usermode process (concurrent
+     * fork children, ash, busybox applets). Keeps pid/fds/kstack; SYSRET into
+     * the new entry via proc->exec_replaced (see LX_execve).
+     */
+    if (p->is_usermode && p->pml4) {
+        int ir = exec_replace(p, resolved, argc ? kargv : NULL);
+        if (ir < 0)
+            return ir;
+        /* Success: do not nest. Caller rewrites the SYSCALL frame. */
+        return 0;
+    }
+
+    /* Kernel/shell first launch: nested blocking exec_file (unchanged). */
     bool nested_exec = get_program_running();
     if (nested_exec)
         exec_push_return_ctx();
@@ -1912,29 +2792,18 @@ int sys_exec(const char *pathname, char *const argv[]) {
     if (nested_exec)
         exec_pop_return_ctx();
 
-    /*
-     * If this is a vfork child, the exec'd program has completed.
-     * Jump back to the parent's fork() instead of returning to the
-     * child's userspace (which would hit stale GS / PML4 state).
-     */
     if (p->fork_parent) {
-        /* No GS fix-up needed: syscall_entry swaps GS back before it calls
-         * into C, so no exit path leaves GS swapped any more. */
         exec_did_swapgs = false;
-
         p->exit_status = ret;
         p->is_running  = false;
         p->is_zombie   = true;
-
         process_t *parent = p->fork_parent;
         int child_pid = (int)p->pid;
         p->fork_parent = NULL;
         current_process = parent;
         exec_set_ring3_active(parent);
-
         serial_printf("fork-exec: child PID %d done (%d), resuming parent %d\n",
                       child_pid, ret, (int)parent->pid);
-
         exec_longjmp((exec_jmpbuf_t *)parent->fork_jmpbuf, child_pid);
         __builtin_unreachable();
     }

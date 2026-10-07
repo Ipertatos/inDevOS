@@ -1,9 +1,12 @@
 #include "serial.h"
+#include "atomic.h"
 #include "hpet.h"
 #include <stdarg.h>
 #include <stddef.h>
 
 #define SERIAL_PORT 0x3F8  // COM1
+
+static spinlock_t serial_out_lock = {0};
 
 /* dmesg-style line prefix: [    sec.usec] */
 #define SERIAL_LINE_PEEK 6
@@ -105,6 +108,24 @@ static void serial_flush_peek(bool with_timestamp) {
     line_peek_len = 0;
 }
 
+static void serial_putc_inner(char c);
+
+/* Unlocked putc — caller must hold serial_out_lock. */
+static void serial_putc_unlocked(char c) {
+    if (!serial_enabled)
+        return;
+    if (c == '\n')
+        serial_putc_inner('\r');
+    serial_putc_inner(c);
+}
+
+static void serial_puts_unlocked(const char *str) {
+    if (!str) str = "(null)";
+    while (*str)
+        serial_putc_unlocked(*str++);
+}
+
+
 static void serial_putc_inner(char c) {
     if (!serial_enabled)
         return;
@@ -201,21 +222,24 @@ void serial_putc(char c) {
     if (!serial_enabled)
         return;
 
-    if (c == '\n')
-        serial_putc_inner('\r');
-    serial_putc_inner(c);
+    spinlock_lock(&serial_out_lock);
+    serial_putc_unlocked(c);
+    spinlock_unlock(&serial_out_lock);
 }
 
 void serial_puts(const char *str) {
     if (!serial_enabled)
         return;
+    spinlock_lock(&serial_out_lock);
     while (*str)
-        serial_putc(*str++);
+        serial_putc_unlocked(*str++);
+    spinlock_unlock(&serial_out_lock);
 }
 
 // Simple printf implementation for serial
 void serial_printf(const char *format, ...) {
     if (!serial_enabled) return;
+    spinlock_lock(&serial_out_lock);
     const char *p = format;
     va_list args;
     va_start(args, format);
@@ -267,17 +291,17 @@ void serial_printf(const char *format, ...) {
                             // Apply padding for zero
                             if (zero_pad && pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++) {
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                                 }
                             } else if (pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++) {
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                                 }
                             }
-                            serial_putc('0');
+                            serial_putc_unlocked('0');
                         } else {
                             if (val < 0) {
-                                serial_putc('-');
+                                serial_putc_unlocked('-');
                                 val = -val;
                             }
                             while (val > 0) {
@@ -288,16 +312,16 @@ void serial_printf(const char *format, ...) {
                             // Apply padding
                             if (zero_pad && pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++) {
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                                 }
                             } else if (pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++) {
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                                 }
                             }
                             
                             while (i > 0) {
-                                serial_putc(buf[--i]);
+                                serial_putc_unlocked(buf[--i]);
                             }
                         }
                     } else {
@@ -308,17 +332,17 @@ void serial_printf(const char *format, ...) {
                             // Apply padding for zero
                             if (zero_pad && pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++) {
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                                 }
                             } else if (pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++) {
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                                 }
                             }
-                            serial_putc('0');
+                            serial_putc_unlocked('0');
                         } else {
                             if (val < 0) {
-                                serial_putc('-');
+                                serial_putc_unlocked('-');
                                 val = -val;
                             }
                             while (val > 0) {
@@ -329,16 +353,16 @@ void serial_printf(const char *format, ...) {
                             // Apply padding
                             if (zero_pad && pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++) {
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                                 }
                             } else if (pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++) {
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                                 }
                             }
                             
                             while (i > 0) {
-                                serial_putc(buf[--i]);
+                                serial_putc_unlocked(buf[--i]);
                             }
                         }
                     }
@@ -354,10 +378,10 @@ void serial_printf(const char *format, ...) {
                             // Handle padding for zero
                             if (zero_pad && pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++) {
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                                 }
                             }
-                            serial_putc('0');
+                            serial_putc_unlocked('0');
                         } else {
                             // Convert to hex string
                             while (val > 0) {
@@ -369,13 +393,13 @@ void serial_printf(const char *format, ...) {
                             // Apply padding
                             if (zero_pad && pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++) {
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                                 }
                             }
                             
                             // Print digits in reverse order
                             while (i > 0) {
-                                serial_putc(buf[--i]);
+                                serial_putc_unlocked(buf[--i]);
                             }
                         }
                     } else {
@@ -383,7 +407,7 @@ void serial_printf(const char *format, ...) {
                         char buf[9];
                         int i = 0;
                         if (val == 0) {
-                            serial_putc('0');
+                            serial_putc_unlocked('0');
                         } else {
                             while (val > 0) {
                                 int digit = val % 16;
@@ -391,7 +415,7 @@ void serial_printf(const char *format, ...) {
                                 val /= 16;
                             }
                             while (i > 0) {
-                                serial_putc(buf[--i]);
+                                serial_putc_unlocked(buf[--i]);
                             }
                         }
                     }
@@ -400,15 +424,15 @@ void serial_printf(const char *format, ...) {
                 case 's': {
                     const char *str = va_arg(args, const char*);
                     if (str) {
-                        serial_puts(str);
+                        serial_puts_unlocked(str);
                     } else {
-                        serial_puts("(null)");
+                        serial_puts_unlocked("(null)");
                     }
                     break;
                 }
                 case 'c': {
                     char c = (char)va_arg(args, int);
-                    serial_putc(c);
+                    serial_putc_unlocked(c);
                     break;
                 }
                 case 'u': {
@@ -419,12 +443,12 @@ void serial_printf(const char *format, ...) {
                         if (val == 0) {
                             if (zero_pad && pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++)
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                             } else if (pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++)
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                             }
-                            serial_putc('0');
+                            serial_putc_unlocked('0');
                         } else {
                             while (val > 0) {
                                 buf[i++] = '0' + (val % 10);
@@ -432,13 +456,13 @@ void serial_printf(const char *format, ...) {
                             }
                             if (zero_pad && pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++)
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                             } else if (pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++)
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                             }
                             while (i > 0)
-                                serial_putc(buf[--i]);
+                                serial_putc_unlocked(buf[--i]);
                         }
                     } else {
                         unsigned int val = va_arg(args, unsigned int);
@@ -447,12 +471,12 @@ void serial_printf(const char *format, ...) {
                         if (val == 0) {
                             if (zero_pad && pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++)
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                             } else if (pad_width > 1) {
                                 for (int k = 0; k < pad_width - 1; k++)
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                             }
-                            serial_putc('0');
+                            serial_putc_unlocked('0');
                         } else {
                             while (val > 0) {
                                 buf[i++] = '0' + (val % 10);
@@ -460,13 +484,13 @@ void serial_printf(const char *format, ...) {
                             }
                             if (zero_pad && pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++)
-                                    serial_putc('0');
+                                    serial_putc_unlocked('0');
                             } else if (pad_width > i) {
                                 for (int k = 0; k < pad_width - i; k++)
-                                    serial_putc(' ');
+                                    serial_putc_unlocked(' ');
                             }
                             while (i > 0)
-                                serial_putc(buf[--i]);
+                                serial_putc_unlocked(buf[--i]);
                         }
                     }
                     break;
@@ -474,12 +498,12 @@ void serial_printf(const char *format, ...) {
                 case 'p': {
                     void *ptr = va_arg(args, void*);
                     unsigned long long val = (unsigned long long)ptr;
-                    serial_puts("0x");
+                    serial_puts_unlocked("0x");
                     
                     char buf[17];
                     int i = 0;
                     if (val == 0) {
-                        serial_putc('0');
+                        serial_putc_unlocked('0');
                     } else {
                         while (val > 0) {
                             int digit = val % 16;
@@ -487,28 +511,29 @@ void serial_printf(const char *format, ...) {
                             val /= 16;
                         }
                         while (i > 0) {
-                            serial_putc(buf[--i]);
+                            serial_putc_unlocked(buf[--i]);
                         }
                     }
                     break;
                 }
                 default:
-                    serial_putc('%');
+                    serial_putc_unlocked('%');
                     if (pad_width > 0) {
                         // Debug: show what we parsed
-                        serial_putc('0' + (pad_width % 10));
+                        serial_putc_unlocked('0' + (pad_width % 10));
                     }
                     if (is_long_long) {
-                        serial_puts("ll");
+                        serial_putc_unlocked('l'); serial_putc_unlocked('l');
                     }
-                    serial_putc(*p);
+                    serial_putc_unlocked(*p);
                     break;
             }
         } else {
-            serial_putc(*p);
+            serial_putc_unlocked(*p);
         }
         p++;
     }
     
     va_end(args);
+    spinlock_unlock(&serial_out_lock);
 }

@@ -41,6 +41,8 @@ typedef struct pipe {
     int readers;                /**< Number of open read endpoints */
     int writers;                /**< Number of open write endpoints */
     bool active;                /**< Whether this pipe slot is in use */
+    void *waiting_reader;       /**< thread_t* blocked in read */
+    void *waiting_writer;       /**< thread_t* blocked in write */
 } pipe_t;
 
 /**
@@ -119,6 +121,8 @@ void pipe_close_write(pipe_t *pipe);
 /** After fork(): second process shares the same pipe end. */
 void pipe_fork_dup_reader(pipe_t *pipe);
 void pipe_fork_dup_writer(pipe_t *pipe);
+void pipe_set_waiting_reader(pipe_t *pipe, void *thr);
+void pipe_set_waiting_writer(pipe_t *pipe, void *thr);
 
 /**
  * @brief Get the number of bytes available to read from a pipe

@@ -1,6 +1,7 @@
 [BITS 64]
 
 extern syscall_handler
+extern syscall_stash_int80_fork_frame
 
 ; ===========================================================================
 ; enter_usermode(uint64_t entry_rip, uint64_t user_rsp)
@@ -32,6 +33,12 @@ enter_usermode:
 ; ===========================================================================
 global syscall_asm_handler
 syscall_asm_handler:
+    ; Stash user RIP/RSP/RFLAGS for SYS_FORK (iframe still at RSP).
+    push rdi
+    mov rdi, rsp
+    add rdi, 8              ; skip our push — point at hardware iretq frame
+    call syscall_stash_int80_fork_frame
+    pop rdi
     ; Save all registers
     push rax
     push rbx
@@ -166,7 +173,10 @@ syscall_entry:
 
     ; SYSRET with a non-canonical RCX faults in ring 0 on the user stack.
     ; RCX came from the SYSCALL itself, so it is canonical unless the frame
-    ; was rewritten; refuse to sysret in that case and use iretq instead.
+    ; was rewritten (signal deliver sets handler RIP); refuse to sysret in
+    ; that case and use iretq instead. Note: GPRs were already popped from
+    ; the frame above — SYSRET only loads rip/rflags from rcx/r11; the rest
+    ; (including rdi=signum for the handler) are already in the real regs.
     push rax
     mov rax, rcx
     shl rax, 16

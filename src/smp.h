@@ -148,6 +148,10 @@ void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector);
  * @param vector Interrupt vector to deliver
  */
 void smp_send_ipi_all_except_self(uint8_t vector);
+/** Broadcast TLB flush and wait until every online CPU has flushed. */
+void smp_tlb_shootdown(void);
+/** Called from IPI_VECTOR_TLB_FLUSH handler after local flush. */
+void smp_tlb_shootdown_ack(void);
 
 /**
  * @brief Request a reschedule on a specific CPU

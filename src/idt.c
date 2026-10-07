@@ -270,50 +270,101 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
     }
 
     /* ================================================================
-     * Copy-on-Write: handle write fault on a COW page
-     * ================================================================ */
+     * Copy-on-Write / break-RO: write fault on a present user page
+     * ================================================================
+     * Always walk the *active* CR3 PML4 (the CPU's tables).  proc->pml4 can
+     * lag behind under concurrent fork (ash parent still named current while
+     * the child CR3 is loaded), and fixing the wrong PTE leaves the child's
+     * RO entry intact — retry then kills the child.
+     *
+     * Also accept present+RO+USER writes in the stack/heap window even when
+     * VMM_COW was lost: sole-owner → make writable; shared → copy.
+     */
     if (page_present && was_write) {
-        {
-            uint64_t page_addr = faulting_address & ~0xFFFULL;
-            uint64_t *pte = vmm_get_pte_in(proc->pml4, page_addr);
-            if (pte && (*pte & VMM_COW)) {
-                uint64_t old_phys = *pte & PTE_ADDR_MASK;
-                uint64_t old_flags = *pte & PTE_FLAGS_MASK;
+        uint64_t page_addr = faulting_address & ~0xFFFULL;
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        uint64_t *active_pml4 = (uint64_t *)phys_to_virt(cr3 & PTE_ADDR_MASK);
+        uint64_t *pml4 = active_pml4 ? active_pml4 : (proc ? proc->pml4 : NULL);
+        uint64_t *pte = pml4 ? vmm_get_pte_in(pml4, page_addr) : NULL;
 
-                /* Check page reference count */
-                extern uint8_t *vmm_page_refcounts;
-                extern uint64_t vmm_max_phys_pages;
-                uint64_t pfn = old_phys / PAGE_SIZE;
+        uint64_t stack_lo = USER_STACK_TOP - (1024ULL * 1024ULL);
+        uint64_t stack_hi = USER_STACK_TOP + PAGE_SIZE;
+        bool in_stack = (faulting_address >= stack_lo && faulting_address < stack_hi);
+        bool in_heap = proc && (faulting_address >= (uint64_t)proc->brk_start &&
+                                faulting_address < (uint64_t)proc->brk_current);
+        bool cow_bit = pte && (*pte & VMM_PRESENT) && (*pte & VMM_COW);
+        bool ro_user = pte && (*pte & VMM_PRESENT) && (*pte & VMM_USER) &&
+                       !(*pte & VMM_WRITABLE);
+        /* Stack/heap: always break. Also break fork-shared RO user pages
+         * (refs>1) even if VMM_COW was cleared — otherwise the child #PFs
+         * writing errno/.data (pipe_sigpipe RIP=0x40172f va=0x401030).
+         * Sole-owner PROT_READ mmap (refs<=1, not stack/heap) still faults. */
+        bool break_ro = cow_bit || (ro_user && (in_stack || in_heap));
+        extern uint8_t vmm_page_get_ref(uint64_t);
+        extern void vmm_page_unref(uint64_t);
+        uint8_t refs_peek = 0;
+        if (!break_ro && ro_user && pte) {
+            refs_peek = vmm_page_get_ref(*pte & PTE_ADDR_MASK);
+            if (refs_peek > 1)
+                break_ro = true;
+        }
 
-                if (vmm_page_refcounts && pfn < vmm_max_phys_pages &&
-                    vmm_page_refcounts[pfn] <= 1) {
-                    /* We are the sole owner -- just make it writable */
-                    *pte = old_phys | ((old_flags & ~VMM_COW) | VMM_WRITABLE);
-                    __asm__ volatile("invlpg (%0)" : : "r"(page_addr) : "memory");
-                    SERIAL_DEBUG_PRINT(MEMORY, "[cow] Sole-owner writeback at 0x%llx PID %d\n",
-                                       (unsigned long long)page_addr, (int)proc->pid);
-                    return true;
-                }
+        if (break_ro && pte) {
+            uint64_t old_phys = *pte & PTE_ADDR_MASK;
+            uint64_t old_flags = *pte & PTE_FLAGS_MASK;
+            uint8_t refs = refs_peek ? refs_peek : vmm_page_get_ref(old_phys);
 
-                /* Multiple owners: copy the page */
-                uint64_t new_frame = vmm_alloc_frame();
-                if (new_frame) {
-                    memcpy(phys_to_virt(new_frame), phys_to_virt(old_phys), PAGE_SIZE);
-                    *pte = new_frame | ((old_flags & ~VMM_COW) | VMM_WRITABLE);
-                    __asm__ volatile("invlpg (%0)" : : "r"(page_addr) : "memory");
-
-                    /* Decrement refcount on the old page */
-                    if (vmm_page_refcounts && pfn < vmm_max_phys_pages) {
-                        if (vmm_page_refcounts[pfn] > 0)
-                            vmm_page_refcounts[pfn]--;
-                    }
-
-                    SERIAL_DEBUG_PRINT(MEMORY, "[cow] Copied page at 0x%llx PID %d\n",
-                                       (unsigned long long)page_addr, (int)proc->pid);
-                    return true;
-                }
-                serial_puts("[cow] Out of physical frames for COW!\n");
+            /* refs==1: true sole owner after peer unref'd — upgrade in place.
+             * refs==0: untracked / accounting hole — MUST copy; treating as
+             * sole-owner mutates a frame the sibling still maps (fork stack
+             * corruption). refs>1: classic COW copy. */
+            if (refs == 1) {
+                *pte = old_phys | ((old_flags & ~VMM_COW) | VMM_WRITABLE);
+                __asm__ volatile("invlpg (%0)" : : "r"(page_addr) : "memory");
+                return true;
             }
+
+            uint64_t new_frame = vmm_alloc_frame();
+            if (new_frame) {
+                /* Copy via kernel map BEFORE installing the new PTE. */
+                memcpy(phys_to_virt(new_frame), phys_to_virt(old_phys), PAGE_SIZE);
+                *pte = new_frame | ((old_flags & ~VMM_COW) | VMM_WRITABLE);
+                if (refs > 1)
+                    vmm_page_unref(old_phys);
+                __asm__ volatile("invlpg (%0)" : : "r"(page_addr) : "memory");
+                return true;
+            }
+            serial_puts("[cow] Out of physical frames for COW!\n");
+        } else if (ro_user && pte) {
+            /* Diagnostics: present+RO+USER write that we refused to break. */
+            extern uint8_t vmm_page_get_ref(uint64_t);
+            uint64_t phys = *pte & PTE_ADDR_MASK;
+            serial_printf("[cow-diag] refuse va=0x%llx pte=0x%llx refs=%u pid=%d "
+                          "proc_pml4=%p active=%p cow=%d stack=%d heap=%d\n",
+                          (unsigned long long)faulting_address,
+                          (unsigned long long)*pte,
+                          (unsigned)vmm_page_get_ref(phys),
+                          proc ? (int)proc->pid : -1,
+                          (void *)(proc ? proc->pml4 : NULL),
+                          (void *)active_pml4,
+                          cow_bit ? 1 : 0,
+                          in_stack ? 1 : 0,
+                          in_heap ? 1 : 0);
+            if (proc && proc->parent && proc->parent->pml4) {
+                uint64_t *ppte = vmm_get_pte_in(proc->parent->pml4, page_addr);
+                if (ppte)
+                    serial_printf("[cow-diag] parent pid=%d pte=0x%llx refs=%u\n",
+                                  (int)proc->parent->pid,
+                                  (unsigned long long)*ppte,
+                                  (unsigned)vmm_page_get_ref(*ppte & PTE_ADDR_MASK));
+            }
+        } else if (page_present && was_write && (!pte || !(*pte & VMM_PRESENT))) {
+            serial_printf("[cow-diag] no PTE va=0x%llx pid=%d active=%p proc_pml4=%p\n",
+                          (unsigned long long)faulting_address,
+                          proc ? (int)proc->pid : -1,
+                          (void *)active_pml4,
+                          (void *)(proc ? proc->pml4 : NULL));
         }
     }
     return false;
@@ -383,8 +434,21 @@ bool handle_page_fault(registers_t* r) {
     bool insn_fetch = (r->err_code & 0x10) != 0;      /* I/D bit */
 
     if (from_user) {
-        if (user_fault_fixup(exec_user_as_process(), faulting_address,
-                             page_present, was_write))
+        /* Resolve the process that owns the *active* CR3.  get_current_process()
+         * can still name ash while the child CR3 is loaded (and vice versa). */
+        process_t *fp = NULL;
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        uint64_t *active = (uint64_t *)phys_to_virt(cr3 & 0x000FFFFFFFFFF000ULL);
+        extern process_t *process_find_by_pml4(uint64_t *pml4);
+        if (active)
+            fp = process_find_by_pml4(active);
+        if (!fp || !fp->is_usermode || !fp->pml4) {
+            fp = get_current_process();
+            if (!fp || !fp->is_usermode || !fp->pml4)
+                fp = exec_user_as_process();
+        }
+        if (user_fault_fixup(fp, faulting_address, page_present, was_write))
             return true;
     } else if (is_user_address(faulting_address) && !insn_fetch) {
         /* Kernel dereferenced a user pointer directly.  Under SMAP that
@@ -736,6 +800,34 @@ void isr_handler(registers_t* r) {
             serial_printf("[exception] User-mode fault #%llu at RIP 0x%016llx <%s> -- killing thread\n",
                           r->int_no, r->rip, exec_lookup_symbol(exec_user_as_process(), r->rip));
 
+            /* Close pipe ends / wake waiters before dropping the thread.
+             * process_fault_kill_current() does not return for concurrent
+             * fork children (hlt loop after zombie). EOI first so the
+             * LAPIC is not left in-service across the hlt. */
+            {
+                extern void process_fault_kill_current(int signum);
+                int sig = 11; /* SIGSEGV */
+                thread_t *cth = global_scheduler.current_thread;
+                process_t *op = cth && cth->owner_process
+                    ? (process_t *)cth->owner_process
+                    : exec_user_as_process();
+                if (op && op->is_usermode && op->sched_thread &&
+                    op->parent && op->parent != NULL) {
+                    /* Likely concurrent fork child — never returns. */
+                    set_current_process(op);
+                    exit_interrupt_context();
+                    apic_eoi();
+                    process_fault_kill_current(sig);
+                    __builtin_unreachable();
+                }
+                if (op && op->is_usermode) {
+                    set_current_process(op);
+                    /* Sync program: close fds / mark zombie, then fall
+                     * through to thread switch below. */
+                    process_fault_kill_current(sig);
+                }
+            }
+
             thread_t *cur = global_scheduler.current_thread;
             if (cur) {
                 cur->state = THREAD_TERMINATED;
@@ -759,6 +851,7 @@ void isr_handler(registers_t* r) {
                         smp_get_current_cpu()->current_thread = next;
                     global_scheduler.current_thread = next;
                     next->state = THREAD_RUNNING;
+                    sched_oncpu_set(next);
 
                     r->rdi = next->saved_regs.rdi;
                     r->rsi = next->saved_regs.rsi;
@@ -788,6 +881,7 @@ void isr_handler(registers_t* r) {
                     if (!next->owner_process)
                         vmm_switch_address_space(vmm_get_kernel_pml4());
 
+                    sched_oncpu_forget(cur);
                     if (cur->stack_base) kfree((void*)cur->stack_base);
                     kfree(cur);
 
@@ -846,11 +940,13 @@ void isr_handler(registers_t* r) {
         return;
     }
     if (r->int_no == 254) {
-        /* IPI_VECTOR_TLB_FLUSH: Flush TLB on this CPU */
+        /* IPI_VECTOR_TLB_FLUSH: Flush TLB on this CPU and ACK shootdown. */
         __asm__ volatile(
             "mov %%cr3, %%rax\n\t"
             "mov %%rax, %%cr3\n\t"
             : : : "rax", "memory");
+        extern void smp_tlb_shootdown_ack(void);
+        smp_tlb_shootdown_ack();
         apic_eoi();
         exit_interrupt_context();
         return;
@@ -893,6 +989,11 @@ static void preemptive_schedule_force(void) {
     preempt_force[cpu_idx] = 1;
 }
 
+/* Public: ask for an immediate preempt on the next timer tick (e.g. after fork). */
+void preempt_nudge(void) {
+    preemptive_schedule_force();
+}
+
 /**
  * Called from handle_timer() with a pointer to the interrupt frame.
  * If the cooperative thread scheduler is running and the time slice
@@ -904,6 +1005,9 @@ static void preemptive_schedule_force(void) {
  */
 void preemptive_schedule(registers_t *r) {
     if (!global_scheduler.scheduler_running) { return; }
+    /* We are on the current thread's stack: the thread this CPU switched
+     * out last is fully off-CPU now. */
+    sched_oncpu_flush();
 
     per_cpu_t *me = smp_get_current_cpu();
     uint32_t cpu_idx = (me && me->cpu_id < MAX_CPUS) ? me->cpu_id : 0;
@@ -932,7 +1036,7 @@ void preemptive_schedule(registers_t *r) {
      * CS on a thread that owns a process). Do NOT apply this to kernel-main
      * / idle — that is how Ring-3 apps first get scheduled; blocking that
      * made spawned Doom never appear. */
-    if (cur && cur->owner_process && (r->cs & 3) == 0)
+    if (cur && cur->owner_process && (r->cs & 3) == 0 && !cur->kwait)
         return;
 
     /* Fast path: nothing in any ready queue and we're already the idle
@@ -1004,6 +1108,8 @@ void preemptive_schedule(registers_t *r) {
         cur->fs_base = thread_rdfsbase();
 
         cur->has_saved_context = true;
+        /* Frame saved; clear on_cpu after we leave this stack. */
+        sched_oncpu_defer_clear(cur);
 
         // Put current thread back on the ready queue (unless it's the idle thread)
         if (cur->state == THREAD_RUNNING) {
@@ -1023,6 +1129,7 @@ void preemptive_schedule(registers_t *r) {
     }
     global_scheduler.current_thread = next;
     next->state = THREAD_RUNNING;
+    sched_oncpu_set(next);
 
     // Restore all GP registers into the interrupt frame
     r->rdi = next->saved_regs.rdi;
@@ -1063,11 +1170,29 @@ void preemptive_schedule(registers_t *r) {
             vmm_switch_address_space(proc->pml4);
         }
         set_current_process(proc);
+        exec_set_ring3_active(proc);
     } else {
-        /* Switching to a kernel-only thread (e.g. the BSP idle/main-loop
-         * thread).  Restore the kernel PML4 so the main loop doesn't run
-         * with a user process's address space still loaded. */
-        vmm_switch_address_space(vmm_get_kernel_pml4());
+        /* Kernel-only thread. If its saved frame is still Ring-3 (exec_file
+         * / ash running on the BSP boot thread), keep that process's PML4
+         * so concurrent fork children can preempt and resume correctly. */
+        /* kwait==2: ash's boot thread parked in sys_wait (ring-0 frame) —
+         * resume with ash's address space like the ring-3 case. */
+        if ((next->saved_regs.cs & 3) == 3 || next->kwait == 2) {
+            process_t *up = exec_user_as_process();
+            if (up && up->pml4) {
+                vmm_switch_address_space(up->pml4);
+                if (up->kernel_stack_top) {
+                    gdt_set_kernel_stack(up->kernel_stack_top);
+                    syscall_set_kernel_stack(up->kernel_stack_top);
+                }
+                set_current_process(up);
+            } else {
+                vmm_switch_address_space(vmm_get_kernel_pml4());
+            }
+        } else {
+            vmm_switch_address_space(vmm_get_kernel_pml4());
+            exec_set_ring3_active(NULL);
+        }
     }
 }
 
