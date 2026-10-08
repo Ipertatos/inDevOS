@@ -56,6 +56,9 @@ typedef struct thread_ctx_node {
     struct thread_ctx_node *next;
 } thread_ctx_node_t;
 static thread_ctx_node_t *thread_ctx_list = NULL;
+/* Guards thread_ctx_list: nodes are now also removed by the reaper, which
+ * can run on any CPU (timer path). */
+static spinlock_t thread_ctx_lock;
 
 // Assembly functions for context switching
 extern void thread_switch_asm(thread_context_t *from, thread_context_t *to);
@@ -95,7 +98,10 @@ thread_t* thread_create(const char *name, void (*entry)(void*), void *arg,
     if (stack_size == 0) {
         stack_size = DEFAULT_STACK_SIZE;
     }
-    
+    /* Free exited threads first, so fork-heavy loops reuse their memory. */
+    thread_reap_dead();
+
+
     // Allocate thread structure
     thread_t *thread = kalloc(sizeof(thread_t));
     if (!thread) {
@@ -185,6 +191,9 @@ void thread_exit(void) {
     if (cur) {
         serial_printf("[thread_exit] Thread '%s' (ID %llu) exiting\n",
                       cur->name, (unsigned long long)cur->id);
+        /* A TERMINATED thread is never resumed: stay on this CPU until the
+         * dead-queue hand-off below is done. */
+        preempt_disable();
         cur->state = THREAD_TERMINATED;
 
         // Remove from all queues (IRQs must be off while holding the lock)
@@ -192,16 +201,17 @@ void thread_exit(void) {
         spinlock_lock(&global_scheduler.scheduler_lock);
         _scheduler_remove_thread_unlocked(cur);
         global_scheduler.current_thread = NULL;
-        per_cpu_t *cpu = smp_get_current_cpu();
-        if (cpu && cpu->current_thread == cur)
-            cpu->current_thread = cpu->idle_thread;
+        /* cur stays this CPU's current_thread until the timer switches
+         * away (see scheduler_detach_thread). */
         spinlock_unlock(&global_scheduler.scheduler_lock);
         irq_restore(flags);
 
-        // NOTE: We cannot free our own stack while we're still running on it.
-        // The preemptive scheduler will detect THREAD_TERMINATED and reclaim
-        // resources next time it runs.  For now, just yield by halting with
-        // interrupts enabled so the timer fires and picks the next thread.
+        // We cannot free our own stack while we're still running on it:
+        // queue it; the reaper frees it after this CPU has switched away.
+        // Halt with interrupts enabled so the timer fires and picks the
+        // next thread.
+        thread_mark_dead(cur, NULL);
+        preempt_enable();
     }
 
     // Yield to the scheduler -- interrupts must be enabled so the timer can fire.
@@ -224,6 +234,29 @@ static void _scheduler_remove_thread_unlocked(thread_t *thread) {
     thread->prev = NULL;
 }
 
+/* Remove (and free) the cooperative switch context node of @thread. */
+static void thread_ctx_drop(thread_t *thread) {
+    thread_ctx_node_t *victim = NULL;
+    uint64_t f = irq_save();
+    spinlock_lock(&thread_ctx_lock);
+    thread_ctx_node_t *prev_ctx = NULL;
+    thread_ctx_node_t *ctx = thread_ctx_list;
+    while (ctx) {
+        if (ctx->thread == thread) {
+            if (prev_ctx) prev_ctx->next = ctx->next;
+            else thread_ctx_list = ctx->next;
+            victim = ctx;
+            break;
+        }
+        prev_ctx = ctx;
+        ctx = ctx->next;
+    }
+    spinlock_unlock(&thread_ctx_lock);
+    irq_restore(f);
+    if (victim)
+        kfree(victim);
+}
+
 // Destroy a thread (interrupt-safe)
 void thread_destroy(thread_t *thread) {
     if (!thread) return;
@@ -235,20 +268,7 @@ void thread_destroy(thread_t *thread) {
     _scheduler_remove_thread_unlocked(thread);
     spinlock_unlock(&global_scheduler.scheduler_lock);
 
-    // Remove saved switch context for this thread.
-    thread_ctx_node_t *prev_ctx = NULL;
-    thread_ctx_node_t *ctx = thread_ctx_list;
-    while (ctx) {
-        if (ctx->thread == thread) {
-            if (prev_ctx) prev_ctx->next = ctx->next;
-            else thread_ctx_list = ctx->next;
-            kfree(ctx);
-            break;
-        }
-        prev_ctx = ctx;
-        ctx = ctx->next;
-    }
-    
+    thread_ctx_drop(thread);
     sched_oncpu_forget(thread);
 
     // Free stack
@@ -415,9 +435,17 @@ void scheduler_remove_thread(thread_t *thread) {
     irq_restore(flags);
 }
 
-/* Remove a thread from all queues and clear current_thread if it points at
- * it — one atomic operation for thread-teardown paths (exec_spawned_exit,
- * signal kill). */
+/* Remove a thread from all queues — for thread-teardown paths
+ * (exec_spawned_exit, fork-child exit, signal kill).
+ *
+ * The thread deliberately STAYS the current_thread of the CPU running it
+ * (state TERMINATED): that CPU keeps executing the dying context (hlt loop on
+ * its stack) until the timer switches away, and the switch must save into and
+ * defer-clear the dying thread.  This used to repoint current_thread at the
+ * CPU's idle thread, so the next preemption saved the dead context (a hlt
+ * loop on a soon-freed process kernel stack) INTO the idle thread and the
+ * idle thread later resumed on that freed stack; the dead thread also never
+ * got on_cpu cleared, so it could never be reaped. */
 void scheduler_detach_thread(thread_t *thread) {
     if (!thread) return;
 
@@ -426,12 +454,34 @@ void scheduler_detach_thread(thread_t *thread) {
     _scheduler_remove_thread_unlocked(thread);
     if (global_scheduler.current_thread == thread)
         global_scheduler.current_thread = NULL;
-    for (uint32_t c = 0; c < MAX_CPUS; c++) {
-        if (cpu_data[c].current_thread == thread)
-            cpu_data[c].current_thread = cpu_data[c].idle_thread;
-    }
     spinlock_unlock(&global_scheduler.scheduler_lock);
     irq_restore(flags);
+}
+
+/* Rebuild a thread's start frame (thread_start_asm -> entry(arg) on the top
+ * of its own stack), exactly as thread_create() does.  Used for AP idle
+ * threads, which are stateless "sti; hlt" loops: switching to idle always
+ * starts it fresh, so no stale saved frame can resume on a foreign stack. */
+void thread_reset_start_context(thread_t *thread) {
+    if (!thread || !thread->stack_base || !thread->entry_point)
+        return;
+    uint64_t *stack = (uint64_t *)((thread->stack_base + thread->stack_size) & ~0xFULL);
+    *--stack = (uint64_t)thread->arg;
+    *--stack = (uint64_t)thread->entry_point;
+    if (((uint64_t)stack & 0xF) != 0)
+        *--stack = 0;
+    thread->rsp = (uint64_t)stack;
+    thread->rip = (uint64_t)thread_start_asm;
+    memset(&thread->saved_regs, 0, sizeof(thread_regs_t));
+    thread->saved_regs.rsp = thread->rsp;
+    thread->saved_regs.rip = thread->rip;
+    thread->saved_regs.cs  = 0x08;
+    thread->saved_regs.ss  = 0x10;
+    thread->saved_regs.rflags = 0x202;
+    thread->saved_regs.rdi = (uint64_t)thread->arg;
+    thread->has_saved_context = true;
+    thread->fs_base = 0;
+    fpu_get_default_state(thread->fxsave_area);
 }
 
 /* Internal: pop the head of the highest non-empty priority level.
@@ -716,6 +766,137 @@ void sched_oncpu_forget(thread_t *t) {
     }
 }
 
+/* ---------------- deferred reaping of exited threads ----------------
+ *
+ * An exiting thread cannot free its own stack (it is running on it), and a
+ * fork child's exit path hlt-loops on its process kernel stack until the
+ * timer switches it away -- while the parent may already be reaping the
+ * process slot on another CPU.  Freeing either at that point let the PMM
+ * hand the stack to someone else under a live CPU.  So exits only QUEUE the
+ * thread (+ the kernel stack it ran on); this reaper frees them once:
+ *   - every online CPU has entered the scheduler tick after the thread was
+ *     queued (grace period: any switch that had already picked it, or was
+ *     about to, has completed), and
+ *   - it is not on_cpu, not any CPU's current/idle/pending thread, not the
+ *     BSP boot thread and no process slot still names it as sched_thread.
+ * Before this, fork-child threads were never freed at all (16 KB stack +
+ * thread_t per fork). */
+#define DEAD_MAX 256
+typedef struct {
+    thread_t *t;
+    void *kstack;
+    uint64_t epoch;
+} dead_ent_t;
+static dead_ent_t dead_ents[DEAD_MAX];
+static volatile int dead_count;
+static spinlock_t dead_lock;
+static volatile uint64_t reap_epoch = 1;
+static volatile uint64_t cpu_seen_epoch[MAX_CPUS];
+static int dead_full_logged;
+
+void thread_mark_dead(thread_t *t, void *kstack) {
+    if (!t && !kstack)
+        return;
+    uint64_t f = irq_save();
+    spinlock_lock(&dead_lock);
+    for (int i = 0; i < dead_count; i++) {
+        if (t && dead_ents[i].t == t) {          /* queued twice: merge */
+            if (!dead_ents[i].kstack)
+                dead_ents[i].kstack = kstack;
+            kstack = NULL;
+            t = NULL;
+            break;
+        }
+    }
+    if (t || kstack) {
+        if (dead_count < DEAD_MAX) {
+            uint64_t e = __atomic_add_fetch(&reap_epoch, 1, __ATOMIC_SEQ_CST);
+            dead_ents[dead_count].t = t;
+            dead_ents[dead_count].kstack = kstack;
+            dead_ents[dead_count].epoch = e;
+            dead_count++;
+        } else if (!dead_full_logged) {
+            dead_full_logged = 1;
+            serial_printf("[reaper] dead-thread queue full - leaking\n");
+        }
+    }
+    spinlock_unlock(&dead_lock);
+    irq_restore(f);
+}
+
+static bool dead_grace_done(uint64_t epoch) {
+    for (uint32_t c = 0; c < MAX_CPUS; c++) {
+        if (!cpu_data[c].online)
+            continue;
+        if (__atomic_load_n(&cpu_seen_epoch[c], __ATOMIC_SEQ_CST) < epoch)
+            return false;
+    }
+    return true;
+}
+
+static bool dead_thread_in_use(thread_t *t) {
+    extern bool process_refs_thread(const void *t);
+    if (__atomic_load_n(&t->on_cpu, __ATOMIC_SEQ_CST))
+        return true;
+    if (global_scheduler.current_thread == t)
+        return true;
+    for (uint32_t c = 0; c < MAX_CPUS; c++) {
+        if (cpu_data[c].current_thread == t || cpu_data[c].idle_thread == t ||
+            oncpu_pending[c] == t)
+            return true;
+    }
+    if (smp_get_bsp_boot_thread() == t)
+        return true;
+    return process_refs_thread(t);
+}
+
+void thread_reap_dead(void) {
+    if (!__atomic_load_n(&dead_count, __ATOMIC_RELAXED))
+        return;
+    thread_t *ft[16];
+    void *fk[16];
+    int n = 0;
+    uint64_t f = irq_save();
+    if (__sync_lock_test_and_set(&dead_lock.lock, 1)) {   /* busy: next time */
+        irq_restore(f);
+        return;
+    }
+    for (int i = 0; i < dead_count && n < 16; ) {
+        dead_ent_t *d = &dead_ents[i];
+        if (dead_grace_done(d->epoch) && !(d->t && dead_thread_in_use(d->t))) {
+            ft[n] = d->t;
+            fk[n] = d->kstack;
+            n++;
+            dead_ents[i] = dead_ents[--dead_count];
+            continue;
+        }
+        i++;
+    }
+    spinlock_unlock(&dead_lock);
+    irq_restore(f);
+    for (int j = 0; j < n; j++) {
+        thread_t *t = ft[j];
+        if (t) {
+            thread_ctx_drop(t);
+            sched_oncpu_forget(t);
+            if (t->stack_base)
+                kfree((void *)t->stack_base);
+            kfree(t);
+        }
+        if (fk[j])
+            kfree(fk[j]);
+    }
+}
+
+/* Timer path, every CPU, on the incoming/current thread's stack: publish
+ * that this CPU passed a scheduling point, then reap what is now safe. */
+void thread_reaper_tick(void) {
+    uint32_t i = oncpu_cpu_idx();
+    __atomic_store_n(&cpu_seen_epoch[i],
+                     __atomic_load_n(&reap_epoch, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+    thread_reap_dead();
+}
+
 /* Park a thread blocked in-kernel IN PLACE (no cooperative switch). User
  * threads' coop context is never resumed by the preempt path (it restores
  * saved_regs), so a coop switch resumed them at a stale ring-3 frame
@@ -992,11 +1173,16 @@ static thread_context_t kernel_context;  // For saving kernel/main thread contex
 static thread_context_t *thread_get_context(thread_t *thread, bool initialize) {
     if (!thread) return NULL;
 
+    uint64_t f = irq_save();
+    spinlock_lock(&thread_ctx_lock);
     thread_ctx_node_t *n = thread_ctx_list;
     while (n) {
-        if (n->thread == thread) return &n->ctx;
+        if (n->thread == thread) break;
         n = n->next;
     }
+    spinlock_unlock(&thread_ctx_lock);
+    irq_restore(f);
+    if (n) return &n->ctx;
 
     n = (thread_ctx_node_t*)kalloc(sizeof(thread_ctx_node_t));
     if (!n) return NULL;
@@ -1007,8 +1193,12 @@ static thread_context_t *thread_get_context(thread_t *thread, bool initialize) {
         n->ctx.rip = thread->rip;
         n->ctx.rflags = 0x202;
     }
+    f = irq_save();
+    spinlock_lock(&thread_ctx_lock);
     n->next = thread_ctx_list;
     thread_ctx_list = n;
+    spinlock_unlock(&thread_ctx_lock);
+    irq_restore(f);
     return &n->ctx;
 }
 

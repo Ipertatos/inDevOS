@@ -1416,6 +1416,32 @@ static void vmm_leaf_release(uint64_t phys_addr) {
     vmm_page_unref(phys_addr);
 }
 
+/* A COW / RO-break fault pointed the faulting PTE at a private copy: drop
+ * that mapping's claim on the OLD frame, with vmm_leaf_release()'s rules
+ * (0 = untracked sole owner and 1 = last owner -> free, 2+ -> unref, 255 /
+ * non-PMM frame -> leave alone).  A count >= 2 is decremented with a CAS:
+ * winning it proves another claim remains, so nothing is freed and no flush
+ * is needed (a racing peer sees 1 and takes the freeing path).  When the
+ * drop frees the frame (count 0 or 1), every CPU flushes its TLB first so no
+ * stale translation can reach a frame the PMM hands out again. */
+void vmm_cow_release_old(uint64_t phys_addr) {
+    if (!phys_addr) return;
+    if (vmm_page_refcounts && phys_addr / PAGE_SIZE < vmm_max_phys_pages) {
+        uint64_t pfn = phys_addr / PAGE_SIZE;
+        for (;;) {
+            uint8_t r = __atomic_load_n(&vmm_page_refcounts[pfn], __ATOMIC_SEQ_CST);
+            if (r >= 255)
+                return;                 /* already freed / saturated */
+            if (r <= 1)
+                break;
+            if (__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], r, (uint8_t)(r - 1)))
+                return;
+        }
+    }
+    smp_tlb_shootdown();
+    vmm_leaf_release(phys_addr);
+}
+
 uint8_t vmm_page_get_ref(uint64_t phys_addr) {
     if (!vmm_page_refcounts) return 0;
     uint64_t pfn = phys_addr / PAGE_SIZE;

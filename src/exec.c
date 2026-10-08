@@ -1922,11 +1922,23 @@ void exec_spawned_exit(int status) {
     }
     printf("%s", tty_get_prompt());
 
-    /* Mark thread terminated so the scheduler skips it */
+    /* Mark thread terminated so the scheduler skips it.  Not switchable
+     * until the hlt loop below: a TERMINATED thread is never resumed, so a
+     * preemption inside process_cleanup() would strand this exit path. */
+    preempt_disable();
     if (thr) {
         thr->state = THREAD_TERMINATED;
         thr->owner_process = NULL; /* slot is reaped below; avoid dangling */
         scheduler_detach_thread(thr);
+        proc->sched_thread = NULL;
+    }
+    /* We are still running on proc->kernel_stack (and hlt-loop on it below):
+     * process_cleanup() memsets the slot, which used to leak the stack and
+     * the thread.  The reaper frees both once this CPU has switched away. */
+    {
+        void *ks = proc->kernel_stack;
+        proc->kernel_stack = NULL;
+        thread_mark_dead(thr, ks);
     }
 
     /* Fully reap: close fds, unlink from parent, release the process slot.
@@ -1937,6 +1949,7 @@ void exec_spawned_exit(int status) {
     set_current_process(fallback);
 
     /* Halt with interrupts enabled; timer will fire and scheduler picks next. */
+    preempt_enable();
     __asm__ volatile("sti");
     for (;;)
         __asm__ volatile("hlt");

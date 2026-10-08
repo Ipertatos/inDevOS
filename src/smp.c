@@ -383,36 +383,92 @@ void smp_send_ipi_all_except_self(uint8_t vector) {
 }
 
 
-/* Generational TLB shootdown: wait for every online CPU to flush. */
-static volatile uint32_t tlb_shootdown_acks;
+/* Generational TLB shootdown, safe against concurrent initiators.
+ *
+ * One request at a time (tlb_sd_lock).  The initiator bumps tlb_sd_gen, IPIs
+ * every other CPU and waits until each ONLINE CPU has published
+ * tlb_sd_acked[cpu] >= its generation.  A responder reads the generation
+ * BEFORE reloading CR3, so its ack always covers PTE changes made before the
+ * request was issued.  Acks are per CPU, so a late or duplicate IPI can never
+ * be counted for the wrong request (the old shared counter could be reset by
+ * a second initiator mid-wait, or reach `need` with the other request's acks).
+ *
+ * Deadlock avoidance: an initiator spins for tlb_sd_lock with interrupts off,
+ * so it cannot take the current owner's IPI.  While spinning it services the
+ * owner's request by polling (flush + ack), which is exactly what the IPI
+ * handler would have done; the IPI that arrives later just flushes again. */
+static spinlock_t tlb_sd_lock;
+static volatile uint64_t tlb_sd_gen;
+static volatile uint64_t tlb_sd_acked[MAX_CPUS];
+static volatile uint32_t tlb_sd_timeouts;
 
+static inline void tlb_flush_local(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+}
+
+/* Flush this CPU's TLB and acknowledge every request issued so far. */
 void smp_tlb_shootdown_ack(void) {
-    __sync_fetch_and_add(&tlb_shootdown_acks, 1);
+    uint32_t me = smp_cpu_index_fast();
+    uint64_t g = __atomic_load_n(&tlb_sd_gen, __ATOMIC_SEQ_CST);
+    tlb_flush_local();
+    if (me < MAX_CPUS) {
+        uint64_t old = __atomic_load_n(&tlb_sd_acked[me], __ATOMIC_RELAXED);
+        if (g > old)
+            __atomic_store_n(&tlb_sd_acked[me], g, __ATOMIC_SEQ_CST);
+    }
+}
+
+/* Answer a request that is waiting on this CPU (used while spinning with
+ * interrupts disabled). */
+static inline void tlb_sd_poll(void) {
+    uint32_t me = smp_cpu_index_fast();
+    if (me < MAX_CPUS &&
+        __atomic_load_n(&tlb_sd_acked[me], __ATOMIC_RELAXED) <
+        __atomic_load_n(&tlb_sd_gen, __ATOMIC_ACQUIRE))
+        smp_tlb_shootdown_ack();
 }
 
 void smp_tlb_shootdown(void) {
     uint64_t online = cpus_online;
     if (online <= 1) {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+        tlb_flush_local();
         return;
     }
-    tlb_shootdown_acks = 0;
-    __sync_synchronize();
-    smp_send_ipi_all_except_self(IPI_VECTOR_TLB_FLUSH);
-    {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
-        smp_tlb_shootdown_ack();
+    uint64_t flags = irq_save();
+    while (__sync_lock_test_and_set(&tlb_sd_lock.lock, 1)) {
+        while (__atomic_load_n(&tlb_sd_lock.lock, __ATOMIC_RELAXED)) {
+            tlb_sd_poll();
+            __asm__ volatile("pause");
+        }
     }
-    uint32_t need = (uint32_t)online;
-    for (volatile uint64_t spins = 0; tlb_shootdown_acks < need && spins < 10000000ULL; spins++)
+    uint32_t me = smp_cpu_index_fast();
+    uint64_t g = __atomic_add_fetch(&tlb_sd_gen, 1, __ATOMIC_SEQ_CST);
+    smp_send_ipi_all_except_self(IPI_VECTOR_TLB_FLUSH);
+    tlb_flush_local();
+    if (me < MAX_CPUS)
+        __atomic_store_n(&tlb_sd_acked[me], g, __ATOMIC_SEQ_CST);
+
+    uint32_t missing = 0;
+    for (uint64_t spins = 0; ; spins++) {
+        missing = 0;
+        for (uint32_t c = 0; c < MAX_CPUS; c++) {
+            if (c == me || !cpu_data[c].online) continue;
+            if (__atomic_load_n(&tlb_sd_acked[c], __ATOMIC_ACQUIRE) < g)
+                missing |= (c < 32) ? (1u << c) : 0x80000000u;
+        }
+        if (!missing || spins >= 20000000ULL)
+            break;
         __asm__ volatile("pause");
-    if (tlb_shootdown_acks < need)
-        serial_printf("smp: TLB shootdown incomplete acks=%u need=%u\n",
-                      tlb_shootdown_acks, need);
+    }
+    __sync_lock_release(&tlb_sd_lock.lock);
+    irq_restore(flags);
+    if (missing && tlb_sd_timeouts < 16) {
+        tlb_sd_timeouts++;
+        serial_printf("smp: TLB shootdown incomplete gen=%llu missing_cpus=0x%x\n",
+                      (unsigned long long)g, missing);
+    }
 }
 
 void smp_reschedule_cpu(uint32_t cpu_id) {

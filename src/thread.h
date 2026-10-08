@@ -123,6 +123,16 @@ void sched_oncpu_set(thread_t *t);
 void sched_oncpu_defer_clear(thread_t *t);
 void sched_oncpu_flush(void);
 void sched_oncpu_forget(thread_t *t);
+
+/* Deferred reaping of exited threads.  A thread that has terminated (and
+ * optionally the per-process kernel stack it was last running on) is queued
+ * with thread_mark_dead(); thread_reaper_tick() (timer path, every CPU) and
+ * thread_create() free it once no CPU can still be running on, switching to
+ * or pointing at it.  Never kfree a stack a CPU may still be using. */
+void thread_mark_dead(thread_t *t, void *kstack);
+void thread_reap_dead(void);
+void thread_reaper_tick(void);
+void thread_reset_start_context(thread_t *thread);
 /* Lost-wakeup wait helpers (hold scheduler_lock via scheduler_irq_*). */
 void scheduler_irq_lock(uint64_t *flags);
 void scheduler_irq_unlock(uint64_t flags);

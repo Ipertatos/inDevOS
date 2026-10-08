@@ -337,7 +337,6 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
          * Sole-owner PROT_READ mmap (refs<=1, not stack/heap) still faults. */
         bool break_ro = cow_bit || (ro_user && (in_stack || in_heap));
         extern uint8_t vmm_page_get_ref(uint64_t);
-        extern void vmm_page_unref(uint64_t);
         uint8_t refs_peek = 0;
         if (!break_ro && ro_user && pte) {
             refs_peek = vmm_page_get_ref(*pte & PTE_ADDR_MASK);
@@ -350,10 +349,14 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
             uint64_t old_flags = *pte & PTE_FLAGS_MASK;
             uint8_t refs = refs_peek ? refs_peek : vmm_page_get_ref(old_phys);
 
-            /* refs==1: true sole owner after peer unref'd — upgrade in place.
-             * refs==0: untracked / accounting hole — MUST copy; treating as
-             * sole-owner mutates a frame the sibling still maps (fork stack
-             * corruption). refs>1: classic COW copy. */
+            /* refs==1: proven sole owner (every fork share is counted, the
+             * peer already dropped its claim) — upgrade in place.
+             * refs==0: untracked — no proof nobody else maps it, so copy
+             * (treating it as sole-owner once mutated a frame a sibling still
+             * mapped).  refs>1: classic COW copy.
+             * After a copy the OLD frame's claim is dropped with the
+             * vmm_leaf_release rules (TLB shootdown first when that frees
+             * it); before this the refs==0 case leaked the old frame. */
             if (refs == 1) {
                 *pte = old_phys | ((old_flags & ~VMM_COW) | VMM_WRITABLE);
                 __asm__ volatile("invlpg (%0)" : : "r"(page_addr) : "memory");
@@ -365,9 +368,8 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
                 /* Copy via kernel map BEFORE installing the new PTE. */
                 memcpy(phys_to_virt(new_frame), phys_to_virt(old_phys), PAGE_SIZE);
                 *pte = new_frame | ((old_flags & ~VMM_COW) | VMM_WRITABLE);
-                if (refs > 1)
-                    vmm_page_unref(old_phys);
                 __asm__ volatile("invlpg (%0)" : : "r"(page_addr) : "memory");
+                vmm_cow_release_old(old_phys);
                 return true;
             }
             serial_puts("[cow] Out of physical frames for COW!\n");
@@ -887,9 +889,11 @@ void isr_handler(registers_t* r) {
                     if (!next->owner_process)
                         vmm_switch_address_space(vmm_get_kernel_pml4());
 
-                    sched_oncpu_forget(cur);
-                    if (cur->stack_base) kfree((void*)cur->stack_base);
-                    kfree(cur);
+                    /* Do not kfree cur here: this handler may still be on a
+                     * stack it owns.  Clear on_cpu after we leave and let the
+                     * reaper free it. */
+                    sched_oncpu_defer_clear(cur);
+                    thread_mark_dead(cur, NULL);
 
                     serial_printf("[exception] Killed thread, resumed '%s'\n",
                                   next->name);
@@ -947,11 +951,9 @@ void isr_handler(registers_t* r) {
         return;
     }
     if (r->int_no == 254) {
-        /* IPI_VECTOR_TLB_FLUSH: Flush TLB on this CPU and ACK shootdown. */
-        __asm__ volatile(
-            "mov %%cr3, %%rax\n\t"
-            "mov %%rax, %%cr3\n\t"
-            : : : "rax", "memory");
+        /* IPI_VECTOR_TLB_FLUSH: flush this CPU's TLB and ACK the current
+         * shootdown generation (smp_tlb_shootdown_ack does both, reading the
+         * generation before the CR3 reload). */
         extern void smp_tlb_shootdown_ack(void);
         smp_tlb_shootdown_ack();
         apic_eoi();
@@ -1015,6 +1017,8 @@ void preemptive_schedule(registers_t *r) {
     /* We are on the current thread's stack: the thread this CPU switched
      * out last is fully off-CPU now. */
     sched_oncpu_flush();
+    /* Grace-period mark for the dead-thread reaper, then free what is safe. */
+    thread_reaper_tick();
 
     per_cpu_t *me = smp_get_current_cpu();
     uint32_t cpu_idx = (me && me->cpu_id < MAX_CPUS) ? me->cpu_id : 0;
@@ -1062,9 +1066,11 @@ void preemptive_schedule(registers_t *r) {
      * TERMINATED thread. With no other user threads ready the timer ISR
      * would return to that dead context forever, starving the kernel-main
      * loop (no keyboard echo, no shell). Resume the saved BSP boot context. */
+    /* Only on the BSP: an AP must never "resume" the BSP boot thread (it may
+     * be live on the BSP); APs fall back to their own idle thread. */
     if (!next && cur && cur->state == THREAD_TERMINATED) {
         thread_t *kmain = smp_get_bsp_boot_thread();
-        if (kmain && kmain != cur && kmain->has_saved_context)
+        if (cpu && cpu->is_bsp && kmain && kmain != cur && kmain->has_saved_context)
             next = kmain;
         else if (cpu && cpu->idle_thread && cpu->idle_thread != cur)
             next = cpu->idle_thread;
@@ -1127,6 +1133,11 @@ void preemptive_schedule(registers_t *r) {
             }
         }
     }
+
+    /* AP idle threads are stateless hlt loops: always start them fresh on
+     * their own stack, never from a saved frame (see thread_reset_start_context). */
+    if (cpu && !cpu->is_bsp && next == cpu->idle_thread)
+        thread_reset_start_context(next);
 
     // --- Restore next thread's FULL state into the interrupt frame ---
     /* Update both per-CPU and global current_thread */

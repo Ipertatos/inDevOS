@@ -489,6 +489,15 @@ static int fd_close_entry(process_t *proc, int fd) {
 }
 
 
+/* Thread reaper: true while any process slot still names @t as its thread. */
+bool process_refs_thread(const void *t) {
+    if (!t) return false;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (processes[i].sched_thread == t)
+            return true;
+    return false;
+}
+
 process_t* process_find_by_pml4(uint64_t *pml4) {
     if (!pml4) return NULL;
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -1896,6 +1905,7 @@ void fork_child_zombie_exit(int status) {
      * and we would close the sibling's fds (PIPEOK: PID4 exit zombied PID5). */
     process_t *proc = get_current_process();
     thread_t *thr = proc ? (thread_t *)proc->sched_thread : NULL;
+    bool exit_nopreempt = false;
 
     /* If we held a newborn, release it so it is not stuck BLOCKED forever. */
     if (proc)
@@ -1919,11 +1929,29 @@ void fork_child_zombie_exit(int status) {
          * the parent (and sibling fork children). Freeing now unrefs those
          * frames and causes parent/sibling stack #PF + kfree double-free
          * spam. wait()/process_cleanup reaps the AS later. */
+        /* From here until the hlt loop this thread must not be switched
+         * out: once owner_process is cleared it is preemptible, and a
+         * TERMINATED thread is never resumed -- the rest of this exit path
+         * (zombie publish, parent wake) would be lost.  (The old code only
+         * survived this because detach aliased the CPU's idle thread onto
+         * the dying context.)  Interrupts stay on so TLB IPIs are answered. */
+        preempt_disable();
+        exit_nopreempt = true;
         if (thr) {
             thr->state = THREAD_TERMINATED;
             thr->owner_process = NULL;
             scheduler_detach_thread(thr);
             proc->sched_thread = NULL;
+        }
+        /* This CPU is running on proc->kernel_stack and hlt-loops on it until
+         * the timer switches it away, but once is_zombie is published the
+         * parent may reap the slot on another CPU -- process_release() used to
+         * kfree this stack right under us.  Hand the stack and the thread to
+         * the deferred reaper instead (the thread itself was never freed). */
+        {
+            void *ks = proc->kernel_stack;
+            proc->kernel_stack = NULL;
+            thread_mark_dead(thr, ks);
         }
         if (proc->fork_parent) {
             process_t *vp = proc->fork_parent;
@@ -1967,6 +1995,9 @@ void fork_child_zombie_exit(int status) {
         exec_set_ring3_active(NULL);
     }
 
+    /* Done: the next timer tick may now switch this dead thread out. */
+    if (exit_nopreempt)
+        preempt_enable();
     __asm__ volatile("sti");
     for (;;)
         __asm__ volatile("hlt");
@@ -2385,6 +2416,11 @@ static void process_signal_terminate(process_t *proc, int signum) {
         thr->owner_process = NULL;
         scheduler_detach_thread(thr);
         proc->sched_thread = NULL;
+        /* The victim may still be executing on another CPU (on its kernel
+         * stack): let the reaper free stack + thread once it is off-CPU. */
+        void *ks = proc->kernel_stack;
+        proc->kernel_stack = NULL;
+        thread_mark_dead(thr, ks);
         desktop_destroy_windows_for_pid(proc->pid);
     }
 
