@@ -57,6 +57,9 @@ static uint64_t      *exec_kernel_pml4_save  = NULL;
 static uint64_t       exec_orig_kstack_top   = 0;
 /* Ring-3 process from exec_run_elf; preempt must not confuse syscalls / #PF */
 static process_t     *exec_ring3_active_proc = NULL;
+/* Zeus foreground program: set/cleared ONLY in exec_run_elf (enter/resume).
+ * exec_ring3_active_proc is clobbered by the scheduler and fork exits. */
+static process_t     *exec_fg_sync_proc = NULL;
 /* Kernel thread (normally the shell) that entered Ring 3 via exec_file */
 static thread_t      *exec_sync_thread = NULL;
 static char *const   *exec_current_argv = NULL;
@@ -271,6 +274,12 @@ process_t *exec_user_as_process(void) {
      * COW / demand-paging MUST use the child's PML4 (CR3), not the parent's. */
     if (p && p->is_usermode && p->pml4 && p->fork_parent)
         return p;
+    /* Concurrent fork child on its own thread: its own PML4, not whichever
+     * process last exec'd (two pipeline members exec at once on SMP). */
+    if (p && p->is_usermode && p->pml4 && p->sched_thread &&
+        p != exec_ring3_active_proc &&
+        (thread_t *)p->sched_thread == scheduler_get_current_thread())
+        return p;
     if (get_program_running() && exec_ring3_active_proc &&
         exec_ring3_active_proc->is_usermode && exec_ring3_active_proc->pml4) {
         return exec_ring3_active_proc;
@@ -278,8 +287,14 @@ process_t *exec_user_as_process(void) {
     return p;
 }
 
+/* Job control: the foreground sync program (ash) and its kernel thread. */
+process_t *exec_get_sync_proc(void) { return exec_fg_sync_proc; }
+thread_t *exec_get_sync_thread_for(process_t *p) {
+    return (p && p == exec_fg_sync_proc) ? exec_sync_thread : NULL;
+}
+
 bool exec_current_is_sync_program(void) {
-    return get_program_running() && exec_ring3_active_proc &&
+    return get_program_running() && exec_fg_sync_proc &&
            exec_sync_thread &&
            scheduler_get_current_thread() == exec_sync_thread;
 }
@@ -1278,6 +1293,7 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
         vmm_switch_address_space(user_pml4);
         exec_ring3_active_proc = proc;
         exec_sync_thread = scheduler_get_current_thread();
+        exec_fg_sync_proc = proc;
         set_program_running(true);
         set_terminate_flag(false);
         ktrace("exec: entering Ring 3 rip=0x%llx rsp=0x%llx\n",
@@ -1298,9 +1314,20 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
     __asm__ volatile("sti" ::: "memory");
     exec_ring3_active_proc = NULL;
     exec_sync_thread = NULL;
+    exec_fg_sync_proc = NULL;
     set_program_running(false);
     set_terminate_flag(false);
     keyboard_set_raw_mode(false);
+    {
+        extern void process_set_fg_pgid(uint32_t pgid);
+        thread_t *st = scheduler_get_current_thread();
+        if (st && st->owner_process == (struct process *)proc)
+            st->owner_process = NULL;
+        if (proc->sched_thread == (void *)st)
+            proc->sched_thread = NULL;
+        process_set_fg_pgid(0);
+        keyboard_restore_shell_input();
+    }
 
     /* The app owned the framebuffer.  When the desktop compositor is running it
      * owns the display, so ask it for a full repaint; redrawing the console
@@ -1357,7 +1384,18 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
  *
  * Must NOT free or replace proc->kernel_stack: we are executing on it.
  */
+static int exec_replace_impl(process_t *proc, const char *filename, char *const argv[]);
+static volatile int exec_replace_busy = 0;
 int exec_replace(process_t *proc, const char *filename, char *const argv[]) {
+    while (__atomic_exchange_n(&exec_replace_busy, 1, __ATOMIC_ACQUIRE)) {
+        if (global_scheduler.scheduler_running) thread_sleep(1);
+        else __asm__ volatile("pause");
+    }
+    int r = exec_replace_impl(proc, filename, argv);
+    __atomic_store_n(&exec_replace_busy, 0, __ATOMIC_RELEASE);
+    return r;
+}
+static int exec_replace_impl(process_t *proc, const char *filename, char *const argv[]) {
     if (!proc || !filename)
         return -EINVAL;
     if (!proc->is_usermode || !proc->pml4)
@@ -1527,6 +1565,8 @@ int exec_replace(process_t *proc, const char *filename, char *const argv[]) {
     }
     proc->pending_signals = 0;
     proc->sig_in_handler = false;
+    proc->sig_from_irq = false;
+    proc->sig_iret_pending = false;
 
     exec_load_elf_symbols(image, fsize, proc);
     kfree(image);
@@ -1537,7 +1577,10 @@ int exec_replace(process_t *proc, const char *filename, char *const argv[]) {
         gdt_set_kernel_stack(proc->kernel_stack_top);
         syscall_set_kernel_stack(proc->kernel_stack_top);
     }
-    exec_set_ring3_active(proc);
+    if (!proc->sched_thread || !exec_ring3_active_proc ||
+        exec_ring3_active_proc == proc ||
+        !exec_ring3_active_proc->is_running)
+        exec_set_ring3_active(proc);
     thread_wrfsbase(0);
     if (proc->sched_thread) {
         thread_t *thr = (thread_t *)proc->sched_thread;

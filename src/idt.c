@@ -193,6 +193,41 @@ char* exception_messages[] = {
 void preemptive_schedule(registers_t *r);
 static void preemptive_schedule_force(void);
 
+/* Job control on every CPU's LAPIC tick: dispatch a posted tty signal and
+ * kill a ring-3-interrupted process whose pending signal is fatal by default
+ * (busy loops never reach a syscall-return delivery point). */
+static void tty_timer_hook(registers_t *r) {
+    extern void tty_dispatch_pending(void);
+    extern int proc_fatal_default_pending(process_t *p);
+    extern void process_fault_kill_current(int signum);
+    extern process_t *get_kernel_process(void);
+    tty_dispatch_pending();
+    if ((r->cs & 3) != 3) return;
+    thread_t *cth = scheduler_get_current_thread();
+    process_t *op = (cth && cth->owner_process) ? (process_t *)cth->owner_process
+                                                : exec_user_as_process();
+    int fsig = proc_fatal_default_pending(op);
+    if (!fsig) {
+        extern int process_irq_deliver(process_t *p, registers_t *r);
+        process_irq_deliver(op, r);
+        return;
+    }
+    bool fork_child = op->sched_thread && (thread_t *)op->sched_thread == cth &&
+                      op->parent && op->parent != get_kernel_process();
+    bool sync = !fork_child && exec_current_is_sync_program();
+    if (!fork_child && !sync) return;
+    serial_printf("tty: ring3 kill pid=%d sig=%d\n", (int)op->pid, fsig);
+    op->pending_signals &= ~(1u << fsig);
+    set_current_process(op);
+    exit_interrupt_context();
+    if (fork_child) {
+        process_fault_kill_current(fsig);
+        __builtin_unreachable();
+    }
+    exec_force_terminate(128 + fsig);
+    __builtin_unreachable();
+}
+
 void handle_timer(registers_t *r){
     hpet_isr();
     fb_cursor_blink_tick();
@@ -902,6 +937,7 @@ void isr_handler(registers_t* r) {
     }
     if(r->int_no == 32){
         apic_timer();
+        tty_timer_hook(r);
         profiler_sample_from_isr(r);
         preemptive_schedule(r);
     }

@@ -294,6 +294,11 @@ typedef struct process {
     uint64_t sig_saved_rip, sig_saved_rsp, sig_saved_rflags;
     uint64_t sig_saved_rax, sig_saved_rdi, sig_saved_rsi, sig_saved_rdx;
     bool     sig_in_handler;
+    /* Handler entered from an IRQ (preempted ring-3 frame): rcx/r11 are live
+     * user values, so rt_sigreturn must iretq with a full GPR restore. */
+    bool     sig_from_irq;
+    bool     sig_iret_pending;
+    uint64_t sig_saved_rcx, sig_saved_r11;
     uint64_t sig_restorer[NSIG];
 
     mode_t file_umask;                  // process umask (default 022)

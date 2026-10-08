@@ -593,6 +593,10 @@ void kmain(void) {
 
             tty_feed_line(active_tty, buffer);
             tty_submit_line(active_tty);
+            /* The tty has its own copy now. Drop the line from the VC buffer
+             * before running it, or a program reading stdin (busybox sh)
+             * gets the Zeus command line again as its first input. */
+            keyboard_clear_buffer();
 
             set_terminate_flag(false);
             tty_poll();

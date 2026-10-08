@@ -463,6 +463,25 @@ static void keyboard_process_byte(uint16_t scancode){
     /* Ctrl+C: always processed, even in raw mode.
      * Sets the active VC's terminate flag — only the foreground job on
      * this console is affected. */
+    /* Linux job control: a Linux program (ash) owns the console. Send
+     * SIGINT/SIGQUIT to the foreground pgrp instead of force-killing the
+     * sync program (which took ash down). Zeus-native / Doom unchanged. */
+    if (left_ctrl_pressed && (ch == 'c' || ch == '\\')) {
+        extern bool tty_linux_foreground(void);
+        extern void tty_post_signal(int sig);
+        if (tty_linux_foreground()) {
+            serial_printf("kbd: Ctrl+%c -> tty signal\n", ch == 'c' ? 'C' : '\\');
+            tty_post_signal(ch == 'c' ? 2 /*SIGINT*/ : 3 /*SIGQUIT*/);
+            memset(vc->kbd_buf, '\0', sizeof(vc->kbd_buf));
+            vc->kbd_len     = 0;
+            vc->kbd_execute = false;
+            safe_echo_char('^');
+            safe_echo_char(ch == 'c' ? 'C' : '\\');
+            safe_echo_char('\n');
+            goto end;
+        }
+    }
+
     if (left_ctrl_pressed && ch == 'c') {
         uint64_t now = hpet_get_ticks();
         serial_printf("kbd: Ctrl+C scancode path (terminate_flag)\n");
@@ -908,6 +927,10 @@ void keyboard_restore_shell_input(void) {
     vc->kbd_cursor  = 0;
     vc->kbd_dirty   = false;
     vc->kbd_execute = false;
+    /* Drop echo queued while the program owned the console (a Linux
+     * program in cooked VC mode); Zeus would replay it all on return. */
+    echo_tail    = echo_head;
+    echo_pending = false;
     spinlock_unlock(&keyboard_lock);
     irq_restore(irq_flags);
 }

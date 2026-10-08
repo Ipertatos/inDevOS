@@ -1,4 +1,5 @@
 #include "drm.h"
+#include "registers.h"
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "idt.h"
@@ -328,6 +329,9 @@ static void process_signal_terminate(process_t *proc, int signum);
 
 static void handle_pending_signals(process_t *proc);
 static void process_signal_terminate(process_t *proc, int signum);
+bool proc_signal_interrupts(process_t *p);
+void process_post_signal(process_t *t, int signum);
+int sys_getchar_intr(process_t *p);
 
 int process_deliver_signals(process_t *proc, void *linux_frame) {
     if (!proc || !linux_frame || proc->sig_in_handler) return 0;
@@ -1113,6 +1117,25 @@ int sys_exit(int status) {
         __builtin_unreachable();
     }
 
+    /* Foreground sync program (ash launched from Zeus) whose boot thread got
+     * pinned as sched_thread: return to Zeus via longjmp, never thread-exit
+     * the Zeus thread (that left Zeus deaf to input after ash exited). */
+    {
+        extern bool exec_current_is_sync_program(void);
+        extern process_t *exec_get_sync_proc(void);
+        extern void process_set_fg_pgid(uint32_t pgid);
+        if (proc && exec_current_is_sync_program() && proc == exec_get_sync_proc()) {
+            thread_t *st = (thread_t *)proc->sched_thread;
+            if (st && st->owner_process == (struct process *)proc)
+                st->owner_process = NULL;
+            proc->sched_thread = NULL;
+            process_set_fg_pgid(0);
+            serial_printf("sys_exit: sync PID %u -> back to Zeus\n", proc->pid);
+            exec_notify_exit(status);
+            __builtin_unreachable();
+        }
+    }
+
     /* Concurrent fork child: become a waitable zombie. */
     if (proc && proc->sched_thread && proc->parent &&
         proc->parent != &processes[0]) {
@@ -1162,7 +1185,12 @@ int sys_read(int fd, void *buf, size_t count) {
         if (!kbuf) return -ENOMEM;
         size_t got = 0;
         for (size_t i = 0; i < count; i++) {
-            char ch = (char)sys_getchar();
+            int ci = sys_getchar_intr(proc);
+            if (ci < 0) {
+                if (got == 0) { kfree(kbuf); return -EINTR; }
+                break;
+            }
+            char ch = (char)ci;
             kbuf[got++] = ch;
             if (ch == '\n')
                 break;
@@ -1200,6 +1228,8 @@ int sys_read(int fd, void *buf, size_t count) {
                     if (self)
                         pipe_set_waiting_reader(p, self);
                     thread_sleep(1);
+                    if (proc_signal_interrupts(get_current_process()))
+                        return -EINTR;
                 } else
                     return 0;
                 kbuf = kalloc(count);
@@ -2407,6 +2437,10 @@ int sys_wait(int *status) {
                 serial_puts("No children left\n");
                 return -ECHILD;
             }
+        } else if (proc_signal_interrupts(parent)) {
+            thread_unblock_current_running_unlocked();
+            scheduler_irq_unlock(wf);
+            return -EINTR;
         } else {
             scheduler_irq_unlock(wf);
             if (!global_scheduler.scheduler_running)
@@ -2456,7 +2490,10 @@ static void process_signal_terminate(process_t *proc, int signum) {
     proc->is_running  = false;
 
     if (proc == get_current_process()) {
-        proc->is_zombie = true;
+        /* Linux ABI: do NOT publish is_zombie while still running — a
+         * parent on another CPU could reap (memset) us. The syscall
+         * return path exits via sys_exit (fork_child_zombie_exit). */
+        if (!proc->linux_abi) proc->is_zombie = true;
         return;
     }
 
@@ -2573,8 +2610,12 @@ int sys_kill(pid_t pid, int signum) {
         return -EPERM;
     }
     
-    target->pending_signals |= (1 << signum);
-    handle_pending_signals(target);
+    if (target == sender) {
+        target->pending_signals |= (1 << signum);
+        handle_pending_signals(target);
+    } else {
+        process_post_signal(target, signum);
+    }
     
     return 0;
 }
@@ -2622,19 +2663,178 @@ int sys_setsid(void) {
 /* Foreground process group for the console (Ctrl+C target). */
 static uint32_t console_fg_pgid = 0;
 void process_set_fg_pgid(uint32_t pgid) { console_fg_pgid = pgid; }
+extern process_t *exec_get_sync_proc(void);
+extern thread_t *exec_get_sync_thread_for(process_t *p);
 uint32_t process_get_fg_pgid(void) {
-    if (console_fg_pgid) return console_fg_pgid;
+    if (console_fg_pgid) {
+        for (int i = 0; i < MAX_PROCESSES; i++)
+            if (processes[i].is_running && processes[i].pgid == console_fg_pgid)
+                return console_fg_pgid;
+    }
+    process_t *sp = exec_get_sync_proc();
+    if (sp && sp->is_running)
+        return sp->pgid ? sp->pgid : sp->pid;
     process_t *c = get_current_process();
     return c ? c->pgid : 0;
 }
+
+/* Signals that interrupt a blocking syscall (-EINTR): pending, unblocked,
+ * not ignored. SIGCHLD/SIGCONT/SIGWINCH/SIGURG never interrupt here (keeps
+ * ash's wait/SIGCHLD flow unchanged). */
+bool proc_signal_interrupts(process_t *p) {
+    if (!p) return false;
+    uint32_t pend = __atomic_load_n(&p->pending_signals, __ATOMIC_ACQUIRE) &
+                    ~p->blocked_signals;
+    if (!pend) return false;
+    for (int s = 1; s < NSIG; s++) {
+        if (!(pend & (1u << s))) continue;
+        if (s == SIGCHLD || s == SIGCONT || s == 28 /*WINCH*/ || s == 23 /*URG*/)
+            continue;
+        if (p->signal_handlers[s] == SIG_IGN && s != SIGKILL)
+            continue;
+        return true;
+    }
+    return false;
+}
+
+/* Pending fatal signal with default action (for ring-3 kill from the timer). */
+int proc_fatal_default_pending(process_t *p) {
+    if (!p || !p->is_running) return 0;
+    uint32_t pend = p->pending_signals & ~p->blocked_signals;
+    if (!pend) return 0;
+    static const int fatal[] = { SIGKILL, SIGINT, SIGQUIT, SIGTERM, SIGHUP };
+    for (unsigned i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++) {
+        int s = fatal[i];
+        if (!(pend & (1u << s))) continue;
+        if (s == SIGKILL || p->signal_handlers[s] == SIG_DFL)
+            return s;
+    }
+    return 0;
+}
+
+/* Post a signal to another (or any) process without running its default
+ * action from the sender's context: mark pending and wake it so a blocking
+ * syscall returns -EINTR and delivery happens on its own return path. */
+void process_post_signal(process_t *t, int signum) {
+    if (!t || signum < 1 || signum >= NSIG) return;
+    __atomic_or_fetch(&t->pending_signals, 1u << signum, __ATOMIC_SEQ_CST);
+    thread_t *thr = (thread_t *)t->sched_thread;
+    if (!thr)
+        thr = exec_get_sync_thread_for(t);
+    if (thr)
+        thread_wake(thr);
+}
+
+/* Deliver a pending signal that has a handler on the IRQ-return-to-user path,
+ * rewriting the LIVE interrupt frame (never a stash). Called from the LAPIC
+ * tick when the interrupted context is ring 3 and owned by p. */
+int process_irq_deliver(process_t *p, registers_t *r) {
+    if (!p || !r || (r->cs & 3) != 3) return 0;
+    if (!p->is_running || p->is_zombie || !p->linux_abi || p->sig_in_handler)
+        return 0;
+    uint32_t pend = p->pending_signals & ~p->blocked_signals;
+    if (!pend) return 0;
+    static const int ok[] = { SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM };
+    for (unsigned i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        int s = ok[i];
+        uint32_t bit = 1u << s;
+        if (!(pend & bit)) continue;
+        sighandler_t h = p->signal_handlers[s];
+        if (h == SIG_DFL || h == SIG_IGN || h == SIG_ERR) continue;
+        uint64_t ha = (uint64_t)(uintptr_t)h;
+        uint64_t restorer = p->sig_restorer[s];
+        if (ha < 0x10000ULL || (ha >> 47) || !restorer || (restorer >> 47)) continue;
+        if (p->signal_sa_flags[s] & 0x4) continue; /* SA_SIGINFO: syscall path only */
+        if (r->rip >> 47) return 0;
+        /* Skip the 128-byte red zone; handler entry sees rsp == 8 mod 16. */
+        uint64_t rsp = ((r->rsp - 128) & ~0xFULL) - 8;
+        set_current_process(p);
+        if (copy_to_user((void *)(uintptr_t)rsp, &restorer, sizeof(restorer)) != 0)
+            return 0; /* stack page not writable yet: try again next syscall/tick */
+        __atomic_and_fetch(&p->pending_signals, ~bit, __ATOMIC_SEQ_CST);
+        p->sig_saved_r15 = r->r15; p->sig_saved_r14 = r->r14;
+        p->sig_saved_r13 = r->r13; p->sig_saved_r12 = r->r12;
+        p->sig_saved_rbp = r->rbp; p->sig_saved_rbx = r->rbx;
+        p->sig_saved_r9  = r->r9;  p->sig_saved_r8  = r->r8;
+        p->sig_saved_r10 = r->r10; p->sig_saved_rdx = r->rdx;
+        p->sig_saved_rsi = r->rsi; p->sig_saved_rdi = r->rdi;
+        p->sig_saved_rax = r->rax; p->sig_saved_rcx = r->rcx;
+        p->sig_saved_r11 = r->r11;
+        p->sig_saved_rip = r->rip; p->sig_saved_rsp = r->rsp;
+        p->sig_saved_rflags = r->rflags;
+        p->sig_from_irq = true;
+        p->sig_in_handler = true;
+        serial_printf("irqsig: pid=%d sig=%d rip=0x%llx rsp=0x%llx -> handler=0x%llx rsp=0x%llx cs=0x%llx ss=0x%llx\n",
+                      (int)p->pid, s, (unsigned long long)r->rip,
+                      (unsigned long long)r->rsp, (unsigned long long)ha,
+                      (unsigned long long)rsp, (unsigned long long)r->cs,
+                      (unsigned long long)r->ss);
+        r->rip = ha;
+        r->rsp = rsp;
+        r->rdi = (uint64_t)s;
+        r->rsi = 0;
+        r->rdx = 0;
+        r->rax = 0;
+        r->rflags = 0x202;
+        return s;
+    }
+    return 0;
+}
+
 void process_kill_pgid(uint32_t pgid, int signum) {
     if (!pgid) return;
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t *t = &processes[i];
         if (!t->is_running || t->pgid != pgid) continue;
-        t->pending_signals |= (1u << signum);
-        handle_pending_signals(t);
+        process_post_signal(t, signum);
     }
+}
+
+int sys_getsid(pid_t pid) {
+    process_t *cur = get_current_process();
+    if (pid == 0) return cur ? (int)cur->sid : -ESRCH;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (processes[i].pid == (uint32_t)pid &&
+            (processes[i].is_running || processes[i].is_zombie))
+            return (int)processes[i].sid;
+    return -ESRCH;
+}
+
+/* ---- tty job-control signals (Ctrl+C / Ctrl+\) ----
+ * Keyboard ISR only posts; a timer tick dispatches to the fg pgrp. */
+static volatile int tty_pending_sig = 0;
+void tty_post_signal(int sig) {
+    __atomic_store_n(&tty_pending_sig, sig, __ATOMIC_SEQ_CST);
+}
+void tty_dispatch_pending(void) {
+    if (!__atomic_load_n(&tty_pending_sig, __ATOMIC_RELAXED)) return;
+    int sig = __atomic_exchange_n(&tty_pending_sig, 0, __ATOMIC_SEQ_CST);
+    if (!sig) return;
+    uint32_t fg = process_get_fg_pgid();
+    serial_printf("tty: signal %d -> fg pgid %u\n", sig, fg);
+    process_kill_pgid(fg, sig);
+}
+bool tty_linux_foreground(void) {
+    process_t *sp = exec_get_sync_proc();   /* exec_fg_sync_proc only */
+    return sp && sp->is_running && sp->linux_abi;
+}
+
+/* Blocking console char read that gives up on an interrupting signal. */
+int sys_getchar_intr(process_t *p) {
+    int c = -1;
+    while (c < 0) {
+        c = keyboard_consume_char();
+        if (c < 0) {
+            if (proc_signal_interrupts(p))
+                return -EINTR;
+            if (global_scheduler.scheduler_running)
+                thread_sleep(1);
+            else
+                __asm__ volatile("hlt");
+        }
+    }
+    keyboard_clear_execute();
+    return c;
 }
 
 
@@ -3188,7 +3388,17 @@ int sys_nanosleep(const timespec_ind_t *req, timespec_ind_t *rem) {
     extern void     ktime_yield_until(uint64_t);
     /* Same path as SDL_Delay(): HLT until the HPET deadline. Safe from a
      * Ring-3 syscall (does not thread_sleep / reschedule this frame). */
-    ktime_yield_until(ktime_deadline_ms(ms));
+    {
+        extern bool ktime_expired(uint64_t);
+        process_t *sp_ = get_current_process();
+        uint64_t dl = ktime_deadline_ms(ms);
+        (void)ktime_yield_until;
+        while (!ktime_expired(dl)) {
+            if (proc_signal_interrupts(sp_))
+                return -EINTR;
+            __asm__ volatile("sti; hlt" ::: "memory");
+        }
+    }
     return 0;
 }
 

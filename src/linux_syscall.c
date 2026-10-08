@@ -238,7 +238,12 @@ static long lx_read_tty(process_t *p, long fd, void *ubuf, size_t count) {
     char kbuf[64];
     size_t got = 0;
     while (got < want) {
-        int ch = sys_getchar();
+        extern int sys_getchar_intr(process_t *);
+        int ch = sys_getchar_intr(p);
+        if (ch < 0) {
+            if (got == 0) return -EINTR;
+            break;
+        }
         kbuf[got++] = (char)ch;
         /* If more chars are already buffered, keep filling without blocking. */
         extern uint32_t keyboard_get_buffer_length(void);
@@ -693,6 +698,14 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
             if (pg < 0) return -EINVAL;
             process_set_fg_pgid((uint32_t)pg);
             return 0;
+        }
+        case 0x540E: /* TIOCSCTTY */
+        case 0x5422: /* TIOCNOTTY */
+            return tty ? 0 : -ENOTTY;
+        case 0x5429: { /* TIOCGSID */
+            if (!tty) return -ENOTTY;
+            int sid = (int)p->sid;
+            return lx_put(arg, &sid, sizeof(sid));
         }
         case LX_FIONREAD:
         case LX_FIONBIO:
@@ -1221,7 +1234,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_getpgid:
         return sys_getpgid((pid_t)(int)a1);
     case LX_getsid:
-        return a1 == 0 ? (long)p->sid : sys_getpgid((pid_t)(int)a1); /* approx */
+        { extern int sys_getsid(pid_t); return sys_getsid((pid_t)(int)a1); }
     case LX_setpgid:
         return sys_setpgid((pid_t)(int)a1, (pid_t)(int)a2);
     case LX_setsid:
@@ -1339,6 +1352,11 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (p && !p->is_running) lx_die_by_signal(p, (int)a2);
             return 0;
         }
+        if ((int)a1 < -1) {
+            /* kill(-pgid, sig) */
+            process_kill_pgid((uint32_t)(-(int)a1), (int)a2);
+            return 0;
+        }
         long r = sys_kill((pid_t)a1, (int)a2);
         /* If we killed ourselves with a fatal default action, exit now. */
         if (r == 0 && p && !p->is_running)
@@ -1421,6 +1439,11 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_rt_sigreturn: {
         if (!p->sig_in_handler) return 0;
         p->sig_in_handler = false;
+        if (p->sig_from_irq) {
+            p->sig_from_irq = false;
+            p->sig_iret_pending = true; /* handled right after lx_dispatch */
+            return 0;
+        }
         /* Restore FULL GPR set into this syscall's live frame. The SYSCALL
          * epilogue pops r15..rbx and a6..a1 from the frame before sysret/iretq,
          * so partial restore left handler/callee-saved regs in place and ash
@@ -1441,6 +1464,12 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         fr->user_rsp = p->sig_saved_rsp;
         fr->user_rflags = p->sig_saved_rflags | 0x200ULL; /* IF */
         return (long)p->sig_saved_rax;
+    }
+    case LX_pause: {
+        extern bool proc_signal_interrupts(process_t *);
+        while (!proc_signal_interrupts(p))
+            ktime_yield_until(ktime_deadline_ms(5));
+        return -EINTR;
     }
     case LX_rt_sigsuspend: {
         /* Replace mask, wait for an unblocked pending signal, restore, EINTR.
@@ -1512,7 +1541,15 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             uint64_t now = (a1 == 0) ? lx_real_us() : lx_mono_us();
             want_us = want_us > now ? want_us - now : 0;
         }
-        ktime_yield_until(ktime_deadline_ms((want_us + 999) / 1000));
+        {
+            extern bool proc_signal_interrupts(process_t *);
+            extern bool ktime_expired(uint64_t);
+            uint64_t dl = ktime_deadline_ms((want_us + 999) / 1000);
+            while (!ktime_expired(dl)) {
+                if (proc_signal_interrupts(p)) return -EINTR;
+                __asm__ volatile("sti; hlt" ::: "memory");
+            }
+        }
         return 0;
     }
     case LX_times: {
@@ -1724,6 +1761,47 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
 }
 
+/* Full register image for returning from an IRQ-delivered handler. Field
+ * order matches lx_iret_full (syscallasm.asm): GPR pops, then iretq frame. */
+typedef struct {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t rip, cs, rflags, rsp, ss;
+} lx_iret_regs_t;
+extern void lx_iret_full(lx_iret_regs_t *regs) __attribute__((noreturn));
+
+__attribute__((noreturn))
+static void lx_sigreturn_iret(process_t *p) {
+    lx_iret_regs_t g;
+    g.r15 = p->sig_saved_r15; g.r14 = p->sig_saved_r14;
+    g.r13 = p->sig_saved_r13; g.r12 = p->sig_saved_r12;
+    g.r11 = p->sig_saved_r11; g.r10 = p->sig_saved_r10;
+    g.r9  = p->sig_saved_r9;  g.r8  = p->sig_saved_r8;
+    g.rbp = p->sig_saved_rbp; g.rdi = p->sig_saved_rdi;
+    g.rsi = p->sig_saved_rsi; g.rdx = p->sig_saved_rdx;
+    g.rcx = p->sig_saved_rcx; g.rbx = p->sig_saved_rbx;
+    g.rax = p->sig_saved_rax;
+    g.rip = p->sig_saved_rip;
+    g.rsp = p->sig_saved_rsp;
+    /* Only arithmetic/DF flags from the user image; IF and bit 1 forced,
+     * IOPL/NT/RF/VM/AC never taken from user. User selectors fixed. */
+    g.rflags = (p->sig_saved_rflags & 0x0CD5ULL) | 0x202ULL;
+    g.cs = 0x23;
+    g.ss = 0x1B;
+    if (g.rip == 0 || (g.rip >> 47) || (g.rsp >> 47)) {
+        serial_printf("irqsig: bad sigreturn image pid=%u rip=0x%llx rsp=0x%llx -> SIGSEGV\n",
+                      p->pid, (unsigned long long)g.rip, (unsigned long long)g.rsp);
+        p->exit_status = 128 + 11;
+        p->is_running = false;
+        sys_exit(128 + 11);
+        __builtin_unreachable();
+    }
+    serial_printf("irqsig: sigreturn pid=%u iretq rip=0x%llx rsp=0x%llx rflags=0x%llx cs=0x23 ss=0x1b\n",
+                  p->pid, (unsigned long long)g.rip, (unsigned long long)g.rsp,
+                  (unsigned long long)g.rflags);
+    lx_iret_full(&g);
+}
+
 uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
     process_t *p = lx_proc();
 
@@ -1784,6 +1862,29 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
 
     long r = lx_dispatch(f);
 
+    if (p && p->sig_iret_pending && f->nr == (uint64_t)LX_rt_sigreturn) {
+        p->sig_iret_pending = false;
+        lx_sigreturn_iret(p); /* noreturn */
+    }
+
+    /* SA_RESTART: rewind to the SYSCALL insn (2 bytes) with rax=nr so the
+     * call re-executes after the handler. pause/sigsuspend never restart. */
+    if (r == -EINTR && p && !p->sig_in_handler &&
+        f->nr != (uint64_t)LX_pause && f->nr != (uint64_t)LX_rt_sigsuspend) {
+        for (int s = 1; s < NSIG; s++) {
+            uint32_t b = 1u << s;
+            if (!(p->pending_signals & b) || (p->blocked_signals & b)) continue;
+            if (s == SIGCHLD || s == SIGCONT) continue;
+            sighandler_t h = p->signal_handlers[s];
+            if (h == SIG_IGN || h == SIG_DFL) continue;
+            if (p->signal_sa_flags[s] & SA_RESTART) {
+                f->user_rip -= 2;
+                r = (long)f->nr;
+            }
+            break;
+        }
+    }
+
     /* Deliver pending custom / default signals before SYSRET.
      * Stash syscall return in sig_saved_rax so rt_sigreturn restores it
      * (else write()-after-SIGPIPE returns n=0 instead of -EPIPE). */
@@ -1799,6 +1900,14 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
         if (f->nr != (uint64_t)LX_fork && f->nr != (uint64_t)LX_clone &&
             f->nr != (uint64_t)LX_vfork)
             process_deliver_signals(p, f);
+    }
+
+    /* exit via sys_exit after fatal default signal to ourselves, so a fork
+     * child becomes a real waitable zombie (closes fds, wakes parent). */
+    if (p && !p->is_running && p->linux_abi) {
+        serial_printf("linux: PID %u killed by signal %d\n", p->pid,
+                      p->exit_status - 128);
+        sys_exit(p->exit_status);
     }
 
     /* Wake pipeline pair after signals so writer SIGCHLD is not delivered

@@ -34,11 +34,28 @@ enter_usermode:
 global syscall_asm_handler
 syscall_asm_handler:
     ; Stash user RIP/RSP/RFLAGS for SYS_FORK (iframe still at RSP).
+    ; The C call clobbers caller-saved regs: rax = syscall nr, rdi/rsi/rdx/
+    ; r10/r8/r9 = args. Save all of them (9 pushes keep RSP 16-aligned).
+    push rax
+    push rcx
+    push rdx
+    push rsi
     push rdi
-    mov rdi, rsp
-    add rdi, 8              ; skip our push — point at hardware iretq frame
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [rsp + 72]     ; skip our 9 pushes — hardware iretq frame
     call syscall_stash_int80_fork_frame
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ; Save all registers
     push rax
     push rbx
@@ -219,6 +236,30 @@ syscall_entry:
 ; exec_setjmp(exec_jmpbuf_t *buf)  -> 0 on first call, non-zero on longjmp
 ; exec_longjmp(exec_jmpbuf_t *buf, int val)  -> never returns
 ; ===========================================================================
+; lx_iret_full(lx_iret_regs_t *rdi) -- return to user from rt_sigreturn of an
+; IRQ-delivered handler: restore ALL GPRs (incl. rcx/r11) and iretq.
+; GS is already in the invariant state (GS_BASE=user) outside the entry stub.
+global lx_iret_full
+lx_iret_full:
+    cli
+    mov rsp, rdi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 global exec_setjmp
 exec_setjmp:
     ; rdi = pointer to exec_jmpbuf_t
