@@ -371,35 +371,6 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
                 return true;
             }
             serial_puts("[cow] Out of physical frames for COW!\n");
-        } else if (ro_user && pte) {
-            /* Diagnostics: present+RO+USER write that we refused to break. */
-            extern uint8_t vmm_page_get_ref(uint64_t);
-            uint64_t phys = *pte & PTE_ADDR_MASK;
-            serial_printf("[cow-diag] refuse va=0x%llx pte=0x%llx refs=%u pid=%d "
-                          "proc_pml4=%p active=%p cow=%d stack=%d heap=%d\n",
-                          (unsigned long long)faulting_address,
-                          (unsigned long long)*pte,
-                          (unsigned)vmm_page_get_ref(phys),
-                          proc ? (int)proc->pid : -1,
-                          (void *)(proc ? proc->pml4 : NULL),
-                          (void *)active_pml4,
-                          cow_bit ? 1 : 0,
-                          in_stack ? 1 : 0,
-                          in_heap ? 1 : 0);
-            if (proc && proc->parent && proc->parent->pml4) {
-                uint64_t *ppte = vmm_get_pte_in(proc->parent->pml4, page_addr);
-                if (ppte)
-                    serial_printf("[cow-diag] parent pid=%d pte=0x%llx refs=%u\n",
-                                  (int)proc->parent->pid,
-                                  (unsigned long long)*ppte,
-                                  (unsigned)vmm_page_get_ref(*ppte & PTE_ADDR_MASK));
-            }
-        } else if (page_present && was_write && (!pte || !(*pte & VMM_PRESENT))) {
-            serial_printf("[cow-diag] no PTE va=0x%llx pid=%d active=%p proc_pml4=%p\n",
-                          (unsigned long long)faulting_address,
-                          proc ? (int)proc->pid : -1,
-                          (void *)active_pml4,
-                          (void *)(proc ? proc->pml4 : NULL));
         }
     }
     return false;

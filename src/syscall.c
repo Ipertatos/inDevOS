@@ -325,10 +325,7 @@ uint32_t *fd_refcount_create(void) {
 }
 
 static void process_signal_terminate(process_t *proc, int signum);
-
-
 static void handle_pending_signals(process_t *proc);
-static void process_signal_terminate(process_t *proc, int signum);
 bool proc_signal_interrupts(process_t *p);
 void process_post_signal(process_t *t, int signum);
 int sys_getchar_intr(process_t *p);
@@ -387,28 +384,13 @@ int process_deliver_signals(process_t *proc, void *linux_frame) {
         }
         proc->pending_signals &= ~bit;
 
-        /* Ensure CR3 is this process before probing user G / pushing restorer. */
+        /* Ensure CR3 is this process before pushing the restorer. */
         if (proc->pml4) {
             extern void vmm_switch_address_space(uint64_t *);
             vmm_switch_address_space(proc->pml4);
         }
 
-        /* busybox ash: ash_ptr_to_globals_misc @ 0x4dd680; SIGCHLD path does
-         * cmpq $0,0x168(%rax) (job-control / trap pointer in globals_misc).
-         * PF if G is NULL. Skip like IGN rather than enter the handler. */
-        {
-            uint64_t ash_g = 0;
-            int g_ok = (copy_from_user(&ash_g, (const void *)(uintptr_t)0x4dd680ULL,
-                                       sizeof(ash_g)) == 0);
-            uint64_t ha = (uint64_t)(uintptr_t)handler;
-            serial_printf("deliver: ash_ptr_to_globals_misc %s=0x%llx\n",
-                          g_ok ? "ok" : "FAIL", (unsigned long long)ash_g);
-            if (signum == SIGCHLD && ha == 0x435a5eULL && (!g_ok || ash_g == 0)) {
-                serial_printf("deliver: skip ash SIGCHLD (G null) pid=%d\n",
-                              (int)proc->pid);
-                continue;
-            }
-        }
+        /* BusyBox ash SIGCHLD G-null skip removed — retest PIPEOK/SIGCHLD. */
 
         /* Snapshot the LIVE frame (this thread's kstack), not a stale stash. */
         proc->sig_saved_r15 = fr->r15;
@@ -428,26 +410,6 @@ int process_deliver_signals(process_t *proc, void *linux_frame) {
         proc->sig_saved_rsp = fr->user_rsp;
         proc->sig_saved_rflags = fr->user_rflags;
         proc->sig_in_handler = true;
-        serial_printf("deliver: pid=%d sig=%d handler=0x%llx restorer=0x%llx flags=0x%x "
-                      "frame rip=0x%llx rsp=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                      "rax=0x%llx rflags=0x%llx\n",
-                      (int)proc->pid, signum,
-                      (unsigned long long)(uintptr_t)handler,
-                      (unsigned long long)proc->sig_restorer[signum],
-                      (unsigned)proc->signal_sa_flags[signum],
-                      (unsigned long long)proc->sig_saved_rip,
-                      (unsigned long long)proc->sig_saved_rsp,
-                      (unsigned long long)proc->sig_saved_rdi,
-                      (unsigned long long)proc->sig_saved_rsi,
-                      (unsigned long long)proc->sig_saved_rdx,
-                      (unsigned long long)proc->sig_saved_rax,
-                      (unsigned long long)proc->sig_saved_rflags);
-        serial_printf("deliver: push restorer=0x%llx on user rsp->0x%llx; "
-                      "enter handler rdi=%d (SA_SIGINFO=%d)\n",
-                      (unsigned long long)proc->sig_restorer[signum],
-                      (unsigned long long)((fr->user_rsp & ~0xFULL) - 8),
-                      signum,
-                      (proc->signal_sa_flags[signum] & 0x4) ? 1 : 0);
 
         uint64_t restorer = proc->sig_restorer[signum];
         uint64_t rsp = fr->user_rsp & ~0xFULL;
@@ -473,8 +435,6 @@ int process_deliver_signals(process_t *proc, void *linux_frame) {
     }
     return 0;
 }
-
-static void handle_pending_signals(process_t *proc);
 
 static int fd_close_entry(process_t *proc, int fd) {
     if (!proc || fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !proc->fds[fd].in_use) {
@@ -804,8 +764,6 @@ static uint64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t a
             proc->signal_handlers[SIGINT] != SIG_DFL &&
             proc->signal_handlers[SIGINT] != SIG_IGN) {
             set_terminate_flag(false);
-            serial_printf("syscall: SIGINT queued for PID %d (graceful)\n",
-                          (int)proc->pid);
             proc->pending_signals |= (1 << SIGINT);
             return syscall_num == SYS_EXIT ? 0 : (uint64_t)-1;
         }
@@ -1110,8 +1068,6 @@ int sys_exit(int status) {
         current_process = parent;
         exec_set_ring3_active(parent);
 
-        serial_printf("fork-exit: child PID %d exited (%d), resuming parent %d\n",
-                      child_pid, status, (int)parent->pid);
 
         exec_longjmp((exec_jmpbuf_t *)parent->fork_jmpbuf, child_pid);
         __builtin_unreachable();
@@ -1250,20 +1206,6 @@ int sys_read(int fd, void *buf, size_t count) {
 }
 
 
-static const char *fd_type_str(uint8_t t) {
-    switch (t) {
-    case FD_TYPE_FILE: return "file";
-    case FD_TYPE_PIPE_READ: return "pipe_r";
-    case FD_TYPE_PIPE_WRITE: return "pipe_w";
-    case FD_TYPE_SOCKET: return "sock";
-    case FD_TYPE_VFS: return "vfs";
-    case FD_TYPE_VFS_DIR: return "dir";
-    case FD_TYPE_DEV_NULL: return "null";
-    case FD_TYPE_DEV_TTY: return "tty";
-    default: return "other";
-    }
-}
-
 int sys_write(int fd, const void *buf, size_t count) {
     process_t *proc = get_current_process();
 
@@ -1280,26 +1222,6 @@ int sys_write(int fd, const void *buf, size_t count) {
 
     if (count > 1048576) {
         return -EINVAL;
-    }
-
-    /* PIPEOK diag: log first writes on fd0/1/2 per process (n, type, bytes). */
-    {
-        static uint32_t wdiag_pid;
-        static int wdiag_left;
-        if (fd <= 2) {
-            if (wdiag_pid != proc->pid) { wdiag_pid = proc->pid; wdiag_left = 0; /* diag off: was jamming serial 6 */ }
-            if (wdiag_left > 0) {
-                unsigned char peek[8];
-                size_t pn = count < 8 ? count : 8;
-                for (size_t i = 0; i < 8; i++) peek[i] = 0;
-                (void)copy_from_user(peek, buf, pn);
-                serial_printf("write_diag: pid=%d fd=%d type=%s n=%zu b0=%02x b1=%02x b2=%02x\n",
-                              (int)proc->pid, fd, fd_type_str(proc->fds[fd].fd_type),
-                              count,
-                              pn > 0 ? peek[0] : 0, pn > 1 ? peek[1] : 0, pn > 2 ? peek[2] : 0);
-                wdiag_left--;
-            }
-        }
     }
 
     /* Pipe/file must win over the fd==1/2 console shortcut so dup2(pipe,1)
@@ -1330,8 +1252,6 @@ int sys_write(int fd, const void *buf, size_t count) {
             }
             kfree(kbuf);
             if (n == -EPIPE || n < 0) {
-                serial_printf("write: EPIPE fd=%d readers=%d writers=%d\n",
-                              fd, pp->readers, pp->writers);
                 /* Broken pipe: queue SIGPIPE for delivery on syscall return
                  * (process_deliver_signals). handle_pending_signals only for
                  * default terminate — calling it for custom handlers raced
@@ -1834,14 +1754,6 @@ static int fork_queue_child_thread(process_t *parent, process_t *child) {
     /* GPRs are now in thr->saved_regs — invalidate the by-value snapshot. */
     parent->fork_saved_gprs_valid = 0;
 
-    serial_printf("fork: queued child PID %d thr rip=0x%llx rsp=0x%llx "
-                  "rflags=0x%llx rbx=0x%llx rbp=0x%llx (held until wait)\n",
-                  (int)child->pid,
-                  (unsigned long long)thr->saved_regs.rip,
-                  (unsigned long long)thr->saved_regs.rsp,
-                  (unsigned long long)thr->saved_regs.rflags,
-                  (unsigned long long)thr->saved_regs.rbx,
-                  (unsigned long long)thr->saved_regs.rbp);
     /* Hold BLOCKED until parent blocking-wait/exit. Prior held child moves
      * to fork_release_at_exit so writer+reader start together at wait.
      * Never wake early here (that raced PIPEOK / bad busybox argv). */
@@ -1938,7 +1850,7 @@ void fork_child_zombie_exit(int status) {
     if (proc)
         fork_release_pending(proc);
 
-serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
+    serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
                   proc ? (int)proc->pid : -1, status);
 
     if (proc) {
@@ -1982,8 +1894,6 @@ serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
                 thread_wake_blocked_unlocked(pt);
             scheduler_irq_unlock(zf);
             if (pt) {
-                serial_printf("fork-child-exit: wake parent=%d (blocked->ready)\n",
-                              (int)par->pid);
                 scheduler_kick_thread(pt);
             }
         }
@@ -2141,7 +2051,6 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
             child->pml4 = parent->pml4;
             child->clone_shared_vm = true;
             parent->clone_shared_vm = true;
-            serial_printf("clone: CLONE_VM share pml4=%p\n", (void *)parent->pml4);
         } else {
             uint64_t *newpml4 = vmm_clone_address_space(parent->pml4);
             if (!newpml4) {
@@ -2195,20 +2104,14 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
         if (child->fds[i].fd_type == FD_TYPE_PIPE_READ) {
             pipe_t *pp = (pipe_t *)child->fds[i].file_handle;
             pipe_fork_dup_reader(pp);
-            serial_printf("fork: dup reader fd=%d -> readers=%d writers=%d\n",
-                          i, pp ? pp->readers : -1, pp ? pp->writers : -1);
         } else if (child->fds[i].fd_type == FD_TYPE_PIPE_WRITE) {
             pipe_t *pp = (pipe_t *)child->fds[i].file_handle;
             pipe_fork_dup_writer(pp);
-            serial_printf("fork: dup writer fd=%d -> readers=%d writers=%d\n",
-                          i, pp ? pp->readers : -1, pp ? pp->writers : -1);
         }
     }
 
     child->fork_parent = NULL;
     
-    serial_printf("fork: child PID %d from parent %d (vm_share=%d)\n",
-                  (int)child->pid, (int)parent->pid, share_vm ? 1 : 0);
 
     /* Re-apply pinned thread stash — process_t may have been cleared during
      * vmm_clone / FD dup by another path. */
@@ -2343,9 +2246,6 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
     bool share_vm = (flags & CLONE_VM) != 0;
     bool do_vfork = (flags & CLONE_VFORK) != 0;
 
-    serial_printf("clone: flags=0x%llx newsp=0x%llx vm=%d vfork=%d\n",
-                  (unsigned long long)flags, (unsigned long long)newsp,
-                  share_vm ? 1 : 0, do_vfork ? 1 : 0);
 
     /* Child stack: honor newsp when non-zero (musl __clone pushes fn/arg). */
     if (newsp)
@@ -2381,8 +2281,6 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
          * in-kernel -- release now or this loops forever. */
         fork_release_pending(parent);
         child->fork_parent = parent;
-        serial_printf("clone: VFORK parent %d waiting on child %d\n",
-                      (int)parent->pid, (int)child->pid);
         while (child->fork_parent == parent) {
             if (child->is_zombie) {
                 child->fork_parent = NULL;
@@ -2390,8 +2288,6 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
             }
             thread_sleep(1);
         }
-        serial_printf("clone: VFORK parent %d resumed (child %d)\n",
-                      (int)parent->pid, (int)child->pid);
     }
 
     return pid;
@@ -2407,10 +2303,6 @@ int sys_wait(int *status) {
     /* Wake held newborns before blocking. */
     if (parent)
         fork_release_pending(parent);
-
-    serial_puts("sys_wait called by PID ");
-    serial_printf("%d", (int)parent->pid);
-    serial_puts("\n");
 
     for (;;) {
         if (!parent->child)
@@ -2433,10 +2325,8 @@ int sys_wait(int *status) {
         if (zombie || !parent->child) {
             thread_unblock_current_running_unlocked();
             scheduler_irq_unlock(wf);
-            if (!zombie) {
-                serial_puts("No children left\n");
+            if (!zombie)
                 return -ECHILD;
-            }
         } else if (proc_signal_interrupts(parent)) {
             thread_unblock_current_running_unlocked();
             scheduler_irq_unlock(wf);
@@ -2449,12 +2339,6 @@ int sys_wait(int *status) {
             thread_yield();
             continue;
         }
-
-        serial_puts("Found zombie child PID ");
-        serial_printf("%d", (int)zombie->pid);
-        serial_puts(" with exit status ");
-        serial_printf("%d", zombie->exit_status);
-        serial_puts("\n");
 
         if (status) {
             if (copy_to_user(status, &zombie->exit_status, sizeof(zombie->exit_status)) != 0)
@@ -2523,15 +2407,8 @@ static void handle_pending_signals(process_t *proc) {
             
             sighandler_t handler = proc->signal_handlers[signum];
             
-            serial_puts("Handling signal ");
-            serial_printf("%d", signum);
-            serial_puts(" for PID ");
-            serial_printf("%d", (int)proc->pid);
-            serial_puts("\n");
-            
             if (handler == SIG_IGN) {
-                // Ignore the signal
-                serial_puts("Signal ignored\n");
+                /* ignore */
             } else if (handler == SIG_DFL) {
                 // Default action
                 switch (signum) {
@@ -2541,7 +2418,6 @@ static void handle_pending_signals(process_t *proc) {
                     case SIGKILL:
                     case SIGPIPE:
                         // Terminate process
-                        serial_puts("Signal causes termination\n");
                         process_signal_terminate(proc, signum);
                         return; /* proc may be reaped — stop iterating */
                     case SIGCHLD:
@@ -2577,13 +2453,6 @@ sighandler_t sys_signal(int signum, sighandler_t handler) {
     }
 
     proc->signal_handlers[signum] = handler;
-    
-    serial_puts("Signal ");
-    serial_printf("%d", signum);
-    serial_puts(" handler set for PID ");
-    serial_printf("%d", (int)proc->pid);
-    serial_puts("\n");
-    
     return old_handler;
 }
 
@@ -2764,11 +2633,6 @@ int process_irq_deliver(process_t *p, registers_t *r) {
         p->sig_saved_rflags = r->rflags;
         p->sig_from_irq = true;
         p->sig_in_handler = true;
-        serial_printf("irqsig: pid=%d sig=%d rip=0x%llx rsp=0x%llx -> handler=0x%llx rsp=0x%llx cs=0x%llx ss=0x%llx\n",
-                      (int)p->pid, s, (unsigned long long)r->rip,
-                      (unsigned long long)r->rsp, (unsigned long long)ha,
-                      (unsigned long long)rsp, (unsigned long long)r->cs,
-                      (unsigned long long)r->ss);
         r->rip = ha;
         r->rsp = rsp;
         r->rdi = (uint64_t)s;
@@ -2963,11 +2827,6 @@ int sys_exec(const char *pathname, char *const argv[]) {
         }
     }
     kargv[argc] = NULL;
-    serial_printf("sys_exec: pid=%d path='%s' argc=%d a0='%s' a1='%s' a2='%s'\n",
-                  p ? (int)p->pid : -1, kpath, argc,
-                  argc > 0 ? kargv[0] : "",
-                  argc > 1 ? kargv[1] : "",
-                  argc > 2 ? kargv[2] : "");
     char resolved[256];
     exec_resolve_path(p, kpath, resolved, sizeof(resolved));
 
@@ -3002,8 +2861,6 @@ int sys_exec(const char *pathname, char *const argv[]) {
         p->fork_parent = NULL;
         current_process = parent;
         exec_set_ring3_active(parent);
-        serial_printf("fork-exec: child PID %d done (%d), resuming parent %d\n",
-                      child_pid, ret, (int)parent->pid);
         exec_longjmp((exec_jmpbuf_t *)parent->fork_jmpbuf, child_pid);
         __builtin_unreachable();
     }
@@ -3415,14 +3272,6 @@ void syscall_set_program_mapping(void *real_base, uint64_t virtual_base, uint64_
     current_program_base = real_base;
     current_program_vbase = virtual_base;
     current_program_size = size;
-    
-    serial_puts("Program mapping set: vbase=0x");
-    serial_printf("%llx", virtual_base);
-    serial_puts(" -> real=0x");
-    serial_printf("%llx", (uint64_t)real_base);
-    serial_puts(" size=");
-    serial_printf("%llu", size);
-    serial_puts("\n");
 }
 
 // Simple user-space memory copy function

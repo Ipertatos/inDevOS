@@ -20,15 +20,6 @@ static pipe_t pipe_table[MAX_PIPES];
 static spinlock_t pipe_table_lock = {0};
 
 
-/* Wake a thread blocked on this pipe (reader or writer). */
-static void pipe_wake_slot(void **slot) {
-    if (!slot || !*slot) return;
-    extern void thread_wake(void *thr);
-    void *t = *slot;
-    *slot = NULL;
-    thread_wake(t);
-}
-
 void pipe_init(void) {
     memset(pipe_table, 0, sizeof(pipe_table));
     serial_puts("pipe: subsystem initialized\n");
@@ -74,7 +65,6 @@ pipe_t* pipe_create(void) {
 
     spinlock_unlock(&pipe_table_lock);
 
-    serial_puts("pipe: created new pipe\n");
     return pipe;
 }
 
@@ -98,7 +88,6 @@ void pipe_destroy(pipe_t *pipe) {
 
     spinlock_unlock(&pipe_table_lock);
 
-    serial_puts("pipe: destroyed pipe\n");
 }
 
 int pipe_read(pipe_t *pipe, void *buf, size_t count) {

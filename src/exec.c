@@ -26,7 +26,6 @@ static uint64_t exec_dbg_t0;
 
 static void exec_dbg_reset(void) {
     exec_dbg_t0 = ktime_now_us();
-    serial_printf("[exec +0us] BEGIN\n");
 }
 
 void exec_dbg_mark(const char *phase) {
@@ -820,7 +819,6 @@ static void exec_apply_relocations(uint64_t *pml4, const Elf64_Phdr *dyn_ph)
                 applied++;
         }
     }
-    serial_printf("exec: applied %u relocations (bias=0x0)\n", applied);
 }
 
 
@@ -1014,16 +1012,14 @@ const char *exec_lookup_symbol(process_t *proc, uint64_t addr) {
     return "unknown";
 }
 
-/* User stack size (64 KB) */
-/* 64 KB user stack.
+/* User stack: 256 pages = 1 MiB.
  *
  * Do NOT shrink this without fixing address-space teardown first: with 8 pages
  * (32 KB) the *second* program launch crashed in vmm_free_table() walking a
  * garbage page table (faulting address 0x40c900000000, "not present, read,
  * supervisor"), i.e. something in the teardown/frame-reuse path is fragile and
- * only the allocation pattern kept it hidden.  16 pages is stable over repeated
- * launch sweeps. */
-#define USER_STACK_PAGES    256  /* 16 * 4096 = 64 KB */
+ * only the allocation pattern kept it hidden. */
+#define USER_STACK_PAGES    256  /* 256 * 4096 = 1 MiB */
 /* Per-process kernel stack (16 KB) */
 #define KSTACK_SIZE         (16 * 1024)
 
@@ -1597,32 +1593,6 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
     proc->exec_entry_rip = entry_rip;
     proc->exec_entry_rsp = ustack_top;
     proc->exec_replaced  = true;
-
-    {
-        const char *a0 = (argv && argv[0]) ? argv[0] : "(null)";
-        const char *a1 = (argv && argv[0] && argv[1]) ? argv[1] : "";
-        const char *a2 = (argv && argv[0] && argv[1] && argv[2]) ? argv[2] : "";
-        serial_printf("exec_replace: PID %d -> '%s' argv0='%s' argv1='%s' argv2='%s' entry=0x%llx rsp=0x%llx\n",
-                      (int)proc->pid, resolved, a0, a1, a2,
-                      (unsigned long long)entry_rip,
-                      (unsigned long long)ustack_top);
-        {
-            const char *tn[3] = {"?", "?", "?"};
-            for (int i = 0; i < 3; i++) {
-                if (!proc->fds[i].in_use) { tn[i] = "closed"; continue; }
-                switch (proc->fds[i].fd_type) {
-                case 1: tn[i] = "pipe_r"; break;
-                case 2: tn[i] = "pipe_w"; break;
-                case 6: tn[i] = "null"; break;
-                case 7: tn[i] = "tty"; break;
-                case 0: tn[i] = "file/cons"; break;
-                default: tn[i] = "other"; break;
-                }
-            }
-            serial_printf("exec_fds: pid=%d fd0=%s fd1=%s fd2=%s\n",
-                          (int)proc->pid, tn[0], tn[1], tn[2]);
-        }
-    }
     return 0;
 }
 
@@ -1672,8 +1642,6 @@ int exec_spawn(const char *filename, char *const argv[]) {
         return -1;
     }
 
-    serial_printf("exec_spawn: '%s' loaded %u bytes into memory\n",
-                  filename, fsize);
 
     /* ---- Validate ELF ---- */
     if (fsize < sizeof(Elf64_Ehdr) || memcmp(image, ELF_MAGIC, 4) != 0) {
@@ -1868,10 +1836,6 @@ int exec_spawn(const char *filename, char *const argv[]) {
     }
 
     int pid = (int)proc->pid;
-    serial_printf("exec_spawn: '%s' PID %d entry=0x%llx  rsp=0x%llx\n",
-                  filename, pid,
-                  (unsigned long long)entry_rip,
-                  (unsigned long long)ustack_top);
     return pid;
 }
 

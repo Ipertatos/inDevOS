@@ -910,7 +910,6 @@ int fat32_list_directory_cluster(uint32_t dir_cluster,
         dir_cluster = fat32_get_next_cluster(&fat32_filesystem, dir_cluster);
     }
 
-done:
     kfree(cluster_buffer);
     return entry_count;
 }

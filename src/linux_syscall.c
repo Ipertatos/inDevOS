@@ -878,8 +878,6 @@ static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
         p->fork_saved_rsi = thr->sc_rsi;
         p->fork_saved_rdi = thr->sc_rdi;
         p->fork_saved_gprs_valid = 1;
-        serial_printf("fork: snapshot src=thread pid=%d rip=0x%llx rsp=0x%llx\n",
-                      (int)p->pid, (unsigned long long)rip, (unsigned long long)rsp);
     } else {
         rip = fr->user_rip;
         rsp = fr->user_rsp;
@@ -897,8 +895,6 @@ static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
         p->fork_saved_rsi = fr->a2;
         p->fork_saved_rdi = fr->a1;
         p->fork_saved_gprs_valid = 1;
-        serial_printf("fork: snapshot src=frame pid=%d rip=0x%llx rsp=0x%llx\n",
-                      (int)p->pid, (unsigned long long)rip, (unsigned long long)rsp);
     }
     p->fork_saved_user_rip = rip;
     p->fork_saved_user_rsp = rsp;
@@ -1208,8 +1204,6 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
 
     /* ---- process ---- */
     case LX_exit: case LX_exit_group:
-        serial_printf("linux: PID %u %s(%d)\n", p ? p->pid : 0,
-                          nr == LX_exit ? "exit" : "exit_group", (int)(a1 & 0xff));
         sys_exit((int)(a1 & 0xff));
         return 0;
     case LX_getpid: case LX_gettid:
@@ -1275,15 +1269,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         /* vfork == clone(CLONE_VM|CLONE_VFORK|SIGCHLD) */
         fork_snapshot_frame(p, fr);
         p->fork_defer_release = 0;
-        serial_printf("vfork: -> clone VM|VFORK|SIGCHLD\n");
         return sys_clone(CLONE_VM | CLONE_VFORK | 17 /* SIGCHLD */, 0, 0, 0, 0);
     }
     case LX_clone: {
         /* flags, newsp, parent_tid, child_tid, tls (x86-64 Linux ABI) */
-        serial_printf("clone: flags=0x%llx newsp=0x%llx ptid=0x%llx ctid=0x%llx tls=0x%llx\n",
-                      (unsigned long long)a1, (unsigned long long)a2,
-                      (unsigned long long)a3, (unsigned long long)a4,
-                      (unsigned long long)a5);
         fork_snapshot_frame(p, fr);
         /* Child stack: honor newsp when non-zero (musl __clone pushes fn/arg). */
         if (a2)
@@ -1292,24 +1281,6 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return sys_clone(a1, a2, a3, a4, a5);
     }
     case LX_execve: {
-        {
-            char pb[96], a0[48], a1b[48], a2b[48];
-            pb[0] = a0[0] = a1b[0] = a2b[0] = 0;
-            if (a1) lx_get(pb, (void *)a1, sizeof(pb) - 1);
-            pb[sizeof(pb) - 1] = 0;
-            if (a2) {
-                uint64_t p0 = 0, p1 = 0, p2 = 0;
-                if (lx_get(&p0, (void *)a2, 8) == 0 && p0)
-                    lx_get(a0, (void *)(uintptr_t)p0, sizeof(a0) - 1);
-                if (lx_get(&p1, (void *)(a2 + 8), 8) == 0 && p1)
-                    lx_get(a1b, (void *)(uintptr_t)p1, sizeof(a1b) - 1);
-                if (lx_get(&p2, (void *)(a2 + 16), 8) == 0 && p2)
-                    lx_get(a2b, (void *)(uintptr_t)p2, sizeof(a2b) - 1);
-                a0[sizeof(a0)-1] = a1b[sizeof(a1b)-1] = a2b[sizeof(a2b)-1] = 0;
-            }
-            serial_printf("linux: execve pid=%d path='%s' argv0='%s' argv1='%s' argv2='%s'\n",
-                          p ? (int)p->pid : -1, pb, a0, a1b, a2b);
-        }
         r = sys_exec((const char *)a1, (char *const *)a2);
         if (r < 0) return r;
                 /* In-place replace: SYSRET into the new entry (same pid). */
@@ -1327,8 +1298,6 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
                 p->fork_parent = NULL;
                 if (vp->sched_thread)
                     thread_wake((thread_t *)vp->sched_thread);
-                serial_printf("clone: vfork parent woken after exec (child %d)\n",
-                              (int)p->pid);
             }
             p->clone_shared_vm = false;
             return 0;
@@ -1407,9 +1376,6 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             p->signal_handlers[a1] = (sighandler_t)(uintptr_t)act.handler;
             p->signal_sa_flags[a1] = (uint32_t)act.flags;
             p->sig_restorer[a1] = act.restorer;
-            serial_printf("linux: rt_sigaction sig=%d handler=0x%llx flags=0x%x restorer=0x%llx\n",
-                          (int)a1, (unsigned long long)act.handler,
-                          (unsigned)act.flags, (unsigned long long)act.restorer);
         }
         return 0;
     }
@@ -1796,9 +1762,6 @@ static void lx_sigreturn_iret(process_t *p) {
         sys_exit(128 + 11);
         __builtin_unreachable();
     }
-    serial_printf("irqsig: sigreturn pid=%u iretq rip=0x%llx rsp=0x%llx rflags=0x%llx cs=0x23 ss=0x1b\n",
-                  p->pid, (unsigned long long)g.rip, (unsigned long long)g.rsp,
-                  (unsigned long long)g.rflags);
     lx_iret_full(&g);
 }
 
@@ -1854,7 +1817,6 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
         set_terminate_flag(false);
         uint32_t fg = process_get_fg_pgid();
         if (!fg && p) fg = p->pgid ? p->pgid : p->pid;
-        serial_printf("linux: Ctrl+C -> SIGINT pgid %u\n", fg);
         process_kill_pgid(fg, SIGINT);
         if (p && !p->is_running)
             return 0;

@@ -283,9 +283,6 @@ const void *fb_get_composite_buffer(void) {
 /* flanterm framebuffer code removed */
 
 /* legacy custom printf removed */
-#if 0
-int printf(const char *format, ...) { return 0; }
-#endif
 
 void putpixel(uint64_t x, uint64_t y, uint32_t color){
     if (!fb) return;

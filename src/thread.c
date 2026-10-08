@@ -62,7 +62,6 @@ extern void thread_switch_asm(thread_context_t *from, thread_context_t *to);
 extern void thread_start_asm(void);
 
 // Forward declarations for internal functions
-static void _remove_from_queue(thread_t *thread, thread_t **queue_head);
 static void _scheduler_remove_thread_unlocked(thread_t *thread);
 static bool _queue_unlink(thread_t *thread, thread_t **head, thread_t **tail);
 static bool _ready_unlink(thread_t *thread);
@@ -382,10 +381,6 @@ static bool _queue_unlink(thread_t *thread, thread_t **head, thread_t **tail) {
 }
 
 // Internal helper to remove from a specific (untailed) queue. Lock held.
-static void _remove_from_queue(thread_t *thread, thread_t **queue_head) {
-    _queue_unlink(thread, queue_head, NULL);
-}
-
 // Internal: remove from whichever ready level the thread is linked in.
 static bool _ready_unlink(thread_t *thread) {
     per_cpu_t *cpu = thread_rq(thread);

@@ -137,7 +137,7 @@ void ide_init() {
     uint32_t bar1 = pci_device_read(dev, 0x14, 4);
     
     // IDE controllers often use legacy I/O addresses if BARs are 0 or 1
-    if ((bar0 & 0xFFFFFFFC) == 0 || (bar0 & 0xFFFFFFFC) == 1) {
+    if ((bar0 & 0xFFFFFFFC) == 0) {  /* BAR unset / legacy (bar0<=1 both mask to 0) */
         ide_ctrl.base_port = 0x1F0;  // Primary IDE legacy base
         ide_ctrl.ctrl_port = 0x3F6;  // Primary IDE control
         printf("IDE: Using legacy I/O addresses (0x1F0)\n");

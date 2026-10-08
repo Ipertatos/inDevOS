@@ -152,21 +152,7 @@ static void kt_run(const char *line) {
         kt_nhist++;
     }
     kt_hpos = kt_nhist;
-    {
-        char shown[200];
-        int n = 0;
-        const char *cwd = zeus_get_cwd();
-        const char *pre = "zeus:";
-        while (*pre && n < 170) shown[n++] = *pre++;
-        if (cwd) while (*cwd && n < 170) shown[n++] = *cwd++;
-        if (n < 190) shown[n++] = '>';
-        if (n < 190) shown[n++] = ' ';
-        while (*line && n < 190) shown[n++] = *line++;
-        shown[n] = '\0';
-        /* line advanced; reload pointer */
-    }
-    /* rebuild shown from the original by walking kt_in which still holds it
-     * until the caller clears it. Use kt_in. */
+    /* Build prompt+command line for history from kt_in. */
     {
         char shown[220];
         int n = 0;
