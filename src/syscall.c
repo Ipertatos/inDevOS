@@ -137,7 +137,6 @@ int sys_shutdown(int fd, int how);
 // Process management (MAX_PROCESSES comes from kernel_config.h)
 static process_t processes[MAX_PROCESSES];
 static spinlock_t gui_queue_lock = {0};
-static int fork_queue_child_thread(process_t *parent, process_t *child);
 static void fork_release_thread(thread_t *thr);
 void fork_child_zombie_exit(int status);
 void process_fault_kill_current(int signum);
@@ -612,7 +611,12 @@ void process_inherit_fds(process_t *dst, process_t *src) {
 #define CLONE_CHILD_SETTID   0x01000000ULL
 #endif
 
-static bool pml4_shared_with_others(uint64_t *pml4, process_t *self) {
+/* Address-space ownership: a PML4 is owned jointly by every live process
+ * slot that points at it (CLONE_VM / vfork share one table).  The LAST
+ * holder to drop it destroys it.  Decide on live sharers only -- the
+ * clone_shared_vm flag is sticky on the vfork parent (it stays set after the
+ * child execs or exits), so using it here leaked the parent's whole AS. */
+bool process_pml4_shared_with_others(uint64_t *pml4, process_t *self) {
     if (!pml4) return false;
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (&processes[i] == self) continue;
@@ -628,7 +632,7 @@ void process_cleanup(process_t *proc) {
         extern uint64_t *vmm_get_kernel_pml4(void);
         extern void vmm_switch_address_space(uint64_t *);
         extern void vmm_destroy_address_space(uint64_t *);
-        if (proc->clone_shared_vm || pml4_shared_with_others(proc->pml4, proc)) {
+        if (process_pml4_shared_with_others(proc->pml4, proc)) {
             proc->pml4 = NULL; /* other sharer still owns the AS */
         } else {
             vmm_switch_address_space(vmm_get_kernel_pml4());
@@ -652,8 +656,7 @@ void process_cleanup(process_t *proc) {
             processes[i].sibling = NULL;
             if (processes[i].is_zombie) {
                 if (processes[i].pml4) {
-                    if (!(processes[i].clone_shared_vm ||
-                          pml4_shared_with_others(processes[i].pml4, &processes[i])))
+                    if (!process_pml4_shared_with_others(processes[i].pml4, &processes[i]))
                         vmm_destroy_address_space(processes[i].pml4);
                     processes[i].pml4 = NULL;
                 }
@@ -730,23 +733,16 @@ void syscall_set_kernel_stack(uint64_t rsp) {
 /* INT 0x80 leaves iretq frame at *iframe: RIP, CS, RFLAGS, RSP, SS.
  * Stash for SYS_FORK so /bin/sh.exe (native ABI) can concurrent-fork. */
 void syscall_stash_int80_fork_frame(uint64_t *iframe) {
-    process_t *p = get_current_process();
     thread_t *thr = scheduler_get_current_thread();
     if (!iframe) return;
-    /* Per-thread stash first (nested fork / SMP-safe). */
+    /* Per-thread stash is the only fork snapshot (nested fork / SMP-safe).
+     * INT 0x80 has no GPR frame here; sc_r* keep their last values. */
     if (thr) {
         thr->sc_user_rip = iframe[0];
         thr->sc_user_rflags = iframe[2];
         thr->sc_user_rsp = iframe[3];
         thr->sc_frame_valid = 1;
     }
-    if (!p) return;
-    p->fork_saved_user_rip = iframe[0];
-    p->fork_saved_user_rflags = iframe[2];
-    p->fork_saved_user_rsp = iframe[3];
-    /* No lx GPR snapshot on INT 0x80 — child gets zeroed scratch regs
-     * (native ABI sh is simpler than ash/musl). */
-    p->fork_saved_gprs_valid = 0;
 }
 
 static uint64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
@@ -1671,7 +1667,7 @@ static void process_release(process_t *proc) {
         proc->kernel_stack = NULL;
     }
     if (proc->pml4 && proc->is_usermode) {
-        if (proc->clone_shared_vm || pml4_shared_with_others(proc->pml4, proc)) {
+        if (process_pml4_shared_with_others(proc->pml4, proc)) {
             proc->pml4 = NULL;
         } else {
             vmm_destroy_address_space(proc->pml4);
@@ -1700,9 +1696,19 @@ static void process_release(process_t *proc) {
 #define FORK_USER_CS  0x23
 #define FORK_USER_SS  0x1B
 
-static int fork_queue_child_thread(process_t *parent, process_t *child) {
+/* By-value copy of the forking thread's sc_* stash, taken once at the top
+ * of fork_spawn_child().  Never a pointer into the per-CPU syscall kstack. */
+typedef struct {
+    uint64_t rip, rsp, rflags;
+    uint64_t r15, r14, r13, r12, rbp, rbx;
+    uint64_t r9, r8, r10, rdx, rsi, rdi;
+    int      gprs_valid;
+} fork_snap_t;
+
+static int fork_queue_child_thread(process_t *parent, process_t *child,
+                                   const fork_snap_t *snap) {
     extern void thread_exit(void);
-    if (!parent->fork_saved_user_rip) {
+    if (!snap->rip) {
         serial_printf("fork: no saved user RIP — cannot concurrent-fork\n");
         return -EINVAL;
     }
@@ -1712,27 +1718,27 @@ static int fork_queue_child_thread(process_t *parent, process_t *child) {
         return -ENOMEM;
 
     memset(&thr->saved_regs, 0, sizeof(thread_regs_t));
-    thr->saved_regs.rip    = parent->fork_saved_user_rip;
-    thr->saved_regs.rsp    = parent->fork_saved_user_rsp;
-    thr->saved_regs.rflags = parent->fork_saved_user_rflags | 0x200ULL;
+    thr->saved_regs.rip    = snap->rip;
+    thr->saved_regs.rsp    = snap->rsp;
+    thr->saved_regs.rflags = snap->rflags | 0x200ULL;
     thr->saved_regs.cs     = FORK_USER_CS;
     thr->saved_regs.ss     = FORK_USER_SS;
     thr->saved_regs.rax    = 0; /* fork child return */
     /* Linux fork preserves all GPRs except rax. Use the by-value snapshot
      * taken at clone entry — never a pointer into the per-CPU kstack. */
-    if (parent->fork_saved_gprs_valid) {
-        thr->saved_regs.r15 = parent->fork_saved_r15;
-        thr->saved_regs.r14 = parent->fork_saved_r14;
-        thr->saved_regs.r13 = parent->fork_saved_r13;
-        thr->saved_regs.r12 = parent->fork_saved_r12;
-        thr->saved_regs.rbp = parent->fork_saved_rbp;
-        thr->saved_regs.rbx = parent->fork_saved_rbx;
-        thr->saved_regs.r9  = parent->fork_saved_r9;
-        thr->saved_regs.r8  = parent->fork_saved_r8;
-        thr->saved_regs.r10 = parent->fork_saved_r10;
-        thr->saved_regs.rdx = parent->fork_saved_rdx;
-        thr->saved_regs.rsi = parent->fork_saved_rsi;
-        thr->saved_regs.rdi = parent->fork_saved_rdi;
+    if (snap->gprs_valid) {
+        thr->saved_regs.r15 = snap->r15;
+        thr->saved_regs.r14 = snap->r14;
+        thr->saved_regs.r13 = snap->r13;
+        thr->saved_regs.r12 = snap->r12;
+        thr->saved_regs.rbp = snap->rbp;
+        thr->saved_regs.rbx = snap->rbx;
+        thr->saved_regs.r9  = snap->r9;
+        thr->saved_regs.r8  = snap->r8;
+        thr->saved_regs.r10 = snap->r10;
+        thr->saved_regs.rdx = snap->rdx;
+        thr->saved_regs.rsi = snap->rsi;
+        thr->saved_regs.rdi = snap->rdi;
     }
     thr->has_saved_context = true;
     thr->owner_process     = (struct process *)child;
@@ -1751,8 +1757,6 @@ static int fork_queue_child_thread(process_t *parent, process_t *child) {
 
     child->sched_thread = thr;
     child->fork_parent  = NULL;
-    /* GPRs are now in thr->saved_regs — invalidate the by-value snapshot. */
-    parent->fork_saved_gprs_valid = 0;
 
     /* Hold BLOCKED until parent blocking-wait/exit. Prior held child moves
      * to fork_release_at_exit so writer+reader start together at wait.
@@ -1926,65 +1930,39 @@ void fork_child_zombie_exit(int status) {
 /*
  * Shared fork/clone body.
  * share_vm: CLONE_VM — share parent pml4 (no COW).
+ * newsp: child user stack (clone newsp); 0 = same RSP as the parent.
  * Everything else (fds memset+copy, pipe_fork_dup_*, signals, queue,
- * stash clear) matches classic sys_fork. newsp must already be reflected
- * in parent->fork_saved_user_rsp when nonzero.
+ * stash clear) matches classic sys_fork.
  * On success returns child pid and sets *out_child; on failure negative errno.
  */
-static int fork_spawn_child(bool share_vm, process_t **out_child) {
+static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child) {
     /* Must use get_current_process() — the current_process global is
      * overwritten by every CPU's scheduler (see get_current_process). */
     process_t *parent = get_current_process();
     if (!parent)
         return -EINVAL;
-    /* Pin THIS thread's entry stash by value before any long work
-     * (vmm_clone). process_t->fork_saved_* can be cleared by a sibling
-     * path; thread locals cannot. */
+    /* Copy THIS thread's sc_* entry stash by value before any long work
+     * (vmm_clone).  It is the single source of truth for the child's user
+     * context: written on every SYSCALL / INT 0x80 entry (and refreshed by
+     * fork_snapshot_frame), never touched by another thread. */
     thread_t *pthr = scheduler_get_current_thread();
-    uint64_t pinned_rip = 0, pinned_rsp = 0, pinned_rfl = 0;
-    uint64_t pinned_r15=0, pinned_r14=0, pinned_r13=0, pinned_r12=0;
-    uint64_t pinned_rbp=0, pinned_rbx=0;
-    uint64_t pinned_r9=0, pinned_r8=0, pinned_r10=0;
-    uint64_t pinned_rdx=0, pinned_rsi=0, pinned_rdi=0;
-    int pinned_gprs = 0;
+    fork_snap_t snap;
+    memset(&snap, 0, sizeof(snap));
     if (pthr && pthr->sc_frame_valid) {
-        pinned_rip = pthr->sc_user_rip;
-        pinned_rsp = pthr->sc_user_rsp;
-        pinned_rfl = pthr->sc_user_rflags;
-        pinned_r15 = pthr->sc_r15; pinned_r14 = pthr->sc_r14;
-        pinned_r13 = pthr->sc_r13; pinned_r12 = pthr->sc_r12;
-        pinned_rbp = pthr->sc_rbp; pinned_rbx = pthr->sc_rbx;
-        pinned_r9 = pthr->sc_r9; pinned_r8 = pthr->sc_r8;
-        pinned_r10 = pthr->sc_r10; pinned_rdx = pthr->sc_rdx;
-        pinned_rsi = pthr->sc_rsi; pinned_rdi = pthr->sc_rdi;
-        pinned_gprs = 1;
-    } else {
-        pinned_rip = parent->fork_saved_user_rip;
-        pinned_rsp = parent->fork_saved_user_rsp;
-        pinned_rfl = parent->fork_saved_user_rflags;
-        pinned_gprs = parent->fork_saved_gprs_valid;
-        if (pinned_gprs) {
-            pinned_r15 = parent->fork_saved_r15; pinned_r14 = parent->fork_saved_r14;
-            pinned_r13 = parent->fork_saved_r13; pinned_r12 = parent->fork_saved_r12;
-            pinned_rbp = parent->fork_saved_rbp; pinned_rbx = parent->fork_saved_rbx;
-            pinned_r9 = parent->fork_saved_r9; pinned_r8 = parent->fork_saved_r8;
-            pinned_r10 = parent->fork_saved_r10; pinned_rdx = parent->fork_saved_rdx;
-            pinned_rsi = parent->fork_saved_rsi; pinned_rdi = parent->fork_saved_rdi;
-        }
+        snap.rip = pthr->sc_user_rip;
+        snap.rsp = pthr->sc_user_rsp;
+        snap.rflags = pthr->sc_user_rflags;
+        snap.r15 = pthr->sc_r15; snap.r14 = pthr->sc_r14;
+        snap.r13 = pthr->sc_r13; snap.r12 = pthr->sc_r12;
+        snap.rbp = pthr->sc_rbp; snap.rbx = pthr->sc_rbx;
+        snap.r9 = pthr->sc_r9; snap.r8 = pthr->sc_r8;
+        snap.r10 = pthr->sc_r10; snap.rdx = pthr->sc_rdx;
+        snap.rsi = pthr->sc_rsi; snap.rdi = pthr->sc_rdi;
+        snap.gprs_valid = 1;
     }
-    /* Re-materialize onto process_t for fork_queue_child_thread. */
-    parent->fork_saved_user_rip = pinned_rip;
-    parent->fork_saved_user_rsp = pinned_rsp;
-    parent->fork_saved_user_rflags = pinned_rfl;
-    parent->fork_saved_gprs_valid = pinned_gprs;
-    if (pinned_gprs) {
-        parent->fork_saved_r15 = pinned_r15; parent->fork_saved_r14 = pinned_r14;
-        parent->fork_saved_r13 = pinned_r13; parent->fork_saved_r12 = pinned_r12;
-        parent->fork_saved_rbp = pinned_rbp; parent->fork_saved_rbx = pinned_rbx;
-        parent->fork_saved_r9 = pinned_r9; parent->fork_saved_r8 = pinned_r8;
-        parent->fork_saved_r10 = pinned_r10; parent->fork_saved_rdx = pinned_rdx;
-        parent->fork_saved_rsi = pinned_rsi; parent->fork_saved_rdi = pinned_rdi;
-    }
+    /* Child stack: honor clone newsp (musl __clone pushes fn/arg there). */
+    if (newsp && snap.rip)
+        snap.rsp = newsp;
     process_t *child = allocate_process();
 
     if (out_child)
@@ -2111,24 +2089,8 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
     }
 
     child->fork_parent = NULL;
-    
 
-    /* Re-apply pinned thread stash — process_t may have been cleared during
-     * vmm_clone / FD dup by another path. */
-    parent->fork_saved_user_rip = pinned_rip;
-    parent->fork_saved_user_rsp = pinned_rsp;
-    parent->fork_saved_user_rflags = pinned_rfl;
-    parent->fork_saved_gprs_valid = pinned_gprs;
-    if (pinned_gprs) {
-        parent->fork_saved_r15 = pinned_r15; parent->fork_saved_r14 = pinned_r14;
-        parent->fork_saved_r13 = pinned_r13; parent->fork_saved_r12 = pinned_r12;
-        parent->fork_saved_rbp = pinned_rbp; parent->fork_saved_rbx = pinned_rbx;
-        parent->fork_saved_r9 = pinned_r9; parent->fork_saved_r8 = pinned_r8;
-        parent->fork_saved_r10 = pinned_r10; parent->fork_saved_rdx = pinned_rdx;
-        parent->fork_saved_rsi = pinned_rsi; parent->fork_saved_rdi = pinned_rdi;
-    }
-
-    if (!parent->fork_saved_user_rip) {
+    if (!snap.rip) {
         /* Linux ABI must always snapshot the live syscall frame before fork.
          * Taking the setjmp path with rip=0 yields User-mode fault at RIP 0
          * (PIPEOK ash pipelines). Native INT80 can still use setjmp. */
@@ -2156,7 +2118,6 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
             return -EINVAL;
         }
         serial_printf("fork: legacy vfork path (no saved user RIP)\n");
-        child->fork_saved_user_rip = 0;
         int resumed = exec_setjmp((exec_jmpbuf_t *)parent->fork_jmpbuf);
         if (resumed != 0) {
             if (parent->kernel_stack_top)
@@ -2187,7 +2148,7 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
     }
 
     {
-        int qr = fork_queue_child_thread(parent, child);
+        int qr = fork_queue_child_thread(parent, child, &snap);
         if (qr < 0) {
             serial_printf("fork: queue child failed %d\n", qr);
             /* Undo pipe credits before dropping the slot. */
@@ -2213,15 +2174,9 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
         }
     }
 
-    /* Drop THIS thread's entry stash + process copy so the next fork in
-     * this thread must re-capture on its own SYSCALL entry. Never touch
-     * another thread's sc_* fields. */
-    parent->fork_saved_gprs_valid = 0;
-    parent->fork_saved_user_rip = 0;
-    parent->fork_saved_user_rsp = 0;
-    parent->fork_saved_user_rflags = 0;
-    child->fork_saved_user_rip = 0;
-    child->fork_saved_gprs_valid = 0;
+    /* Drop THIS thread's entry stash so the next fork in this thread must
+     * re-capture on its own SYSCALL entry. Never touch another thread's
+     * sc_* fields. */
     if (pthr) {
         pthr->sc_frame_valid = 0;
         pthr->sc_user_rip = 0;
@@ -2236,7 +2191,7 @@ static int fork_spawn_child(bool share_vm, process_t **out_child) {
 
 int sys_fork(void) {
     /* Plain COW fork — same helper clone(SIGCHLD) uses without CLONE_VM. */
-    return fork_spawn_child(false, NULL);
+    return fork_spawn_child(false, 0, NULL);
 }
 
 int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
@@ -2247,11 +2202,7 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
     bool do_vfork = (flags & CLONE_VFORK) != 0;
 
 
-    /* Child stack: honor newsp when non-zero (musl __clone pushes fn/arg). */
-    if (newsp)
-        parent->fork_saved_user_rsp = newsp;
-
-    int pid = fork_spawn_child(share_vm, &child);
+    int pid = fork_spawn_child(share_vm, newsp, &child);
     if (pid < 0)
         return pid;
     /* Legacy setjmp path returns 0 in the child with child==NULL out — done. */

@@ -322,19 +322,8 @@ typedef struct process {
      * thread; longjmp back to fork_jmpbuf returns child_pid to parent. */
     struct process *fork_parent;
     uint64_t fork_jmpbuf[8]; /* same layout as exec_jmpbuf_t */
-    /* Saved SYSCALL user context so a vfork parent can sysret after the
-     * child has returned through the same kernel frame (and possibly
-     * overwritten it if stacks were shared). */
-    uint64_t fork_saved_user_rip;
-    uint64_t fork_saved_user_rsp;
-    uint64_t fork_saved_user_rflags;
-    /* By-value snapshot of parent GPRs at clone/fork — NEVER a pointer into
-     * the per-CPU syscall kstack (that frame is overwritten on the next IRQ). */
-    uint64_t fork_saved_r15, fork_saved_r14, fork_saved_r13, fork_saved_r12;
-    uint64_t fork_saved_rbp, fork_saved_rbx;
-    uint64_t fork_saved_r9, fork_saved_r8, fork_saved_r10;
-    uint64_t fork_saved_rdx, fork_saved_rsi, fork_saved_rdi;
-    int fork_saved_gprs_valid;
+    /* The fork/clone user context (RIP/RSP/RFLAGS/GPRs) lives only in the
+     * forking thread's sc_* stash (thread_t), copied by value at fork. */
     /* SMP: newest fork child held BLOCKED past fork SYSRET. */
     void *fork_pending_release; /* thread_t * */
     /* Prior held child: kept BLOCKED until wait/exit (with newest).
@@ -476,6 +465,7 @@ int allocate_fd(process_t *process);
 void free_fd(process_t *process, int fd);
 process_t* process_alloc(void);
 void process_cleanup(process_t *proc);
+bool process_pml4_shared_with_others(uint64_t *pml4, process_t *self);
 void process_inherit_fds(process_t *dst, process_t *src);
 void process_gui_enqueue_by_pid(uint32_t pid, const gui_event_t *ev);
 

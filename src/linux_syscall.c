@@ -855,52 +855,12 @@ static long lx_enosys(process_t *p, uint64_t nr) {
 /* Dispatcher                                                               */
 /* ------------------------------------------------------------------------ */
 
-/* Snapshot live syscall frame GPRs into process_t (by value). */
+/* Refresh THIS thread's sc_* fork stash from the live syscall frame.
+ * The per-thread stash is the only fork snapshot: fork_spawn_child() copies
+ * it by value before doing any long work, so a sibling thread or a nested
+ * fork can never clobber it. */
 static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
-    /* Prefer THIS thread's entry stash (written at linux_syscall_dispatch /
-     * int80 entry). Fall back to the live frame if the thread has no stash. */
     thread_t *thr = scheduler_get_current_thread();
-    uint64_t rip, rsp, rfl;
-    if (thr && thr->sc_frame_valid) {
-        rip = thr->sc_user_rip;
-        rsp = thr->sc_user_rsp;
-        rfl = thr->sc_user_rflags;
-        p->fork_saved_r15 = thr->sc_r15;
-        p->fork_saved_r14 = thr->sc_r14;
-        p->fork_saved_r13 = thr->sc_r13;
-        p->fork_saved_r12 = thr->sc_r12;
-        p->fork_saved_rbp = thr->sc_rbp;
-        p->fork_saved_rbx = thr->sc_rbx;
-        p->fork_saved_r9  = thr->sc_r9;
-        p->fork_saved_r8  = thr->sc_r8;
-        p->fork_saved_r10 = thr->sc_r10;
-        p->fork_saved_rdx = thr->sc_rdx;
-        p->fork_saved_rsi = thr->sc_rsi;
-        p->fork_saved_rdi = thr->sc_rdi;
-        p->fork_saved_gprs_valid = 1;
-    } else {
-        rip = fr->user_rip;
-        rsp = fr->user_rsp;
-        rfl = fr->user_rflags;
-        p->fork_saved_r15 = fr->r15;
-        p->fork_saved_r14 = fr->r14;
-        p->fork_saved_r13 = fr->r13;
-        p->fork_saved_r12 = fr->r12;
-        p->fork_saved_rbp = fr->rbp;
-        p->fork_saved_rbx = fr->rbx;
-        p->fork_saved_r9  = fr->a6;
-        p->fork_saved_r8  = fr->a5;
-        p->fork_saved_r10 = fr->a4;
-        p->fork_saved_rdx = fr->a3;
-        p->fork_saved_rsi = fr->a2;
-        p->fork_saved_rdi = fr->a1;
-        p->fork_saved_gprs_valid = 1;
-    }
-    p->fork_saved_user_rip = rip;
-    p->fork_saved_user_rsp = rsp;
-    p->fork_saved_user_rflags = rfl;
-    /* Also refresh thread stash from the live frame so nested fork in the
-     * same process always sees this entry's RIP even if process_t was cleared. */
     if (thr) {
         thr->sc_user_rip = fr->user_rip;
         thr->sc_user_rsp = fr->user_rsp;
@@ -913,9 +873,9 @@ static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
         thr->sc_rsi = fr->a2; thr->sc_rdi = fr->a1;
         thr->sc_frame_valid = 1;
     }
-    if (!rip)
+    if (!fr->user_rip)
         serial_printf("fork: WARNING snapshot user_rip=0 pid=%d nr=%llu\n",
-                      (int)p->pid, (unsigned long long)fr->nr);
+                      p ? (int)p->pid : -1, (unsigned long long)fr->nr);
 }
 
 static long lx_dispatch(linux_syscall_frame_t *fr) {
@@ -1274,9 +1234,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_clone: {
         /* flags, newsp, parent_tid, child_tid, tls (x86-64 Linux ABI) */
         fork_snapshot_frame(p, fr);
-        /* Child stack: honor newsp when non-zero (musl __clone pushes fn/arg). */
-        if (a2)
-            p->fork_saved_user_rsp = a2;
+        /* Child stack (newsp = a2) is applied by sys_clone. */
         p->fork_defer_release = 0;
         return sys_clone(a1, a2, a3, a4, a5);
     }

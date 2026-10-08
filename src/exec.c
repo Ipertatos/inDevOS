@@ -1345,12 +1345,18 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
     /* Restore kernel process as current */
     process_t *parent = proc->parent;
 
-    /* Free user-mode resources before process_cleanup() clears the slot */
+    /* Free user-mode resources before process_cleanup() clears the slot.
+     * process_cleanup() is the single owner of the user address space: it
+     * destroys proc->pml4 (unless a live CLONE_VM sharer still uses it).
+     * Do NOT also destroy the local user_pml4 here.  It is the same table
+     * (or, after an in-place execve, a table exec_replace already freed),
+     * so a second vmm_destroy_address_space() re-walked freed page tables
+     * and kfree'd every one of them again -- the "already freed" burst
+     * printed each time a sync program returned to Zeus. */
     exec_free_user_symbols(proc);
     process_cleanup(proc);
     if (parent) set_current_process(parent);
 
-    vmm_destroy_address_space(user_pml4);
     kfree(kstack);
 
     return actual_exit;
@@ -1523,11 +1529,14 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
     ustack_top = exec_build_abi_stack(new_pml4, ustack_top, resolved);
     uint64_t entry_rip = eh->e_entry;
 
-    /* Tear down old user AS — switch to kernel first so we don't free CR3. */
+    /* Tear down old user AS — switch to kernel first so we don't free CR3.
+     * A CLONE_VM (vfork) child shares its parent's PML4: execve must only
+     * drop its reference, never free the parent's live page tables. */
     extern uint64_t *vmm_get_kernel_pml4(void);
     vmm_switch_address_space(vmm_get_kernel_pml4());
     if (proc->pml4) {
-        vmm_destroy_address_space(proc->pml4);
+        if (!process_pml4_shared_with_others(proc->pml4, proc))
+            vmm_destroy_address_space(proc->pml4);
         proc->pml4 = NULL;
     }
     while (proc->mmap_regions) {
@@ -1798,8 +1807,9 @@ int exec_spawn(const char *filename, char *const argv[]) {
     thread_t *thr = thread_create(filename, (void(*)(void*))thread_exit,
                                   NULL, 0, PRIORITY_NORMAL);
     if (!thr) {
+        /* process_cleanup() destroys proc->pml4 (== user_pml4); a second
+         * destroy here would double-free every page table. */
         process_cleanup(proc);
-        vmm_destroy_address_space(user_pml4);
         kfree(kstack);
         return -1;
     }

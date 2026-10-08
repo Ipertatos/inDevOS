@@ -845,12 +845,24 @@ uint64_t* vmm_get_kernel_pml4(void) {
     return kernel_pml4;
 }
 
-// Allocate a zeroed physical frame for use as a page table
+// Allocate a zeroed physical frame (page table or user page)
 uint64_t vmm_alloc_frame(void) {
     void *page = kalloc(PAGE_SIZE);
     if (!page) return 0;
     memset(page, 0, PAGE_SIZE);
-    return virt_to_phys(page);
+    uint64_t phys = virt_to_phys(page);
+    /* A freshly allocated frame has no PTE owners yet: reset its COW
+     * refcount.  Release paths park a freed frame at 255 ("already freed",
+     * so a stale second release is a no-op), but nothing cleared that when
+     * the PMM handed the frame out again -- the next owner then saw a
+     * saturated count and the frame was never freed (leaked on every
+     * teardown, and fork's vmm_page_ref() made it immortal). */
+    if (vmm_page_refcounts) {
+        uint64_t pfn = phys / PAGE_SIZE;
+        if (pfn < vmm_max_phys_pages)
+            __atomic_store_n(&vmm_page_refcounts[pfn], 0, __ATOMIC_RELEASE);
+    }
+    return phys;
 }
 
 void vmm_free_frame(uint64_t phys_addr) {
