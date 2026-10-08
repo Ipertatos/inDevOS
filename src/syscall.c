@@ -1462,8 +1462,34 @@ int sys_seek(int fd, off_t offset, int whence) {
     return -EBADF;
 }
 
+/* brk/mmap/munmap change (and now free) the caller's pages, so they must act
+ * on the address space the calling user code actually runs in: the PML4
+ * live in CR3 at syscall entry.  exec_user_as_process() is a heuristic and
+ * under SMP can name another process (e.g. the last pipeline member that
+ * exec'd); freeing that process's frames/page tables would corrupt it.
+ * If the heuristic disagrees with CR3, use CR3's owner (as the #PF handler
+ * does).  Kernel/non-usermode callers are returned unchanged. */
+static process_t *mm_syscall_owner(process_t *proc) {
+    if (!proc || !proc->is_usermode || !proc->pml4)
+        return proc;
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t *active = (uint64_t *)phys_to_virt(cr3 & PTE_ADDR_MASK);
+    if (proc->pml4 == active)
+        return proc;
+    process_t *owner = process_find_by_pml4(active);
+    static int mm_owner_logs;
+    if (mm_owner_logs < 8) {
+        mm_owner_logs++;
+        serial_printf("mm: syscall named PID %u but CR3 belongs to PID %d - using CR3 owner\n",
+                      proc->pid, owner ? (int)owner->pid : -1);
+    }
+    return owner ? owner : proc;
+}
+
 void* sys_brk(void *addr) {
     process_t *proc = exec_user_as_process();
+    proc = mm_syscall_owner(proc);
 
     if (addr == NULL) {
         return proc->brk_current;
@@ -1500,6 +1526,16 @@ void* sys_brk(void *addr) {
         }
     }
 
+    /* Shrink: unmap and release the heap pages wholly above the new break
+     * (Linux brk semantics).  Without this a brk-down kept every frame
+     * mapped until exit. */
+    if (addr < old_brk && proc->is_usermode && proc->pml4) {
+        uint64_t lo = ((uint64_t)addr + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t hi = ((uint64_t)old_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+        if (hi > lo)
+            vmm_unmap_range_release_in(proc->pml4, lo, (hi - lo) / PAGE_SIZE);
+    }
+
     proc->brk_current = addr;
     return addr;
 }
@@ -1518,6 +1554,7 @@ static int mmap_region_prepend(process_t *proc, uint64_t v, size_t len) {
 void *sys_mmap(void *addr, size_t length, int prot, int flags) {
 #define MMAP_ERR(e) ((void *)(uintptr_t)((uint64_t)(int64_t)(-(e))))
     process_t *proc = exec_user_as_process();
+    proc = mm_syscall_owner(proc);
     if (length == 0 || length > (256ull << 20))
         return MMAP_ERR(EINVAL);
     if (!(flags & MAP_ANONYMOUS))
@@ -1537,6 +1574,12 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
     uint64_t v0;
     if (addr && (flags & MAP_FIXED)) {
         v0 = (uint64_t)addr & ~(uint64_t)(PAGE_SIZE - 1);
+        if (!is_user_address(v0) || !is_user_address(v0 + pages * PAGE_SIZE - 1))
+            return MMAP_ERR(EINVAL);
+        /* MAP_FIXED replaces whatever is mapped there: release the old
+         * frames first (vmm_map_page_in would just overwrite the PTEs and
+         * leak them). */
+        vmm_unmap_range_release_in(proc->pml4, v0, pages);
     } else {
         if (proc->mmap_anon_next == 0)
             proc->mmap_anon_next = 0x20000000ULL;
@@ -1553,18 +1596,21 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
     for (size_t p = 0; p < pages; p++) {
         uint64_t va = v0 + p * PAGE_SIZE;
         uint64_t frame = vmm_alloc_frame();
-        if (!frame)
+        if (!frame) {
+            /* Undo the pages already mapped by this call. */
+            vmm_unmap_range_release_in(proc->pml4, v0, p);
             return MMAP_ERR(ENOMEM);
+        }
         memset(phys_to_virt(frame), 0, PAGE_SIZE);
         if (vmm_map_page_in(proc->pml4, va, frame, pte_flags) != 0) {
             vmm_free_frame(frame);
+            vmm_unmap_range_release_in(proc->pml4, v0, p);
             return MMAP_ERR(ENOMEM);
         }
     }
 
     if (mmap_region_prepend(proc, v0, pages * PAGE_SIZE) != 0) {
-        for (size_t p = 0; p < pages; p++)
-            vmm_unmap_page_release_in(proc->pml4, v0 + p * PAGE_SIZE);
+        vmm_unmap_range_release_in(proc->pml4, v0, pages);
         return MMAP_ERR(ENOMEM);
     }
 
@@ -1606,6 +1652,7 @@ int sys_mprotect(void *addr, size_t length, int prot) {
 
 int sys_munmap(void *addr, size_t length) {
     process_t *proc = exec_user_as_process();
+    proc = mm_syscall_owner(proc);
     if (!addr || length == 0)
         return -EINVAL;
 
@@ -1616,24 +1663,24 @@ int sys_munmap(void *addr, size_t length) {
 
     uint64_t v = (uint64_t)addr & ~(uint64_t)(PAGE_SIZE - 1);
     size_t pages = (length + ((uint64_t)addr - v) + PAGE_SIZE - 1) / PAGE_SIZE;
+    /* Never let a user munmap clear PTEs in the shared kernel half. */
+    if (!is_user_address(v) || !is_user_address(v + pages * PAGE_SIZE - 1))
+        return -EINVAL;
+
+    /* Clear the PTEs, shoot down every CPU's TLB, then release the frames
+     * (refcount-aware: sole owner frees, COW peers just drop a ref). */
+    vmm_unmap_range_release_in(proc->pml4, v, pages);
 
     proc_mmap_region_t **pp = &proc->mmap_regions;
     while (*pp) {
         proc_mmap_region_t *r = *pp;
         if (r->virt == v && r->len >= pages * PAGE_SIZE) {
-            /* Release the physical frames, not just the PTEs — otherwise
-             * every munmap permanently leaks RAM. */
-            for (size_t p = 0; p < pages; p++)
-                vmm_unmap_page_release_in(proc->pml4, v + p * PAGE_SIZE);
             *pp = r->next;
             kfree(r);
             return 0;
         }
         pp = &r->next;
     }
-
-    for (size_t p = 0; p < pages; p++)
-        vmm_unmap_page_release_in(proc->pml4, v + p * PAGE_SIZE);
     return 0;
 }
 

@@ -265,6 +265,10 @@ int vmm_unmap_page_in(uint64_t *pml4, uint64_t virtual_addr);
  *  Use for anonymous user memory; vmm_unmap_page_in() alone leaks the frame. */
 int vmm_unmap_page_release_in(uint64_t *pml4, uint64_t virtual_addr);
 
+/** @brief Unmap @pages user pages from @virtual_addr, shoot down the TLB on all
+ *  CPUs, then release (unref/free) the frames.  Returns PTEs cleared. */
+int vmm_unmap_range_release_in(uint64_t *pml4, uint64_t virtual_addr, uint64_t pages);
+
 /** @brief Check if virtual address is mapped; returns physical address or 0 */
 uint64_t vmm_is_mapped(uint64_t virtual_addr);
 

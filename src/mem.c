@@ -945,27 +945,133 @@ int vmm_unmap_page_in(uint64_t *pml4, uint64_t virtual_addr) {
     return 0;
 }
 
+static void vmm_leaf_release(uint64_t phys_addr);
+
 /**
- * Unmap a user page AND release its physical frame (refcount-aware).
- * Use this for anonymous user memory (mmap/brk/stack) — plain
- * vmm_unmap_page_in() only clears the PTE and leaks the frame.
- * Mirrors the leaf behaviour of vmm_free_table().
+ * Unmap a range of user pages AND release their physical frames.
+ *
+ * Use this for anonymous user memory (munmap, brk shrink, MAP_FIXED
+ * replacement) -- plain vmm_unmap_page_in() only clears the PTE and leaks
+ * the frame.  Frames go through vmm_leaf_release(), the same refcount rule
+ * as address-space teardown: refcount 0 (untracked sole owner) or 1 (last
+ * COW owner) frees the frame, >1 just drops this mapping's reference.
+ *
+ * Page tables (PT, then PD/PDPT) that become completely empty are unhooked
+ * and freed too: mmap hands out ever-new VA, so without this every
+ * mmap/munmap cycle left one empty 4 KiB PT per 2 MiB behind until exit.
+ *
+ * Every PTE/table entry is cleared first, then all CPUs flush their TLBs
+ * (and ACK) before any frame or table is released, so no CPU can still use a
+ * stale translation (or cached paging structure) into memory the PMM has
+ * handed to someone else.  Releases are batched to bound the stack buffers.
+ *
+ * Returns the number of PTEs that were present and cleared.
  */
+#define VMM_UNMAP_BATCH  128
+#define VMM_TABLE_BATCH  16
+
+typedef struct {
+    uint64_t frames[VMM_UNMAP_BATCH];
+    uint64_t tables[VMM_TABLE_BATCH];
+    unsigned nf, nt;
+    bool need_flush;
+} vmm_unmap_batch_t;
+
+static void vmm_unmap_batch_flush(vmm_unmap_batch_t *b) {
+    if (b->need_flush)
+        smp_tlb_shootdown();
+    b->need_flush = false;
+    for (unsigned j = 0; j < b->nf; j++)
+        vmm_leaf_release(b->frames[j]);
+    for (unsigned j = 0; j < b->nt; j++)
+        vmm_free_frame(b->tables[j]);
+    b->nf = b->nt = 0;
+}
+
+static bool vmm_table_empty(const uint64_t *t) {
+    for (int i = 0; i < 512; i++)
+        if (t[i]) return false;
+    return true;
+}
+
+/* Unhook an emptied table: clear the parent entry now, free it after the
+ * shootdown. */
+static void vmm_unmap_drop_table(vmm_unmap_batch_t *b, uint64_t *parent_entry) {
+    uint64_t phys = *parent_entry & PTE_ADDR_MASK;
+    *parent_entry = 0;
+    b->need_flush = true;
+    if (b->nt == VMM_TABLE_BATCH)
+        vmm_unmap_batch_flush(b);
+    b->tables[b->nt++] = phys;
+}
+
+int vmm_unmap_range_release_in(uint64_t *pml4, uint64_t virtual_addr,
+                               uint64_t pages) {
+    if (!pml4 || !pages) return pml4 ? 0 : -1;
+    vmm_unmap_batch_t b;
+    b.nf = b.nt = 0;
+    b.need_flush = false;
+    int cleared = 0;
+
+    uint64_t va  = virtual_addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end = va + pages * PAGE_SIZE;
+    while (va < end) {
+        /* Never touch the shared kernel half. */
+        if (PML4_INDEX(va) >= 256)
+            break;
+        uint64_t *pml4e = &pml4[PML4_INDEX(va)];
+        if (!(*pml4e & VMM_PRESENT)) {
+            va = (va + (1ULL << 39)) & ~((1ULL << 39) - 1);
+            continue;
+        }
+        uint64_t *pdpt = (uint64_t *)phys_to_virt(*pml4e & PTE_ADDR_MASK);
+        uint64_t *pdpte = &pdpt[PDP_INDEX(va)];
+        if (!(*pdpte & VMM_PRESENT) || (*pdpte & VMM_HUGE)) {
+            va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+            continue;
+        }
+        uint64_t *pd = (uint64_t *)phys_to_virt(*pdpte & PTE_ADDR_MASK);
+        uint64_t *pde = &pd[PD_INDEX(va)];
+        uint64_t next = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+        if (!(*pde & VMM_PRESENT) || (*pde & VMM_HUGE)) {
+            va = next;
+            continue;
+        }
+        uint64_t *pt = (uint64_t *)phys_to_virt(*pde & PTE_ADDR_MASK);
+        uint64_t stop = next < end ? next : end;
+        for (; va < stop; va += PAGE_SIZE) {
+            uint64_t *pte = &pt[PT_INDEX(va)];
+            uint64_t ent = *pte;
+            if (!(ent & VMM_PRESENT))
+                continue;
+            *pte = 0;
+            __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+            b.need_flush = true;
+            cleared++;
+            uint64_t phys = ent & PTE_ADDR_MASK;
+            if (!(ent & VMM_USER) || !phys)
+                continue;           /* never release kernel/supervisor frames */
+            if (b.nf == VMM_UNMAP_BATCH)
+                vmm_unmap_batch_flush(&b);
+            b.frames[b.nf++] = phys;
+        }
+        /* Free tables this unmap emptied (bottom-up). */
+        if (vmm_table_empty(pt)) {
+            vmm_unmap_drop_table(&b, pde);
+            if (vmm_table_empty(pd)) {
+                vmm_unmap_drop_table(&b, pdpte);
+                if (vmm_table_empty(pdpt))
+                    vmm_unmap_drop_table(&b, pml4e);
+            }
+        }
+    }
+    vmm_unmap_batch_flush(&b);
+    return cleared;
+}
+
+/* Single-page wrapper (kept for existing callers). */
 int vmm_unmap_page_release_in(uint64_t *pml4, uint64_t virtual_addr) {
-    if (!pml4) return -1;
-
-    uint64_t *pte = vmm_get_pte_in(pml4, virtual_addr);
-    if (!pte || !(*pte & VMM_PRESENT)) return -1;
-
-    uint64_t phys = *pte & PTE_ADDR_MASK;
-    bool user_page = (*pte & VMM_USER) != 0;
-
-    *pte = 0;
-    __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr) : "memory");
-
-    if (user_page && phys)
-        vmm_page_unref(phys);
-    return 0;
+    return vmm_unmap_range_release_in(pml4, virtual_addr, 1) > 0 ? 0 : -1;
 }
 
 uint64_t vmm_is_mapped_in(uint64_t *pml4, uint64_t virtual_addr) {
@@ -1165,8 +1271,6 @@ void vmm_switch_address_space(uint64_t *pml4) {
  * Recursively free user-space page table structures.
  * Also releases mapped user physical pages at leaf entries.
  */
-static void vmm_leaf_release(uint64_t phys_addr);
-
 static void vmm_free_table(uint64_t *table, int level) {
     int limit = (level == 4) ? 256 : 512;
 
@@ -1247,23 +1351,62 @@ void vmm_page_unref(uint64_t phys_addr) {
     } while (!__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], old, old - 1));
 }
 
-/* Release a leaf frame from an address space being destroyed.
- * Refcounted pages: unref (free on last). Untracked (ref 0): free once
- * and leave ref at 0. */
+/* Is @phys a frame the PMM handed out as its own one-page allocation?
+ * That is what every user frame is (vmm_alloc_frame).  MMIO, framebuffer,
+ * firmware-reserved RAM, slab pages and pages inside a multi-page kalloc
+ * are not, and must never be freed because a user PTE pointed at them.
+ *   1  = live one-page PMM allocation (a user frame: releasable)
+ *   0  = not PMM-owned user RAM (leave it alone)
+ *  -1  = PMM page that is currently FREE (a stale/double release) */
+static int pmm_user_frame_kind(uint64_t phys) {
+    if (!entry_map || !page_bitmap)
+        return 0;
+    uint64_t idx = _get_page_from_addr(phys_to_virt(phys));
+    if (idx >= num_pages_in_map)
+        return 0;
+    uint32_t e = entry_map[idx].pages_allocated;
+    if (e == 1)
+        return 1;
+    if (e == 0 && !bitmap_test(page_bitmap, idx))
+        return -1;
+    return 0;
+}
+
+/* Release a user leaf frame (address-space teardown, munmap, brk shrink,
+ * MAP_FIXED replacement).  COW refcount convention:
+ *   0   untracked sole owner        -> free (claim with 255 first)
+ *   1   last owner after COW split  -> free (vmm_page_unref: 1 -> 255)
+ *   2+  shared with fork peers      -> drop one reference
+ *   255 already freed / saturated   -> nothing
+ * vmm_alloc_frame() resets the count to 0 when the frame is reused. */
 static void vmm_leaf_release(uint64_t phys_addr) {
     if (!phys_addr) return;
     if (!vmm_page_refcounts) {
-        vmm_free_frame(phys_addr);
+        if (pmm_user_frame_kind(phys_addr) == 1)
+            vmm_free_frame(phys_addr);
         return;
     }
     uint64_t pfn = phys_addr / PAGE_SIZE;
     if (pfn >= vmm_max_phys_pages) {
-        vmm_free_frame(phys_addr);
+        /* Outside the refcount array: free only if the PMM owns it as a
+         * one-page allocation (never MMIO / framebuffer). */
+        if (pmm_user_frame_kind(phys_addr) == 1)
+            vmm_free_frame(phys_addr);
         return;
     }
     uint8_t r = vmm_page_refcounts[pfn];
     if (r >= 255)
         return; /* already freed / saturated */
+    {
+        int kind = pmm_user_frame_kind(phys_addr);
+        if (kind < 0) {
+            serial_printf("vmm: user PTE mapped a free frame 0x%llx (stale mapping) - not freed\n",
+                          (unsigned long long)phys_addr);
+            return;
+        }
+        if (kind == 0)
+            return; /* reserved / kernel / MMIO page: not a user frame */
+    }
     if (r == 0) {
         /* Untracked sole mapping: claim with poison, free once. */
         if (__sync_bool_compare_and_swap(&vmm_page_refcounts[pfn], 0, 255))

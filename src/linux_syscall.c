@@ -1506,6 +1506,13 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         memset(si, 0, sizeof(si));
         int64_t up = (int64_t)(lx_mono_us() / 1000000ULL);
         memcpy(si, &up, 8);
+        /* struct sysinfo: totalram @32, freeram @40 (bytes, mem_unit=1).
+         * freeram is the PMM's free-page count -- lets user tests watch for
+         * frame leaks (e.g. munmap/brk churn). */
+        uint64_t totalram = total_memory_bytes;
+        uint64_t freeram = num_pages_available * (uint64_t)PAGE_SIZE;
+        memcpy(si + 32, &totalram, 8);
+        memcpy(si + 40, &freeram, 8);
         uint32_t unit = 1;
         memcpy(si + 104, &unit, 4);
         uint16_t procs = 1;
