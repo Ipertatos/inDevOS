@@ -3,6 +3,15 @@
 
 #include "types.h"
 
+/* Compile-time switch for the AMD GPU driver. 0 = never probed or
+ * initialised: the kernel keeps the Limine/GOP framebuffer and
+ * amd_gpu_is_available() is always false. Disabled because the
+ * experimental init hangs real AMD laptops right after
+ * "AMD GPU: Initialization complete". Set to 1 to re-enable. */
+#ifndef ENABLE_AMD_GPU
+#define ENABLE_AMD_GPU 0
+#endif
+
 void amd_gpu_init(void);
 
 // GPU drawing functions

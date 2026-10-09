@@ -419,7 +419,7 @@ static const char *const zeus_fs_programs[] = {
  * fails if the two ever drift apart.
  */
 static const char *const zeus_command_names[] = {
-    "addarp", "arp", "arpstatus", "arptest", "audio", "cachestats",
+    "addarp", "arp", "arpstatus", "arptest", "audio", "blktest", "cachestats",
     "cat", "cd", "checkpackets", "chmod", "chown", "clear",
     "clip", "clipboard", "cmd", "cp", "curl", "date",
     "ddhcp", "desktop", "desktopstop", "dhcp", "dir", "dlopen",
@@ -430,7 +430,7 @@ static const char *const zeus_command_names[] = {
     "insmod", "install", "inttest", "ipv6", "kblayout", "keyboard",
     "kill", "login", "logout", "ls", "lsmod", "luade",
     "mac", "matrix", "memtest", "menu", "mkdir", "mount",
-    "mv", "neofetch", "net", "netdebug", "netset", "netverbose",
+    "mv", "neofetch", "net", "nvme", "netdebug", "netset", "netverbose",
     "open", "passwd", "perms", "ping", "pkg", "poweroff",
     "prof", "ps", "pwd", "qemunet", "reboot", "res",
     "rm", "rmmod", "rtldebug",     "saveperm", "saveusers", "scheddebug",
@@ -669,6 +669,15 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
     } else if (kstrcmp(command, "neofetch") == 0) {
         extern void print_info(void);
         print_info();
+    } else if (kstrcmp(command, "blktest") == 0) {
+        if (argc < 2) {
+            printf("Usage: blktest <device_id> [base_lba]  (pattern write/read/restore)\n");
+        } else {
+            storage_selftest((uint8_t)atoi(argv[1]), argc >= 3 ? (uint64_t)atoi(argv[2]) : 2048u);
+        }
+    } else if (kstrcmp(command, "nvme") == 0) {
+        extern void nvme_print_info(void);
+        nvme_print_info();
     } else if (kstrcmp(command, "storage") == 0) {
         extern void show_storage_devices(void);
         show_storage_devices();

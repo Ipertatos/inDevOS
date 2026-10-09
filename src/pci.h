@@ -90,8 +90,12 @@ struct pci_device {
     bool msix_enabled;
 };
 
-extern struct pci_device *pci_devices[];
-extern uint8_t pci_device_count;
+/* Upper bound on enumerated PCI functions. Real laptops easily exceed 32
+ * (PCH functions + root ports + GPU/NVMe/Wi-Fi/USB behind bridges). */
+#define PCI_MAX_DEVICES 256
+
+extern struct pci_device *pci_devices[PCI_MAX_DEVICES];
+extern int pci_device_count;
 
 void pci_init(void);
 struct pci_device* pci_find_device(uint8_t class_code, uint8_t subclass_code);

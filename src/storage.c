@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include "string.h"
 #include "atomic.h"
+#include "nvme.h"
+#include "ktime.h"
 
 // ============================================================================
 // LRU Block Cache
@@ -454,7 +456,6 @@ static int storage_read_sectors_hw(storage_device_t *dev, uint8_t device_id,
         extern int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
         result = ahci_read_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
-        extern int nvme_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
         result = nvme_read_sectors(dev, lba, sector_count, buffer);
     }
     return result;
@@ -525,7 +526,6 @@ int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count
         extern int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
         result = ahci_write_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
-        extern int nvme_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
         result = nvme_write_sectors(dev, lba, sector_count, buffer);
     }
 
@@ -566,14 +566,66 @@ int storage_flush(uint8_t device_id) {
         return ahci_flush(dev);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
         // NVMe device
-        extern int nvme_flush(storage_device_t *dev);
         return nvme_flush(dev);
     }
     
     return -1; // Unsupported device type
 }
 
-// Helper: Parse MBR and return first FAT32 partition LBA (0 if not found)
+/* GPT: first partition whose type is EFI System or Microsoft Basic Data and
+ * whose first sector is a FAT32 boot sector. Returns 0 if none. */
+static const uint8_t gpt_type_esp[16] = {
+    0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+    0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
+static const uint8_t gpt_type_basic[16] = {
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+    0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 };
+
+static int storage_is_fat32_boot(const uint8_t *s) {
+    return s[510] == 0x55 && s[511] == 0xAA &&
+           *(const uint16_t *)(s + 11) == 512 && s[13] != 0 &&
+           *(const uint16_t *)(s + 22) == 0 && *(const uint32_t *)(s + 36) != 0;
+}
+
+static uint32_t storage_gpt_find_fat32(uint8_t device_id, uint8_t *buf) {
+    if (storage_read_sectors(device_id, 1, 1, buf) != 0 || memcmp(buf, "EFI PART", 8) != 0) {
+        printf("storage: protective MBR but no GPT header\n");
+        return 0;
+    }
+    uint64_t ent_lba = *(uint64_t *)(buf + 72);
+    uint32_t nents = *(uint32_t *)(buf + 80);
+    uint32_t esize = *(uint32_t *)(buf + 84);
+    if (esize < 128 || esize > 512 || (512 % esize) != 0 || nents > 1024 || ent_lba < 2) {
+        printf("storage: GPT header has unusual entry layout (size %u, count %u)\n", esize, nents);
+        return 0;
+    }
+    uint32_t per = 512 / esize;
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < nents && !found; i++) {
+        if (i % per == 0 && storage_read_sectors(device_id, ent_lba + i / per, 1, buf) != 0)
+            return 0;
+        const uint8_t *e = buf + (i % per) * esize;
+        int esp = memcmp(e, gpt_type_esp, 16) == 0;
+        int basic = memcmp(e, gpt_type_basic, 16) == 0;
+        uint64_t first = *(const uint64_t *)(e + 32);
+        if (!esp && !basic) continue;
+        printf("storage: GPT partition %u %s first LBA %llu\n", i,
+               esp ? "EFI System" : "Basic Data", (unsigned long long)first);
+        if (first == 0 || first > 0xFFFFFFFFull) continue;
+        uint8_t *bs = kalloc(512);
+        if (!bs) return 0;
+        if (storage_read_sectors(device_id, first, 1, bs) == 0 && storage_is_fat32_boot(bs))
+            found = (uint32_t)first;
+        kfree(bs);
+    }
+    if (found)
+        printf("storage: Found FAT32 GPT partition at LBA %u\n", found);
+    else
+        printf("storage: No FAT32 partition in GPT\n");
+    return found;
+}
+
+// Helper: Parse MBR (or GPT behind a protective MBR) and return the first FAT32 partition LBA (0 if not found)
 uint32_t find_first_fat32_partition_lba(uint8_t device_id) {
     uint8_t *mbr = kalloc(512);
     if (!mbr) {
@@ -597,6 +649,11 @@ uint32_t find_first_fat32_partition_lba(uint8_t device_id) {
             printf("storage: Found FAT32 partition at LBA %u\n", lba);
             kfree(mbr);
             return lba;
+        }
+        if (part_type == 0xEE) {
+            uint32_t g = storage_gpt_find_fat32(device_id, mbr);
+            kfree(mbr);
+            return g;
         }
     }
     printf("storage: No FAT32 partition found in MBR\n");
@@ -631,6 +688,7 @@ int storage_find_boot_device(void) {
     int optical_fat = -1;
     int optical_sig = -1;
     int disk_sig = -1;
+    int disk_fat = -1;
     uint32_t want;
     int chosen;
     const char *why;
@@ -675,8 +733,11 @@ int storage_find_boot_device(void) {
                 optical_fat = dev->device_id;
             if (got && want && sig == want)
                 optical_sig = dev->device_id;
-        } else if (got && want && sig == want && disk_sig < 0) {
-            disk_sig = dev->device_id;
+        } else {
+            if (got && want && sig == want && disk_sig < 0)
+                disk_sig = dev->device_id;
+            if (fat && disk_fat < 0)
+                disk_fat = dev->device_id;
         }
     }
 
@@ -704,6 +765,11 @@ int storage_find_boot_device(void) {
     } else if (!file && optical_fat >= 0) {
         chosen = optical_fat;
         why = "FAT32 DVD (Limine reported no kernel file)";
+    } else if (disk_fat >= 0) {
+        /* Device order follows PCI order, so a blank or foreign NVMe disk
+         * can be device 0. Prefer a disk that actually holds a FAT32 volume. */
+        chosen = disk_fat;
+        why = "no Limine disk id match; first disk with a FAT32 partition";
     } else if (storage_device_count > 0) {
         chosen = 0;
         why = "no Limine disk id; device 0";
@@ -724,4 +790,49 @@ int storage_find_boot_device(void) {
     }
     boot_dev_cached = chosen;
     return chosen;
+}
+
+/* blktest: write a pattern, read it back uncached, compare, restore the old
+ * data. Covers single sectors, unaligned starts/lengths (4K-LBA read-modify-
+ * write) and transfers larger than one driver command. Destructive only if
+ * the restore fails. */
+int storage_selftest(uint8_t device_id, uint64_t base) {
+    static const uint32_t lens[] = { 1, 7, 8, 9, 64, 300, 513, 1024, 2051 };
+    static const uint32_t offs[] = { 0, 3, 8, 1,  5,  16,  0,    7,  1 };
+    storage_device_t *dev = storage_get_device(device_id);
+    uint32_t maxn = 2051 + 16;
+    if (!dev) { printf("blktest: no device %u\n", device_id); return -1; }
+    if (base + 4096 + maxn > dev->sector_count) base = 0;
+    uint8_t *orig = kalloc(maxn * 512u), *pat = kalloc(maxn * 512u), *chk = kalloc(maxn * 512u);
+    int fails = 0, total = 0;
+    if (!orig || !pat || !chk) { printf("blktest: out of memory\n"); goto out; }
+    printf("blktest: device %u (%s), base LBA %llu\n", device_id, dev->name, (unsigned long long)base);
+    for (unsigned t = 0; t < sizeof(lens) / sizeof(lens[0]); t++) {
+        uint64_t lba = base + 256u * t + offs[t];
+        uint32_t n = lens[t];
+        uint64_t t0 = ktime_now_ms();
+        total++;
+        if (storage_read_sectors(device_id, lba, n, orig) != 0) { printf("blktest: read orig failed lba %llu n %u\n", (unsigned long long)lba, n); fails++; continue; }
+        for (uint32_t i = 0; i < n * 512u; i++)
+            pat[i] = (uint8_t)((i * 7u) ^ (uint32_t)(lba + i / 512u) ^ (t * 0x35u));
+        if (storage_write_sectors(device_id, lba, n, pat) != 0) { printf("blktest: write failed lba %llu n %u\n", (unsigned long long)lba, n); fails++; continue; }
+        storage_flush(device_id);
+        storage_bcache_invalidate_all();
+        memset(chk, 0xA5, n * 512u);
+        int ok = storage_read_sectors(device_id, lba, n, chk) == 0 && memcmp(chk, pat, n * 512u) == 0;
+        /* neighbours of an unaligned range must be untouched */
+        if (storage_write_sectors(device_id, lba, n, orig) != 0) { printf("blktest: RESTORE FAILED lba %llu n %u\n", (unsigned long long)lba, n); ok = 0; }
+        storage_bcache_invalidate_all();
+        if (ok && (storage_read_sectors(device_id, lba, n, chk) != 0 || memcmp(chk, orig, n * 512u) != 0)) ok = 0;
+        printf("blktest: lba %llu n %u: %s (%llu ms)\n", (unsigned long long)lba, n, ok ? "ok" : "MISMATCH",
+               (unsigned long long)(ktime_now_ms() - t0));
+        if (!ok) fails++;
+    }
+    storage_flush(device_id);
+    printf("BLKTEST %s dev=%u cases=%d fail=%d\n", fails ? "FAIL" : "OK", device_id, total, fails);
+out:
+    if (orig) kfree(orig);
+    if (pat) kfree(pat);
+    if (chk) kfree(chk);
+    return fails ? -1 : 0;
 }

@@ -17,6 +17,9 @@ static bool gpu_initialized = false;
 
 // AMD GPU drawing functions
 bool amd_gpu_is_available(void) {
+#if !ENABLE_AMD_GPU
+    return false;
+#endif
     return gpu_initialized && amdgpu_device != NULL;
 }
 
@@ -82,12 +85,16 @@ void amd_gpu_fillrect(uint32_t color, uint64_t x, uint64_t y, uint64_t w, uint64
 }
 
 void amd_gpu_init(void) {
+#if !ENABLE_AMD_GPU
+    printf("AMD GPU: driver disabled (ENABLE_AMD_GPU=0), using boot framebuffer\n");
+    return;
+#endif
     printf("AMD GPU: Initializing\n");
     DEBUG_SERIAL("AMD GPU: Initializing\n");
 
     struct pci_device *amdgpu_dev = NULL;
 
-    for(uint8_t i = 0; i < pci_device_count; i++) {
+    for(int i = 0; i < pci_device_count; i++) {
         struct pci_device *dev = pci_devices[i];
         if(dev->class_code == 0x03 && dev->subclass_code == 0x00 && dev->vendor_id == 0x1002) {
             printf("AMD GPU: Found AMD VGA device: device_id=0x%x at bus=%d dev=%d func=%d\n",

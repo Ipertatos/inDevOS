@@ -244,7 +244,10 @@ void fat32_parse_83_filename(const char *long_name, char *short_name) {
     int ext_len = 0;
     bool in_extension = false;
     
-    for (int i = 0; long_name[i] && name_len < 8; i++) {
+    /* Walk the whole name: stopping once 8 base characters were copied
+     * dropped the extension of 8.3 names with an 8-character base
+     * (NEOFETCH.EXE became "NEOFETCH   " and could never be found again). */
+    for (int i = 0; long_name[i]; i++) {
         char c = long_name[i];
         
         if (c == '.') {

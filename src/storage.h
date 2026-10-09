@@ -42,3 +42,4 @@ void storage_init_ramdisk();
 // Block cache statistics
 void storage_cache_stats(void);
 void storage_bcache_invalidate_all(void);
+int storage_selftest(uint8_t device_id, uint64_t base);

@@ -402,6 +402,10 @@ int amd_gpu_driver_adapter_deinit(void) {
 }
 
 int amd_gpu_driver_adapter_probe(struct pci_device *dev) {
+#if !ENABLE_AMD_GPU
+    (void)dev;
+    return -1; /* driver compiled out: never bind to AMD VGA devices */
+#endif
     // Check if this is an AMD GPU device
     if (dev->vendor_id == 0x1002 && dev->class_code == 0x03 && dev->subclass_code == 0x00) {
         return 0; // AMD GPU device found

@@ -499,7 +499,7 @@ void usb_init() {
     DEBUG_SERIAL("USB: Starting USB subsystem initialization\n");
     
     // Find USB controllers
-    for (uint8_t i = 0; i < pci_device_count; i++) {
+    for (int i = 0; i < pci_device_count; i++) {
         struct pci_device *pci_dev = pci_devices[i];
         
         /* Serial-bus / USB host (UHCI/OHCI/EHCI/xHCI). 0x05 is SMBus. */

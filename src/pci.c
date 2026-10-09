@@ -4,8 +4,61 @@
 #include "serial.h"
 #include "registers.h"
 
-struct pci_device *pci_devices[32];
-uint8_t pci_device_count = 0;
+struct pci_device *pci_devices[PCI_MAX_DEVICES];
+int pci_device_count = 0;
+
+/* ECAM windows from the ACPI MCFG table. The table may hold several
+ * allocation entries (one per segment / bus range). Only segment 0 is
+ * reachable through this driver. Per the PCI Firmware spec the entry's base
+ * address corresponds to bus 0 (not start_bus), so a function's config space
+ * is base + (bus << 20 | dev << 15 | fn << 12) for start_bus <= bus <= end_bus.
+ * Buses outside every window are never touched through ECAM (reading past the
+ * window hits unrelated MMIO and yields phantom devices). */
+#define PCI_MCFG_MAX_ENTRIES 16
+#define PCI_MCFG_HDR_SIZE    44u   /* 36-byte SDT header + 8 reserved */
+#define PCI_MCFG_ENTRY_SIZE  16u
+static struct { uint64_t base; uint8_t start_bus, end_bus; } pci_ecam[PCI_MCFG_MAX_ENTRIES];
+static int pci_ecam_count = -1;    /* -1: MCFG not parsed yet */
+
+static void pci_ecam_parse(void)
+{
+    pci_ecam_count = 0;
+    if (mcfg == NULL)
+        return;
+    uint32_t len = mcfg->desc.length;
+    const uint8_t *tbl = (const uint8_t *)mcfg;
+    for (uint32_t off = PCI_MCFG_HDR_SIZE;
+         off + PCI_MCFG_ENTRY_SIZE <= len && pci_ecam_count < PCI_MCFG_MAX_ENTRIES;
+         off += PCI_MCFG_ENTRY_SIZE) {
+        uint64_t base = *(const uint64_t *)(tbl + off);
+        uint16_t seg = *(const uint16_t *)(tbl + off + 8);
+        uint8_t sb = tbl[off + 10], eb = tbl[off + 11];
+        serial_printf("PCI: MCFG entry base=0x%llx seg=%u bus %u-%u\n",
+                      (unsigned long long)base, seg, sb, eb);
+        if (seg != 0 || base == 0 || eb < sb)
+            continue;
+        pci_ecam[pci_ecam_count].base = base;
+        pci_ecam[pci_ecam_count].start_bus = sb;
+        pci_ecam[pci_ecam_count].end_bus = eb;
+        pci_ecam_count++;
+    }
+}
+
+/* Virtual address of the 4 KiB ECAM config page for bus:dev.fn, or 0 when
+ * no ECAM window decodes that bus. */
+static uint64_t pci_ecam_addr(uint8_t bus, uint8_t device, uint8_t function)
+{
+    if (pci_ecam_count < 0)
+        pci_ecam_parse();
+    for (int i = 0; i < pci_ecam_count; i++) {
+        if (bus >= pci_ecam[i].start_bus && bus <= pci_ecam[i].end_bus)
+            return pci_ecam[i].base + vmm_higher_half_offset
+                 + ((uint64_t)bus << 20)
+                 + ((uint64_t)(device & 0x1Fu) << 15)
+                 + ((uint64_t)(function & 0x7u) << 12);
+    }
+    return 0;
+}
 
 // Get device string representation of the specified class code and subclass code
 const char* get_device_str(uint8_t class_code, uint8_t sub_class_code){
@@ -134,10 +187,19 @@ uint32_t pci_device_read(struct pci_device *dev, uint32_t offset, uint8_t size){
     }
     /* No ECAM window: use mechanism #1 instead of faulting or returning 0
      * (a zero vendor id would look like a present device). */
-    if (mcfg == NULL)
-        return pci_legacy_read(dev, offset, size);
-    uint64_t addr = mcfg->base_addr + vmm_higher_half_offset + offset + 
-    ((dev->bus - mcfg->start_bus) << 20) + (dev->device << 15) + (dev->function << 12);
+    uint64_t base = pci_ecam_addr(dev->bus, dev->device, dev->function);
+    if (base == 0) {
+        /* No usable ECAM at all: mechanism #1. ECAM present but not decoding
+         * this bus: nothing can live there, read as an absent function. */
+        if (pci_ecam_count == 0)
+            return pci_legacy_read(dev, offset, size);
+        return size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+    }
+    if (offset > 0xFFC) {
+        DEBUG_SERIAL("PCI: config read offset 0x%x out of range\n", offset);
+        return 0;
+    }
+    uint64_t addr = base + offset;
     uint32_t result = 0;
     switch (size) {
     case 1:
@@ -161,12 +223,17 @@ uint32_t pci_device_read(struct pci_device *dev, uint32_t offset, uint8_t size){
 //write to pci configuration for a pci device
 void pci_device_write(struct pci_device *dev, uint32_t offset, uint8_t size, uint32_t val)
 {
-    if (mcfg == NULL) {
-        pci_legacy_write(dev, offset, size, val);
+    if (dev == NULL)
+        return;
+    uint64_t base = pci_ecam_addr(dev->bus, dev->device, dev->function);
+    if (base == 0) {
+        if (pci_ecam_count == 0)
+            pci_legacy_write(dev, offset, size, val);
         return;
     }
-    uint64_t addr = mcfg->base_addr + vmm_higher_half_offset + offset + 
-    ((dev->bus - mcfg->start_bus) << 20) + (dev->device << 15) + (dev->function << 12);
+    if (offset > 0xFFC)
+        return;
+    uint64_t addr = base + offset;
 
     switch (size)
     {
@@ -249,6 +316,20 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
     uint8_t subclass = pci_mm_read_subclass_code(bus, device, function);
     uint8_t progif = pci_mm_read_prog_if(bus, device, function);
 
+    if (pci_device_count >= PCI_MAX_DEVICES) {
+        printf("PCI: device table full (%d), ignoring %02x:%02x.%x\n",
+               PCI_MAX_DEVICES, bus, device, function);
+        return;
+    }
+    /* Never register the same bus:dev.fn twice. */
+    for (int i = 0; i < pci_device_count; i++) {
+        struct pci_device *d = pci_devices[i];
+        if (d->bus == bus && d->device == device && d->function == function) {
+            serial_printf("PCI: duplicate %02x:%02x.%x ignored\n", bus, device, function);
+            return;
+        }
+    }
+
     // Create the new device and store it in the device list.
     struct pci_device *dev = kalloc(sizeof(struct pci_device));
     
@@ -256,12 +337,6 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
     if (dev == NULL) {
         printf("PCI: Failed to allocate memory for PCI device\n");
         DEBUG_SERIAL("PCI: Failed to allocate memory for PCI device\n");
-        return;
-    }
-
-    if (pci_device_count >= 32) {
-        printf("PCI: device table full, ignoring %02x:%02x.%x\n", bus, device, function);
-        kfree(dev);
         return;
     }
 
@@ -277,15 +352,14 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
     dev->function = function;
     dev->device = device;
     dev->header_type = header_type;
-    if (mcfg)
-        dev->address = mcfg->base_addr + vmm_higher_half_offset + ((bus - mcfg->start_bus) << 20 | device << 15 | function << 12);
-    else
-        dev->address = 0; /* no ECAM; config access uses 0xCF8/0xCFC */
+    /* 0 when no ECAM window covers the bus; config access then uses 0xCF8/0xCFC */
+    dev->address = pci_ecam_addr(bus, device, function);
 
     /* Scan for MSI/MSI-X capabilities */
     pci_scan_capabilities(dev);
 
-    printf("PCI: %s (Class %002x:%002x)\n", dev->description, classcode, subclass);
+    printf("PCI: %02x:%02x.%x %s (Class %02x:%02x)\n", bus, device, function,
+           dev->description, classcode, subclass);
     // DEBUG_SERIAL("PCI: %s (Class %02x:%02x) at bus=%d, device=%d, func=%d\n", 
     //              dev->description, classcode, subclass, bus, device, function);
     
@@ -330,7 +404,9 @@ void check_device(uint8_t bus, uint8_t device)
         // It's a multi-function device, so check remaining functions.
         for (function = 1; function < 8; function++) {
             if (pci_mm_read_vendor_id(bus, device, function) != 0xFFFF) {
-                check_function(bus, device, function, headerType);
+                /* each function has its own header type (0 = endpoint, 1 = bridge) */
+                check_function(bus, device, function,
+                               pci_mm_read_header_type(bus, device, function));
             }
         }
     }
@@ -341,11 +417,18 @@ void check_device(uint8_t bus, uint8_t device)
 */
 void scan_all_buses()
 {
-    // DEBUG_SERIAL("PCI: Starting scan of all buses\n");
+    /* Brute-force scan (no bridge recursion, so no bus is visited twice).
+     * Firmware has already numbered the buses behind PCI-to-PCI bridges.
+     * With ECAM only the buses decoded by an MCFG window are scanned, each
+     * once even if windows overlap; with no usable window every bus is
+     * probed through 0xCF8/0xCFC. */
+    if (pci_ecam_count < 0)
+        pci_ecam_parse();
     for (uint16_t bus = 0; bus < 256; bus++) {
-        // DEBUG_SERIAL("PCI: Scanning bus %d\n", bus);
+        if (pci_ecam_count > 0 && pci_ecam_addr((uint8_t)bus, 0, 0) == 0)
+            continue;
         for (uint8_t device = 0; device < 32; device++) {
-            check_device(bus, device);
+            check_device((uint8_t)bus, device);
         }
     }
 }
@@ -359,6 +442,7 @@ void pci_init()
     }
     scan_all_buses();
     printf("PCI: Found %d PCI devices.\n", pci_device_count);
+    serial_printf("PCI: Found %d PCI devices (max %d)\n", pci_device_count, PCI_MAX_DEVICES);
     printf("PCI: Initialized.\n");
 }
 
