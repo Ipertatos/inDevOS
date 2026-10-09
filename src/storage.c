@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "kprof.h"
 #include "limine.h"
 #include "utils.h"
 #include "mem.h"
@@ -203,6 +204,7 @@ static spinlock_t storage_lock = {0};
  * (512 KiB) in one PRDT. PIO fallback and AHCI still split inside the driver
  * (AHCI bounce is 128 sectors). */
 #define STORAGE_HW_READ_MAX_SECTORS 1024
+#define STORAGE_READAHEAD_SECTORS 64
 static uint8_t storage_seq_hw_buf[STORAGE_HW_READ_MAX_SECTORS * SECTOR_SIZE];
 
 // Storage operations for RAM disk
@@ -443,10 +445,36 @@ storage_device_t* storage_get_device(uint8_t device_id) {
 }
 
 /* Internal: read sectors directly from hardware (no cache) */
+kprof_slot_t kprof_slots[KP_COUNT];
+const char *const kprof_names[KP_COUNT] = {
+    "storage read (driver)", "storage read (cache only)", "storage write (driver)",
+    "storage flush", "fat32 resolve_path", "fat32 find_in_dir", "fat32 dir clusters scanned",
+    "fat32 create_file", "fat32 mkdir", "fat32 open", "fat32 read", "fat32 write",
+    "fat32 update_dir_entry", "fat32 flush_fat", "fat32 clusters allocated",
+    "fat32 truncate", "vfs exists", "vfs mkdir -p", "install: walk", "install: read files",
+    "install: mkdir", "install: write files", "install: log output", "install: final flush",
+};
+
+void kprof_reset(void) {
+    memset(kprof_slots, 0, sizeof(kprof_slots));
+}
+
+void kprof_dump(const char *tag) {
+    for (int i = 0; i < KP_COUNT; i++) {
+        kprof_slot_t *s = &kprof_slots[i];
+        if (!s->count && !s->us)
+            continue;
+        serial_printf("kprof %s: %s n=%llu ms=%llu sectors=%llu\n", tag, kprof_names[i],
+                      (unsigned long long)s->count, (unsigned long long)(s->us / 1000u),
+                      (unsigned long long)s->sectors);
+    }
+}
+
 static int storage_read_sectors_hw(storage_device_t *dev, uint8_t device_id,
                                    uint64_t lba, uint32_t sector_count, void *buffer) {
     (void)device_id;
     int result = -1;
+    uint64_t kp_t0 = kprof_begin();
     if (dev->pci_dev == NULL) {
         result = storage_ops.read_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x01) {
@@ -458,6 +486,7 @@ static int storage_read_sectors_hw(storage_device_t *dev, uint8_t device_id,
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
         result = nvme_read_sectors(dev, lba, sector_count, buffer);
     }
+    kprof_end(KP_ST_RD_HW, kp_t0, sector_count);
     return result;
 }
 
@@ -471,6 +500,8 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
 
     uint8_t *dst = (uint8_t *)buffer;
     int result = 0;
+    int kp_hw = 0;
+    uint64_t kp_t0 = kprof_begin();
 
     for (uint32_t i = 0; i < sector_count; ) {
         bcache_entry_t *hit = bcache_lookup(device_id, lba + i);
@@ -488,7 +519,24 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
                 break;
             n++;
         }
+        /* Readahead for small requests: a directory cluster, a FAT sector or
+         * a small file costs one device command whatever its length (tens of
+         * ms under emulation), and the next request usually wants the sectors
+         * right after it. Pull up to STORAGE_READAHEAD_SECTORS into the cache.
+         * DMA devices only (AHCI, NVMe): on PIO IDE every sector costs. */
+        uint32_t n_req = n;
+        if (i + n == sector_count && sector_count < STORAGE_READAHEAD_SECTORS &&
+            bcache.enabled && dev->sector_count && dev->pci_dev &&
+            dev->pci_dev->class_code == 0x01 &&
+            (dev->pci_dev->subclass_code == 0x06 || dev->pci_dev->subclass_code == 0x08) &&
+            (dev->sector_size == 0 || dev->sector_size == SECTOR_SIZE)) {
+            while (n < STORAGE_READAHEAD_SECTORS &&
+                   lba + i + n < (uint64_t)dev->sector_count &&
+                   !bcache_lookup(device_id, lba + i + n))
+                n++;
+        }
 
+        kp_hw = 1;
         int r = storage_read_sectors_hw(dev, device_id, lba + i, n, storage_seq_hw_buf);
         if (r != 0) {
             result = r;
@@ -497,12 +545,15 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
 
         for (uint32_t j = 0; j < n; j++) {
             const uint8_t *src = storage_seq_hw_buf + j * SECTOR_SIZE;
-            memcpy(dst + (i + j) * SECTOR_SIZE, src, SECTOR_SIZE);
+            if (j < n_req)
+                memcpy(dst + (i + j) * SECTOR_SIZE, src, SECTOR_SIZE);
             bcache_insert(device_id, lba + i + j, src);
         }
-        i += n;
+        i += n_req;
     }
 
+    if (!kp_hw)
+        kprof_end(KP_ST_RD_CACHED, kp_t0, sector_count);
     spinlock_unlock(&storage_lock);
     return result;
 }
@@ -516,6 +567,7 @@ int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count
     }
     
     int result = -1;
+    uint64_t kp_t0 = kprof_begin();
     // Dispatch to appropriate driver based on device type
     if (dev->pci_dev == NULL) {
         result = storage_ops.write_sectors(dev, lba, sector_count, buffer);
@@ -528,6 +580,7 @@ int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
         result = nvme_write_sectors(dev, lba, sector_count, buffer);
     }
+    kprof_end(KP_ST_WR_HW, kp_t0, sector_count);
 
     /* Write-through for small writes. Format and file-copy runs are hundreds
      * of sectors of zeros or payload; inserting each one evicts the cache
@@ -546,7 +599,7 @@ int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count
     return result;
 }
 
-int storage_flush(uint8_t device_id) {
+static int storage_flush_impl(uint8_t device_id) {
     storage_device_t *dev = storage_get_device(device_id);
     if (!dev) {
         return -1;
@@ -570,6 +623,13 @@ int storage_flush(uint8_t device_id) {
     }
     
     return -1; // Unsupported device type
+}
+
+int storage_flush(uint8_t device_id) {
+    uint64_t kp_t0 = kprof_begin();
+    int r = storage_flush_impl(device_id);
+    kprof_end(KP_ST_FLUSH, kp_t0, 0);
+    return r;
 }
 
 /* GPT: first partition whose type is EFI System or Microsoft Basic Data and

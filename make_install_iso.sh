@@ -96,7 +96,20 @@ elif [[ -L tests/tcc/stage ]]; then
 elif [[ -x tests/tcc/stage/bin/tcc.exe ]]; then
     TCC_STAGE=tests/tcc/stage
 fi
+# TinyCC is configured with sysincludepaths /usr/include:/usr/lib/tcc/include,
+# libpaths /usr/lib:/usr/lib/tcc and crtprefix /usr/lib (tests/tcc/build_tcc.sh),
+# so the installed tree needs exactly these. Refuse a half-populated stage.
+TCC_RUNTIME=(
+    usr/include/stdio.h usr/include/stdlib.h usr/include/string.h
+    usr/include/inttypes.h usr/include/stdio_ext.h usr/include/sys/types.h
+    usr/include/bits/alltypes.h usr/lib/tcc/include/stddef.h
+    usr/lib/tcc/include/stdarg.h usr/lib/tcc/libtcc1.a
+    usr/lib/crt1.o usr/lib/crti.o usr/lib/crtn.o usr/lib/libc.a
+)
 if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
+    for f in "${TCC_RUNTIME[@]}"; do
+        [[ -f "$TCC_STAGE/$f" ]] || die "TCC stage $TCC_STAGE lacks $f (rerun tests/tcc/build_tcc.sh)"
+    done
     mmd -i "$ROOTFS" ::/usr 2>/dev/null || true
     mmd -i "$ROOTFS" ::/usr/lib 2>/dev/null || true
     mmd -i "$ROOTFS" ::/usr/lib/tcc 2>/dev/null || true
@@ -109,7 +122,14 @@ if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
     if ls "$TCC_STAGE"/home/user/*.c >/dev/null 2>&1; then
         mcopy -o -i "$ROOTFS" "$TCC_STAGE"/home/user/*.c ::/home/user/
     fi
-    echo "    /bin/tcc.exe + /usr/{include,lib} from $TCC_STAGE"
+    echo "    /bin/tcc.exe + /usr/{include,lib} from $TCC_STAGE ($(find "$TCC_STAGE/usr" -type f | wc -l) files)"
+    # mtools writes long names (stdio_ext.h, bits/alltypes.h, ...) as VFAT LFN
+    # entries; check a few made it with their real names.
+    for f in usr/include/stdio_ext.h usr/include/bits/alltypes.h usr/lib/tcc/libtcc1.a usr/lib/crt1.o; do
+        mdir -i "$ROOTFS" "::/$f" >/dev/null 2>&1 || die "rootfs is missing /$f after copying the TCC stage"
+    done
+else
+    echo "    WARNING: no TinyCC stage (tests/tcc/stage.path or tests/tcc/stage); /bin/tcc.exe and its headers are NOT in the image"
 fi
 
 

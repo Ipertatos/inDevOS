@@ -11,10 +11,13 @@
  */
 
 #include "install.h"
+#include "kprof.h"
+#include "ktime.h"
 #include "fat32.h"
 #include "vfs.h"
 #include "vfs_fat32.h"
 #include "storage.h"
+#include "serial.h"
 #include "mem.h"
 #include "string.h"
 #include "tui.h"
@@ -25,10 +28,14 @@
 /* 64 KiB clusters and a 32 MiB in-memory FAT: about 512 GiB. Matches fat32_format. */
 #define INSTALL_MAX_PART_SECTORS (128u * ((32u * 1024u * 1024u) / 4u))
 #define INSTALL_MIN_PART_SECTORS 131072u  /* 64 MiB: Limine needs >= 65525 clusters */
-#define INSTALL_MAX_NODES        256
+/* The live root holds the shell tools plus the TCC runtime (about 250
+ * headers and libraries), so leave plenty of room. Both limits are hard
+ * errors before anything is formatted, never a silent truncation. */
+#define INSTALL_MAX_NODES        4096
 #define INSTALL_PATH_MAX         192
 #define INSTALL_FILE_MAX         (16u * 1024u * 1024u)
-#define INSTALL_DIR_ENTS         64
+#define INSTALL_PROGRESS_EVERY   50
+#define INSTALL_DIR_ENTS         VFS_READDIR_MAX
 
 extern void mount_filesystem_device(uint8_t device_id);
 
@@ -165,9 +172,16 @@ static int install_join(char *dst, size_t dstsz, const char *dir, const char *na
 static int install_add(install_node_t *nodes, int *count, const char *path, int is_dir) {
     install_node_t *n;
     size_t len;
-    if (*count >= INSTALL_MAX_NODES) return -1;
+    if (*count >= INSTALL_MAX_NODES) {
+        printf("install: more than %d files and directories in the live root\n",
+               INSTALL_MAX_NODES);
+        return -1;
+    }
     len = strlen(path);
-    if (len == 0 || len >= INSTALL_PATH_MAX) return -1;
+    if (len == 0 || len >= INSTALL_PATH_MAX) {
+        printf("install: path too long: %s\n", path);
+        return -1;
+    }
     n = &nodes[*count];
     memset(n, 0, sizeof(*n));
     memcpy(n->path, path, len + 1);
@@ -176,66 +190,69 @@ static int install_add(install_node_t *nodes, int *count, const char *path, int 
     return 0;
 }
 
+/* Collect every directory and file under `dir`. The listing buffer is freed
+ * before recursing, so deep trees do not hold one big buffer per level.
+ * Directories are added before their contents, which is the order the
+ * copy loop creates them in. */
 static int install_walk(install_node_t *nodes, int *count, const char *dir, int depth) {
     vfs_dirent_t *ents;
-    int nent, i;
-    if (depth > 8) return -1;
+    int nent, i, first, last;
+    if (depth > 8) {
+        printf("install: %s is nested too deeply\n", dir);
+        return -1;
+    }
     ents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * INSTALL_DIR_ENTS);
-    if (!ents) return -1;
+    if (!ents) {
+        printf("install: out of memory listing %s\n", dir);
+        return -1;
+    }
     nent = vfs_readdir(dir, ents, INSTALL_DIR_ENTS);
     if (nent < 0) {
         kfree(ents);
         printf("install: cannot list %s\n", dir);
         return -1;
     }
-    if (nent >= INSTALL_DIR_ENTS)
-        printf("install: directory %s may be truncated\n", dir);
-
-    for (i = 0; i < nent; i++) {
-        char child[INSTALL_PATH_MAX];
-        if (ents[i].name[0] == '\0') continue;
-        if (ents[i].name[0] == '.' &&
-            (ents[i].name[1] == '\0' ||
-             (ents[i].name[1] == '.' && ents[i].name[2] == '\0')))
-            continue;
-        if (ents[i].type != VFS_DIRECTORY) continue;
-        if (install_join(child, sizeof(child), dir, ents[i].name) != 0) {
-            kfree(ents);
-            return -1;
-        }
-        if (install_add(nodes, count, child, 1) != 0) {
-            kfree(ents);
-            return -1;
-        }
-        if (install_walk(nodes, count, child, depth + 1) != 0) {
-            kfree(ents);
-            return -1;
-        }
+    if (nent >= INSTALL_DIR_ENTS) {
+        kfree(ents);
+        printf("install: directory %s has more than %d entries\n", dir, INSTALL_DIR_ENTS - 1);
+        return -1;
     }
+
+    first = *count;
     for (i = 0; i < nent; i++) {
         char child[INSTALL_PATH_MAX];
+        int is_dir = (ents[i].type == VFS_DIRECTORY);
         if (ents[i].name[0] == '\0') continue;
         if (ents[i].name[0] == '.' &&
             (ents[i].name[1] == '\0' ||
              (ents[i].name[1] == '.' && ents[i].name[2] == '\0')))
             continue;
-        if (ents[i].type == VFS_DIRECTORY) continue;
         if (install_join(child, sizeof(child), dir, ents[i].name) != 0) {
+            printf("install: path too long: %s/%s\n", dir, ents[i].name);
             kfree(ents);
             return -1;
         }
-        /* The install image ships Doom once, at /bin/doom.exe, and the WAD
-         * once, at /doom1.wad. Skip any other copy so it is not read. */
-        if (path_ends_ci(child, "/doom.exe") && !path_eq_ci(child, "/bin/doom.exe"))
-            continue;
-        if (path_ends_ci(child, "/doom1.wad") && !path_eq_ci(child, "/doom1.wad"))
-            continue;
-        if (install_add(nodes, count, child, 0) != 0) {
+        if (!is_dir) {
+            /* The install image ships Doom once, at /bin/doom.exe, and the WAD
+             * once, at /doom1.wad. Skip any other copy so it is not read. */
+            if (path_ends_ci(child, "/doom.exe") && !path_eq_ci(child, "/bin/doom.exe"))
+                continue;
+            if (path_ends_ci(child, "/doom1.wad") && !path_eq_ci(child, "/doom1.wad"))
+                continue;
+        }
+        if (install_add(nodes, count, child, is_dir) != 0) {
             kfree(ents);
             return -1;
         }
     }
     kfree(ents);
+
+    last = *count;
+    for (i = first; i < last; i++) {
+        if (!nodes[i].is_dir) continue;
+        if (install_walk(nodes, count, nodes[i].path, depth + 1) != 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -485,6 +502,9 @@ void cmd_install(int argc, char **argv) {
 
     if (use_tui) tui_progress_step(1, 5, "Reading the live root...");
     printf("install: reading the live root.\n");
+    kprof_reset();
+    uint64_t t_install0 = ktime_now_us();
+    uint64_t kp_t;
 
     nodes = (install_node_t *)kalloc(sizeof(install_node_t) * INSTALL_MAX_NODES);
     if (!nodes) {
@@ -494,17 +514,29 @@ void cmd_install(int argc, char **argv) {
     }
     memset(nodes, 0, sizeof(install_node_t) * INSTALL_MAX_NODES);
 
-    if (install_walk(nodes, &count, "/", 0) != 0) {
+    kp_t = kprof_begin();
+    int walk_rc = install_walk(nodes, &count, "/", 0);
+    kprof_end(KP_INST_WALK, kp_t, 0);
+    if (walk_rc != 0) {
         install_free_nodes(nodes, count);
         if (use_tui) tui_progress_finish("Could not read the live directory tree.");
         else printf("install: could not read the live directory tree.\n");
         return;
     }
+    /* Per-file lines go to the serial log only; the console gets a progress
+     * line every INSTALL_PROGRESS_EVERY files. Each console line scrolls the
+     * framebuffer, which under QEMU cost ~0.4 s, more than the file I/O. */
+    int n_files = 0, n_done = 0;
+    for (i = 0; i < count; i++)
+        if (!nodes[i].is_dir) n_files++;
+    printf("install: %d directories and %d files to copy.\n", count - n_files, n_files);
 
     for (i = 0; i < count; i++) {
         int n;
         if (nodes[i].is_dir) continue;
+        kp_t = kprof_begin();
         n = vfs_read_file_alloc(nodes[i].path, &nodes[i].data, INSTALL_FILE_MAX);
+        kprof_end(KP_INST_READ, kp_t, n > 0 ? ((uint32_t)n + 511u) / 512u : 0);
         if (n < 0 || !nodes[i].data) {
             printf("install: failed to read %s\n", nodes[i].path);
             install_free_nodes(nodes, count);
@@ -514,7 +546,12 @@ void cmd_install(int argc, char **argv) {
         }
         nodes[i].size = (uint32_t)n;
         total_bytes += nodes[i].size;
-        printf("install: read %s (%u bytes)\n", nodes[i].path, nodes[i].size);
+        kp_t = kprof_begin();
+        serial_printf("install: read %s (%u bytes)\n", nodes[i].path, nodes[i].size);
+        n_done++;
+        if (n_done % INSTALL_PROGRESS_EVERY == 0 || n_done == n_files)
+            printf("install: read %d/%d files (%u KB)\n", n_done, n_files, total_bytes / 1024u);
+        kprof_end(KP_INST_LOG, kp_t, 0);
 
         if (path_has_ci(nodes[i].path, "/bin/") && path_ends_ci(nodes[i].path, ".exe") &&
             !path_ends_ci(nodes[i].path, "/doom.exe"))
@@ -595,13 +632,19 @@ void cmd_install(int argc, char **argv) {
         else printf("install: could not mount the new volume.\n");
         return;
     }
+    /* Batch FAT write-back for the whole copy; synced before detaching. */
+    fat32_set_deferred_flush(true);
 
     if (use_tui) tui_progress_step(4, 5, "Copying utils, Doom, kernel...");
     for (i = 0; i < count; i++) {
         int rc;
         if (!nodes[i].is_dir) continue;
-        printf("install: mkdir %s\n", nodes[i].path);
+        kp_t = kprof_begin();
+        serial_printf("install: mkdir %s\n", nodes[i].path);
+        kprof_end(KP_INST_LOG, kp_t, 0);
+        kp_t = kprof_begin();
         rc = vfs_mkdir(nodes[i].path);
+        kprof_end(KP_INST_MKDIR, kp_t, 0);
         if (rc != 0 && !vfs_exists(nodes[i].path)) {
             printf("install: mkdir failed for %s (%d)\n", nodes[i].path, rc);
             failed = 1;
@@ -609,11 +652,22 @@ void cmd_install(int argc, char **argv) {
         }
     }
     if (!failed) {
+        uint32_t bytes_done = 0;
+        n_done = 0;
         for (i = 0; i < count; i++) {
             int rc;
             if (nodes[i].is_dir) continue;
-            printf("install: write %s (%u bytes)\n", nodes[i].path, nodes[i].size);
+            kp_t = kprof_begin();
+            serial_printf("install: write %s (%u bytes)\n", nodes[i].path, nodes[i].size);
+            n_done++;
+            bytes_done += nodes[i].size;
+            if (n_done % INSTALL_PROGRESS_EVERY == 0 || n_done == n_files)
+                printf("install: copied %d/%d files (%u KB)\n", n_done, n_files,
+                       bytes_done / 1024u);
+            kprof_end(KP_INST_LOG, kp_t, 0);
+            kp_t = kprof_begin();
             rc = vfs_write_file(nodes[i].path, nodes[i].data, nodes[i].size);
+            kprof_end(KP_INST_WRITE, kp_t, (nodes[i].size + 511u) / 512u);
             if (rc != 0) {
                 printf("install: write failed for %s (%d)\n", nodes[i].path, rc);
                 failed = 1;
@@ -633,7 +687,16 @@ void cmd_install(int argc, char **argv) {
 
     install_free_nodes(nodes, count);
     nodes = NULL;
+    kp_t = kprof_begin();
+    /* Write back everything the copy left in the FAT cache (all FAT copies,
+     * FSInfo) before the volume is detached; unmount syncs again. */
+    fat32_set_deferred_flush(false);
+    if (fat32_sync() != 0) {
+        printf("install: writing the FAT to device %u failed.\n", target);
+        failed = 1;
+    }
     install_detach_root();
+    kprof_end(KP_INST_FINAL, kp_t, 0);
 
     if (failed) {
         install_restore_live(live);
@@ -649,8 +712,19 @@ void cmd_install(int argc, char **argv) {
         else printf("install: Limine install failed. Live disk remounted.\n");
         return;
     }
+    kp_t = kprof_begin();
     storage_flush(target);
+    kprof_end(KP_INST_FINAL, kp_t, 0);
     install_restore_live(live);
+    {
+        uint64_t total_ms = (ktime_now_us() - t_install0) / 1000u;
+        kprof_slot_t *r = &kprof_slots[KP_INST_READ], *w = &kprof_slots[KP_INST_WRITE];
+        printf("install: timing: total %llu ms; read %llu files in %llu ms, wrote %llu files in %llu ms\n",
+               (unsigned long long)total_ms,
+               (unsigned long long)r->count, (unsigned long long)(r->us / 1000u),
+               (unsigned long long)w->count, (unsigned long long)(w->us / 1000u));
+        kprof_dump("install");
+    }
 
     printf("install: complete. Device %u is a bootable FAT32 disk with /bin, Doom, and Limine.\n",
            target);

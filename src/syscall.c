@@ -3732,19 +3732,29 @@ int sys_readdir(int fd, void *dirp, size_t count) {
     if (!path)
         return -EIO;
 
-    enum { BATCH = 256 };
-    vfs_dirent_t kents[BATCH];
+    /* The listing is rebuilt on every call and sliced at fd.position.
+     * It used to live in a 256-entry array on the 16 KiB kernel stack
+     * (about 68 KiB), so a big directory overwrote whatever lay below the
+     * stack and capped listings at 256 names. */
+    vfs_dirent_t *kents;
     int total;
 
     if (!vfs_has_root_mount())
         return -EIO;
-    total = vfs_readdir(path, kents, BATCH);
-    if (total < 0)
+    kents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * VFS_READDIR_MAX);
+    if (!kents)
+        return -ENOMEM;
+    total = vfs_readdir(path, kents, VFS_READDIR_MAX);
+    if (total < 0) {
+        kfree(kents);
         return -EIO;
+    }
 
     uint32_t pos = proc->fds[fd].position;
-    if (pos >= (uint32_t)total)
+    if (pos >= (uint32_t)total) {
+        kfree(kents);
         return 0;
+    }
 
     size_t room = count;
     if (room > (size_t)(total - (int)pos))
@@ -3762,10 +3772,13 @@ int sys_readdir(int fd, void *dirp, size_t count) {
         out.d_ino = src->inode;
         out.d_type = src->type;
         out.d_size = src->size;
-        if (copy_to_user((uint8_t *)dirp + i * sizeof(out), &out, sizeof(out)) != 0)
+        if (copy_to_user((uint8_t *)dirp + i * sizeof(out), &out, sizeof(out)) != 0) {
+            kfree(kents);
             return -EFAULT;
+        }
     }
 
+    kfree(kents);
     proc->fds[fd].position = pos + (uint32_t)room;
     return (int)room;
 }

@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "kprof.h"
 #include "string.h"
 #include "utils.h"
 #include "mem.h"
@@ -196,13 +197,17 @@ int vfs_open(const char *path, uint32_t flags) {
     }
 
     // Auto-create if O_CREATE and the fs supports it
+    uint32_t open_flags = flags;
     if ((flags & VFS_O_CREATE) && fs->ops->create) {
         if (!fs->ops->exists || !fs->ops->exists(fs, rel)) {
-            fs->ops->create(fs, rel);
+            /* A file created just now is empty: O_TRUNC has nothing to do,
+             * and on FAT32 it cost another lookup and a directory write. */
+            if (fs->ops->create(fs, rel) == 0 && fs->ops->exists)
+                open_flags &= ~VFS_O_TRUNC;
         }
     }
 
-    void *handle = fs->ops->open(fs, rel, flags);
+    void *handle = fs->ops->open(fs, rel, open_flags);
     if (!handle) {
         VFS_UNLOCK(); return -ENOENT;
     }
@@ -335,7 +340,15 @@ int vfs_mkdir_p(const char *path) {
     return 0;
 }
 
+static int vfs_ensure_parent_impl(const char *path);
 int vfs_ensure_parent(const char *path) {
+    uint64_t kp_t0 = kprof_begin();
+    int r = vfs_ensure_parent_impl(path);
+    kprof_end(KP_VFS_MKDIRP, kp_t0, 0);
+    return r;
+}
+
+static int vfs_ensure_parent_impl(const char *path) {
     if (!path || path[0] == '\0') return -EINVAL;
     char buf[VFS_MAX_PATH];
     size_t n = 0;
@@ -406,7 +419,9 @@ int vfs_exists(const char *path) {
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     if (!fs || !fs->ops || !fs->ops->exists) { VFS_UNLOCK(); return 0; }
+    uint64_t kp_t0 = kprof_begin();
     int ret = fs->ops->exists(fs, rel);
+    kprof_end(KP_VFS_EXISTS, kp_t0, 0);
     VFS_UNLOCK(); return ret;
 }
 

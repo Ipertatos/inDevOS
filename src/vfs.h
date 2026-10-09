@@ -14,6 +14,9 @@
 #define VFS_MAX_OPEN_FILES  64
 #define VFS_MAX_PATH        1024
 #define VFS_MAX_NAME        256
+/* Upper bound on the entries one directory listing returns (sys_readdir,
+ * getdents64, the installer). Callers allocate it on the heap. */
+#define VFS_READDIR_MAX     2048
 
 // Node types
 #define VFS_FILE        0x01

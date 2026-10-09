@@ -589,7 +589,7 @@ static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
     if (f->fd_type != FD_TYPE_VFS_DIR || !f->file_handle) return -ENOTDIR;
     if (count > 65536) count = 65536;
 
-    enum { MAXENT = 256 };
+    enum { MAXENT = VFS_READDIR_MAX };
     vfs_dirent_t *ents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * MAXENT);
     uint8_t *kbuf = (uint8_t *)kalloc(count ? count : 1);
     if (!ents || !kbuf) {

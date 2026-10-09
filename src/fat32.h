@@ -115,6 +115,12 @@ typedef struct {
     char filename[MAX_FILENAME_LEN];
     uint8_t attributes;
     fat32_fs_t *filesystem;
+    /* Where this file's 8.3 entry lives (dirent_cluster 0 = unknown), so a
+     * size/cluster update rewrites that one directory cluster instead of
+     * rescanning the parent directory by name. */
+    uint32_t dirent_cluster;
+    uint32_t dirent_index;
+    char dirent_name[11];
 } fat32_file_t;
 
 // Directory listing structure
@@ -131,6 +137,12 @@ extern fat32_file_t open_files[FAT32_MAX_OPEN_FILES];
 // Function declarations
 int fat32_mount(uint8_t storage_device_id);
 void fat32_unmount();
+/* Write the cached FAT sectors (all copies) and refresh FSInfo. */
+int fat32_sync(void);
+/* While deferred, closing a file does not flush the FAT; the FAT is written
+ * by fat32_sync(), fat32_unmount() or when deferral is switched off (which
+ * flushes). Used by the installer to batch metadata for hundreds of files. */
+void fat32_set_deferred_flush(bool defer);
 bool fat32_is_mounted();
 
 // Formatting
