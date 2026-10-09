@@ -193,14 +193,19 @@ char* exception_messages[] = {
 void preemptive_schedule(registers_t *r);
 static void preemptive_schedule_force(void);
 
-/* Job control on every CPU's LAPIC tick: dispatch a posted tty signal and
- * kill a ring-3-interrupted process whose pending signal is fatal by default
- * (busy loops never reach a syscall-return delivery point). */
+/* Job control on every CPU's LAPIC tick (and reschedule IPI): dispatch a
+ * posted tty signal and kill a ring-3-interrupted process whose pending
+ * signal is fatal by default or that has a remote kill request (busy loops
+ * never reach a syscall-return delivery point).  Interrupted in ring 3 means
+ * the process holds no kernel lock and has no half-done kernel work, so this
+ * is a safe point to run its own exit path.  A ring-0 frame is never acted
+ * on here: that thread exits at its syscall return instead. */
 static void tty_timer_hook(registers_t *r) {
     extern void tty_dispatch_pending(void);
     extern int proc_fatal_default_pending(process_t *p);
     extern void process_fault_kill_current(int signum);
     extern process_t *get_kernel_process(void);
+    extern void exec_spawned_exit(int status) __attribute__((noreturn));
     tty_dispatch_pending();
     if ((r->cs & 3) != 3) return;
     thread_t *cth = scheduler_get_current_thread();
@@ -215,13 +220,23 @@ static void tty_timer_hook(registers_t *r) {
     bool fork_child = op->sched_thread && (thread_t *)op->sched_thread == cth &&
                       op->parent && op->parent != get_kernel_process();
     bool sync = !fork_child && exec_current_is_sync_program();
-    if (!fork_child && !sync) return;
+    /* Spawned (zeus `spawn` / desktop) process on its own thread: it used to
+     * be torn down remotely by process_terminate(); now it exits itself. */
+    bool spawned = !fork_child && !sync && op->sched_thread &&
+                   (thread_t *)op->sched_thread == cth;
+    if (!fork_child && !sync && !spawned) return;
     serial_printf("tty: ring3 kill pid=%d sig=%d\n", (int)op->pid, fsig);
     op->pending_signals &= ~(1u << fsig);
     set_current_process(op);
     exit_interrupt_context();
     if (fork_child) {
         process_fault_kill_current(fsig);
+        __builtin_unreachable();
+    }
+    if (spawned) {
+        /* Same as its own sys_exit: we are on its kernel stack, user state
+         * is fully saved in the frame and no kernel lock is held. */
+        exec_spawned_exit(128 + fsig);
         __builtin_unreachable();
     }
     exec_force_terminate(128 + fsig);
@@ -242,13 +257,37 @@ void handle_timer(registers_t *r){
      * For kernel-mode flat binaries: also safe via setjmp/longjmp. */
     if (get_terminate_flag() && get_program_running()) {
         bool is_ring3 = (r->cs & 3) == 3;
-        if (is_ring3 || get_force_kill_flag()) {
+        extern process_t *exec_get_sync_proc(void);
+        process_t *sp = exec_get_sync_proc();
+        /* Unwinding with exec_force_terminate (longjmp to exec_run_elf) is
+         * only safe from the program's own ring-3 context.  A ring-3 program
+         * caught in a syscall (ring-0 frame, possibly holding a klock or
+         * pipe/fd state), or a ring-3 frame that belongs to another thread
+         * on this CPU, gets an asynchronous kill instead: it exits itself at
+         * its syscall return / next ring-3 tick. */
+        if (is_ring3 && exec_current_is_sync_program()) {
             set_terminate_flag(false);
             hpet_ack();
             apic_eoi();
             exit_interrupt_context();
             exec_force_terminate(128 + 2 /* SIGINT */);
             __builtin_unreachable();
+        }
+        if (sp && sp->is_usermode && (is_ring3 || get_force_kill_flag())) {
+            set_terminate_flag(false);
+            process_request_kill(sp, 2 /* SIGINT */);
+        } else if (!is_ring3 && get_force_kill_flag() && (!sp || !sp->is_usermode)) {
+            /* Kernel-mode flat binary (double Ctrl+C): it runs in ring 0 by
+             * design; still never unwind while this CPU holds a klock. */
+            uint32_t ci = smp_cpu_index_fast();
+            if (ci >= PREEMPT_MAX_CPUS || !preempt_count_cpu[ci]) {
+                set_terminate_flag(false);
+                hpet_ack();
+                apic_eoi();
+                exit_interrupt_context();
+                exec_force_terminate(128 + 2 /* SIGINT */);
+                __builtin_unreachable();
+            }
         }
     }
 
@@ -943,10 +982,14 @@ void isr_handler(registers_t* r) {
     /* ---- SMP IPI handlers ---- */
     if (r->int_no == 253) {
         /* IPI_VECTOR_RESCHEDULE: skip the quantum so a remote enqueue
-         * is picked up on this interrupt, not 10 ms later. */
+         * is picked up on this interrupt, not 10 ms later.  Also an
+         * IRQ-return-to-user safe point: a remote kill IPIs the target's CPU,
+         * and tty_timer_hook terminates it here if it was in ring 3 (it does
+         * not return then, so EOI first). */
+        apic_eoi();
+        tty_timer_hook(r);
         preemptive_schedule_force();
         preemptive_schedule(r);
-        apic_eoi();
         exit_interrupt_context();
         return;
     }

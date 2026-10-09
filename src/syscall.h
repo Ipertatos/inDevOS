@@ -358,6 +358,13 @@ typedef struct process {
     bool     exec_replaced;
     uint64_t exec_entry_rip;
     uint64_t exec_entry_rsp;
+
+    /* Asynchronous kill request (remote kill / zeus `kill` / desktop close).
+     * Non-zero = the signal that killed it.  Set only by
+     * process_request_kill(); the target thread exits ITSELF at its next safe
+     * point (syscall return, IRQ return to ring 3, or an interruptible sleep
+     * that returns -EINTR first) -- it is never torn down from outside. */
+    volatile int kill_sig;
 } process_t;
 
 /** @brief Virtual memory layout for processes */
@@ -384,6 +391,10 @@ typedef struct process {
 #define TIME_SLICE_MS       10
 
 // Function declarations
+/* Remote/asynchronous kill (see process_request_kill in syscall.c). */
+void process_request_kill(process_t *t, int signum);
+bool process_is_self(process_t *p);
+bool proc_kill_pending(process_t *p);
 void syscall_init(void);
 void syscall_enable_cpu(uint32_t cpu_id);
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,

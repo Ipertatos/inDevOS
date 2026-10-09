@@ -1829,6 +1829,16 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
             process_deliver_signals(p, f);
     }
 
+    /* Remote kill (process_request_kill): this is the safe point -- the
+     * syscall has unwound (a blocking one returned -EINTR) and released its
+     * locks.  Checked even when delivery was skipped above (fork/clone return,
+     * or already inside a handler). */
+    if (p && p->is_running && __atomic_load_n(&p->kill_sig, __ATOMIC_ACQUIRE) &&
+        process_is_self(p)) {
+        p->exit_status = 128 + p->kill_sig;
+        p->is_running = false;
+    }
+
     /* exit via sys_exit after fatal default signal to ourselves, so a fork
      * child becomes a real waitable zombie (closes fds, wakes parent). */
     if (p && !p->is_running && p->linux_abi) {

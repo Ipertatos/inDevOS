@@ -489,11 +489,15 @@ static int fd_close_entry(process_t *proc, int fd) {
 }
 
 
-/* Thread reaper: true while any process slot still names @t as its thread. */
+/* Thread reaper: true while any process slot still names @t as its thread,
+ * or still holds it as a not-yet-released fork newborn (a killed held child
+ * can exit before its parent's fork_release_pending() looks at it). */
 bool process_refs_thread(const void *t) {
     if (!t) return false;
     for (int i = 0; i < MAX_PROCESSES; i++)
-        if (processes[i].sched_thread == t)
+        if (processes[i].sched_thread == t ||
+            processes[i].fork_pending_release == t ||
+            processes[i].fork_release_at_exit == t)
             return true;
     return false;
 }
@@ -1046,6 +1050,15 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     profiler_syscall_leave(syscall_num, ret);
     {
         process_t *p = get_current_process();
+        /* Safe point: a remote kill takes effect here, after the syscall has
+         * unwound and released whatever it held. */
+        if (p && p->is_running && __atomic_load_n(&p->kill_sig, __ATOMIC_ACQUIRE) &&
+            process_is_self(p)) {
+            int ks = p->kill_sig;
+            serial_printf("signal: PID %u exits on kill (sig %d) at syscall return\n",
+                          p->pid, ks);
+            sys_exit(128 + ks);
+        }
         fork_release_after_syscall(p);
     }
     return ret;
@@ -1249,6 +1262,11 @@ int sys_write(int fd, const void *buf, size_t count) {
                     if (self)
                         pipe_set_waiting_writer(pp, self);
                     thread_sleep(1);
+                    /* Killed while blocked on a full pipe: unwind. */
+                    if (proc_kill_pending(proc)) {
+                        kfree(kbuf);
+                        return -EINTR;
+                    }
                 } else {
                     kfree(kbuf);
                     return -EAGAIN;
@@ -2393,43 +2411,32 @@ int sys_wait(int *status) {
 }
 
 /* Terminate a process from the signal path.
- * - If it is the current process, just mark it; it will exit through its own
- *   exit path (sys_exit / exec longjmp).
- * - Otherwise stop its scheduler thread (if any), release resources and, when
- *   the parent is the kernel (which never calls sys_wait), reap immediately so
- *   the slot doesn't leak as a permanent zombie. */
+ * - Called on the process's OWN thread (self kill, default fatal signal being
+ *   delivered on its syscall return): just mark it; the caller's return path
+ *   exits through sys_exit (fork child -> zombie, spawned -> exec_spawned_exit,
+ *   sync program -> back to Zeus).
+ * - Anything else is an asynchronous kill.  It used to tear the target down
+ *   right here (thread TERMINATED + detached, and for kernel-parented
+ *   processes process_release()/process_cleanup() freed its address space,
+ *   fds and slot) while that thread could be running on another CPU in the
+ *   middle of a syscall -- holding a klock (VFS/FAT/net), pipe credits or a
+ *   half-built kernel object, or still using the page tables being freed.  It
+ *   now only posts the kill (process_request_kill); the target unwinds and
+ *   exits itself at a safe point. */
 static void process_signal_terminate(process_t *proc, int signum) {
-    proc->exit_status = 128 + signum;
-    proc->is_running  = false;
-
-    if (proc == get_current_process()) {
-        /* Linux ABI: do NOT publish is_zombie while still running — a
-         * parent on another CPU could reap (memset) us. The syscall
-         * return path exits via sys_exit (fork_child_zombie_exit). */
-        if (!proc->linux_abi) proc->is_zombie = true;
+    if (!proc) return;
+    if (!process_is_self(proc)) {
+        process_request_kill(proc, signum);
         return;
     }
-
-    if (proc->sched_thread) {
-        thread_t *thr = (thread_t *)proc->sched_thread;
-        thr->state = THREAD_TERMINATED;
-        thr->owner_process = NULL;
-        scheduler_detach_thread(thr);
-        proc->sched_thread = NULL;
-        /* The victim may still be executing on another CPU (on its kernel
-         * stack): let the reaper free stack + thread once it is off-CPU. */
-        void *ks = proc->kernel_stack;
-        proc->kernel_stack = NULL;
-        thread_mark_dead(thr, ks);
-        desktop_destroy_windows_for_pid(proc->pid);
-    }
-
-    if (!proc->parent || proc->parent == &processes[0]) {
-        process_release(proc);
-        process_cleanup(proc);
-    } else {
-        proc->is_zombie = true;
-    }
+    if (proc->kill_sig)
+        signum = proc->kill_sig;    /* report the signal that killed it */
+    proc->exit_status = 128 + signum;
+    proc->is_running  = false;
+    /* Linux ABI: do NOT publish is_zombie while still running -- a parent on
+     * another CPU could reap (memset) us.  The syscall return path exits via
+     * sys_exit (fork_child_zombie_exit). */
+    if (!proc->linux_abi) proc->is_zombie = true;
 }
 
 // Handle pending signals for a process
@@ -2586,6 +2593,8 @@ uint32_t process_get_fg_pgid(void) {
  * ash's wait/SIGCHLD flow unchanged). */
 bool proc_signal_interrupts(process_t *p) {
     if (!p) return false;
+    if (__atomic_load_n(&p->kill_sig, __ATOMIC_ACQUIRE))
+        return true;                /* remote kill: always interrupts */
     uint32_t pend = __atomic_load_n(&p->pending_signals, __ATOMIC_ACQUIRE) &
                     ~p->blocked_signals;
     if (!pend) return false;
@@ -2603,6 +2612,9 @@ bool proc_signal_interrupts(process_t *p) {
 /* Pending fatal signal with default action (for ring-3 kill from the timer). */
 int proc_fatal_default_pending(process_t *p) {
     if (!p || !p->is_running) return 0;
+    int ks = __atomic_load_n(&p->kill_sig, __ATOMIC_ACQUIRE);
+    if (ks)
+        return ks;
     uint32_t pend = p->pending_signals & ~p->blocked_signals;
     if (!pend) return 0;
     static const int fatal[] = { SIGKILL, SIGINT, SIGQUIT, SIGTERM, SIGHUP };
@@ -2618,14 +2630,81 @@ int proc_fatal_default_pending(process_t *p) {
 /* Post a signal to another (or any) process without running its default
  * action from the sender's context: mark pending and wake it so a blocking
  * syscall returns -EINTR and delivery happens on its own return path. */
-void process_post_signal(process_t *t, int signum) {
-    if (!t || signum < 1 || signum >= NSIG) return;
-    __atomic_or_fetch(&t->pending_signals, 1u << signum, __ATOMIC_SEQ_CST);
+/* The thread that executes @t (its own thread, or the boot thread for the
+ * foreground sync program). */
+static thread_t *process_exec_thread(process_t *t) {
     thread_t *thr = (thread_t *)t->sched_thread;
     if (!thr)
         thr = exec_get_sync_thread_for(t);
+    return thr;
+}
+
+/* Make @thr notice a just-posted signal promptly: wake it if it sleeps
+ * interruptibly (BLOCKED/SLEEPING -> READY, the syscall then sees the signal
+ * and returns -EINTR), and IPI any other CPU it is running on so the
+ * reschedule IPI's IRQ-return-to-user check (tty_timer_hook) acts at once
+ * instead of on the next tick. */
+static void process_kick_thread(thread_t *thr) {
+    if (!thr) return;
+    thread_wake(thr);
+    uint32_t me = smp_cpu_index_fast();
+    for (uint32_t c = 0; c < MAX_CPUS; c++) {
+        if (c == me || !cpu_data[c].online) continue;
+        if (cpu_data[c].current_thread == thr)
+            smp_reschedule_cpu(c);
+    }
+}
+
+void process_post_signal(process_t *t, int signum) {
+    if (!t || signum < 1 || signum >= NSIG) return;
+    __atomic_or_fetch(&t->pending_signals, 1u << signum, __ATOMIC_SEQ_CST);
+    process_kick_thread(process_exec_thread(t));
+}
+
+/* True when @p is executing on the calling context, i.e. this CPU's current
+ * thread is the thread that runs @p.  get_current_process() alone is a
+ * heuristic (boot-thread ash has owner_process == NULL) and must not decide
+ * whether it is safe to finish a process synchronously. */
+bool process_is_self(process_t *p) {
+    if (!p) return false;
+    thread_t *thr = process_exec_thread(p);
     if (thr)
-        thread_wake(thr);
+        return thr == scheduler_get_current_thread();
+    return p == get_current_process();
+}
+
+/* Asynchronous kill (Linux model): mark the target killed with a pending
+ * SIGKILL, wake it out of an interruptible sleep and IPI its CPU.  Nothing
+ * of the target is torn down here: it may be anywhere in the kernel on
+ * another CPU.  It terminates itself at its next safe point -- syscall
+ * return (linux_syscall_dispatch / syscall_handler), IRQ return to ring 3
+ * (tty_timer_hook), or immediately after a -EINTR from a blocking call --
+ * through its normal exit path (fork child -> zombie for wait4 + reaper,
+ * spawned -> exec_spawned_exit, sync program -> back to Zeus). */
+void process_request_kill(process_t *t, int signum) {
+    if (!t || signum < 1 || signum >= NSIG) return;
+    if (!t->is_running || t->is_zombie || t == &processes[0]) return;
+    int zero = 0;
+    __atomic_compare_exchange_n(&t->kill_sig, &zero, signum, false,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(&t->pending_signals, 1u << SIGKILL, __ATOMIC_SEQ_CST);
+    thread_t *thr = process_exec_thread(t);
+    if (!thr)
+        serial_printf("signal: kill PID %u (sig %d) has no thread yet; "
+                      "it exits at its next syscall\n", t->pid, signum);
+    process_kick_thread(thr);
+}
+
+/* Fatal signal pending for @p: used by blocking loops that used to ignore
+ * signals entirely.  A remote kill always counts.  A default-fatal pending
+ * signal counts only for Linux-ABI processes, whose syscall return path
+ * delivers it; native (INT 0x80) programs only act on kill requests there,
+ * so returning -EINTR for anything else would just make them spin. */
+bool proc_kill_pending(process_t *p) {
+    if (!p) return false;
+    if (__atomic_load_n(&p->kill_sig, __ATOMIC_ACQUIRE))
+        return true;
+    return p->linux_abi && proc_fatal_default_pending(p) != 0;
 }
 
 /* Deliver a pending signal that has a handler on the IRQ-return-to-user path,
@@ -2936,6 +3015,8 @@ int sys_sleep(unsigned int seconds) {
 
     uint64_t deadline = ktime_deadline_ms((uint64_t)seconds * 1000);
     while (!ktime_expired(deadline)) {
+        if (proc_kill_pending(get_current_process()))
+            return -EINTR;
         if (global_scheduler.scheduler_running)
             thread_sleep(1);
         else
@@ -3044,6 +3125,8 @@ int sys_select(int nfds, fd_set_t *readfds, fd_set_t *writefds, fd_set_t *except
                 return -EFAULT;
             return n;
         }
+        if (proc_kill_pending(get_current_process()))
+            return -EINTR;
         if (global_scheduler.scheduler_running)
             thread_sleep(1);
         else
@@ -3126,6 +3209,8 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
             return cnt;
         }
         poll_network_once();
+        if (proc_kill_pending(get_current_process()))
+            return -EINTR;
         if (global_scheduler.scheduler_running)
             thread_sleep(1);
         else
@@ -3333,6 +3418,8 @@ int sys_getchar(void) {
     while (c < 0) {
         c = keyboard_consume_char();
         if (c < 0) {
+            if (proc_kill_pending(get_current_process()))
+                return -EINTR;
             if (global_scheduler.scheduler_running)
                 thread_sleep(1);
             else
