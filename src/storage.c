@@ -485,6 +485,9 @@ static int storage_read_sectors_hw(storage_device_t *dev, uint8_t device_id,
         result = ahci_read_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
         result = nvme_read_sectors(dev, lba, sector_count, buffer);
+    } else if (dev->pci_dev->class_code == 0x0C && dev->pci_dev->subclass_code == 0x03) {
+        extern int usb_msc_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer);
+        result = usb_msc_read_sectors(dev, lba, sector_count, buffer);
     }
     kprof_end(KP_ST_RD_HW, kp_t0, sector_count);
     return result;
@@ -527,8 +530,9 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
         uint32_t n_req = n;
         if (i + n == sector_count && sector_count < STORAGE_READAHEAD_SECTORS &&
             bcache.enabled && dev->sector_count && dev->pci_dev &&
-            dev->pci_dev->class_code == 0x01 &&
-            (dev->pci_dev->subclass_code == 0x06 || dev->pci_dev->subclass_code == 0x08) &&
+            ((dev->pci_dev->class_code == 0x01 &&
+              (dev->pci_dev->subclass_code == 0x06 || dev->pci_dev->subclass_code == 0x08)) ||
+             (dev->pci_dev->class_code == 0x0C && dev->pci_dev->subclass_code == 0x03)) &&
             (dev->sector_size == 0 || dev->sector_size == SECTOR_SIZE)) {
             while (n < STORAGE_READAHEAD_SECTORS &&
                    lba + i + n < (uint64_t)dev->sector_count &&
@@ -579,6 +583,9 @@ int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count
         result = ahci_write_sectors(dev, lba, sector_count, buffer);
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
         result = nvme_write_sectors(dev, lba, sector_count, buffer);
+    } else if (dev->pci_dev->class_code == 0x0C && dev->pci_dev->subclass_code == 0x03) {
+        extern int usb_msc_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer);
+        result = usb_msc_write_sectors(dev, lba, sector_count, buffer);
     }
     kprof_end(KP_ST_WR_HW, kp_t0, sector_count);
 
@@ -620,6 +627,10 @@ static int storage_flush_impl(uint8_t device_id) {
     } else if (dev->pci_dev->class_code == 0x01 && dev->pci_dev->subclass_code == 0x08) {
         // NVMe device
         return nvme_flush(dev);
+    } else if (dev->pci_dev->class_code == 0x0C && dev->pci_dev->subclass_code == 0x03) {
+        // USB mass storage (xHCI)
+        extern int usb_msc_flush(storage_device_t *dev);
+        return usb_msc_flush(dev);
     }
     
     return -1; // Unsupported device type
@@ -741,6 +752,33 @@ static int boot_dev_cached = -2;
 /* The live disk is the one Limine loaded the kernel from, not the largest
  * FAT32 volume. Optical boot (Hyper-V DVD on the second IDE channel) must
  * win over a hard disk that happens to be device 0. */
+/* "3" -> 3; "usb0" / "nvme0n1" / "SATA0" -> the device whose name starts
+ * with that word (case-insensitive). -1 if none. */
+int storage_resolve_name(const char *arg) {
+    if (!arg || !arg[0]) return -1;
+    bool numeric = true;
+    for (const char *c = arg; *c; c++) if (*c < '0' || *c > '9') numeric = false;
+    if (numeric) {
+        int v = 0;
+        for (const char *c = arg; *c; c++) v = v * 10 + (*c - '0');
+        return v;
+    }
+    for (uint8_t i = 0; i < storage_device_count; i++) {
+        const char *n = storage_devices[i].name;
+        size_t k = 0;
+        while (arg[k] && n[k]) {
+            char a = arg[k], b = n[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+            k++;
+        }
+        if (!arg[k] && (n[k] == ' ' || n[k] == '\0'))
+            return i;
+    }
+    return -1;
+}
+
 int storage_find_boot_device(void) {
     const struct limine_file *file = NULL;
     uint8_t i;

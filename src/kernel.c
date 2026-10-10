@@ -192,12 +192,14 @@ void kmain(void) {
     klog_info("Initializing USB subsystem\n");
     usb_init();
     
-    // Initialize xHCI (USB 3.0) host controller
-    klog_info("Initializing xHCI USB 3.0 controller\n");
-    xhci_init();
-    
-    // Enumerate connected USB devices (HID keyboards, mice, etc.)
-    xhci_enumerate_all();
+    // xHCI controllers, then enumerate root ports and hubs; binds HID
+    // keyboards/mice and mass storage (usbN disks registered here are seen
+    // by storage_init's boot-device detection and the installer).
+    klog_info("Initializing xHCI USB controllers\n");
+    {
+        extern void usb_core_init(void);
+        usb_core_init();
+    }
     
     // Initialize AC97 audio driver
     klog_info("Initializing audio subsystem\n");

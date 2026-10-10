@@ -598,6 +598,9 @@ static void usb_keyboard_process_report_to_buffer(usb_keyboard_report_t *report)
 
 // USB Keyboard polling and integration functions
 void usb_keyboard_poll_all() {
+    /* xHCI devices (HID reports, hotplug) are serviced by usb_core. */
+    extern void usb_poll(void);
+    usb_poll();
     // Poll all USB keyboards for input
     uint8_t controller_count = usb_get_controller_count();
     
@@ -719,6 +722,8 @@ int usb_mouse_process_report(usb_mouse_report_t *report) {
 
 // USB Mouse polling - check all USB mice for input
 void usb_mouse_poll_all() {
+    extern void usb_poll(void);
+    usb_poll();
     // Poll all USB mice for input
     uint8_t controller_count = usb_get_controller_count();
     

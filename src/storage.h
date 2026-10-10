@@ -31,6 +31,7 @@ extern storage_ops_t storage_ops;
 // Function declarations
 void storage_init();
 int storage_find_boot_device(void);
+int storage_resolve_name(const char *arg);
 storage_device_t* storage_get_device(uint8_t device_id);
 int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer);
 int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer);

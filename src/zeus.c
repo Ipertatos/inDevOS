@@ -440,7 +440,7 @@ static const char *const zeus_command_names[] = {
     "terminals", "testkey", "threadtest", "time", "timeraccuracy",
     "timertest", "touch", "tui", "tuidesktop", "udpverbose",     "unmount", "unset", "udp_test",
     "usb", "usbenum", "usbkeyboard", "usbpoll", "useradd", "userdel",
-    "users", "version", "wc", "whoami", "xhci",
+    "users", "version", "wc", "whoami", "xhci", "lsusb",
     "uptime", "execsym", "trace",
     (const char *)0
 };
@@ -673,7 +673,9 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
         if (argc < 2) {
             printf("Usage: blktest <device_id> [base_lba]  (pattern write/read/restore)\n");
         } else {
-            storage_selftest((uint8_t)atoi(argv[1]), argc >= 3 ? (uint64_t)atoi(argv[2]) : 2048u);
+            int bdev = storage_resolve_name(argv[1]);
+            if (bdev < 0) printf("blktest: no device '%s'\n", argv[1]);
+            else storage_selftest((uint8_t)bdev, argc >= 3 ? (uint64_t)atoi(argv[2]) : 2048u);
         }
     } else if (kstrcmp(command, "nvme") == 0) {
         extern void nvme_print_info(void);
@@ -690,7 +692,9 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
             printf("  mount 0              - mount device 0 as FAT32 at /\n");
             printf("  mount 1 2048 ext4 /mnt - mount device 1, LBA 2048, ext4 at /mnt\n");
         } else {
-            uint8_t device_id = (uint8_t)atoi(argv[1]);
+            int mdev = storage_resolve_name(argv[1]);
+            if (mdev < 0) { printf("mount: no device '%s'\n", argv[1]); return; }
+            uint8_t device_id = (uint8_t)mdev;
             uint32_t lba = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 0;
             const char *fstype = (argc >= 4) ? argv[3] : "fat32";
             const char *mpath  = (argc >= 5) ? argv[4] : "/";
@@ -1961,9 +1965,13 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
         extern void smp_print_status(void);
         smp_print_status();
     } else if (kstrcmp(command, "xhci") == 0) {
-        /* xHCI USB 3.0 controller status */
+        /* xHCI controllers and root ports */
         extern void xhci_print_status(void);
         xhci_print_status();
+    } else if (kstrcmp(command, "lsusb") == 0) {
+        /* USB devices: bus, port path, vid:pid, class, speed, driver */
+        extern void usb_list_devices(bool verbose);
+        usb_list_devices(argc > 1 && kstrcmp(argv[1], "-v") == 0);
     } else if (kstrcmp(command, "insmod") == 0) {
         /* Load kernel module */
         extern int kmod_load(const char *filename);

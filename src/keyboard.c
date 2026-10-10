@@ -569,6 +569,14 @@ end:
     spinlock_unlock(&keyboard_lock);
 }
 
+/* USB HID keyboards translate their reports to set-1 bytes and feed them
+ * here, so they share all PS/2 key handling. */
+void keyboard_inject_scancode(uint8_t b) {
+    uint64_t flags = irq_save();
+    keyboard_process_byte(b);
+    irq_restore(flags);
+}
+
 void keyboard_handler(void) {
     keyboard_process_byte(inb(0x60));
     apic_eoi();

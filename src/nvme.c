@@ -164,6 +164,20 @@ static void *nvme_dma_alloc(uint32_t bytes, uint64_t *phys) {
     return p;
 }
 
+/* Shared with other PCI DMA drivers (xHCI): map a BAR uncached at
+ * HHDM+phys, and page-aligned, physically contiguous zeroed DMA memory. */
+uint64_t pci_map_bar_uc(uint64_t phys, uint64_t size) {
+    return nvme_map_bar(phys, size);
+}
+
+void *dma_alloc_pages(uint32_t bytes, uint64_t *phys) {
+    return nvme_dma_alloc(bytes, phys);
+}
+
+void dma_free_pages(void *p) {
+    if (p) kfree(p);
+}
+
 /* ------------------------------------------------------------------------
  * Waits (all bounded)
  * ------------------------------------------------------------------------ */

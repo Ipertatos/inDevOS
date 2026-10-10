@@ -222,7 +222,7 @@ void zeus_cmd_help(ZeusShell* shell, int argc, char* argv[]) {
     printf("  curl [-v] [-I] <url>  ipv6 [enable|status|ping <addr>]\n");
 
     printf("\nUSB / Input:\n");
-    printf("  usb  usbenum  usbkeyboard  usbpoll  inputinfo  xhci\n");
+    printf("  lsusb [-v]  xhci  usb  inputinfo\n");
     printf("  keyboard  testkey  kblayout <us|uk|de|fr>\n");
 
     printf("\nAudio:\n");
