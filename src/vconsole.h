@@ -65,6 +65,7 @@ void vconsole_switch(int id);
 void vconsole_request_switch(int id);
 /** True when the graphical desktop may own the framebuffer (tty0). */
 bool vconsole_graphics_active(void);
+bool vconsole_desktop_owns_display(void);
 int  vconsole_get_active(void);
 /* Session TTY: process_t.cont_tty for current task, else active VC (see term_write). */
 int  vconsole_get_thread_console(void);

@@ -134,7 +134,10 @@ int vconsole_get_active(void) {
 
 int vconsole_get_thread_console(void) {
     process_t *p = get_current_process();
-    if (!p) {
+    /* Kernel main loop (Zeus on whichever VT is active, echo, tab
+     * completion) runs as the kernel process: it talks to the active VT. */
+    extern process_t *get_kernel_process(void);
+    if (!p || p == get_kernel_process()) {
         return vconsole_get_active();
     }
     if (p->cont_tty >= 0 && p->cont_tty < MAX_VCONSOLES) {
@@ -169,11 +172,17 @@ void vconsole_switch(int id) {
     if (id < 0 || id >= MAX_VCONSOLES) return;
     if (id == active_console) return;
 
+    extern bool desktop_is_running(void);
+    bool desk = desktop_is_running();
     uint64_t flags = irq_save();
 
-    vc_save_current();
-
     int prev = active_console;
+    /* While the desktop owns VT 0 the framebuffer holds desktop pixels, not
+     * VT 0's text: do not save them as VT 0's screen, and when returning to
+     * VT 0 do not paint its old text grid; the compositor repaints. */
+    if (!(desk && prev == 0))
+        vc_save_current();
+
     active_console = id;
 
     if (!consoles[id].initialized) {
@@ -181,16 +190,24 @@ void vconsole_switch(int id) {
         consoles[id].state = VC_STATE_SHELL;
     }
 
-    vc_restore(id);
-    vconsole_flush_output(id);
-    vconsole_draw_status_bar();
+    if (desk && id == 0) {
+        consoles[0].out_tail = consoles[0].out_head;   /* drop text meant for VT 0 */
+    } else {
+        vc_restore(id);
+        vconsole_flush_output(id);
+        vconsole_draw_status_bar();
+    }
 
     irq_restore(flags);
 
     if (prev != id) {
-        serial_printf("[vconsole] Switched %d -> %d\n", prev, id);
-        if (id == 0)
+        serial_printf("[vconsole] Switched %d -> %d%s\n", prev, id,
+                      desk ? (id == 0 ? " (desktop resumes)" : " (desktop paused)") : "");
+        if (id == 0) {
+            extern void fb_mark_dirty_all(void);
             desktop_request_redraw();
+            if (desk) fb_mark_dirty_all();
+        }
         /* Print a welcome + prompt the first time a console is visited */
         if (consoles[id].cursor_x == 0 && consoles[id].cursor_y == 0 && id != 0) {
             printf("--- tty%d  (Ctrl+F1 desktop, Ctrl+F2-F4 ttys, Ctrl+Q cycle) ---\n", id);
@@ -206,6 +223,13 @@ void vconsole_switch_next(void) {
 
 void vconsole_request_switch(int id) {
     requested_console = id;
+}
+
+/* The desktop compositor owns display and input only while VT 0 (the
+ * graphics VT) is active. Text VTs own them otherwise. */
+bool vconsole_desktop_owns_display(void) {
+    extern bool desktop_is_running(void);
+    return desktop_is_running() && vc_initialized && active_console == 0;
 }
 
 bool vconsole_graphics_active(void) {

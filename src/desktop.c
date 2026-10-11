@@ -2391,6 +2391,9 @@ void desktop_start(void) {
     mouse_sync_screen_bounds();
 
     desktop_thread = NULL;
+    /* Taking over the display: damage the whole screen so the first frame
+     * replaces the console text (dt_dirty alone has no damage rect). */
+    desktop_request_redraw();
     serial_puts("[desktop] started — compositor running in kernel main loop\n");
 }
 
@@ -2431,6 +2434,10 @@ void desktop_stop(void) {
     /* Redraw the console screen */
     extern void clear_screen(void);
     clear_screen();
+}
+
+bool desktop_has_backbuffer(void) {
+    return desktop_running && dt_backbuffer != NULL;
 }
 
 bool desktop_is_running(void) {

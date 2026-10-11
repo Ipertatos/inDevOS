@@ -191,6 +191,22 @@ void fb_flush(void) {
     if (!fb) return;
     if (dirty_y_min >= dirty_y_max) return;
 
+    /* The desktop compositor owns the screen (VT 0 active, compositing from
+     * its own backbuffer): the console backbuffer still holds the pre-desktop
+     * text, so copying its dirty rows out would paint that text over the
+     * desktop. Drop the pending console paint; switching to a text VT
+     * repaints that VT from its chargrid. */
+    {
+        extern bool vconsole_desktop_owns_display(void);
+        extern bool desktop_has_backbuffer(void);
+        if (vconsole_desktop_owns_display() && desktop_has_backbuffer()) {
+            dirty_y_min = 0xFFFFFFFF;
+            dirty_y_max = 0;
+            fb_flush_waiting = false;
+            return;
+        }
+    }
+
     /* Console output batching.
      *
      * Every paint is a memcpy plus a GPU scanout transfer of the dirty rows;
@@ -1219,8 +1235,8 @@ static void fb_draw_cursor(bool show){
 }
 
 void fb_cursor_blink_tick(){
-    extern bool desktop_is_running(void);
-    if (desktop_is_running()) return;
+    extern bool vconsole_desktop_owns_display(void);
+    if (vconsole_desktop_owns_display()) return;
     if(++blink_counter < CURSOR_BLINK_INTERVAL) return;
     blink_counter = 0;
     cursor_visible = !cursor_visible;

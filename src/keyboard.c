@@ -1,4 +1,5 @@
 #include "keyboard.h"
+extern bool desktop_is_running(void);
 #include "apic.h"
 #include "acpi.h"
 #include "cpu.h"
@@ -396,11 +397,15 @@ static void keyboard_process_byte(uint16_t scancode){
      * etc.) see key transitions even when the main-loop drainer is
      * starved by a long-running Ring-3 process. The byte store is atomic
      * and lock-free, so it's safe from interrupt context. */
-    SDL_InjectKeyState_Fast(!is_release, code);
+    /* With the desktop running, presses typed on a text VT belong to that
+     * VT only; releases always pass so nothing sticks in the desktop. */
+    bool to_gfx = is_release || !desktop_is_running() || vconsole_get_active() == 0;
+    if (to_gfx)
+        SDL_InjectKeyState_Fast(!is_release, code);
 
     /* Defer the full SDL event push (event_queue spinlock + desktop GUI
      * notify) to main-loop context; ISR must stay minimal. */
-    {
+    if (to_gfx) {
         uint32_t next = (sdl_key_head + 1) % SDL_KEY_QUEUE_SIZE;
         if (next != sdl_key_tail) {
             sdl_key_queue[sdl_key_head].scancode = code;

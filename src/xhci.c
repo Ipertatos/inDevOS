@@ -576,8 +576,19 @@ int xhci_port_reset(xhci_ctrl_t *hc, uint32_t port, uint8_t *speed_out) {
         uint64_t dl = ktime_deadline_ms(500);
         while (!(rd32(hc->op, OP_PORTSC(port)) & PORTSC_PRC) && !ktime_expired(dl))
             ktime_busywait_ms(1);
+        /* Reset done means PR clear and PED set; some controllers (AMD
+         * 1022:15e5) raise PRC before the port is actually enabled. */
+        dl = ktime_deadline_ms(200);
+        for (;;) {
+            uint32_t v = rd32(hc->op, OP_PORTSC(port));
+            if (!(v & PORTSC_PR) && (v & PORTSC_PED)) break;
+            if (ktime_expired(dl)) break;
+            ktime_busywait_ms(1);
+        }
     }
-    ktime_busywait_ms(10);                 /* TRSTRCY */
+    /* TRSTRCY reset recovery: USB 2.0 requires >= 10 ms before the first
+     * request; give slow sticks 50 ms. */
+    ktime_busywait_ms(major >= 3 ? 10 : 50);
     xhci_port_ack_changes(hc, port);
     sc = rd32(hc->op, OP_PORTSC(port));
     if (!(sc & PORTSC_PED)) {

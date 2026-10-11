@@ -102,14 +102,16 @@ void term_write(const char *buf, size_t len) {
         }
     }
 
-    /* When the desktop compositor owns the framebuffer, skip all
-     * console writes — output goes to serial only (handled above). */
-    extern bool desktop_is_running(void);
-    if (desktop_is_running()) return;
-
     /* Route output for background virtual consoles to their ring buffer
      * instead of the visible framebuffer. */
     int vc = vconsole_get_thread_console();
+
+    /* The desktop owns VT 0: text for VT 0 goes to serial only (handled
+     * above), whether or not VT 0 is on screen. Text VTs keep working
+     * while the desktop runs. */
+    extern bool desktop_is_running(void);
+    if (desktop_is_running() && vc == 0) return;
+
     if (vc >= 0 && vc != vconsole_get_active()) {
         vconsole_buffer_output(vc, buf, len);
         return;

@@ -138,6 +138,11 @@ static void hub_attach(usb_dev_t *d, usb_iface_info_t *ifc);
 static void usb_detach(usb_dev_t *d);
 static void port_path(usb_dev_t *d, char *out, uint32_t sz);
 
+/* Which enumeration step failed last, with its completion code (for logs). */
+static const char *enum_step = "";
+static int enum_cc;
+#define ENUM_FAIL(step, ccv) do { enum_step = (step); enum_cc = (ccv); goto fail; } while (0)
+
 static usb_dev_t *usb_attach(xhci_ctrl_t *hc, usb_dev_t *parent, uint8_t port, uint8_t speed) {
     usb_dev_t *d = dev_alloc();
     if (!d) {
@@ -163,40 +168,39 @@ static usb_dev_t *usb_attach(xhci_ctrl_t *hc, usb_dev_t *parent, uint8_t port, u
     } else {
         d->root_port = port;
     }
+    enum_step = ""; enum_cc = 0;
     d->slot = xhci_alloc_slot(hc);
-    if (!d->slot) goto fail;
+    if (!d->slot) ENUM_FAIL("enable slot", hc->cmd_cc);
     uint16_t mps0 = speed >= USB_SPEED_SUPER ? 512 : speed == USB_SPEED_HIGH ? 64 : 8;
     if (xhci_address_device(d->slot, d->root_port, d->route, speed, d->tt_slot, d->tt_port,
                             mps0) != 0)
-        goto fail;
+        ENUM_FAIL("address device", hc->cmd_cc);
     ktime_busywait_ms(2);
     uint8_t head[8];
     if (usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0100, 0, 8, head) < 8) {
-        serial_printf("usb: no device descriptor (port %u)\n", port);
-        goto fail;
+        ENUM_FAIL("device descriptor (8 bytes)", d->slot->ep[1].cc);
     }
     uint16_t real_mps = speed >= USB_SPEED_SUPER ? (uint16_t)(1u << (head[7] & 0xF)) : head[7];
     if (real_mps && real_mps != mps0 && xhci_update_ep0_mps(d->slot, real_mps) != 0)
         serial_printf("usb: EP0 max packet update failed\n");
     if (usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0100, 0, 18, &d->desc) < 18)
-        goto fail;
+        ENUM_FAIL("device descriptor (18 bytes)", d->slot->ep[1].cc);
     uint8_t cfg9[9];
     if (usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0200, 0, 9, cfg9) < 9)
-        goto fail;
+        ENUM_FAIL("config descriptor", d->slot->ep[1].cc);
     uint16_t total = (uint16_t)(cfg9[2] | (cfg9[3] << 8));
     if (total > 1024) total = 1024;
     uint8_t *cfg = (uint8_t *)kalloc(1024);
     if (!cfg) goto fail;
     int got = usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0200, 0, total, cfg);
-    if (got < 9) { kfree(cfg); goto fail; }
+    if (got < 9) { kfree(cfg); ENUM_FAIL("full config descriptor", d->slot->ep[1].cc); }
     d->config_value = cfg[5];
     parse_config(d, cfg, (uint32_t)got);
     kfree(cfg);
     get_string(d, d->desc.iManufacturer, d->manufacturer, sizeof(d->manufacturer));
     get_string(d, d->desc.iProduct, d->product, sizeof(d->product));
     if (usb_ctrl(d, 0x00, USB_REQ_SET_CONFIG, d->config_value, 0, 0, NULL) < 0) {
-        serial_printf("usb: SET_CONFIGURATION failed\n");
-        goto fail;
+        ENUM_FAIL("set configuration", d->slot->ep[1].cc);
     }
     d->present = true;
     {
@@ -236,7 +240,8 @@ static usb_dev_t *usb_attach(xhci_ctrl_t *hc, usb_dev_t *parent, uint8_t port, u
     }
     return d;
 fail:
-    printf("usb: enumeration failed on %s port %u\n", parent ? "hub" : "root", port);
+    printf("usb: enumeration failed on %s port %u: %s (cc=%d)\n", parent ? "hub" : "root",
+           port, enum_step[0] ? enum_step : "?", enum_cc);
     if (d->slot) xhci_free_slot(d->slot);
     d->slot = NULL;
     d->present = false;
@@ -406,6 +411,32 @@ static usb_dev_t *root_dev(xhci_ctrl_t *hc, uint32_t port) {
     return NULL;
 }
 
+/* Reset + enumerate a root port, up to 3 tries with growing delays. A
+ * failed try has already disabled its slot. Returns true if attached. */
+static bool root_port_enumerate(xhci_ctrl_t *hc, uint32_t port) {
+    static const uint32_t pre_ms[3] = { 50, 200, 500 };
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (!xhci_port_connected(hc, port)) return false;
+        ktime_busywait_ms(pre_ms[attempt]);      /* debounce / back off */
+        uint8_t speed = 0;
+        if (xhci_port_reset(hc, port, &speed) != 0) {
+            printf("usb: root port %u try %d: port reset failed (PORTSC 0x%x)\n", port,
+                   attempt + 1, xhci_port_status(hc, port));
+            continue;
+        }
+        ktime_busywait_ms(10 + 20 * attempt);    /* settle before Address Device */
+        usb_dev_t *nd = usb_attach(hc, NULL, (uint8_t)port, speed);
+        if (nd) {
+            hc->port_slot[port] = nd->slot->slot_id;
+            if (attempt) printf("usb: root port %u enumerated on try %d\n", port, attempt + 1);
+            return true;
+        }
+        printf("usb: root port %u try %d failed at %s (cc=%d)\n", port, attempt + 1,
+               enum_step[0] ? enum_step : "?", enum_cc);
+    }
+    return false;
+}
+
 static void root_port_check(xhci_ctrl_t *hc, uint32_t port) {
     usb_dev_t *d = root_dev(hc, port);
     uint32_t sc = xhci_port_status(hc, port);
@@ -417,12 +448,8 @@ static void root_port_check(xhci_ctrl_t *hc, uint32_t port) {
         d = NULL;
     }
     if (conn && !d) {
-        uint8_t speed = 0;
         serial_printf("usb: root port %u connected (PORTSC 0x%x)\n", port, sc);
-        ktime_busywait_ms(50);
-        if (xhci_port_reset(hc, port, &speed) != 0) return;
-        usb_dev_t *nd = usb_attach(hc, NULL, (uint8_t)port, speed);
-        if (nd) hc->port_slot[port] = nd->slot->slot_id;
+        root_port_enumerate(hc, port);
     }
 }
 
@@ -436,6 +463,23 @@ void usb_core_init(void) {
         for (uint32_t p = 1; p <= hc->max_ports; p++) {
             if (xhci_port_connected(hc, p)) root_port_check(hc, p);
             else xhci_port_ack_changes(hc, p);
+        }
+        xhci_process_events(hc);
+        hc->port_changed = 0;
+    }
+    /* Second pass: ports still connected without a device get another go
+     * after the bus has settled (slow sticks on AMD xHCI). */
+    for (int i = 0; i < n; i++) {
+        xhci_ctrl_t *hc = xhci_get_controller(i);
+        if (!hc) continue;
+        bool waited = false;
+        for (uint32_t p = 1; p <= hc->max_ports; p++) {
+            if (!xhci_port_connected(hc, p) || root_dev(hc, p)) continue;
+            if (!waited) { ktime_busywait_ms(300); waited = true; }
+            printf("usb: retrying root port %u (second pass)\n", p);
+            xhci_port_ack_changes(hc, p);
+            if (!root_port_enumerate(hc, p))
+                printf("usb: root port %u: giving up (replug to retry)\n", p);
         }
         xhci_process_events(hc);
         hc->port_changed = 0;
