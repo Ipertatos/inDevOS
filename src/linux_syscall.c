@@ -118,7 +118,11 @@ enum {
     LX_mremap = 25, LX_msync = 26, LX_mincore = 27, LX_madvise = 28,
     LX_dup = 32, LX_dup2 = 33, LX_pause = 34, LX_nanosleep = 35,
     LX_getitimer = 36, LX_alarm = 37, LX_setitimer = 38, LX_getpid = 39,
-    LX_sendfile = 40, LX_socket = 41, LX_clone = 56, LX_fork = 57, LX_vfork = 58,
+    LX_sendfile = 40, LX_socket = 41, LX_connect = 42, LX_accept = 43,
+    LX_sendto = 44, LX_recvfrom = 45, LX_sendmsg = 46, LX_recvmsg = 47,
+    LX_shutdown = 48, LX_bind = 49, LX_listen = 50, LX_getsockname = 51,
+    LX_getpeername = 52, LX_socketpair = 53, LX_setsockopt = 54,
+    LX_getsockopt = 55, LX_accept4 = 288, LX_eventfd = 284, LX_eventfd2 = 290, LX_clone = 56, LX_fork = 57, LX_vfork = 58,
     LX_execve = 59, LX_exit = 60, LX_wait4 = 61, LX_kill = 62, LX_uname = 63,
     LX_fcntl = 72, LX_flock = 73, LX_fsync = 74, LX_fdatasync = 75,
     LX_truncate = 76, LX_ftruncate = 77, LX_getdents = 78, LX_getcwd = 79,
@@ -255,6 +259,67 @@ static long lx_read_tty(process_t *p, long fd, void *ubuf, size_t count) {
     return (long)got;
 }
 
+/* Linux socket glue (syscall_net.c) */
+long lx_sock_socket(long domain, long type, long protocol);
+long lx_sock_recv(int fd, void *ubuf, size_t len, int flags);
+long lx_sock_send(int fd, const void *ubuf, size_t len, int flags);
+long lx_sock_sendto(int fd, const void *ubuf, size_t len, int flags, const void *uaddr, uint32_t alen);
+long lx_sock_recvfrom(int fd, void *ubuf, size_t len, int flags, void *uaddr, uint32_t *ualen);
+long lx_sock_name(int fd, void *uaddr, uint32_t *ualen, bool peer);
+long lx_sock_getsockopt(int fd, int level, int opt, void *uval, uint32_t *ulen);
+long lx_sock_setsockopt(int fd, int level, int opt, const void *uval, uint32_t len);
+long lx_sock_shutdown(int fd, int how);
+bool lx_fd_is_socket(process_t *p, int fd);
+int sys_bind(int fd, const sockaddr_in_t *addr, uint32_t addrlen);
+int sys_listen(int fd, int backlog);
+int sys_accept(int fd, sockaddr_in_t *addr, uint32_t *addrlen);
+int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen);
+
+
+/* eventfd: 64-bit counter object (curl uses it as its multi wakeup fd) */
+#define FD_TYPE_EVENTFD 8
+extern int lx_strace;
+static long lx_put(void *uptr, const void *k, size_t n);
+static long lx_get(void *k, const void *uptr, size_t n);
+static long lx_eventfd_create(process_t *p, uint64_t initval, long flags) {
+    int fd = allocate_fd(p);
+    if (fd < 0) return -EMFILE;
+    uint64_t *ctr = (uint64_t *)kalloc(sizeof(uint64_t));
+    if (!ctr) { p->fds[fd].in_use = false; return -ENOMEM; }
+    *ctr = initval;
+    p->fds[fd].ref_count = fd_refcount_create();
+    if (!p->fds[fd].ref_count) { kfree(ctr); p->fds[fd].in_use = false; return -ENOMEM; }
+    p->fds[fd].fd_type = FD_TYPE_EVENTFD;
+    p->fds[fd].file_handle = ctr;
+    p->fds[fd].flags = (flags & 04000) ? O_NONBLOCK : 0;   /* EFD_NONBLOCK */
+    p->fds[fd].position = 0;
+    p->fds[fd].cloexec = (flags & 02000000) != 0;          /* EFD_CLOEXEC */
+    p->fds[fd].in_use = true;
+    return fd;
+}
+
+static long lx_eventfd_rw(process_t *p, long fd, void *ubuf, size_t len, bool wr) {
+    if (len < 8) return -EINVAL;
+    volatile uint64_t *ctr = (volatile uint64_t *)p->fds[fd].file_handle;
+    uint64_t v;
+    if (lx_strace)
+        serial_printf("lxt:  eventfd %s pid %u fd %ld ctr@%p=%llu\n", wr ? "write" : "read",
+                      p->pid, fd, (void *)ctr, (unsigned long long)*ctr);
+    if (wr) {
+        if (lx_get(&v, ubuf, 8)) return -EFAULT;
+        if (v == ~0ULL) return -EINVAL;
+        *ctr += v;
+        return 8;
+    }
+    for (;;) {
+        v = *ctr;
+        if (v) { *ctr = 0; return lx_put(ubuf, &v, 8) ? -EFAULT : 8; }
+        if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
+        if (proc_kill_pending(p)) return -EINTR;
+        thread_sleep(1);
+    }
+}
+
 static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     uint8_t ty = p->fds[fd].fd_type;
@@ -262,6 +327,10 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
         return 0;
     if (ty == FD_TYPE_DEV_TTY || lx_fd_is_tty(p, fd))
         return lx_read_tty(p, fd, ubuf, count);
+    if (ty == FD_TYPE_SOCKET)
+        return lx_sock_recv((int)fd, ubuf, count, 0);
+    if (ty == FD_TYPE_EVENTFD)
+        return lx_eventfd_rw(p, fd, ubuf, count, false);
     return (long)sys_read((int)fd, ubuf, count);
 }
 
@@ -374,6 +443,23 @@ static int lx_path_kind(const char *abspath, stat_t *st_out) {
     return ((st.st_mode & S_IFMT) == S_IFDIR) ? 2 : 1;
 }
 
+/*
+ * inDevOS programs live as /bin/<name>.exe. Shells (busybox ash) and make
+ * search PATH with stat()/access() before execve(), so "tcc" would never be
+ * found. For metadata lookups only, a missing extensionless path that has a
+ * regular-file "<path>.exe" sibling resolves to it (execve already does this).
+ */
+static void lx_exe_alias(char *path, size_t sz) {
+    if (lx_path_kind(path, NULL)) return;
+    size_t n = strlen(path);
+    const char *slash = path;
+    for (size_t i = 0; i < n; i++) if (path[i] == '/') slash = path + i + 1;
+    for (const char *c = slash; *c; c++) if (*c == '.') return;
+    if (!*slash || n + 5 > sz) return;
+    memcpy(path + n, ".exe", 5);
+    if (lx_path_kind(path, NULL) != 1) path[n] = '\0';
+}
+
 static void lx_fill_stat(lx_stat_t *ls, const stat_t *st) {
     memset(ls, 0, sizeof(*ls));
     uint64_t now = lx_real_us() / 1000000ULL;
@@ -472,6 +558,10 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     if (p->fds[fd].fd_type == FD_TYPE_DEV_NULL)
         return (long)len;
+    if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
+        return lx_sock_send((int)fd, ubuf, len, 0);
+    if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
+        return lx_eventfd_rw(p, fd, (void *)ubuf, len, true);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_TTY) {
         /* Write through stdout. */
         long r = sys_write(STDOUT_FILENO, ubuf, len);
@@ -674,6 +764,10 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
             p->linux_ti_lflag = ti.c_lflag;
             memcpy(p->linux_ti_cc, ti.c_cc, sizeof(p->linux_ti_cc));
             p->linux_ti_valid = true;
+            {
+                extern void keyboard_set_linux_noncanon(bool enable);
+                keyboard_set_linux_noncanon(!(ti.c_lflag & LX_ICANON));
+            }
             return 0;
         }
         case LX_TIOCGWINSZ: {
@@ -878,6 +972,8 @@ static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
                       p ? (int)p->pid : -1, (unsigned long long)fr->nr);
 }
 
+int lx_strace;   /* zeus `lxtrace on`: log Linux syscalls to serial */
+
 static long lx_dispatch(linux_syscall_frame_t *fr) {
     process_t *p = lx_proc();
     const uint64_t nr = fr->nr;
@@ -1003,6 +1099,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     /* ---- metadata / paths ---- */
     case LX_stat: case LX_lstat:
         if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false))) return r;
+        lx_exe_alias(path, sizeof(path));
         return lx_stat_path(path, (void *)a2);
     case LX_fstat:
         return lx_fstat(p, (long)a1, (void *)a2);
@@ -1018,13 +1115,16 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             }
         }
         if ((r = lx_resolve(p, (long)(int)a1, (const char *)a2, path, sizeof(path), false))) return r;
+        lx_exe_alias(path, sizeof(path));
         return lx_stat_path(path, (void *)a3);
     }
     case LX_access:
         if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false))) return r;
+        lx_exe_alias(path, sizeof(path));
         return lx_path_kind(path, NULL) ? 0 : -ENOENT;
     case LX_faccessat: case LX_faccessat2:
         if ((r = lx_resolve(p, (long)(int)a1, (const char *)a2, path, sizeof(path), false))) return r;
+        lx_exe_alias(path, sizeof(path));
         return lx_path_kind(path, NULL) ? 0 : -ENOENT;
     case LX_readlink: case LX_readlinkat: {
         const char *up = (const char *)(nr == LX_readlink ? a1 : a2);
@@ -1164,6 +1264,13 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
 
     /* ---- process ---- */
     case LX_exit: case LX_exit_group:
+        if (p->linux_clear_child_tid) {
+            /* CLONE_CHILD_CLEARTID: zero the tid word so pthread_join's
+             * futex wait (polling) sees the thread is gone. */
+            uint32_t z = 0;
+            lx_put((void *)p->linux_clear_child_tid, &z, 4);
+            p->linux_clear_child_tid = 0;
+        }
         sys_exit((int)(a1 & 0xff));
         return 0;
     case LX_getpid: case LX_gettid:
@@ -1567,6 +1674,84 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         memcpy(sx + 0x48, &size, 8);
         return lx_put((void *)a5, sx, sizeof(sx));
     }
+    /* ---- sockets (AF_INET only) ---- */
+    case LX_socket:      return lx_sock_socket((long)a1, (long)a2, (long)a3);
+    case LX_connect: {
+        if (!lx_fd_is_socket(p, (int)a1)) return -ENOTSOCK;
+        if (a3 < sizeof(sockaddr_in_t)) return -EINVAL;
+        uint16_t fam = 0;
+        if (lx_get(&fam, (const void *)a2, sizeof(fam))) return -EFAULT;
+        if (fam != AF_INET) return -EAFNOSUPPORT;
+        return sys_connect((int)a1, (sockaddr_in_t *)a2, sizeof(sockaddr_in_t));
+    }
+    case LX_bind: {
+        if (!lx_fd_is_socket(p, (int)a1)) return -ENOTSOCK;
+        uint16_t fam = 0;
+        if (lx_get(&fam, (const void *)a2, sizeof(fam))) return -EFAULT;
+        if (fam != AF_INET) return -EAFNOSUPPORT;
+        return sys_bind((int)a1, (const sockaddr_in_t *)a2, (uint32_t)a3);
+    }
+    case LX_listen:      return sys_listen((int)a1, (int)a2);
+    case LX_accept: case LX_accept4: {
+        long fd = sys_accept((int)a1, (sockaddr_in_t *)a2, (uint32_t *)a3);
+        if (fd >= 0 && nr == LX_accept4) {
+            if (a4 & 04000) p->fds[fd].flags |= O_NONBLOCK;
+            if (a4 & 02000000) p->fds[fd].cloexec = true;
+        }
+        return fd;
+    }
+    case LX_sendto:      return lx_sock_sendto((int)a1, (const void *)a2, (size_t)a3, (int)a4,
+                                               (const void *)a5, (uint32_t)a6);
+    case LX_recvfrom:    return lx_sock_recvfrom((int)a1, (void *)a2, (size_t)a3, (int)a4,
+                                                 (void *)a5, (uint32_t *)a6);
+    case LX_sendmsg: case LX_recvmsg: {
+        /* struct msghdr { name, namelen, iov, iovlen, control, controllen, flags } */
+        struct { uint64_t name; uint32_t namelen, pad; uint64_t iov, iovlen, control, controllen; int flags; } m;
+        if (lx_get(&m, (const void *)a2, sizeof(m))) return -EFAULT;
+        int flags = (int)a3 | m.flags;
+        if (m.iovlen == 0) {
+            /* Still must consume one datagram on recv so poll(POLLIN) clears. */
+            if (nr == LX_recvmsg) {
+                uint8_t bitbucket[1];
+                long r = lx_sock_recvfrom((int)a1, bitbucket, 0, flags, NULL, NULL);
+                return r < 0 ? r : 0;
+            }
+            return 0;
+        }
+        long total = 0;
+        for (uint64_t i = 0; i < m.iovlen && i < 64; i++) {
+            lx_iovec_t v;
+            if (lx_get(&v, (const lx_iovec_t *)m.iov + i, sizeof(v))) return total ? total : -EFAULT;
+            if (!v.iov_len) continue;
+            long r;
+            if (nr == LX_sendmsg)
+                r = lx_sock_sendto((int)a1, (const void *)v.iov_base, (size_t)v.iov_len, flags,
+                                   m.name ? (const void *)m.name : NULL, m.namelen);
+            else
+                r = lx_sock_recvfrom((int)a1, (void *)v.iov_base, (size_t)v.iov_len, flags,
+                                     m.name ? (void *)m.name : NULL,
+                                     m.name ? (uint32_t *)((uint8_t *)a2 + 8) : NULL);
+            if (r < 0) return total ? total : r;
+            total += r;
+            if ((uint64_t)r < v.iov_len || nr == LX_recvmsg) break;
+        }
+        /* All iovecs empty: still consume one datagram (POSIX). */
+        if (nr == LX_recvmsg && total == 0) {
+            uint8_t bitbucket[1];
+            long r = lx_sock_recvfrom((int)a1, bitbucket, 0, flags, NULL, NULL);
+            if (r < 0) return r;
+        }
+        return total;
+    }
+    case LX_shutdown:    return lx_sock_shutdown((int)a1, (int)a2);
+    case LX_getsockname: return lx_sock_name((int)a1, (void *)a2, (uint32_t *)a3, false);
+    case LX_getpeername: return lx_sock_name((int)a1, (void *)a2, (uint32_t *)a3, true);
+    case LX_setsockopt:  return lx_sock_setsockopt((int)a1, (int)a2, (int)a3, (const void *)a4, (uint32_t)a5);
+    case LX_getsockopt:  return lx_sock_getsockopt((int)a1, (int)a2, (int)a3, (void *)a4, (uint32_t *)a5);
+    case LX_socketpair:  return -EAFNOSUPPORT;
+    case LX_eventfd:     return lx_eventfd_create(p, (uint32_t)a1, 0);
+    case LX_eventfd2:    return lx_eventfd_create(p, (uint32_t)a1, (long)a2);
+
     case LX_getrandom: {
         size_t n = (size_t)a2;
         if (n > 4096) n = 4096;
@@ -1679,10 +1864,31 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (op == 1 /* WAKE */ || op == 10 /* WAKE_BITSET */)
             return 0;
         if (op == 0 /* WAIT */ || op == 9 /* WAIT_BITSET */) {
+            /* Threads are VM-sharing processes: WAIT sleeps until the word
+             * changes (WAKE is implicit via polling), the timeout expires, or
+             * a kill is pending. BITSET timeouts are absolute: sleep a 10 ms
+             * slice and report a spurious wake (-EAGAIN) so libc rechecks. */
+            extern uint64_t ktime_deadline_ms(uint64_t);
+            extern bool     ktime_expired(uint64_t);
             uint32_t cur;
             if (lx_get(&cur, (void *)a1, 4)) return -EFAULT;
-            /* Single-threaded processes: nobody could ever wake us. */
-            return cur != (uint32_t)a3 ? -EAGAIN : -ETIMEDOUT;
+            if (cur != (uint32_t)a3) return -EAGAIN;
+            bool has_to = a4 != 0;
+            uint64_t ms = 0;
+            if (has_to) {
+                lx_timespec_t ts;
+                if (lx_get(&ts, (void *)a4, sizeof(ts))) return -EFAULT;
+                if (op == 9) ms = 10;
+                else ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+            }
+            uint64_t dl = ktime_deadline_ms(ms);
+            for (;;) {
+                if (lx_get(&cur, (void *)a1, 4)) return -EFAULT;
+                if (cur != (uint32_t)a3) return 0;
+                if (has_to && ktime_expired(dl)) return op == 9 ? -EAGAIN : -ETIMEDOUT;
+                if (proc_kill_pending(p)) return -EINTR;
+                thread_sleep(1);
+            }
         }
         return lx_enosys(p, nr);
     }
@@ -1787,7 +1993,14 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
             return 0;
     }
 
+    if (lx_strace)
+        serial_printf("lxt: pid %u tid %u nr %llu (%llx, %llx, %llx, %llx)\n", p ? p->pid : 0,
+                      (unsigned)(scheduler_get_current_thread() ? scheduler_get_current_thread()->id : 0),
+                      (unsigned long long)f->nr, (unsigned long long)f->a1, (unsigned long long)f->a2,
+                      (unsigned long long)f->a3, (unsigned long long)f->a4);
     long r = lx_dispatch(f);
+    if (lx_strace)
+        serial_printf("lxt: pid %u nr %llu -> %ld\n", p ? p->pid : 0, (unsigned long long)f->nr, r);
 
     if (p && p->sig_iret_pending && f->nr == (uint64_t)LX_rt_sigreturn) {
         p->sig_iret_pending = false;

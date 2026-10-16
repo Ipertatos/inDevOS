@@ -41,9 +41,11 @@ typedef struct {
     uint8_t cls, sub, proto;
     uint8_t n_ep;
     usb_ep_info_t ep[4];
+    uint8_t alt;         /* alternate setting the endpoints belong to */
+    uint8_t cdc_mac;     /* CDC Ethernet functional descriptor iMACAddress */
 } usb_iface_info_t;
 
-enum { USB_DRV_NONE = 0, USB_DRV_HUB, USB_DRV_KBD, USB_DRV_MOUSE, USB_DRV_MSC };
+enum { USB_DRV_NONE = 0, USB_DRV_HUB, USB_DRV_KBD, USB_DRV_MOUSE, USB_DRV_MSC, USB_DRV_NET };
 
 typedef struct usb_dev {
     bool present;
@@ -98,3 +100,11 @@ void usb_hid_detach(void *data);
 void usb_hid_poll(void *data);
 int usb_msc_attach(usb_dev_t *d, usb_iface_info_t *ifc, void **data);
 void usb_msc_detach(void *data);
+/* USB ethernet (usb_net.c): CDC-ECM, CDC-NCM, RNDIS */
+int usb_net_kind(const usb_iface_info_t *ifc);
+int usb_net_attach(usb_dev_t *d, usb_iface_info_t *ifc, void **data);
+void usb_net_detach(void *data);
+void usb_net_poll(void *data);
+void usb_net_status(void);
+int usb_net_bringup(void);
+bool usb_net_present(void);

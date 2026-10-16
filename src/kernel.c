@@ -367,11 +367,23 @@ void kmain(void) {
         /* Spawned Ring-3 apps present via SYS_DESKTOP_COMPOSITE. While one is
          * READY, yield instead of burning a CRITICAL quantum on the compositor
          * (flamegraph showed ~24% samples in kmain competing with Doom). */
+        /* Bounded: a background Ring-3 process that polls (e.g. the
+         * desktop terminal's ash waiting on its stdin pipe wakes every
+         * tick) must not starve VT switching, input and the compositor,
+         * so do a full pass at least every 10 ms. */
+        static uint64_t kmain_last_full_pass;
         if (global_scheduler.scheduler_running &&
-            scheduler_has_ready_user_threads()) {
-            thread_yield();
+            scheduler_has_ready_user_threads() &&
+            current_time - kmain_last_full_pass < 10) {
+            /* Do not thread_yield() here: with no other kernel thread ready
+             * it switches kmain to the idle thread, and the preempt path only
+             * resumes user threads, so kmain never ran again (desktop froze
+             * right after the terminal window started ash). Halt to the next
+             * interrupt instead; user threads run on the other CPUs. */
+            __asm__ volatile("sti; hlt" ::: "memory");
             continue;
         }
+        kmain_last_full_pass = current_time;
 
     /* WM vs client fast-present:
      * desktop_wm_needs_composite() is true for multi-window stacking, drag,
@@ -408,6 +420,21 @@ void kmain(void) {
         if (keyboard_has_sdl_pending()) {
             keyboard_process_sdl_events();
             did_work = true;
+        }
+
+#ifdef ENABLE_LUA
+        /* Non-blocking LuaDE: one script time slice while VT 0 is shown. */
+        {
+            extern bool luade_tick(void);
+            if (luade_tick()) did_work = true;
+        }
+#endif
+        /* Desktop terminal window: keep draining its shell's output even
+         * while a text VT is on screen, so the shell never blocks on a full
+         * pipe. */
+        if (desktop_is_running()) {
+            extern bool kterm_pump(void);
+            if (kterm_pump()) did_work = true;
         }
 
         if (desktop_may_paint && !app_fast_present) {
@@ -589,22 +616,41 @@ void kmain(void) {
          * (keyboard_get_execute), we submit the line through the TTY
          * layer which dispatches to Zeus via the registered callback.
          */
-        if (keyboard_get_execute()) {
-            char *buffer = keyboard_get_buffer();
+        extern uint32_t keyboard_take_line(char *out, uint32_t outsz);
+        static char zline[256];
+        /* take_line returns 0 (and drops the flag) when kbd_execute was
+         * stale - no '\n' left in the buffer. */
+        if (keyboard_get_execute() && keyboard_take_line(zline, sizeof(zline)) > 0) {
             int active_tty = vconsole_get_active();
 
-            tty_feed_line(active_tty, buffer);
+            /* Take ONLY the first line out of the VC buffer before running
+             * it (a program reading stdin must not see the Zeus command
+             * line again). Type-ahead after it stays queued; clearing the
+             * whole buffer here dropped keys typed while a program ran. */
+            tty_feed_line(active_tty, zline);
             tty_submit_line(active_tty);
-            /* The tty has its own copy now. Drop the line from the VC buffer
-             * before running it, or a program reading stdin (busybox sh)
-             * gets the Zeus command line again as its first input. */
-            keyboard_clear_buffer();
 
             set_terminate_flag(false);
             tty_poll();
-            keyboard_clear_buffer();
+            /* Do NOT clear the VC buffer here: keys typed after the program
+             * exited (type-ahead) are already queued for echo, so wiping
+             * them made the screen show the whole line while Zeus got only
+             * the tail. A program's own leftover input is dropped at exit
+             * by keyboard_restore_shell_input(), together with its echo. */
             set_terminate_flag(false);
             printf("%s", tty_get_prompt());
+            /* Type-ahead kept across the program: show it so the screen
+             * matches what Zeus will run (echo was cleared at restore). */
+            {
+                char *tb = keyboard_get_buffer();
+                uint32_t tn = keyboard_get_buffer_length();
+                if (tn > 0 && tb) {
+                    for (uint32_t ti = 0; ti < tn; ti++) {
+                        if (tb[ti] == '\n') break;
+                        printf("%c", tb[ti]);
+                    }
+                }
+            }
             did_work = true;
         }
         

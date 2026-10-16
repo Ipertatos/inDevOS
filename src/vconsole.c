@@ -67,6 +67,7 @@ void vconsole_init(void) {
         vc->force_kill_flag  = false;
         vc->program_running  = false;
         vc->raw_mode         = false;
+        vc->lx_noncanon      = false;
         vc->last_ctrlc_tick  = 0;
     }
 
@@ -146,6 +147,13 @@ int vconsole_get_thread_console(void) {
     return vconsole_get_active();
 }
 
+/* True when the calling process is attached to no VT (VC_TTY_DETACHED). */
+bool vconsole_thread_detached(void) {
+    process_t *p = get_current_process();
+    extern process_t *get_kernel_process(void);
+    return p && p != get_kernel_process() && p->cont_tty == VC_TTY_DETACHED;
+}
+
 static void vc_save_current(void) {
     vconsole_t *vc = &consoles[active_console];
     fb_console_save_state(
@@ -167,13 +175,25 @@ static void vc_restore(int id) {
     fb_console_redraw_from_chargrid();
 }
 
+/* A graphical owner of VT 0: the native desktop or non-blocking LuaDE.
+ * Either one draws VT 0's framebuffer, so VT 0's text grid is not shown
+ * (or saved) while it runs; text VTs keep working. */
+bool vconsole_gfx_owner_running(void) {
+    extern bool desktop_is_running(void);
+    if (desktop_is_running()) return true;
+#ifdef ENABLE_LUA
+    extern bool luade_is_running(void);
+    if (luade_is_running()) return true;
+#endif
+    return false;
+}
+
 void vconsole_switch(int id) {
     if (!vc_initialized) return;
     if (id < 0 || id >= MAX_VCONSOLES) return;
     if (id == active_console) return;
 
-    extern bool desktop_is_running(void);
-    bool desk = desktop_is_running();
+    bool desk = vconsole_gfx_owner_running();
     uint64_t flags = irq_save();
 
     int prev = active_console;
@@ -205,6 +225,10 @@ void vconsole_switch(int id) {
                       desk ? (id == 0 ? " (desktop resumes)" : " (desktop paused)") : "");
         if (id == 0) {
             extern void fb_mark_dirty_all(void);
+#ifdef ENABLE_LUA
+            extern void luade_notify_vt_return(void);
+            luade_notify_vt_return();
+#endif
             desktop_request_redraw();
             if (desk) fb_mark_dirty_all();
         }
@@ -255,8 +279,7 @@ void vconsole_poll_switch(void) {
 /* ---------- status bar ---------- */
 
 void vconsole_draw_status_bar(void) {
-    extern bool desktop_is_running(void);
-    if (desktop_is_running() && vconsole_graphics_active()) return;
+    if (vconsole_gfx_owner_running() && vconsole_graphics_active()) return;
     extern struct limine_framebuffer *fb;
     if (!fb) return;
 

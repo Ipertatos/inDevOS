@@ -79,6 +79,11 @@ extern bool exec_did_swapgs;
  * Returns the child PID (>0) on success, negative on error.
  * The caller is NOT blocked; the child runs when the scheduler picks it. */
 int exec_spawn(const char *filename, char *const argv[]);
+struct pipe;
+/** Give the next exec_spawn() child stdin=@in (read end) and stdout+stderr=
+ *  @out (write end). The child takes the pipes' initial reader/writer
+ *  credits; the caller keeps the other ends. */
+void exec_spawn_set_stdio_pipes(struct pipe *in, struct pipe *out);
 
 /* Replace the calling process image in place (same pid).  On success sets
  * proc->exec_replaced and exec_entry_{rip,rsp}; caller SYSRETs into the new

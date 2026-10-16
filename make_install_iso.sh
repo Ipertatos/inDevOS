@@ -87,6 +87,24 @@ if [[ -f tests/busybox/build/busybox.exe ]]; then
     echo "    /bin/busybox.exe (static musl BusyBox)"
 fi
 
+# Networking config + CA bundle (HTTPS cert validation) + optional static curl.
+NETTMP=$(mktemp -d)
+printf "nameserver 10.0.2.3\n" > "$NETTMP/resolv.conf"
+printf "127.0.0.1 localhost\n" > "$NETTMP/hosts"
+mmd -D s -i "$ROOTFS" ::/etc ::/etc/ssl ::/etc/ssl/certs 2>/dev/null || true
+mcopy -o -i "$ROOTFS" "$NETTMP/resolv.conf" ::/etc/resolv.conf
+mcopy -o -i "$ROOTFS" "$NETTMP/hosts" ::/etc/hosts
+if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
+    mcopy -o -i "$ROOTFS" /etc/ssl/certs/ca-certificates.crt ::/etc/ssl/certs/ca-certificates.crt
+    echo "    /etc/ssl/certs/ca-certificates.crt (CA bundle)"
+fi
+# Static musl curl (e.g. stunnel/static-curl curl-linux-x86_64-musl) at tests/curl/curl
+if [[ -f tests/curl/curl ]]; then
+    mcopy -o -i "$ROOTFS" tests/curl/curl ::/bin/curl.exe
+    echo "    /bin/curl.exe (static musl curl, HTTPS)"
+fi
+rm -rf "$NETTMP"
+
 # Static TinyCC + musl sysroot (headers, crt, libc.a) for on-OS C compile.
 TCC_STAGE=""
 if [[ -f tests/tcc/stage.path ]]; then
@@ -122,6 +140,14 @@ if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
     if ls "$TCC_STAGE"/home/user/*.c >/dev/null 2>&1; then
         mcopy -o -i "$ROOTFS" "$TCC_STAGE"/home/user/*.c ::/home/user/
     fi
+    # Self-hosting extras: static musl GNU make and a tiny make demo.
+    if [[ -f "$TCC_STAGE/bin/make.exe" ]]; then
+        mcopy -o -i "$ROOTFS" "$TCC_STAGE/bin/make.exe" ::/bin/make.exe
+        echo "    /bin/make.exe (static musl GNU make)"
+    fi
+    if [[ -d "$TCC_STAGE/home/user/mk" ]]; then
+        mcopy -o -s -i "$ROOTFS" "$TCC_STAGE/home/user/mk" ::/home/user/
+    fi
     echo "    /bin/tcc.exe + /usr/{include,lib} from $TCC_STAGE ($(find "$TCC_STAGE/usr" -type f | wc -l) files)"
     # mtools writes long names (stdio_ext.h, bits/alltypes.h, ...) as VFAT LFN
     # entries; check a few made it with their real names.
@@ -141,6 +167,8 @@ echo ">>> installing Limine payload for the in-OS installer (/install)"
 mcopy -o -i "$ROOTFS" kernel_final.bin ::/install/boot.bin
 mcopy -o -i "$ROOTFS" limine.cfg ::/install/limine.cfg
 mcopy -o -i "$ROOTFS" limine/limine-bios.sys ::/install/limine-bios.sys
+# UEFI loader: the installer copies it to /EFI/BOOT/BOOTX64.EFI on the target.
+mcopy -o -i "$ROOTFS" limine/BOOTX64.EFI ::/install/BOOTX64.EFI
 
 readme="$(mktemp)"
 cat > "$readme" << 'ENDREADME'
@@ -151,7 +179,7 @@ Programs: /bin/<name>.exe   (ls, sh, cat, and the other shell tools)
 Linux:    /bin/hello_musl.exe, /bin/musltest.exe, /bin/busybox.exe, /bin/tcc.exe
 Doom:     /bin/doom.exe
 WAD:      /doom1.wad
-Installer payload: /install/ (kernel, limine.cfg, limine-bios.sys).
+Installer payload: /install/ (kernel, limine.cfg, limine-bios.sys, BOOTX64.EFI).
 The in-OS install command copies this whole root, then places the
 kernel and Limine under /boot so the target disk boots on its own.
 ENDREADME

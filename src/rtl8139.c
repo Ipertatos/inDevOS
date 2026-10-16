@@ -602,11 +602,15 @@ void rtl8139_init() {
     // Enable interrupts
     rtl8139_enable_interrupts(&rtl8139_dev);
     
-    // Configure IOAPIC to route RTL8139 interrupt (IRQ 11) to vector 43
+    // Configure IOAPIC to route the RTL8139 PCI INTx line to vector 43
     // Get the LAPIC ID from the first CPU
     uint32_t lapic_id = 0; // Assuming single CPU for now
-    ioapic_redirect_irq(lapic_id, 43, 11, true); // Enable IRQ 11 -> vector 43
-    printf("RTL8139: Configured interrupt routing: IRQ 11 -> vector 43\n");
+    /* Route the line the PCI config says (10 on QEMU -M pc). The old
+     * hardcoded 11 is virtio-gpu INTx there: an IRQ storm with ISR=0. */
+    uint8_t rtl_line = pci_device_read(pci_dev, 0x3C, 1) & 0xFF;
+    if (rtl_line == 0 || rtl_line >= 24) rtl_line = 11;
+    ioapic_redirect_irq(lapic_id, 43, rtl_line, true);
+    printf("RTL8139: IRQ %u -> vector 43\n", rtl_line);
     
     // Initialize network stack
     arp_init();
@@ -747,30 +751,14 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     // If they are equal, the buffer is empty
     // DEBUG: If we have a pending flag but CBR==ptr, check if there's data anyway
     if (cbr == packet_ptr) {
-        if (rtl8139_dev.rx_pending_flag) {
-            // Check if there's a valid header at the packet pointer
-            volatile uint8_t *rb_check = (volatile uint8_t*)rtl8139_dev.rx_buffer;
-            uint32_t header_check = (uint32_t)rb_check[packet_ptr] |
-                              ((uint32_t)rb_check[packet_ptr + 1] << 8) |
-                              ((uint32_t)rb_check[packet_ptr + 2] << 16) |
-                              ((uint32_t)rb_check[packet_ptr + 3] << 24);
-            
-            if (header_check != 0 && (header_check & 0xFFFF) & RTL8139_RXSTAT_ROK) {
-                serial_printf("RTL8139: WARN: CBR==ptr (0x%x) but valid header found (0x%08x). Forcing process.\n", cbr, header_check);
-                // Fall through to processing
-            } else {
-                rtl8139_dev.rx_pending_flag = 0; // Clear pending flag as buffer is empty
-                spinlock_unlock(&rtl8139_rx_lock);
-                irq_restore(flags);
-                return 0; // No new packets
-            }
-        } else {
-            spinlock_unlock(&rtl8139_rx_lock);
-            irq_restore(flags);
-            return 0; // No new packets
-        }
+        /* Empty ring. The old "valid header found, forcing process" path
+         * re-read an already-consumed header and desynced the ring. */
+        rtl8139_dev.rx_pending_flag = 0;
+        spinlock_unlock(&rtl8139_rx_lock);
+        irq_restore(flags);
+        return 0;
     }
-    
+
     // Read the packet header (4 bytes: status + length)
     volatile uint8_t *rb = (volatile uint8_t*)rtl8139_dev.rx_buffer;
     uint32_t header = (uint32_t)rb[packet_ptr] |
@@ -788,11 +776,12 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     if (header == 0) {
         serial_printf("RTL8139: WARNING: Header is all zeros - possible buffer issue\n");
         // Skip this packet and try the next one
-        rtl8139_dev.current_packet_ptr = (packet_ptr + 4 + 3) & ~3;
-        if (rtl8139_dev.current_packet_ptr >= RTL8139_RX_BUFFER_SIZE) {
-            rtl8139_dev.current_packet_ptr = 0;
-        }
+        /* Corrupt/unknown header: drop the ring contents and resync the
+         * read pointer to the hardware write pointer instead of jumping by
+         * a garbage length (which desynced forever: "len 23644" storm). */
+        rtl8139_dev.current_packet_ptr = cbr % RTL8139_RX_BUFFER_SIZE;
         rtl8139_write_reg16(&rtl8139_dev, RTL8139_CAPR, (uint16_t)(rtl8139_dev.current_packet_ptr - 0x10));
+        rtl8139_dev.rx_pending_flag = 0;
         
         spinlock_unlock(&rtl8139_rx_lock);
         irq_restore(flags);
@@ -803,11 +792,12 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     if (!(status & RTL8139_RXSTAT_ROK)) {
         serial_printf("RTL8139: Received packet with error status 0x%04x\n", status);
         // Skip this packet
-        rtl8139_dev.current_packet_ptr = (packet_ptr + length + 4 + 3) & ~3;
-        if (rtl8139_dev.current_packet_ptr >= RTL8139_RX_BUFFER_SIZE) {
-            rtl8139_dev.current_packet_ptr = 0;
-        }
+        /* Corrupt/unknown header: drop the ring contents and resync the
+         * read pointer to the hardware write pointer instead of jumping by
+         * a garbage length (which desynced forever: "len 23644" storm). */
+        rtl8139_dev.current_packet_ptr = cbr % RTL8139_RX_BUFFER_SIZE;
         rtl8139_write_reg16(&rtl8139_dev, RTL8139_CAPR, (uint16_t)(rtl8139_dev.current_packet_ptr - 0x10));
+        rtl8139_dev.rx_pending_flag = 0;
         
         spinlock_unlock(&rtl8139_rx_lock);
         irq_restore(flags);
@@ -818,11 +808,12 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     if (length > max_length || length < 14) { // Minimum Ethernet frame
         serial_printf("RTL8139: Invalid packet length %d\n", length);
         // Skip this packet
-        rtl8139_dev.current_packet_ptr = (packet_ptr + length + 4 + 3) & ~3;
-        if (rtl8139_dev.current_packet_ptr >= RTL8139_RX_BUFFER_SIZE) {
-            rtl8139_dev.current_packet_ptr = 0;
-        }
+        /* Corrupt/unknown header: drop the ring contents and resync the
+         * read pointer to the hardware write pointer instead of jumping by
+         * a garbage length (which desynced forever: "len 23644" storm). */
+        rtl8139_dev.current_packet_ptr = cbr % RTL8139_RX_BUFFER_SIZE;
         rtl8139_write_reg16(&rtl8139_dev, RTL8139_CAPR, (uint16_t)(rtl8139_dev.current_packet_ptr - 0x10));
+        rtl8139_dev.rx_pending_flag = 0;
         
         spinlock_unlock(&rtl8139_rx_lock);
         irq_restore(flags);
@@ -910,6 +901,7 @@ int rtl8139_has_pending_receive() {
 }
 
 // Handle network interrupt
+extern uint8_t virtio_gpu_ack_irq(void) __attribute__((weak));
 void rtl8139_handle_interrupt() {
     // serial_printf("RTL8139: Interrupt handler called!\n");
     
@@ -920,6 +912,13 @@ void rtl8139_handle_interrupt() {
     
     // Read interrupt status
     uint16_t isr = rtl8139_read_reg16(&rtl8139_dev, RTL8139_ISR);
+    if (isr == 0) {
+        /* Not ours: IRQ 11 is a shared level line (virtio-gpu INTx on -M pc).
+         * Ack the other device so the line drops, else we storm forever. */
+        if (virtio_gpu_ack_irq) (void)virtio_gpu_ack_irq();
+        apic_eoi();
+        return;
+    }
     // serial_printf("RTL8139: Interrupt status: 0x%04x\n", isr);
     
     // Clear interrupt status

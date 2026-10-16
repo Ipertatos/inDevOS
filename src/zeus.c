@@ -428,7 +428,7 @@ static const char *const zeus_command_names[] = {
     "fputest", "fsinfo", "gpu", "grep", "groupadd", "groups",
     "head", "help", "history", "hpet", "img", "inputinfo",
     "insmod", "install", "inttest", "ipv6", "kblayout", "keyboard",
-    "kill", "login", "logout", "ls", "lsmod", "luade",
+    "kill", "login", "logout", "ls", "lsmod", "luade", "luadestop",
     "mac", "matrix", "memtest", "menu", "mkdir", "mount",
     "mv", "neofetch", "net", "nvme", "netdebug", "netset", "netverbose",
     "open", "passwd", "perms", "ping", "pkg", "poweroff",
@@ -436,11 +436,11 @@ static const char *const zeus_command_names[] = {
     "rm", "rmmod", "rtldebug",     "saveperm", "saveusers", "scheddebug",
     "sendtest", "set", "setip", "settings", "sh", "shell", "shutdown", "smp",
     "spawn", "srv", "stopdhcp", "stopwatch", "storage", "su",
-    "tapconfig", "task", "tcpclean", "tcpinfo", "tdesk", "terminal",
+    "tapconfig", "task", "tcpclean", "tcpinfo", "tdesk", "terminal", "termwin",
     "terminals", "testkey", "threadtest", "time", "timeraccuracy",
     "timertest", "touch", "tui", "tuidesktop", "udpverbose",     "unmount", "unset", "udp_test",
     "usb", "usbenum", "usbkeyboard", "usbpoll", "useradd", "userdel",
-    "users", "version", "wc", "whoami", "xhci", "lsusb",
+    "users", "version", "wc", "whoami", "xhci", "lsusb", "usbnet", "lxtrace",
     "uptime", "execsym", "trace",
     (const char *)0
 };
@@ -965,8 +965,15 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
     } else if (kstrcmp(command, "desktop") == 0) {
         extern void desktop_start(void);
         extern bool desktop_is_running(void);
+#ifdef ENABLE_LUA
+        extern bool luade_is_running(void);
+#else
+#define luade_is_running() false
+#endif
         if (desktop_is_running()) {
             printf("Desktop is already running.\n");
+        } else if (luade_is_running()) {
+            printf("LuaDE is running; stop it first (luadestop).\n");
         } else {
             printf("Starting desktop environment...\n");
             desktop_start();
@@ -980,6 +987,18 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
                 printf("Spawned '%s' (PID %d)\n", argv[1], pid);
             else
                 printf("spawn: failed to launch '%s'\n", argv[1]);
+        }
+    } else if (kstrcmp(command, "termwin") == 0) {
+        /* Open the desktop's terminal window (BusyBox ash on pipes) from
+         * any TTY, then show the desktop. */
+        extern bool desktop_is_running(void);
+        extern void kterm_open(void);
+        if (!desktop_is_running()) {
+            printf("termwin: the desktop is not running (type: desktop)\n");
+        } else {
+            kterm_open();
+            extern void vconsole_request_switch(int id);
+            vconsole_request_switch(0);
         }
     } else if (kstrcmp(command, "desktopstop") == 0) {
         extern void desktop_stop(void);
@@ -1029,17 +1048,24 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
         timer_test();
     } else if (kstrcmp(command, "luade") == 0) {
 #ifdef ENABLE_LUA
-        extern bool luade_init(void);
-        extern void luade_main_loop(void);
-        extern void luade_shutdown(void);
-        printf("Starting LuaDE - Lua Desktop Environment\n");
-        printf("Initializing...\n");
-        if (luade_init()) {
-            luade_main_loop();
-            luade_shutdown();
-        } else {
-            printf("Failed to initialize LuaDE\n");
+        extern bool luade_start(void);
+        /* Non-blocking: the script runs from the kernel main loop on VT 0
+         * and this returns at once (Ctrl+F2-F4 for text TTYs). */
+        if (luade_start()) {
+            extern int vconsole_get_active(void);
+            extern void vconsole_request_switch(int id);
+            if (vconsole_get_active() != 0)
+                vconsole_request_switch(0);
         }
+#else
+        printf("Lua support not compiled in (ENABLE_LUA not set)\n");
+#endif
+    } else if (kstrcmp(command, "luadestop") == 0) {
+#ifdef ENABLE_LUA
+        extern bool luade_is_running(void);
+        extern void luade_stop(void);
+        if (luade_is_running()) luade_stop();
+        else printf("LuaDE is not running.\n");
 #else
         printf("Lua support not compiled in (ENABLE_LUA not set)\n");
 #endif
@@ -1968,6 +1994,17 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
         /* xHCI controllers and root ports */
         extern void xhci_print_status(void);
         xhci_print_status();
+    } else if (kstrcmp(command, "usbnet") == 0) {
+        extern void usb_net_status(void);
+        extern int usb_net_prefer_rndis;
+        if (argc > 1 && kstrcmp(argv[1], "rndis") == 0) usb_net_prefer_rndis = 1;
+        else if (argc > 1 && kstrcmp(argv[1], "ecm") == 0) usb_net_prefer_rndis = 0;
+        usb_net_status();
+    } else if (kstrcmp(command, "lxtrace") == 0) {
+        /* lxtrace on|off: log every Linux-ABI syscall (entry + result) to serial */
+        extern int lx_strace;
+        if (argc > 1) lx_strace = kstrcmp(argv[1], "on") == 0;
+        printf("lxtrace: %s\n", lx_strace ? "on" : "off");
     } else if (kstrcmp(command, "lsusb") == 0) {
         /* USB devices: bus, port path, vid:pid, class, speed, driver */
         extern void usb_list_devices(bool verbose);

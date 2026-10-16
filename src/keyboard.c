@@ -57,6 +57,9 @@ static volatile bool home_pressed = false;
 static volatile bool end_pressed = false;
 static volatile bool kill_line_pressed = false;
 static volatile bool kill_word_pressed = false;
+/* Set when a program put a VC in raw mode; its leftover bytes are raw keys,
+ * not shell type-ahead, so keyboard_restore_shell_input() drops them. */
+static volatile bool kbd_raw_used = false;
 static volatile bool f1_pressed = false;
 static volatile bool f5_pressed = false;
 
@@ -399,7 +402,7 @@ static void keyboard_process_byte(uint16_t scancode){
      * and lock-free, so it's safe from interrupt context. */
     /* With the desktop running, presses typed on a text VT belong to that
      * VT only; releases always pass so nothing sticks in the desktop. */
-    bool to_gfx = is_release || !desktop_is_running() || vconsole_get_active() == 0;
+    bool to_gfx = is_release || !vconsole_gfx_owner_running() || vconsole_get_active() == 0;
     if (to_gfx)
         SDL_InjectKeyState_Fast(!is_release, code);
 
@@ -415,6 +418,38 @@ static void keyboard_process_byte(uint16_t scancode){
         }
     }
 
+#ifdef ENABLE_LUA
+    /* Non-blocking LuaDE owns VT 0's keys like the desktop does: they go
+     * to the script's event queue, not to the hidden Zeus line on VT 0.
+     * Ctrl+F1..F4 and Ctrl+Q still switch consoles. */
+    {
+        extern bool luade_owns_input(void);
+        extern void luade_keyboard_event(char key, int scancode, bool pressed);
+        if (luade_owns_input()) {
+            bool vt_chord = left_ctrl_pressed &&
+                            ((code >= 0x3B && code <= 0x3E) || code == 0x10 /*q*/);
+            bool modifier = code == 0x1D || code == 0x2A || code == 0x36 ||
+                            code == 0x38 || code == 0x3A;
+            if (!vt_chord && !modifier) {
+                char ch = (code == 0x01) ? 27 : ps2_translate2ascii(code, shift_pressed, capsLock);
+                if (ch == '\n') ch = 13;
+                luade_keyboard_event(ch, ext ? (code | 0x80) : code, !is_release);
+                if (!is_release) goto end;
+            }
+        }
+    }
+#endif
+    /* Same for the native desktop: while it owns VT 0, presses reach it
+     * through the SDL queue above only. Feeding them to the hidden Zeus
+     * line on VT 0 as well made Zeus run half-typed commands (and block
+     * the main loop in a sync program) while typing into a window. */
+    if (!is_release && desktop_is_running() && vconsole_get_active() == 0) {
+        bool vt_chord = left_ctrl_pressed &&
+                        ((code >= 0x3B && code <= 0x3E) || code == 0x10 /*q*/);
+        bool modifier = code == 0x1D || code == 0x2A || code == 0x36 ||
+                        code == 0x38 || code == 0x3A;
+        if (!vt_chord && !modifier) goto end;
+    }
     if (is_release) {
         switch(code) {
             case 0x1D: left_ctrl_pressed = false; break;
@@ -431,6 +466,31 @@ static void keyboard_process_byte(uint16_t scancode){
         case 0x36: shift_pressed = true; goto end;
         case 0x38: left_alt_pressed = true; goto end;
         case 0x3A: capsLock = !capsLock; goto end;
+    }
+    /* Raw-mode (termios ~ICANON) Linux programs such as busybox vi/less
+     * read keys from kbd_buf: deliver Esc, arrows and the nav block as the
+     * VT100 sequences they expect instead of the Zeus-only key flags. */
+    if (vc && (vc->raw_mode || vc->lx_noncanon)) {
+        const char *seq = NULL;
+        switch (code) {
+            case 0x01: seq = "\x1b"; break;
+            case 0x48: seq = "\x1b[A"; break;
+            case 0x50: seq = "\x1b[B"; break;
+            case 0x4D: seq = "\x1b[C"; break;
+            case 0x4B: seq = "\x1b[D"; break;
+            case 0x47: seq = "\x1b[H"; break;
+            case 0x4F: seq = "\x1b[F"; break;
+            case 0x49: seq = "\x1b[5~"; break;
+            case 0x51: seq = "\x1b[6~"; break;
+            case 0x53: seq = "\x1b[3~"; break;
+        }
+        if (seq) {
+            for (; *seq && vc->kbd_len < sizeof(vc->kbd_buf) - 1; seq++)
+                vc->kbd_buf[vc->kbd_len++] = *seq;
+            vc->kbd_buf[vc->kbd_len] = '\0';
+            vc->kbd_cursor = vc->kbd_len;
+            goto end;
+        }
     }
     if (code == 0x01) { escape_pressed = true; goto end; }
     if (code == 0x48) { arrow_up_pressed = true; goto end; }
@@ -653,6 +713,41 @@ void keyboard_clear_buffer(void) {
     irq_restore(irq_flags);
 }
 
+/* Take the first complete line (through '\n') out of the active VC buffer.
+ * Type-ahead after it stays buffered (and stays executable if it holds
+ * another '\n'), so keys typed while a program ran are not lost. */
+uint32_t keyboard_take_line(char *out, uint32_t outsz) {
+    vconsole_t *vc = vconsole_get_by_id(vconsole_get_active());
+    uint64_t irq_flags = irq_save();
+    spinlock_lock(&keyboard_lock);
+    uint32_t n = 0;
+    while (n < vc->kbd_len && vc->kbd_buf[n] != '\n') n++;
+    if (n >= vc->kbd_len) {
+        /* Stale execute flag: a stdin reader (e.g. an exiting ash) took
+         * the '\n' via keyboard_consume_char(). Keep the partial line. */
+        vc->kbd_execute = false;
+        spinlock_unlock(&keyboard_lock);
+        irq_restore(irq_flags);
+        return 0;
+    }
+    uint32_t take = n + 1;
+    uint32_t c = take < outsz - 1 ? take : outsz - 1;
+    memcpy(out, vc->kbd_buf, c);
+    out[c] = '\0';
+    memmove(vc->kbd_buf, vc->kbd_buf + take, vc->kbd_len - take);
+    vc->kbd_len -= take;
+    vc->kbd_buf[vc->kbd_len] = '\0';
+    vc->kbd_cursor = vc->kbd_len;
+    vc->kbd_dirty = false;
+    bool more = false;
+    for (uint32_t i = 0; i < vc->kbd_len; i++)
+        if (vc->kbd_buf[i] == '\n') { more = true; break; }
+    vc->kbd_execute = more;
+    spinlock_unlock(&keyboard_lock);
+    irq_restore(irq_flags);
+    return c;
+}
+
 int keyboard_consume_char(void) {
     int vc_id = vconsole_get_thread_console();
     vconsole_t *vc = vconsole_get_by_id(vc_id);
@@ -666,11 +761,15 @@ int keyboard_consume_char(void) {
     }
 
     char ch = vc->kbd_buf[0];
+    if (ch == '\n')
+        vc->kbd_execute = false;   /* reader took the line */
     if (vc->kbd_len > 1) {
         memmove(vc->kbd_buf, vc->kbd_buf + 1, vc->kbd_len - 1);
     }
     vc->kbd_len--;
     vc->kbd_buf[vc->kbd_len] = '\0';
+    if (vc->kbd_cursor > 0)
+        vc->kbd_cursor--;
 
     spinlock_unlock(&keyboard_lock);
     irq_restore(irq_flags);
@@ -869,10 +968,29 @@ void keyboard_clear_vconsole_switch(void) {
     vconsole_switch_requested = false;
 }
 
+void keyboard_set_linux_noncanon(bool enable) {
+    vconsole_t *vc = vconsole_get_by_id(vconsole_get_thread_console());
+    if (vc) vc->lx_noncanon = enable;
+}
+
 void keyboard_set_raw_mode(bool enable) {
     vconsole_t *vc = vconsole_get_by_id(vconsole_get_thread_console());
+    if (!enable && vc->raw_mode) {
+        /* Leaving raw: discard only what the program buffered in raw mode.
+         * Keys typed after this (still before restore) are cooked type-ahead. */
+        memset(vc->kbd_buf, 0, sizeof(vc->kbd_buf));
+        vc->kbd_len     = 0;
+        vc->kbd_cursor  = 0;
+        vc->kbd_dirty   = false;
+        vc->kbd_execute = false;
+        echo_tail    = echo_head;
+        echo_pending = false;
+        kbd_raw_used = false;
+    }
     vc->raw_mode = enable;
+    if (!enable) vc->lx_noncanon = false;
     if (enable) {
+        kbd_raw_used = true;
         arrow_up_pressed = false;
         arrow_down_pressed = false;
         arrow_left_pressed = false;
@@ -929,19 +1047,40 @@ void keyboard_restore_shell_input(void) {
     vconsole_t *vc = vconsole_get_by_id(vconsole_get_active());
     uint64_t irq_flags = irq_save();
     spinlock_lock(&keyboard_lock);
-    vc->raw_mode         = false;
     vc->terminate_flag   = false;
     vc->force_kill_flag  = false;
     vc->program_running  = false;
-    memset(vc->kbd_buf, 0, sizeof(vc->kbd_buf));
-    vc->kbd_len     = 0;
-    vc->kbd_cursor  = 0;
-    vc->kbd_dirty   = false;
-    vc->kbd_execute = false;
-    /* Drop echo queued while the program owned the console (a Linux
-     * program in cooked VC mode); Zeus would replay it all on return. */
+    /* Always drop echo queued while the program owned the console. Ash
+     * (cooked VC) consumes keys into its own line editor but leaves our
+     * echo queue full; replaying it after the Zeus prompt made the screen
+     * show ash keystrokes while Zeus's buffer did not match. */
     echo_tail    = echo_head;
     echo_pending = false;
+    if (vc->raw_mode || kbd_raw_used) {
+        /* Still raw-owned: leftovers are raw scancodes/bytes, not a Zeus line. */
+        memset(vc->kbd_buf, 0, sizeof(vc->kbd_buf));
+        vc->kbd_len     = 0;
+        vc->kbd_execute = false;
+    } else {
+        /* Cooked type-ahead the program did not read - keep for Zeus. */
+        vc->kbd_buf[vc->kbd_len] = '\0';
+        bool has_nl = false;
+        for (uint32_t i = 0; i < vc->kbd_len; i++)
+            if (vc->kbd_buf[i] == '\n') { has_nl = true; break; }
+        vc->kbd_execute = has_nl;
+    }
+    vc->raw_mode    = false;
+    kbd_raw_used    = false;
+    vc->kbd_cursor  = vc->kbd_len;
+    vc->kbd_dirty   = false;
+    /* Line-editing chords pressed while the program ran must not apply
+     * to the next Zeus line (stale Home/Ctrl-U moved or cut its start). */
+    arrow_up_pressed = arrow_down_pressed = false;
+    arrow_left_pressed = arrow_right_pressed = false;
+    home_pressed = end_pressed = false;
+    kill_line_pressed = kill_word_pressed = false;
+    tab_requested = false;
+    escape_pressed = false;
     spinlock_unlock(&keyboard_lock);
     irq_restore(irq_flags);
 }

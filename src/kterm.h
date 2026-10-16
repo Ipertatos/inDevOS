@@ -12,5 +12,7 @@ void kterm_on_key(int32_t keycode, bool pressed);
 void kterm_on_mouse(int rx, int ry, bool down);
 void kterm_on_window_destroyed(desktop_window_t *win);
 bool kterm_tick(void);
+/** Drain the window shell's output pipe (call from the main loop). */
+bool kterm_pump(void);
 
 #endif

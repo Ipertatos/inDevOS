@@ -468,7 +468,9 @@ static int fd_close_entry(process_t *proc, int fd) {
     fde->ref_count = NULL;
 
     if (should_free_object && ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) {
-        if (ty == FD_TYPE_SOCKET) {
+        if (ty == 8 /* FD_TYPE_EVENTFD */) {
+            if (fde->file_handle) kfree(fde->file_handle);
+        } else if (ty == FD_TYPE_SOCKET) {
             kernel_socket_t *sock = (kernel_socket_t *)fde->file_handle;
             if (sock) {
                 kernel_socket_destroy(sock);
@@ -2323,6 +2325,12 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
         (void)copy_to_user((void *)child_tidptr, &tid, sizeof(tid));
     }
 
+    /* Threads (pthread_create: CLONE_VM | CLONE_THREAD, no CLONE_VFORK) must
+     * start now: the hold-until-wait policy for fork children would leave a
+     * new thread BLOCKED forever (curl's threaded resolver never ran). */
+    if (share_vm && !do_vfork && (flags & 0x00010000ULL /* CLONE_THREAD */))
+        fork_release_pending(parent);
+
     if (do_vfork) {
         /* Child was queued BLOCKED with defer; must run while we wait
          * in-kernel -- release now or this loops forever. */
@@ -2330,6 +2338,15 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
         child->fork_parent = parent;
         while (child->fork_parent == parent) {
             if (child->is_zombie) {
+                child->fork_parent = NULL;
+                break;
+            }
+            /* Linux waits TASK_KILLABLE here: a fatal signal (Ctrl-C with
+             * default action, remote kill) ends the wait and the parent dies
+             * at the syscall-return safe point. Handled signals stay pending
+             * until the child execs or exits, as on Linux. */
+            if (proc_kill_pending(parent)) {
+                serial_printf("vfork: parent %u wait interrupted by signal\n", parent->pid);
                 child->fork_parent = NULL;
                 break;
             }
@@ -3154,7 +3171,10 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
         return -EFAULT;
 
     process_t *proc = get_current_process();
-    while (!ktime_expired(deadline)) {
+    /* Always evaluate readiness at least once. timeout==0 must not skip the
+     * check (ktime_deadline_ms(0)==now makes while(!expired) never enter). */
+    for (;;) {
+        poll_network_once();  /* advance TCP handshakes before checking readiness */
         int cnt = 0;
         for (unsigned i = 0; i < nfds; i++) {
             kfds[i].revents = 0;
@@ -3164,57 +3184,80 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
             if ((kfds[i].events & POLLIN) && fd == STDIN_FILENO &&
                 keyboard_get_buffer_length() > 0) {
                 kfds[i].revents |= POLLIN;
-                cnt++;
             } else if ((kfds[i].events & POLLIN) && fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
                        proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_PIPE_READ) {
-                if (pipe_available((pipe_t *)proc->fds[fd].file_handle) > 0) {
+                if (pipe_available((pipe_t *)proc->fds[fd].file_handle) > 0)
                     kfds[i].revents |= POLLIN;
-                    cnt++;
-                }
             } else if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
                        proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_SOCKET) {
                 kernel_socket_t *ks = (kernel_socket_t *)proc->fds[fd].file_handle;
                 if (ks && ks->type == SOCK_DGRAM) {
                     udp_pcb_t *pcb = (udp_pcb_t *)ks->transport;
-                    if ((kfds[i].events & POLLIN) && pcb && udp_pcb_rx_ready(pcb) > 0) {
+                    if ((kfds[i].events & POLLIN) && pcb && udp_pcb_rx_ready(pcb) > 0)
                         kfds[i].revents |= POLLIN;
-                        cnt++;
-                    }
-                    if (kfds[i].events & POLLOUT) {
+                    if (kfds[i].events & (POLLOUT | 0x0100)) {
                         kfds[i].revents |= POLLOUT;
-                        cnt++;
+                        if (kfds[i].events & 0x0100) kfds[i].revents |= 0x0100;
                     }
                 } else {
                     tcp_socket_t *ts = ks ? (tcp_socket_t *)ks->transport : NULL;
                     tcp_connection_t *conn = ts ? ts->connection : NULL;
+                    extern bool tcp_conn_at_eof(tcp_connection_t *c);
                     if ((kfds[i].events & POLLIN) && conn && conn->recv_buffer_used > 0) {
                         kfds[i].revents |= POLLIN;
-                        cnt++;
+                    } else if (conn && ks->connected && tcp_conn_at_eof(conn)) {
+                        /* peer closed: readable (read returns 0) and hung up */
+                        kfds[i].revents |= POLLIN | POLLHUP;
                     }
-                    if ((kfds[i].events & POLLOUT) && conn &&
-                        conn->state == TCP_STATE_ESTABLISHED) {
-                        kfds[i].revents |= POLLOUT;
-                        cnt++;
+                    if (kfds[i].events & (POLLOUT | 0x0100 /* POLLWRNORM */)) {
+                        if (conn && conn->state == TCP_STATE_ESTABLISHED) {
+                            kfds[i].revents |= POLLOUT;
+                            if (kfds[i].events & 0x0100) kfds[i].revents |= 0x0100;
+                            ks->connected = true;
+                        } else if (ts && (!conn || conn->state == TCP_STATE_CLOSED)) {
+                            /* connect finished with failure (RST/refuse): wake like Linux */
+                            kfds[i].revents |= POLLOUT | POLLERR | POLLHUP;
+                        }
                     }
                 }
             }
-            if ((kfds[i].events & POLLOUT) && fd >= 1 && fd <= 2) {
-                kfds[i].revents |= POLLOUT;
-                cnt++;
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 8 /* FD_TYPE_EVENTFD */) {
+                uint64_t v = *(volatile uint64_t *)proc->fds[fd].file_handle;
+                if ((kfds[i].events & POLLIN) && v) kfds[i].revents |= POLLIN;
+                if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
             }
+            if ((kfds[i].events & POLLOUT) && fd >= 1 && fd <= 2)
+                kfds[i].revents |= POLLOUT;
+            /* POSIX: return value is the number of fds with nonzero revents */
+            if (kfds[i].revents)
+                cnt++;
+        }
+        extern int lx_strace;
+        if (lx_strace && (cnt > 0 || nfds <= 2)) {
+            for (unsigned j = 0; j < nfds; j++)
+                serial_printf("lxt:  poll fd %d type %d ev %x rev %x c=%d\n", kfds[j].fd,
+                              (kfds[j].fd >= 0 && kfds[j].fd < MAX_OPEN_FILES_SYSCALL &&
+                               proc->fds[kfds[j].fd].in_use) ? proc->fds[kfds[j].fd].fd_type : -1,
+                              kfds[j].events, kfds[j].revents, cnt);
         }
         if (cnt > 0) {
             if (copy_to_user(fds, kfds, nfds * sizeof(pollfd_t)) != 0)
                 return -EFAULT;
             return cnt;
         }
-        poll_network_once();
+        if (timeout_ms == 0)
+            break;  /* one-shot: report no ready fds */
+        if (timeout_ms > 0 && ktime_expired(deadline))
+            break;
         if (proc_kill_pending(get_current_process()))
             return -EINTR;
         if (global_scheduler.scheduler_running)
             thread_sleep(1);
         else
             __asm__ volatile("hlt");
+        if (timeout_ms > 0 && ktime_expired(deadline))
+            break;
     }
     if (copy_to_user(fds, kfds, nfds * sizeof(pollfd_t)) != 0)
         return -EFAULT;
@@ -4127,4 +4170,64 @@ int sys_ioctl(int fd, unsigned long request, void *arg) {
         default:
             return -ENOTTY;  // Unsupported ioctl
     }
+}
+
+/* ---- Kernel-side stdio plumbing for the desktop terminal window ----
+ * The desktop terminal spawns a shell whose stdin/stdout/stderr are pipes
+ * held by the kernel (a pty-like pair without a line discipline). */
+int process_install_pipe_fd(process_t *p, int fd, pipe_t *pp, bool write_end) {
+    if (!p || !pp || fd < 0 || fd > 2)
+        return -EINVAL;
+    file_descriptor_t *f = &p->fds[fd];
+    if (f->in_use && !(f->fd_type == FD_TYPE_FILE && f->file_handle == NULL))
+        fd_close_entry(p, fd);
+    memset(f, 0, sizeof(*f));
+    f->ref_count = fd_refcount_create();
+    if (!f->ref_count)
+        return -ENOMEM;
+    f->in_use = true;
+    f->fd_type = write_end ? FD_TYPE_PIPE_WRITE : FD_TYPE_PIPE_READ;
+    f->file_handle = pp;
+    f->vfs_fd = -1;
+    return 0;
+}
+
+static bool process_is_descendant(process_t *p, uint32_t root_pid) {
+    int depth = 0;
+    for (process_t *q = p->parent; q && depth < MAX_PROCESSES; q = q->parent, depth++)
+        if (q->pid == root_pid)
+            return true;
+    return false;
+}
+
+/* Post @sig to every running descendant of @root_pid (and to the root
+ * itself when @include_root). SIGKILL uses the safe deferred-kill path. */
+int process_signal_tree(uint32_t root_pid, int sig, bool include_root) {
+    int n = 0;
+    if (root_pid == 0 || sig < 1 || sig >= NSIG)
+        return 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *t = &processes[i];
+        if (!t->is_running || t->is_zombie || t->pid == 0)
+            continue;
+        bool hit = (t->pid == root_pid) ? include_root
+                                        : process_is_descendant(t, root_pid);
+        if (!hit)
+            continue;
+        if (sig == SIGKILL)
+            process_request_kill(t, sig);
+        else
+            process_post_signal(t, sig);
+        n++;
+    }
+    return n;
+}
+
+bool process_pid_alive(uint32_t pid) {
+    if (pid == 0) return false;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (processes[i].pid == pid && processes[i].is_running &&
+            !processes[i].is_zombie)
+            return true;
+    return false;
 }

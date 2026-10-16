@@ -101,14 +101,27 @@ static void parse_config(usb_dev_t *d, const uint8_t *cfg, uint32_t len) {
         if (bl < 2 || o + bl > len) break;
         if (ty == 4 && bl >= 9) {
             cur = NULL;
-            if (cfg[o + 3] == 0 && d->n_iface < 8) {     /* alternate setting 0 only */
+            if (cfg[o + 3] == 0 && d->n_iface < 8) {     /* alternate setting 0 */
                 cur = &d->iface[d->n_iface++];
                 memset(cur, 0, sizeof(*cur));
                 cur->number = cfg[o + 2];
                 cur->cls = cfg[o + 5];
                 cur->sub = cfg[o + 6];
                 cur->proto = cfg[o + 7];
+            } else if (cfg[o + 3] != 0) {
+                /* A later alternate setting: used when alt 0 has no endpoints
+                 * (CDC-ECM/NCM data interfaces put their bulk pipes in alt 1). */
+                for (int k = 0; k < d->n_iface; k++) {
+                    usb_iface_info_t *f = &d->iface[k];
+                    if (f->number == cfg[o + 2] && f->n_ep == 0 && f->alt == 0) {
+                        f->alt = cfg[o + 3];
+                        cur = f;
+                        break;
+                    }
+                }
             }
+        } else if (ty == 0x24 && bl >= 13 && cfg[o + 2] == 0x0F && cur) {
+            cur->cdc_mac = cfg[o + 3];                   /* CDC Ethernet Networking */
         } else if (ty == 5 && bl >= 7 && cur && cur->n_ep < 4) {
             usb_ep_info_t *e = &cur->ep[cur->n_ep++];
             e->addr = cfg[o + 2];
@@ -135,6 +148,33 @@ static usb_dev_t *dev_alloc(void) {
 }
 
 static void hub_attach(usb_dev_t *d, usb_iface_info_t *ifc);
+
+/* Read configuration descriptor <index> (up to 1024 bytes) into buf. */
+static int read_config(usb_dev_t *d, uint8_t index, uint8_t *buf) {
+    if (usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, (uint16_t)(0x0200 | index), 0, 9, buf) < 9)
+        return -1;
+    uint16_t total = (uint16_t)(buf[2] | (buf[3] << 8));
+    if (total > 1024) total = 1024;
+    if (total < 9) return -1;
+    return usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, (uint16_t)(0x0200 | index), 0, total, buf);
+}
+
+/* How well we can drive the parsed configuration (0 = nothing we support). */
+static int config_score(usb_dev_t *d) {
+    int best = 0;
+    for (int i = 0; i < d->n_iface; i++) {
+        usb_iface_info_t *f = &d->iface[i];
+        int s = 0;
+        if (f->cls == 9 || f->cls == 3 || f->cls == 8) s = 10;
+        else {
+            int k = usb_net_kind(f);
+            extern int usb_net_prefer_rndis;
+            s = k == 1 ? 5 : k == 3 ? (usb_net_prefer_rndis ? 6 : 4) : k == 2 ? 3 : 0;  /* ECM > RNDIS > NCM */
+        }
+        if (s > best) best = s;
+    }
+    return best;
+}
 static void usb_detach(usb_dev_t *d);
 static void port_path(usb_dev_t *d, char *out, uint32_t sz);
 
@@ -185,17 +225,33 @@ static usb_dev_t *usb_attach(xhci_ctrl_t *hc, usb_dev_t *parent, uint8_t port, u
         serial_printf("usb: EP0 max packet update failed\n");
     if (usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0100, 0, 18, &d->desc) < 18)
         ENUM_FAIL("device descriptor (18 bytes)", d->slot->ep[1].cc);
-    uint8_t cfg9[9];
-    if (usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0200, 0, 9, cfg9) < 9)
-        ENUM_FAIL("config descriptor", d->slot->ep[1].cc);
-    uint16_t total = (uint16_t)(cfg9[2] | (cfg9[3] << 8));
-    if (total > 1024) total = 1024;
     uint8_t *cfg = (uint8_t *)kalloc(1024);
     if (!cfg) goto fail;
-    int got = usb_ctrl(d, 0x80, USB_REQ_GET_DESCRIPTOR, 0x0200, 0, total, cfg);
-    if (got < 9) { kfree(cfg); ENUM_FAIL("full config descriptor", d->slot->ep[1].cc); }
+    int got = read_config(d, 0, cfg);
+    if (got < 9) { kfree(cfg); ENUM_FAIL("config descriptor", d->slot->ep[1].cc); }
     d->config_value = cfg[5];
     parse_config(d, cfg, (uint32_t)got);
+    if (d->desc.bNumConfigurations > 1) {
+        /* Multi-config devices (Realtek RTL8152/8153, phones, ...): pick the
+         * configuration with the best supported function, e.g. the CDC-ECM
+         * one instead of a vendor-specific default. */
+        int best = config_score(d), best_i = 0;
+        int ncfg = d->desc.bNumConfigurations > 4 ? 4 : d->desc.bNumConfigurations;
+        for (int ci = 1; ci < ncfg; ci++) {
+            int g = read_config(d, (uint8_t)ci, cfg);
+            if (g < 9) continue;
+            parse_config(d, cfg, (uint32_t)g);
+            int sc = config_score(d);
+            if (sc > best) { best = sc; best_i = ci; }
+        }
+        got = read_config(d, (uint8_t)best_i, cfg);
+        if (got < 9) { kfree(cfg); ENUM_FAIL("config descriptor", d->slot->ep[1].cc); }
+        d->config_value = cfg[5];
+        parse_config(d, cfg, (uint32_t)got);
+        if (best_i)
+            printf("usb: dev %u: using configuration %u of %u\n", (unsigned)d->id,
+                   d->config_value, d->desc.bNumConfigurations);
+    }
     kfree(cfg);
     get_string(d, d->desc.iManufacturer, d->manufacturer, sizeof(d->manufacturer));
     get_string(d, d->desc.iProduct, d->product, sizeof(d->product));
@@ -233,6 +289,13 @@ static usb_dev_t *usb_attach(xhci_ctrl_t *hc, usb_dev_t *parent, uint8_t port, u
                 d->bound[d->n_bound].data = data;
                 d->n_bound++;
             }
+        } else if (usb_net_kind(ifc)) {
+            if (usb_net_attach(d, ifc, &data) == 0) {
+                d->bound[d->n_bound].drv = USB_DRV_NET;
+                d->bound[d->n_bound].iface = ifc->number;
+                d->bound[d->n_bound].data = data;
+                d->n_bound++;
+            }
         } else if (ifc->cls == 8) {
             printf("usb dev %u: mass storage subclass %u protocol 0x%x not supported (BOT/SCSI only)\n",
                    (unsigned)d->id, ifc->sub, ifc->proto);
@@ -258,6 +321,7 @@ static void usb_detach(usb_dev_t *d) {
     }
     for (int i = 0; i < d->n_bound; i++) {
         if (d->bound[i].drv == USB_DRV_MSC) usb_msc_detach(d->bound[i].data);
+        else if (d->bound[i].drv == USB_DRV_NET) usb_net_detach(d->bound[i].data);
         else if (d->bound[i].drv == USB_DRV_KBD || d->bound[i].drv == USB_DRV_MOUSE)
             usb_hid_detach(d->bound[i].data);
     }
@@ -516,6 +580,8 @@ void usb_poll(void) {
         for (int b = 0; b < d->n_bound; b++) {
             if (d->bound[b].drv == USB_DRV_KBD || d->bound[b].drv == USB_DRV_MOUSE)
                 usb_hid_poll(d->bound[b].data);
+            else if (d->bound[b].drv == USB_DRV_NET)
+                usb_net_poll(d->bound[b].data);
         }
     }
     usb_unlock();
@@ -537,6 +603,7 @@ static const char *drv_name(int drv) {
     case USB_DRV_KBD: return "keyboard";
     case USB_DRV_MOUSE: return "mouse";
     case USB_DRV_MSC: return "storage";
+    case USB_DRV_NET: return "ethernet";
     default: return "-";
     }
 }
@@ -572,6 +639,7 @@ void usb_list_devices(bool verbose) {
                 usb_iface_info_t *f = &d->iface[k];
                 printf("    if %u: class %02x/%02x/%02x %s", f->number, f->cls, f->sub,
                        f->proto, class_name(f->cls));
+                if (f->alt) printf(" alt %u", f->alt);
                 for (int e = 0; e < f->n_ep; e++)
                     printf(" ep%02x(%s,%u)", f->ep[e].addr,
                            f->ep[e].attr == 2 ? "bulk" : f->ep[e].attr == 3 ? "int" : "iso",

@@ -787,6 +787,7 @@ int storage_find_boot_device(void) {
     int optical_sig = -1;
     int disk_sig = -1;
     int disk_fat = -1;
+    int disk_gpt = -1;
     uint32_t want;
     int chosen;
     const char *why;
@@ -805,6 +806,7 @@ int storage_find_boot_device(void) {
         uint32_t sig = 0;
         int fat = 0;
         int part;
+        int gpt_match = 0;
         if (!dev->is_initialized || dev->pci_dev == NULL)
             continue;
         got = storage_read_sectors(dev->device_id, 0, 1, sec) == 0 &&
@@ -822,8 +824,22 @@ int storage_find_boot_device(void) {
                                ((uint32_t)sec[446 + part * 16 + 11] << 24);
                 if ((typ == 0x0B || typ == 0x0C) && lba)
                     fat = 1;
+                /* GPT disk (UEFI install): protective MBR + ESP/basic FAT32.
+                 * Limine reports the GPT disk GUID instead of an MBR id. */
+                if (typ == 0xEE && part == 0) {
+                    uint8_t hdr[512];
+                    if (storage_gpt_find_fat32(dev->device_id, hdr) != 0)
+                        fat = 1;
+                    if (file && storage_read_sectors(dev->device_id, 1, 1, hdr) == 0 &&
+                        memcmp(hdr, "EFI PART", 8) == 0 &&
+                        memcmp(hdr + 56, &file->gpt_disk_uuid, 16) == 0) {
+                        gpt_match = 1;
+                    }
+                }
             }
         }
+        if (gpt_match && !dev->optical && disk_gpt < 0)
+            disk_gpt = dev->device_id;
         if (dev->optical) {
             if (optical < 0)
                 optical = dev->device_id;
@@ -854,6 +870,9 @@ int storage_find_boot_device(void) {
         } else {
             why = "Limine optical boot, but no ATAPI DVD was found";
         }
+    } else if (disk_gpt >= 0) {
+        chosen = disk_gpt;
+        why = "Limine GPT disk GUID";
     } else if (want && disk_sig >= 0) {
         chosen = disk_sig;
         why = "Limine MBR disk id";

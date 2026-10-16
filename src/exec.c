@@ -1,4 +1,5 @@
 #include "exec.h"
+#include "pipe.h"
 #include "fat32.h"
 #include "vfs.h"
 #include "mem.h"
@@ -533,7 +534,22 @@ int exec_file(const char *filename, char *const argv[]) {
         return exec_run_custom(buffer, fsize, filename);
     }
 
-    /* Fall back to raw binary execution */
+    /* Raw flat binaries run in ring 0 with no checks, so only accept them
+     * when explicitly named *.bin.  Anything else (C source, text, data)
+     * would be jumped into and fault the kernel (seen as a GPF/#PF when a
+     * mistyped command such as `big.c` resolved to a source file). */
+    {
+        size_t fl = strlen(filename);
+        bool is_bin = fl > 4 && filename[fl - 4] == '.' &&
+                      (filename[fl - 3] | 0x20) == 'b' &&
+                      (filename[fl - 2] | 0x20) == 'i' &&
+                      (filename[fl - 1] | 0x20) == 'n';
+        if (!is_bin) {
+            printf("exec: '%s' is not an executable (not ELF)\n", filename);
+            kfree(buffer);
+            return -1;
+        }
+    }
     return exec_run_raw(buffer, fsize, filename);
 }
 
@@ -1605,8 +1621,22 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
     return 0;
 }
 
+/* Optional stdio pipes for the next exec_spawn() (desktop terminal). Set
+ * with exec_spawn_set_stdio_pipes() right before exec_spawn(); consumed
+ * (and cleared) by it whether or not the spawn succeeds. */
+static pipe_t *exec_spawn_in_pipe;
+static pipe_t *exec_spawn_out_pipe;
+
+void exec_spawn_set_stdio_pipes(pipe_t *in, pipe_t *out) {
+    exec_spawn_in_pipe  = in;
+    exec_spawn_out_pipe = out;
+}
+
 int exec_spawn(const char *filename, char *const argv[]) {
     exec_current_argv = argv;
+    pipe_t *spawn_in  = exec_spawn_in_pipe;
+    pipe_t *spawn_out = exec_spawn_out_pipe;
+    exec_spawn_in_pipe = exec_spawn_out_pipe = NULL;
     exec_dbg_reset();
     exec_dbg_mark(filename);
 
@@ -1795,6 +1825,22 @@ int exec_spawn(const char *filename, char *const argv[]) {
     if (proc->parent) {
         proc->sibling       = proc->parent->child;
         proc->parent->child = proc;
+    }
+
+    if (spawn_in || spawn_out) {
+        /* Desktop terminal: the child takes over the pipes' initial
+         * reader (stdin) and writer (stdout) credits; stderr shares the
+         * stdout pipe with its own writer credit. No controlling VT, so
+         * keyboard Ctrl+C on a VT never reaches it. */
+        extern int process_install_pipe_fd(process_t *p, int fd, pipe_t *pp, bool write_end);
+        if (spawn_in)
+            process_install_pipe_fd(proc, 0, spawn_in, false);
+        if (spawn_out) {
+            process_install_pipe_fd(proc, 1, spawn_out, true);
+            pipe_fork_dup_writer(spawn_out);
+            process_install_pipe_fd(proc, 2, spawn_out, true);
+        }
+        proc->cont_tty = VC_TTY_DETACHED;
     }
 
     exec_load_elf_symbols(image, fsize, proc);

@@ -19,6 +19,20 @@
 static lua_State *luade_L = NULL;
 static bool luade_running = false;
 
+/* Non-blocking mode: the desktop script runs as a coroutine that the kernel
+ * main loop resumes (luade_tick) only while VT 0 is on screen, exactly like
+ * the native compositor. luade.sleep() and a time-slice hook yield back, so
+ * text VTs keep working and the Zeus prompt returns at once. */
+static lua_State *luade_co = NULL;
+static int luade_co_ref = LUA_NOREF;
+static volatile bool luade_active = false;
+static volatile bool luade_vt_returned = false;  /* VT 0 came back */
+static bool luade_script_redraw = false;          /* luade.needs_redraw() */
+static bool luade_exit_req = false;
+static uint64_t luade_wake_ms = 0;
+static uint64_t luade_slice_ms = 0;
+#define LUADE_SLICE_MS 20
+
 // Track last executed Lua location for diagnostics
 static int luade_last_line = 0;
 static char luade_last_src[128];
@@ -82,12 +96,23 @@ static void luade_line_hook(lua_State *L, lua_Debug *ar) {
         luade_current_src[n] = '\0';
         ev = 'C';
         // Do not update last_func; keep it blank to avoid confusion
+    } else if (ar->event == LUA_HOOKCOUNT) {
+        goto maybe_yield;
     } else {
         // Ignore other events
         return;
     }
 
     luade_trace_push(ev, src, line, "");
+    return;
+maybe_yield:
+    /* Time-slice: a script that never sleeps must not freeze the kernel
+     * main loop. Hooks may yield (nresults 0) on line/count events. */
+    if (luade_active && L == luade_co && lua_isyieldable(L) &&
+        hpet_get_ticks() - luade_slice_ms >= LUADE_SLICE_MS) {
+        luade_wake_ms = 0;
+        lua_yield(L, 0);
+    }
 }
 
 /* One-shot reader for lua_load in C */
@@ -118,6 +143,10 @@ static int l_luade_log(lua_State *L) {
 // Lua function: luade.sleep(ms) — HPET-based wait when available
 static int l_luade_sleep(lua_State *L) {
     int ms = luaL_checkinteger(L, 1);
+    if (luade_active && L == luade_co && lua_isyieldable(L)) {
+        luade_wake_ms = hpet_get_ticks() + (uint64_t)(ms > 0 ? ms : 0);
+        return lua_yield(L, 0);
+    }
     if (ms <= 0)
         return 0;
     if (hpet_main_cnt && hpet_get_frequency() > 0) {
@@ -130,10 +159,20 @@ static int l_luade_sleep(lua_State *L) {
 
 // Lua function: luade.exit()
 static int l_luade_exit(lua_State *L) {
-    (void)L;
     luade_running = false;
-    printf("[LuaDE] Desktop environment shutting down\n");
+    serial_puts("[LuaDE] Desktop environment shutting down\n");
+    if (luade_active && L == luade_co && lua_isyieldable(L)) {
+        luade_exit_req = true;
+        return lua_yield(L, 0);
+    }
     return 0;
+}
+
+// Lua function: luade.needs_redraw() -> true once after VT 0 is shown again
+static int l_luade_needs_redraw(lua_State *L) {
+    lua_pushboolean(L, luade_script_redraw);
+    luade_script_redraw = false;
+    return 1;
 }
 
 // Initialize LuaDE system
@@ -170,6 +209,8 @@ bool luade_init(void) {
     lua_setfield(luade_L, -2, "sleep");
     lua_pushcfunction(luade_L, l_luade_exit);
     lua_setfield(luade_L, -2, "exit");
+    lua_pushcfunction(luade_L, l_luade_needs_redraw);
+    lua_setfield(luade_L, -2, "needs_redraw");
     lua_setglobal(luade_L, "luade");
     
     // Override print to use our logging
@@ -187,7 +228,7 @@ bool luade_init(void) {
         luade_trace[i].func[0] = '\0';
     }
     luade_trace_head = 0;
-    lua_sethook(luade_L, luade_line_hook, LUA_MASKLINE | LUA_MASKCALL, 0);
+    lua_sethook(luade_L, luade_line_hook, LUA_MASKLINE | LUA_MASKCALL | LUA_MASKCOUNT, 2000);
     
     luade_running = true;
     DEBUG_PRINT(LUA, "[LuaDE] Initialization complete\n");
@@ -215,8 +256,23 @@ bool luade_run_script(const char *script) {
     return true;
 }
 
+static bool luade_load_file(const char *filename, bool quiet);
+
 // Load and run Lua file from filesystem (unprotected)
 bool luade_run_file(const char *filename) {
+    if (!luade_L) {
+        printf("[LuaDE] Error: Not initialized\n");
+        return false;
+    }
+    if (!luade_load_file(filename, false))
+        return false;
+    // Call without protection; keep interrupts enabled so input IRQs keep flowing
+    lua_call(luade_L, 0, LUA_MULTRET);
+    return true;
+}
+
+/* Load a Lua file and leave the compiled chunk on the luade_L stack. */
+static bool luade_load_file(const char *filename, bool quiet) {
     if (!luade_L) {
         printf("[LuaDE] Error: Not initialized\n");
         return false;
@@ -225,9 +281,9 @@ bool luade_run_file(const char *filename) {
     // Memory allocator is now interrupt-safe, no need to disable interrupts
     
     // Try to open the file
-    fat32_file_t *file = fat32_open(filename, "r");
+    fat32_file_t *file = fat32_is_mounted() ? fat32_open(filename, "r") : NULL;
     if (!file) {
-        printf("[LuaDE] Error: Could not open file '%s'\n", filename);
+        if (!quiet) printf("[LuaDE] Error: Could not open file '%s'\n", filename);
         // No longer need interrupt management
         return false;
     }
@@ -276,11 +332,39 @@ bool luade_run_file(const char *filename) {
         lua_pop(luade_L, 1);
         return false;
     }
-
-    // Call without protection; keep interrupts enabled so input IRQs keep flowing
-    lua_call(luade_L, 0, LUA_MULTRET);
     return true;
 }
+
+/* Built-in desktop used when no sdeskt.lua / safe_desktop.lua / desktop.lua
+ * is on disk. Esc quits. Repaints everything when VT 0 comes back. */
+static const char *const luade_fallback_desktop =
+            "local width, height = gfx.get_screen_size()\n"
+            "local running = true\n"
+            "local frame_count = 0\n"
+            "local function paint()\n"
+            "    gfx.clear_screen(gfx.rgb(20, 50, 100))\n"
+            "    gfx.fill_rect(10, 10, 200, 50, gfx.WHITE)\n"
+            "    gfx.fill_rect(12, 12, 196, 46, gfx.rgb(50, 50, 50))\n"
+            "    gfx.draw_text(20, 28, 'LuaDE  (Esc quits)', gfx.WHITE)\n"
+            "end\n"
+            "paint()\n"
+            "while running do\n"
+            "    if luade.needs_redraw() then paint() end\n"
+            "    local event = input.poll_event()\n"
+            "    while event do\n"
+            "        if event.type == 'key_press' and event.key == 27 then running = false end\n"
+            "        if event.type == 'key_press' and event.key >= 32 and event.key < 127 then\n"
+            "            gfx.fill_rect(10, 70, 300, 20, gfx.rgb(20, 50, 100))\n"
+            "            gfx.draw_text(12, 72, 'key: ' .. string.char(event.key), gfx.WHITE)\n"
+            "        end\n"
+            "        event = input.poll_event()\n"
+            "    end\n"
+            "    if frame_count % 20 == 0 then\n"
+            "        gfx.fill_rect(220, 20, 100, 20, gfx.rgb(frame_count % 255, 100, 200))\n"
+            "    end\n"
+            "    frame_count = frame_count + 1\n"
+            "    luade.sleep(50)\n"
+            "end\n";
 
 // Main LuaDE event loop
 void luade_main_loop(void) {
@@ -297,25 +381,8 @@ void luade_main_loop(void) {
     } else {
         printf("[LuaDE] Could not load external desktop.lua, using fallback\n");
         
-        // Fallback: minimal desktop environment
-        const char *fallback_desktop = 
-            "local width, height = gfx.get_screen_size()\n"
-            "local running = true\n"
-            "local frame_count = 0\n"
-            "gfx.clear_screen(gfx.rgb(20, 50, 100))\n"
-            "gfx.fill_rect(10, 10, 200, 50, gfx.WHITE)\n"
-            "gfx.fill_rect(12, 12, 196, 46, gfx.rgb(50, 50, 50))\n"
-            "while running do\n"
-            "    local event = input.poll_event()\n"
-            "    if event and event.type == 'key_press' and event.key == 27 then\n"
-            "        running = false\n"
-            "    end\n"
-            "    if frame_count % 60 == 0 then\n"
-            "        gfx.fill_rect(220, 20, 100, 20, gfx.rgb(frame_count % 255, 100, 200))\n"
-            "    end\n"
-            "    frame_count = frame_count + 1\n"
-            "    luade.sleep(50)\n"
-            "end\n";
+        const char *fallback_desktop = luade_fallback_desktop;
+        (void)0;
             
         if (!luade_run_script(fallback_desktop)) {
             printf("[LuaDE] Failed to start fallback desktop\n");
@@ -324,6 +391,117 @@ void luade_main_loop(void) {
     }
     
     printf("[LuaDE] Desktop environment exited normally\n");
+}
+
+
+extern bool luade_has_back_buffer(void);
+extern void luade_swap_buffers(void);
+
+/* ---------------- Non-blocking LuaDE (shares VTs like the desktop) ---------- */
+
+bool luade_is_running(void) { return luade_active; }
+
+/* LuaDE owns display and input only while VT 0 is the active console. */
+bool luade_owns_input(void) {
+    extern bool vconsole_graphics_active(void);
+    return luade_active && vconsole_graphics_active();
+}
+
+void luade_notify_vt_return(void) {
+    if (luade_active) luade_vt_returned = true;
+}
+
+static void luade_stop_now(const char *why) {
+    if (!luade_active && !luade_L) return;
+    luade_active = false;
+    luade_co = NULL;
+    if (luade_L && luade_co_ref != LUA_NOREF)
+        luaL_unref(luade_L, LUA_REGISTRYINDEX, luade_co_ref);
+    luade_co_ref = LUA_NOREF;
+    serial_printf("[LuaDE] stopped (%s)\n", why ? why : "?");
+    luade_shutdown();
+    /* Give VT 0 back to the text console. */
+    extern bool vconsole_graphics_active(void);
+    if (vconsole_graphics_active()) {
+        extern void clear_screen(void);
+        clear_screen();
+    }
+    printf("LuaDE exited (%s).\n", why ? why : "?");
+    extern const char *zeus_get_prompt(void);
+    printf("%s", zeus_get_prompt());
+}
+
+void luade_stop(void) { luade_stop_now("luadestop"); }
+
+/* Start the desktop script as a coroutine and return immediately. */
+bool luade_start(void) {
+    extern bool desktop_is_running(void);
+    if (luade_active) { printf("LuaDE is already running.\n"); return false; }
+    if (desktop_is_running()) {
+        printf("The desktop is running; stop it first (desktopstop).\n");
+        return false;
+    }
+    if (!luade_init()) return false;
+    luade_exit_req = false;
+    luade_script_redraw = false;
+    luade_vt_returned = false;
+
+    const char *names[] = { "sdeskt.lua", "safe_desktop.lua", "desktop.lua", NULL };
+    const char *loaded = NULL;
+    for (int i = 0; names[i]; i++)
+        if (luade_load_file(names[i], true)) { loaded = names[i]; break; }
+    if (!loaded) {
+        LuadeReaderBuf R = { luade_fallback_desktop, strlen(luade_fallback_desktop), 0 };
+        if (lua_load(luade_L, luade_reader_once, &R, "(builtin desktop)", NULL) != LUA_OK) {
+            const char *err = lua_tostring(luade_L, -1);
+            printf("[LuaDE] Load error: %s\n", err ? err : "unknown");
+            luade_shutdown();
+            return false;
+        }
+        loaded = "built-in desktop";
+    }
+    luade_co = lua_newthread(luade_L);              /* stack: chunk, thread */
+    luade_co_ref = luaL_ref(luade_L, LUA_REGISTRYINDEX); /* pops thread */
+    lua_xmove(luade_L, luade_co, 1);                /* chunk -> coroutine */
+    luade_wake_ms = 0;
+    printf("LuaDE started (%s). Ctrl+F2-F4: text TTYs, Ctrl+F1: back. "
+           "Esc or 'luadestop' quits.\n", loaded);
+    serial_printf("[LuaDE] started non-blocking (%s)\n", loaded);
+    luade_active = true;
+    return true;
+}
+
+/* Resume the script for one time slice. Called from the kernel main loop.
+ * Does nothing while a text VT is on screen. */
+bool luade_tick(void) {
+    if (!luade_active) return false;
+    if (luade_exit_req) { luade_stop_now("exit"); return true; }
+    extern bool vconsole_graphics_active(void);
+    if (!vconsole_graphics_active()) return false;
+    uint64_t now = hpet_get_ticks();
+    if (luade_vt_returned) {
+        luade_vt_returned = false;
+        luade_script_redraw = true;
+        luade_wake_ms = 0;                  /* repaint right away */
+        if (luade_has_back_buffer()) luade_swap_buffers();
+    }
+    if (now < luade_wake_ms) return false;
+    luade_slice_ms = now;
+    int nres = 0;
+    int st = lua_resume(luade_co, luade_L, 0, &nres);
+    if (st == LUA_YIELD) {
+        if (nres > 0) lua_pop(luade_co, nres);
+        if (luade_exit_req) luade_stop_now("exit");
+        return true;
+    }
+    if (st == LUA_OK) {
+        luade_stop_now("script finished");
+    } else {
+        const char *err = lua_tostring(luade_co, -1);
+        serial_printf("[LuaDE] runtime error: %s\n", err ? err : "unknown");
+        luade_stop_now(err ? err : "error");
+    }
+    return true;
 }
 
 // Shutdown LuaDE

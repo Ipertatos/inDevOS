@@ -2,7 +2,9 @@
  * install.c - In-OS installer for inDevOS
  *
  * Copies the live FAT root onto a second disk and makes that disk boot
- * by itself (MBR + Limine BIOS + FAT32). The live disk is never formatted.
+ * by itself: MBR + Limine BIOS + FAT32 (default, also carries
+ * EFI/BOOT/BOOTX64.EFI), or "gpt": GPT + EFI System Partition for UEFI.
+ * The live disk is never formatted.
  *
  * The running system is the hybrid install image mounted as /. That root
  * holds /bin (shell utils and one doom.exe), /doom1.wad, and /install
@@ -375,8 +377,148 @@ static int write_limine_mbr(uint8_t device_id) {
     return 0;
 }
 
+/* ---- GPT (UEFI) layout -------------------------------------------------
+ * LBA 0 protective MBR, LBA 1 header, LBA 2..33 128 entries, partition 1
+ * (EFI System, FAT32) from INSTALL_PART_START, backup array and header at
+ * the end of the disk. The ESP is also the root filesystem. */
+#define GPT_ENTRIES      128u
+#define GPT_ENTRY_SIZE   128u
+#define GPT_ARRAY_SECT   ((GPT_ENTRIES * GPT_ENTRY_SIZE) / 512u)   /* 32 */
+
+static const uint8_t install_gpt_esp_type[16] = {
+    0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+    0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
+
+static uint32_t install_crc32(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    int k;
+    for (i = 0; i < n; i++) {
+        c ^= p[i];
+        for (k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static void install_guid(uint8_t g[16], uint64_t seed) {
+    int i;
+    for (i = 0; i < 16; i++) {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        g[i] = (uint8_t)(seed >> 24);
+    }
+    g[7] = (uint8_t)((g[7] & 0x0F) | 0x40);   /* version 4 */
+    g[8] = (uint8_t)((g[8] & 0x3F) | 0x80);   /* RFC 4122 variant */
+}
+
+static void install_gpt_header(uint8_t *h, uint64_t my_lba, uint64_t alt_lba,
+                               uint64_t first, uint64_t last, uint64_t array_lba,
+                               const uint8_t disk_guid[16], uint32_t array_crc) {
+    memset(h, 0, 512);
+    memcpy(h, "EFI PART", 8);
+    *(uint32_t *)(h + 8)  = 0x00010000u;
+    *(uint32_t *)(h + 12) = 92;
+    *(uint64_t *)(h + 24) = my_lba;
+    *(uint64_t *)(h + 32) = alt_lba;
+    *(uint64_t *)(h + 40) = first;
+    *(uint64_t *)(h + 48) = last;
+    memcpy(h + 56, disk_guid, 16);
+    *(uint64_t *)(h + 72) = array_lba;
+    *(uint32_t *)(h + 80) = GPT_ENTRIES;
+    *(uint32_t *)(h + 84) = GPT_ENTRY_SIZE;
+    *(uint32_t *)(h + 88) = array_crc;
+    *(uint32_t *)(h + 16) = install_crc32(h, 92);
+}
+
+static int install_write_gpt(uint8_t device_id, uint32_t *out_start, uint32_t *out_size) {
+    storage_device_t *dev = storage_get_device(device_id);
+    uint64_t total, last_usable, part_end;
+    uint32_t part;
+    uint8_t *buf, *arr, *e;
+    uint8_t disk_guid[16], part_guid[16];
+    uint32_t arr_crc;
+    uint64_t seed;
+    int rc = -1;
+    static const char name[] = "inDevOS";
+    size_t i;
+
+    if (!dev) return -1;
+    total = dev->sector_count;
+    if (total <= INSTALL_PART_START + INSTALL_MIN_PART_SECTORS + 1 + GPT_ARRAY_SECT) {
+        printf("install: device %u is too small\n", device_id);
+        return -1;
+    }
+    last_usable = total - 2 - GPT_ARRAY_SECT;
+    part_end = last_usable;
+    if (part_end - INSTALL_PART_START + 1 > INSTALL_MAX_PART_SECTORS) {
+        part_end = INSTALL_PART_START + INSTALL_MAX_PART_SECTORS - 1;
+        printf("install: disk is larger than the in-memory FAT can mount; using the first %u MiB.\n",
+               (unsigned)(((uint64_t)INSTALL_MAX_PART_SECTORS * 512ull) >> 20));
+    }
+    part = (uint32_t)(part_end - INSTALL_PART_START + 1);
+
+    buf = (uint8_t *)kalloc(512);
+    arr = (uint8_t *)kalloc(GPT_ARRAY_SECT * 512u);
+    if (!buf || !arr) goto out;
+
+    seed = ktime_now_us() ^ (total * 0x9E3779B97F4A7C15ull) ^ 0xD1B54A32D192ED03ull;
+    install_guid(disk_guid, seed);
+    install_guid(part_guid, seed * 31u + 7u);
+
+    memset(arr, 0, GPT_ARRAY_SECT * 512u);
+    e = arr;
+    memcpy(e, install_gpt_esp_type, 16);
+    memcpy(e + 16, part_guid, 16);
+    *(uint64_t *)(e + 32) = INSTALL_PART_START;
+    *(uint64_t *)(e + 40) = part_end;
+    *(uint64_t *)(e + 48) = 0;
+    for (i = 0; name[i]; i++)
+        *(uint16_t *)(e + 56 + i * 2) = (uint16_t)name[i];
+    arr_crc = install_crc32(arr, GPT_ARRAY_SECT * 512u);
+
+    /* Protective MBR */
+    memset(buf, 0, 512);
+    buf[446 + 1] = 0x00; buf[446 + 2] = 0x02; buf[446 + 3] = 0x00;
+    buf[446 + 4] = 0xEE;
+    buf[446 + 5] = 0xFF; buf[446 + 6] = 0xFF; buf[446 + 7] = 0xFF;
+    *(uint32_t *)(buf + 446 + 8) = 1;
+    *(uint32_t *)(buf + 446 + 12) = (total - 1 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)(total - 1);
+    buf[510] = 0x55; buf[511] = 0xAA;
+    if (storage_write_sectors(device_id, 0, 1, buf) != 0) goto out;
+
+    /* Primary array + header */
+    if (storage_write_sectors(device_id, 2, GPT_ARRAY_SECT, arr) != 0) goto out;
+    install_gpt_header(buf, 1, total - 1, 34, last_usable, 2, disk_guid, arr_crc);
+    if (storage_write_sectors(device_id, 1, 1, buf) != 0) goto out;
+
+    /* Backup array + header */
+    if (storage_write_sectors(device_id, (uint32_t)(total - 1 - GPT_ARRAY_SECT),
+                              GPT_ARRAY_SECT, arr) != 0) goto out;
+    install_gpt_header(buf, total - 1, 1, 34, last_usable, total - 1 - GPT_ARRAY_SECT,
+                       disk_guid, arr_crc);
+    if (storage_write_sectors(device_id, (uint32_t)(total - 1), 1, buf) != 0) goto out;
+
+    /* Clear the old FAT boot sector so a stale volume is not picked up. */
+    memset(buf, 0, 512);
+    storage_write_sectors(device_id, INSTALL_PART_START, 1, buf);
+
+    *out_start = INSTALL_PART_START;
+    *out_size = part;
+    printf("install: GPT on device %u: EFI System Partition LBA %u, %u sectors\n",
+           device_id, INSTALL_PART_START, part);
+    rc = 0;
+out:
+    if (rc != 0) printf("install: failed to write the GPT\n");
+    if (buf) kfree(buf);
+    if (arr) kfree(arr);
+    return rc;
+}
+
 static void install_usage(void) {
-    printf("Usage: install [device_id] [yes]\n");
+    printf("Usage: install [device_id] [yes] [mbr|gpt]\n");
+    printf("  mbr (default): MBR + Limine BIOS, plus EFI/BOOT/BOOTX64.EFI so\n");
+    printf("                 UEFI firmware can boot the same disk.\n");
+    printf("  gpt:           GPT + EFI System Partition, UEFI boot only.\n");
     printf("  Copies this live root onto another disk: /bin, Doom, the kernel,\n");
     printf("  and Limine. Rewrites that disk as one bootable FAT32 partition.\n");
     printf("  Asks before wiping unless 'yes' is given. Never formats the live disk.\n");
@@ -389,6 +531,10 @@ void cmd_install(int argc, char **argv) {
     uint8_t target = 0xFF;
     int got_target = 0;
     int assume_yes = 0;
+    int use_gpt = 0;
+    uint32_t gpt_start = 0, gpt_size = 0;
+    void *boot_efi = NULL;
+    uint32_t boot_efi_sz = 0;
     int i;
     install_node_t *nodes = NULL;
     int count = 0;
@@ -408,6 +554,10 @@ void cmd_install(int argc, char **argv) {
         if (kstrcmp(argv[i], "yes") == 0 || kstrcmp(argv[i], "-y") == 0 ||
             kstrcmp(argv[i], "--yes") == 0) {
             assume_yes = 1;
+        } else if (kstrcmp(argv[i], "gpt") == 0 || kstrcmp(argv[i], "uefi") == 0) {
+            use_gpt = 1;
+        } else if (kstrcmp(argv[i], "mbr") == 0 || kstrcmp(argv[i], "bios") == 0) {
+            use_gpt = 0;
         } else if (kstrcmp(argv[i], "help") == 0 || kstrcmp(argv[i], "-h") == 0) {
             install_usage();
             return;
@@ -578,6 +728,13 @@ void cmd_install(int argc, char **argv) {
             boot_cfg = nodes[i].data;
             boot_cfg_sz = nodes[i].size;
         }
+        if (path_eq_ci(nodes[i].path, "/install/BOOTX64.EFI")) {
+            boot_efi = nodes[i].data;
+            boot_efi_sz = nodes[i].size;
+        } else if (path_eq_ci(nodes[i].path, "/EFI/BOOT/BOOTX64.EFI") && !boot_efi) {
+            boot_efi = nodes[i].data;
+            boot_efi_sz = nodes[i].size;
+        }
         if (path_eq_ci(nodes[i].path, "/install/limine-bios.sys")) {
             boot_sys = nodes[i].data;
             boot_sys_sz = nodes[i].size;
@@ -596,6 +753,15 @@ void cmd_install(int argc, char **argv) {
         if (use_tui) tui_progress_finish("Live root is missing files. Nothing was erased.");
         return;
     }
+    if (use_gpt && !boot_efi) {
+        printf("install: gpt needs /install/BOOTX64.EFI in the live root. Nothing was erased.\n");
+        install_free_nodes(nodes, count);
+        if (use_tui) tui_progress_finish("No UEFI loader in the live root. Nothing was erased.");
+        return;
+    }
+    if (!boot_efi)
+        printf("install: no BOOTX64.EFI in the live root; the disk will boot on BIOS only.\n");
+    printf("install: %s layout.\n", use_gpt ? "GPT/UEFI" : "MBR/BIOS (+UEFI)");
     printf("install: %d entries, %u bytes of files. Target device %u.\n",
            count, total_bytes, target);
 
@@ -608,7 +774,8 @@ void cmd_install(int argc, char **argv) {
 
     if (use_tui) tui_progress_step(2, 5, "Partitioning the target...");
     install_detach_root();
-    if (install_write_partition(target) != 0) {
+    if ((use_gpt ? install_write_gpt(target, &gpt_start, &gpt_size)
+                 : install_write_partition(target)) != 0) {
         install_free_nodes(nodes, count);
         install_restore_live(live);
         if (use_tui) tui_progress_finish("Partitioning failed. Live disk restored.");
@@ -617,7 +784,8 @@ void cmd_install(int argc, char **argv) {
     }
 
     if (use_tui) tui_progress_step(3, 5, "Formatting FAT32...");
-    if (fat32_format(target, "INDEVOS") != 0) {
+    if ((use_gpt ? fat32_format_range(target, "INDEVOS", gpt_start, gpt_size)
+                 : fat32_format(target, "INDEVOS")) != 0) {
         install_free_nodes(nodes, count);
         install_restore_live(live);
         if (use_tui) tui_progress_finish("Format failed. Live disk restored.");
@@ -684,6 +852,16 @@ void cmd_install(int argc, char **argv) {
             failed = 1;
         }
     }
+    if (!failed && boot_efi) {
+        if ((vfs_mkdir("/EFI") != 0 && !vfs_exists("/EFI")) ||
+            (vfs_mkdir("/EFI/BOOT") != 0 && !vfs_exists("/EFI/BOOT")) ||
+            vfs_write_file("/EFI/BOOT/BOOTX64.EFI", boot_efi, boot_efi_sz) != 0) {
+            printf("install: failed to write /EFI/BOOT/BOOTX64.EFI.\n");
+            failed = 1;
+        } else {
+            printf("install: placed UEFI loader /EFI/BOOT/BOOTX64.EFI.\n");
+        }
+    }
 
     install_free_nodes(nodes, count);
     nodes = NULL;
@@ -705,8 +883,9 @@ void cmd_install(int argc, char **argv) {
         return;
     }
 
-    if (use_tui) tui_progress_step(5, 5, "Installing Limine into the MBR...");
-    if (write_limine_mbr(target) != 0) {
+    if (use_tui) tui_progress_step(5, 5, use_gpt ? "Finishing the UEFI install..."
+                                                 : "Installing Limine into the MBR...");
+    if (!use_gpt && write_limine_mbr(target) != 0) {
         install_restore_live(live);
         if (use_tui) tui_progress_finish("Bootloader install failed.");
         else printf("install: Limine install failed. Live disk remounted.\n");

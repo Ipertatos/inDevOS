@@ -147,6 +147,8 @@ bool fat32_is_mounted();
 
 // Formatting
 int fat32_format(uint8_t device_id, const char *label);
+int fat32_format_range(uint8_t device_id, const char *label,
+                       uint32_t start_lba, uint32_t sectors);
 
 // File operations
 fat32_file_t* fat32_open(const char *filename, const char *mode);

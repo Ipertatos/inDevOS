@@ -2940,6 +2940,23 @@ static int fat32_write_sectors_buf(uint8_t device_id, uint32_t lba, uint32_t cou
     return 0;
 }
 
+/* Set by fat32_format_range(): format exactly this LBA range and leave
+ * sector 0 alone (used for GPT disks, whose LBA 0 is a protective MBR). */
+static uint32_t fat32_fmt_force_start;
+static uint32_t fat32_fmt_force_size;
+
+int fat32_format_range(uint8_t device_id, const char *label,
+                       uint32_t start_lba, uint32_t sectors) {
+    int rc;
+    if (start_lba == 0 || sectors == 0) return -1;
+    fat32_fmt_force_start = start_lba;
+    fat32_fmt_force_size = sectors;
+    rc = fat32_format(device_id, label);
+    fat32_fmt_force_start = 0;
+    fat32_fmt_force_size = 0;
+    return rc;
+}
+
 int fat32_format(uint8_t device_id, const char *label) {
     FS_LOCK();
     storage_device_t *dev = storage_get_device(device_id);
@@ -2953,6 +2970,17 @@ int fat32_format(uint8_t device_id, const char *label) {
     // For simplicity, we'll try to use the first available partition.
     // If none, we'll make a partition starting at sector 2048 using MBR.
 
+    uint32_t partition_start = 0;
+    uint32_t partition_size = 0;
+    bool found_partition = false;
+
+    if (fat32_fmt_force_start) {
+        partition_start = fat32_fmt_force_start;
+        partition_size = fat32_fmt_force_size;
+        printf("fat32: Formatting LBA %u (%u sectors)\n", partition_start, partition_size);
+        goto fat32_fmt_have_range;
+    }
+
     uint8_t *mbr = kalloc(SECTOR_SIZE);
     if (!mbr) { FS_UNLOCK(); return -1; }
     
@@ -2961,10 +2989,6 @@ int fat32_format(uint8_t device_id, const char *label) {
         kfree(mbr);
         FS_UNLOCK(); return -1;
     }
-
-    uint32_t partition_start = 0;
-    uint32_t partition_size = 0;
-    bool found_partition = false;
 
     // Check if it's already an MBR with a valid signature
     if (mbr[510] == 0x55 && mbr[511] == 0xAA) {
@@ -3020,6 +3044,7 @@ int fat32_format(uint8_t device_id, const char *label) {
     
     kfree(mbr);
 
+fat32_fmt_have_range:;
     // Now format the partition
     // Parameters
     uint32_t reserved_sectors = 32;

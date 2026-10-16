@@ -109,8 +109,11 @@ void term_write(const char *buf, size_t len) {
     /* The desktop owns VT 0: text for VT 0 goes to serial only (handled
      * above), whether or not VT 0 is on screen. Text VTs keep working
      * while the desktop runs. */
-    extern bool desktop_is_running(void);
-    if (desktop_is_running() && vc == 0) return;
+    /* Detached: a process detached from every VT (the desktop terminal
+     * window's shell and its children) -> serial only, never painted over
+     * the desktop or a text VT. The desktop / LuaDE own VT 0's pixels. */
+    if (vconsole_thread_detached()) return;
+    if (vconsole_gfx_owner_running() && vc == 0) return;
 
     if (vc >= 0 && vc != vconsole_get_active()) {
         vconsole_buffer_output(vc, buf, len);

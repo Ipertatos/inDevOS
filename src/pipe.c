@@ -239,3 +239,63 @@ void pipe_set_waiting_writer(pipe_t *pipe, void *thr) {
     pipe->waiting_writer = thr;
     spinlock_unlock(&pipe->lock);
 }
+
+/* Non-blocking variants for kernel main-loop callers (desktop terminal).
+ * pipe->lock is a plain spinlock that a Ring-3 reader/writer can hold
+ * while it is preempted; the non-preemptible main loop must never spin on
+ * it, so these give up with -EAGAIN when the lock is busy. */
+static bool pipe_trylock(pipe_t *pipe) {
+    return __sync_lock_test_and_set(&pipe->lock.lock, 1) == 0;
+}
+
+int pipe_try_read(pipe_t *pipe, void *buf, size_t count) {
+    if (!pipe || !buf) return -1;
+    if (!pipe_trylock(pipe)) return -EAGAIN;
+    if (!pipe->active || !pipe->buffer) {
+        spinlock_unlock(&pipe->lock);
+        return -1;
+    }
+    if (pipe->count == 0) {
+        int writers = pipe->writers;
+        spinlock_unlock(&pipe->lock);
+        return writers == 0 ? 0 : -EAGAIN;
+    }
+    uint32_t to_read = (count < pipe->count) ? (uint32_t)count : pipe->count;
+    uint8_t *dst = (uint8_t *)buf;
+    for (uint32_t i = 0; i < to_read; i++) {
+        dst[i] = pipe->buffer[pipe->read_pos];
+        pipe->read_pos = (pipe->read_pos + 1) % pipe->buf_size;
+    }
+    pipe->count -= to_read;
+    void *ww = pipe->waiting_writer;
+    pipe->waiting_writer = NULL;
+    spinlock_unlock(&pipe->lock);
+    if (ww) { extern void thread_wake(void *); thread_wake(ww); }
+    return (int)to_read;
+}
+
+int pipe_try_write(pipe_t *pipe, const void *buf, size_t count) {
+    if (!pipe || !buf) return -EPIPE;
+    if (!pipe_trylock(pipe)) return -EAGAIN;
+    if (!pipe->active || !pipe->buffer || pipe->readers == 0) {
+        spinlock_unlock(&pipe->lock);
+        return -EPIPE;
+    }
+    uint32_t space = pipe->buf_size - pipe->count;
+    if (space == 0) {
+        spinlock_unlock(&pipe->lock);
+        return -EAGAIN;
+    }
+    uint32_t to_write = (count < space) ? (uint32_t)count : space;
+    const uint8_t *src = (const uint8_t *)buf;
+    for (uint32_t i = 0; i < to_write; i++) {
+        pipe->buffer[pipe->write_pos] = src[i];
+        pipe->write_pos = (pipe->write_pos + 1) % pipe->buf_size;
+    }
+    pipe->count += to_write;
+    void *wr = pipe->waiting_reader;
+    pipe->waiting_reader = NULL;
+    spinlock_unlock(&pipe->lock);
+    if (wr) { extern void thread_wake(void *); thread_wake(wr); }
+    return (int)to_write;
+}

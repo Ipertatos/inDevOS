@@ -44,6 +44,13 @@ static void add_event(luade_event_t *event) {
     if (!luade_input_initialized) {
         return;
     }
+    /* Non-blocking LuaDE: events only while VT 0 (LuaDE) is on screen. */
+    {
+        extern bool luade_is_running(void);
+        extern bool luade_owns_input(void);
+        if (luade_is_running() && !luade_owns_input())
+            return;
+    }
     
     // CRITICAL: Disable interrupts instead of spinlock (prevents deadlock)
     uint64_t flags = irq_save();

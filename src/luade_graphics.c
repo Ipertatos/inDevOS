@@ -1,3 +1,4 @@
+#include "render.h"
 #include "luade_graphics.h"
 #include "utils.h"
 #include "term.h"
@@ -120,6 +121,8 @@ void luade_fillrect_buffer(uint32_t color, uint64_t x, uint64_t y, uint64_t w, u
         }
     }
 }
+
+bool luade_has_back_buffer(void) { return luade_back_buffer != 0; }
 
 // Copy LuaDE back buffer to front buffer (swap buffers)
 void luade_swap_buffers() {
@@ -298,6 +301,22 @@ static int l_draw_text(lua_State *L) {
 
     DEBUG_PRINT(LUA, "[LuaDE] gfx.draw_text (%d,%d) '%.*s' color=0x%x\n",
                  x, y, (int)tlen, text, color);
+    r_target_t t;
+    if (luade_back_buffer) {
+        r_target_init(&t, luade_back_buffer, (int)luade_buffer_width,
+                      (int)luade_buffer_height, (int)luade_pixels_per_line);
+    } else {
+        extern uint32_t *fb_draw_target(void);
+        uint32_t *px = fb_draw_target();
+        if (!px || fb->bpp != 32) return 0;
+        r_target_init(&t, px, (int)fb->width,
+                      (int)fb->height, (int)(fb->pitch / 4));
+    }
+    r_text(&t, x, y, text, 0xFF000000u | (uint32_t)color);
+    if (!luade_back_buffer && y < (int)fb->height) {
+        extern void fb_mark_dirty_rows(uint32_t y, uint32_t h);
+        fb_mark_dirty_rows((uint32_t)(y < 0 ? 0 : y), 16);
+    }
     return 0;
 }
 

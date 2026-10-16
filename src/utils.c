@@ -276,6 +276,14 @@ void fb_present_scanout(void) {
     gpu_hal_present_all();
 }
 
+/* Pixel buffer that fillrect() draws into (the console shadow buffer when
+ * there is one, else the framebuffer). Callers that draw directly must
+ * mark the rows dirty with fb_mark_dirty_rows(). */
+uint32_t *fb_draw_target(void) {
+    if (!fb) return NULL;
+    return (uint32_t *)(backbuffer ? backbuffer : (uint8_t *)fb->address);
+}
+
 void fb_mark_dirty_all(void) {
     if (!fb) return;
     dirty_y_min = 0;

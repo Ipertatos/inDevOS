@@ -2415,6 +2415,12 @@ void desktop_stop(void) {
     spinlock_lock(&desktop_lock);
     for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
         if (windows[i].id != 0) {
+            /* Let kernel apps drop their window pointers (the terminal
+             * also ends its shell). */
+            notepad_on_window_destroyed(&windows[i]);
+            files_on_window_destroyed(&windows[i]);
+            kterm_on_window_destroyed(&windows[i]);
+            settings_app_on_window_destroyed(&windows[i]);
             if (windows[i].pixels) {
                 kfree(windows[i].pixels);
                 windows[i].pixels = NULL;

@@ -54,6 +54,7 @@ static tcp_listener_t *tcp_find_listener(uint16_t port) {
 
 // Buffer sizes
 #define TCP_DEFAULT_BUFFER_SIZE 4096
+#define TCP_RECV_BUFFER_SIZE    32768   /* advertised receive window */
 #define TCP_MAX_CONNECTIONS 16
 
 // Function prototypes
@@ -69,7 +70,7 @@ static int tcp_send_packet_with_options(tcp_connection_t *conn, uint8_t flags,
 static void tcp_handle_syn(tcp_connection_t *conn, const tcp_header_t *tcp_header, uint32_t payload_len);
 static void tcp_handle_ack(tcp_connection_t *conn, const tcp_header_t *tcp_header);
 static void tcp_handle_fin(tcp_connection_t *conn, const tcp_header_t *tcp_header);
-static void tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uint32_t len);
+static uint32_t tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uint32_t len);
 static void tcp_retransmit_enqueue(tcp_connection_t *conn, uint32_t seq, uint8_t flags,
                                    const uint8_t *data, uint32_t data_len);
 static void tcp_retransmit_ack(tcp_connection_t *conn, uint32_t ack_num);
@@ -199,7 +200,7 @@ static tcp_connection_t* tcp_create_connection(const uint8_t *local_ip, uint16_t
 
     // Allocate buffers
     new_conn->send_buffer = kalloc(TCP_DEFAULT_BUFFER_SIZE);
-    new_conn->recv_buffer = kalloc(TCP_DEFAULT_BUFFER_SIZE);
+    new_conn->recv_buffer = kalloc(TCP_RECV_BUFFER_SIZE);
 
     if (!new_conn->send_buffer || !new_conn->recv_buffer) {
         printf("TCP: Failed to allocate buffers\n");
@@ -210,7 +211,7 @@ static tcp_connection_t* tcp_create_connection(const uint8_t *local_ip, uint16_t
     }
 
     new_conn->send_buffer_size = TCP_DEFAULT_BUFFER_SIZE;
-    new_conn->recv_buffer_size = TCP_DEFAULT_BUFFER_SIZE;
+    new_conn->recv_buffer_size = TCP_RECV_BUFFER_SIZE;
     new_conn->send_buffer_used = 0;
     new_conn->recv_buffer_used = 0;
 
@@ -960,15 +961,19 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
      */
     void (*deferred_connect_cb)(tcp_connection_t *conn) = NULL;
     bool deferred_data_cb = false;
+    uint32_t deliver_len = 0;
     const uint8_t *payload_ptr = frame + tcp_start + data_offset;
 
     TCP_LOCK();
 
     // Handle different TCP states and flags
     if (tcp_header.flags & TCP_FLAG_RST) {
+        /* Leave CLOSED in place so poll()/SO_ERROR can observe failure.
+         * Destroying here left tcp_socket_t->connection dangling (UAF) and
+         * poll never reported POLLOUT|POLLERR, so nonblocking connect hung. */
         serial_printf("TCP: Received RST, closing connection\n");
         conn->state = TCP_STATE_CLOSED;
-        tcp_destroy_connection_locked(conn);
+        tcp_retransmit_flush(conn);
         TCP_UNLOCK();
         return;
     }
@@ -1064,36 +1069,68 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
             break;
 
         case TCP_STATE_ESTABLISHED:
+        {
+            /* RFC 793: process the segment text first, then the FIN. A server
+             * that closes right after its last write often sends data+FIN in a
+             * single segment; handling FIN first used to drop that data. */
+            bool in_order = (tcp_header.seq_num == conn->ack_num);
+            if (tcp_payload_len > 0) {
+                if (!in_order) {
+                    /* Old retransmit or out-of-order: re-ACK what we have. */
+                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
+                    break;
+                }
+                uint32_t taken = tcp_handle_data(conn, payload_ptr, tcp_payload_len);
+                if (taken > 0) {
+                    deferred_data_cb = true;
+                    deliver_len = taken;
+                }
+                /* Only ACK what fit in the buffer; the peer retransmits the rest
+                 * once our advertised window opens again. */
+                conn->ack_num = tcp_header.seq_num + taken;
+                if (taken < tcp_payload_len) {
+                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
+                    break;  /* FIN (if any) sits after unaccepted data */
+                }
+            }
             if (tcp_header.flags & TCP_FLAG_FIN) {
-                // Received FIN, send ACK and move to CLOSE_WAIT
+                uint32_t fin_seq = tcp_header.seq_num + tcp_payload_len;
+                if (fin_seq != conn->ack_num) {
+                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
+                    break;
+                }
                 serial_printf("TCP: Received FIN, closing connection\n");
-                conn->ack_num = tcp_header.seq_num + 1;
+                conn->ack_num = fin_seq + 1;
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_CLOSE_WAIT;
                 tcp_send_packet(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_LAST_ACK;
             } else if (tcp_payload_len > 0) {
-                /* Deliver only in-order data. Retransmits reuse an older seq and must
-                 * not invoke data_callback again (fixes duplicate telnet garbage). */
-                if (tcp_header.seq_num != conn->ack_num) {
-                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
-                } else {
-                    tcp_handle_data(conn, payload_ptr, tcp_payload_len);
-                    deferred_data_cb = true;
-                    conn->ack_num = tcp_header.seq_num + tcp_payload_len;
-                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
-                }
+                tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
             } else if (tcp_header.flags & TCP_FLAG_ACK) {
-                // Handle pure ACK (already processed retransmit queue above)
                 tcp_handle_ack(conn, &tcp_header);
             }
             break;
+        }
 
         case TCP_STATE_FIN_WAIT_1:
+            /* Peer may still send data after our FIN (half-close). */
+            if (tcp_payload_len > 0 && tcp_header.seq_num == conn->ack_num) {
+                uint32_t taken = tcp_handle_data(conn, payload_ptr, tcp_payload_len);
+                if (taken > 0) { deferred_data_cb = true; deliver_len = taken; }
+                conn->ack_num += taken;
+                if (taken < tcp_payload_len || !(tcp_header.flags & TCP_FLAG_FIN)) {
+                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
+                    break;
+                }
+            } else if (tcp_payload_len > 0) {
+                tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
+                break;
+            }
             if ((tcp_header.flags & (TCP_FLAG_FIN | TCP_FLAG_ACK)) == (TCP_FLAG_FIN | TCP_FLAG_ACK)) {
                 // Received FIN-ACK, send ACK
                 serial_printf("TCP: Received FIN-ACK, sending final ACK\n");
-                conn->ack_num = tcp_header.seq_num + 1;
+                conn->ack_num = tcp_header.seq_num + tcp_payload_len + 1;
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_TIME_WAIT;
                 tcp_retransmit_flush(conn);
@@ -1102,7 +1139,7 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
                 return;
             } else if (tcp_header.flags & TCP_FLAG_FIN) {
                 // Received FIN, send ACK
-                conn->ack_num = tcp_header.seq_num + 1;
+                conn->ack_num = tcp_header.seq_num + tcp_payload_len + 1;
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_CLOSING;
             }
@@ -1110,12 +1147,16 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
 
         case TCP_STATE_LAST_ACK:
             if (tcp_header.flags & TCP_FLAG_ACK) {
-                // Received final ACK, close connection
+                // Received final ACK. Do not free here: the owner (curl,
+                // a socket, telnet) may still hold the pointer and read
+                // recv_buffer; it frees the connection with tcp_close(), and
+                // tcp_cleanup_stale_connections() reaps unowned CLOSED ones.
+                // (Freeing here caused a use-after-free + double free when the
+                // server's FIN and the final ACK arrived before curl looked.)
                 serial_printf("TCP: Connection closed\n");
                 tcp_retransmit_flush(conn);
-                tcp_destroy_connection_locked(conn);
-                TCP_UNLOCK();
-                return;
+                conn->state = TCP_STATE_CLOSED;
+                break;
             }
             break;
 
@@ -1131,7 +1172,7 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
         deferred_connect_cb(conn);
     }
     if (deferred_data_cb && conn->data_callback) {
-        conn->data_callback(conn, payload_ptr, tcp_payload_len);
+        conn->data_callback(conn, payload_ptr, deliver_len);
     }
 }
 
@@ -1139,10 +1180,10 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
  * tcp_socket_recv() actually returns data (previously rx data was only ever
  * handed to data_callback and recv() always saw an empty buffer).
  * Caller must hold tcp_lock. */
-static void tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uint32_t len) {
+static uint32_t tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uint32_t len) {
     tcp_dbg("TCP: Received %u bytes of data\n", len);
 
-    if (!conn->recv_buffer || len == 0) return;
+    if (!conn->recv_buffer || len == 0) return len;  /* callback-only conn */
 
     uint32_t space = conn->recv_buffer_size - conn->recv_buffer_used;
     uint32_t to_copy = (len < space) ? len : space;
@@ -1153,6 +1194,7 @@ static void tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uint32_
         memcpy(conn->recv_buffer + conn->recv_buffer_used, data, to_copy);
         conn->recv_buffer_used += to_copy;
     }
+    return to_copy;
 }
 
 static void tcp_handle_ack(tcp_connection_t *conn, const tcp_header_t *tcp_header) {
@@ -1293,6 +1335,17 @@ int tcp_socket_recv(tcp_socket_t *sock, uint8_t *buffer, uint32_t max_len) {
                 sock->connection->recv_buffer + to_copy, remaining);
     }
     sock->connection->recv_buffer_used = remaining;
+    /* Window update: if the window we last advertised was nearly closed
+     * (less than one MSS), tell the peer that space opened up. Without it a
+     * full buffer stalls the transfer until the peer's persist timer fires. */
+    {
+        tcp_connection_t *c = sock->connection;
+        uint32_t before = c->recv_buffer_size - available;
+        uint32_t now = c->recv_buffer_size - remaining;
+        if (before < 1460 && now >= 1460 &&
+            (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_FIN_WAIT_1))
+            tcp_send_packet(c, TCP_FLAG_ACK, NULL, 0);
+    }
     TCP_UNLOCK();
 
     return to_copy;

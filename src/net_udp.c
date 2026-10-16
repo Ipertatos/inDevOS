@@ -491,7 +491,7 @@ int udp_pcb_recvfrom(udp_pcb_t *s, uint8_t *buf, uint16_t len,
     klock(&udp_lock);
     if (s->rx_count <= 0) {
         kunlock(&udp_lock);
-        return 0;
+        return -EAGAIN;  /* empty queue (not a 0-length datagram) */
     }
     udp_rx_pkt_t *pkt = &s->rx[s->rx_head];
     uint16_t n = pkt->len;

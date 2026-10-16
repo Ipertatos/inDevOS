@@ -70,57 +70,145 @@ static void ahci_write_port_reg32(uint8_t port, uint32_t offset, uint32_t value)
     *(volatile uint32_t*)(ahci_ctrl.bar5_base + port_base + offset) = value;
 }
 
-// Wait for port to be ready
-static int ahci_port_wait_ready(uint8_t port) {
-    int timeout = 10000;
-    
-    while (timeout--) {
+/* Bounded waits. ktime may not advance during early driver init (timer
+ * IRQs masked), so every loop is also capped by iterations. Each iteration
+ * does one port-0x80 write (~1 us on PC hardware and in QEMU) plus the
+ * register read, so AHCI_SPIN_CAP(ms) iterations last at least ~ms. */
+#define AHCI_SPIN_CAP(ms) ((uint64_t)(ms) * 1000ULL)
+
+static inline void ahci_io_delay(void) {
+    __asm__ volatile("outb %%al, $0x80" : : "a"(0));
+}
+
+static void ahci_delay_ms(uint32_t ms) {
+    uint64_t dl = ktime_deadline_ms(ms);
+    uint64_t cap = AHCI_SPIN_CAP(ms);
+    while (!ktime_expired(dl) && cap--) ahci_io_delay();
+}
+
+// Wait for BSY and DRQ to clear (device ready). Real disks can take
+// several seconds after power-on/COMRESET, so allow up to timeout_ms.
+static int ahci_port_wait_ready_ms(uint8_t port, uint32_t timeout_ms) {
+    uint64_t dl = ktime_deadline_ms(timeout_ms);
+    uint64_t cap = AHCI_SPIN_CAP(timeout_ms);
+    for (;;) {
         uint32_t tfd = ahci_read_port_reg32(port, AHCI_PORT_TFD);
-        if (!(tfd & 0x88)) { // Not BSY and not DRQ
-            return 0;
-        }
-        // Small delay
-        for (volatile int i = 0; i < 1000; i++);
+        if (!(tfd & 0x88)) return 0;               /* !BSY && !DRQ */
+        if (ktime_expired(dl) || !cap--) return -1;
+        ahci_io_delay();
     }
-    
-    return -1; // Timeout
+}
+
+static int ahci_port_wait_ready(uint8_t port) {
+    return ahci_port_wait_ready_ms(port, 5000);
+}
+
+static int ahci_port_stop(uint8_t port) {
+    uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
+    cmd &= ~AHCI_PORT_CMD_ST;
+    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+    uint64_t dl = ktime_deadline_ms(500);
+    uint64_t cap = AHCI_SPIN_CAP(500);
+    while ((ahci_read_port_reg32(port, AHCI_PORT_CMD) & AHCI_PORT_CMD_CR) &&
+           !ktime_expired(dl) && cap--) ahci_io_delay();
+    cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
+    cmd &= ~AHCI_PORT_CMD_FRE;
+    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+    dl = ktime_deadline_ms(500);
+    cap = AHCI_SPIN_CAP(500);
+    while ((ahci_read_port_reg32(port, AHCI_PORT_CMD) & AHCI_PORT_CMD_FR) &&
+           !ktime_expired(dl) && cap--) ahci_io_delay();
+    return (ahci_read_port_reg32(port, AHCI_PORT_CMD) &
+            (AHCI_PORT_CMD_CR | AHCI_PORT_CMD_FR)) ? -1 : 0;
+}
+
+static int ahci_port_start(uint8_t port) {
+    /* ST must not be set while BSY/DRQ; if the device stays busy use CLO
+     * (command list override) when the HBA supports it. */
+    if (ahci_port_wait_ready_ms(port, 1000) != 0) {
+        uint32_t cap = ahci_read_reg32(AHCI_REG_CAP);
+        if (cap & (1u << 24)) {                    /* CAP.SCLO */
+            uint32_t c = ahci_read_port_reg32(port, AHCI_PORT_CMD);
+            ahci_write_port_reg32(port, AHCI_PORT_CMD, c | AHCI_PORT_CMD_CLO);
+            uint64_t dl = ktime_deadline_ms(500);
+            uint64_t sc = AHCI_SPIN_CAP(500);
+            while ((ahci_read_port_reg32(port, AHCI_PORT_CMD) & AHCI_PORT_CMD_CLO) &&
+                   !ktime_expired(dl) && sc--) ahci_io_delay();
+        }
+    }
+    uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
+    cmd |= AHCI_PORT_CMD_FRE;
+    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+    cmd |= AHCI_PORT_CMD_ST;
+    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+    return 0;
+}
+
+/* Spin-up + COMRESET, then wait for the PHY link (DET=3) and clear SERR. */
+static int ahci_port_comreset(uint8_t port) {
+    uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
+    cmd |= AHCI_PORT_CMD_POD | AHCI_PORT_CMD_SUD;  /* staggered spin-up */
+    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+
+    uint32_t sctl = ahci_read_port_reg32(port, AHCI_PORT_SCTL);
+    /* DET=1 (COMRESET), SPD=0 (no limit), IPM=3 (no partial/slumber) */
+    sctl = (sctl & ~0xFFFu) | 0x301u;
+    ahci_write_port_reg32(port, AHCI_PORT_SCTL, sctl);
+    ahci_delay_ms(2);                              /* spec: >= 1 ms */
+    sctl &= ~0xFu;
+    ahci_write_port_reg32(port, AHCI_PORT_SCTL, sctl);
+
+    /* An empty port never shows PHY activity: give up after 20 ms. Once
+     * DET is non-zero a device is there; allow up to 1 s for the link. */
+    uint64_t dl = ktime_deadline_ms(20);
+    uint64_t sc = AHCI_SPIN_CAP(20);
+    uint32_t det;
+    bool seen = false;
+    do {
+        det = ahci_read_port_reg32(port, AHCI_PORT_SSTS) & AHCI_PORT_SSTS_DET_MASK;
+        if (det == AHCI_PORT_SSTS_DET_PRESENT) break;
+        if (det != 0 && !seen) {
+            seen = true;
+            dl = ktime_deadline_ms(1000);
+            sc = AHCI_SPIN_CAP(1000);
+        }
+        ahci_io_delay();
+    } while (!ktime_expired(dl) && sc--);
+    ahci_write_port_reg32(port, AHCI_PORT_SERR, 0xFFFFFFFF);
+    return det == AHCI_PORT_SSTS_DET_PRESENT ? 0 : -1;
 }
 
 // Initialize a single AHCI port
 static int ahci_init_port(uint8_t port) {
     printf("AHCI: Initializing port %d\n", port);
-    
-    // Check if device is present (be lenient for QEMU)
+
     uint32_t ssts = ahci_read_port_reg32(port, AHCI_PORT_SSTS);
     uint32_t det = ssts & AHCI_PORT_SSTS_DET_MASK;
     printf("AHCI: Port %d SSTS=0x%x, DET=0x%x\n", port, ssts, det);
-    
-    // Be more lenient - accept any detection state except "no device"
-    if (det == 0) {
-        printf("AHCI: No device detected on port %d\n", port);
-        return -1;
-    }
-    printf("AHCI: Device detected on port %d (DET=0x%x)\n", port, det);
-    
-    // Stop port operations
-    uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-    cmd &= ~(AHCI_PORT_CMD_ST | AHCI_PORT_CMD_FRE);
-    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
-    
-    // Wait for port to stop
-    int timeout = 1000;
-    while (timeout--) {
-        cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-        if (!(cmd & (AHCI_PORT_CMD_CR | AHCI_PORT_CMD_FR))) {
-            break;
-        }
-    }
-    
-    if (timeout <= 0) {
+
+    // Stop port operations (ST first, then FRE, per AHCI 1.3 10.1.2)
+    if (ahci_port_stop(port) != 0) {
         printf("AHCI: Port %d failed to stop\n", port);
         return -1;
     }
-    
+
+    /* Some firmware (seen on AMD laptops) leaves the link down or in a
+     * partial state; COMRESET when the link is not fully established. */
+    if (det != AHCI_PORT_SSTS_DET_PRESENT) {
+        if (ahci_port_comreset(port) != 0) {
+            printf("AHCI: No device detected on port %d\n", port);
+            return -1;
+        }
+        printf("AHCI: Port %d link up after COMRESET\n", port);
+    }
+    ahci_write_port_reg32(port, AHCI_PORT_SERR, 0xFFFFFFFF);
+
+    uint32_t sig = ahci_read_port_reg32(port, AHCI_PORT_SIG);
+    if (sig == 0xEB140101u || sig == 0xC33C0101u || sig == 0x96690101u) {
+        printf("AHCI: Port %d is not an ATA disk (SIG=0x%x) - skipping\n", port, sig);
+        return -1;
+    }
+
     // Allocate memory for command list, FIS, and command table
     // Command list: 32 entries * 32 bytes = 1KB, aligned to 1KB
     ahci_ctrl.cmd_list[port] = kalloc(1024);
@@ -175,23 +263,21 @@ static int ahci_init_port(uint8_t port) {
     // Clear port interrupt status
     ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
     
-    // Enable FIS receive (FRE) and power up / spin up (POD | SUD)
-    cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
-    cmd |= AHCI_PORT_CMD_FRE | AHCI_PORT_CMD_POD | AHCI_PORT_CMD_SUD;
+    // Power up / spin up, enable FIS receive, then start the engine
+    uint32_t cmd = ahci_read_port_reg32(port, AHCI_PORT_CMD);
+    cmd |= AHCI_PORT_CMD_POD | AHCI_PORT_CMD_SUD;
     ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
-
-    // Finally start the command engine (ST)
-    cmd |= AHCI_PORT_CMD_ST;
-    ahci_write_port_reg32(port, AHCI_PORT_CMD, cmd);
+    ahci_port_start(port);
     
     printf("AHCI: Port %d initialized successfully\n", port);
     return 0;
 }
 
 // Issue IDENTIFY command to get drive capacity
-static int ahci_identify_drive(uint8_t port) {
+static int ahci_identify_once(uint8_t port) {
     if (ahci_port_wait_ready(port) != 0) {
-        printf("AHCI: Port %d not ready for IDENTIFY\n", port);
+        printf("AHCI: Port %d not ready for IDENTIFY (TFD=0x%x)\n", port,
+               ahci_read_port_reg32(port, AHCI_PORT_TFD));
         return -1;
     }
     
@@ -236,17 +322,23 @@ static int ahci_identify_drive(uint8_t port) {
     // Issue command
     ahci_write_port_reg32(port, AHCI_PORT_CI, 1); // Issue command slot 0
     
-    // Wait for command completion
-    int timeout = 10000;
-    while (timeout--) {
+    // Wait for command completion (up to 5 s; ktime + spin cap)
+    uint64_t dl = ktime_deadline_ms(5000);
+    uint64_t sc = AHCI_SPIN_CAP(5000);
+    bool done = false;
+    for (;;) {
         uint32_t ci = ahci_read_port_reg32(port, AHCI_PORT_CI);
-        if (!(ci & 1)) { // Command completed
-            break;
-        }
+        if (!(ci & 1)) { done = true; break; }
+        if (ahci_read_port_reg32(port, AHCI_PORT_IS) & AHCI_PORT_IS_TFES) break;
+        if (ktime_expired(dl) || !sc--) break;
+        ahci_io_delay();
     }
-    
-    if (timeout <= 0) {
-        printf("AHCI: IDENTIFY command timeout on port %d\n", port);
+
+    if (!done || (ahci_read_port_reg32(port, AHCI_PORT_TFD) & 0x1)) {
+        printf("AHCI: IDENTIFY %s on port %d (TFD=0x%x IS=0x%x)\n",
+               done ? "error" : "timeout", port,
+               ahci_read_port_reg32(port, AHCI_PORT_TFD),
+               ahci_read_port_reg32(port, AHCI_PORT_IS));
         kfree(identify_buffer);
         return -1;
     }
@@ -272,6 +364,21 @@ static int ahci_identify_drive(uint8_t port) {
     
     kfree(identify_buffer);
     return 0;
+}
+
+static int ahci_identify_drive(uint8_t port) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt) {
+            printf("AHCI: Port %d IDENTIFY retry %d (COMRESET)\n", port, attempt);
+            ahci_port_stop(port);
+            ahci_port_comreset(port);
+            ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
+            ahci_port_wait_ready_ms(port, 10000);  /* disk spin-up */
+            ahci_port_start(port);
+        }
+        if (ahci_identify_once(port) == 0) return 0;
+    }
+    return -1;
 }
 
 // ---- AHCI Interrupt Handler -------------------------------------------------
@@ -408,6 +515,17 @@ void ahci_init(void) {
     cmd |= 0x06; // Enable memory space and bus mastering
     pci_device_write(dev, 0x04, 2, cmd);
     
+    // BIOS/OS handoff (CAP2.BOH) so firmware SMM stops touching the HBA
+    if (ahci_read_reg32(0x24) & 1u) {
+        uint32_t bohc = ahci_read_reg32(0x28);
+        ahci_write_reg32(0x28, bohc | (1u << 1));          /* OOS */
+        uint64_t dl = ktime_deadline_ms(2000);
+        uint64_t sc = AHCI_SPIN_CAP(2000);
+        while ((ahci_read_reg32(0x28) & 1u) && !ktime_expired(dl) && sc--)
+            ahci_io_delay();                       /* BOS clear */
+        ahci_delay_ms(25);
+    }
+
     // Enable AHCI mode
     uint32_t ghc = ahci_read_reg32(AHCI_REG_GHC);
     ghc |= AHCI_GHC_AHCI_EN;

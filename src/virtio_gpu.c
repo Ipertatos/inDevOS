@@ -644,3 +644,11 @@ int virtio_gpu_set_viewport_size(uint32_t width, uint32_t height)
     serial_printf("virtio_gpu: viewport resized to %ux%u\n", width, height);
     return 0;
 }
+
+/* Shared legacy INTx: virtio-gpu raises a level IRQ on queue completion even
+ * though this driver polls. Reading the ISR register deasserts the line.
+ * Called from other handlers on the same line. Returns the ISR bits read. */
+uint8_t virtio_gpu_ack_irq(void) {
+    if (!gpu.vdev.isr_cfg) return 0;
+    return *gpu.vdev.isr_cfg;
+}

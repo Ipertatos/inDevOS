@@ -10,13 +10,20 @@
 #include "../include/indevos_errno.h"
 
 /* ── Helper: drain the NIC receive queue (drives TCP state machine) ───────── */
+/* Serialized: concurrent callers (poll/recv/futex-woken threads on other
+ * CPUs, the net thread) skip instead of racing the NIC RX ring; the holder
+ * drains until empty, so a skipper never loses a packet for long. */
+static volatile int poll_net_busy = 0;
 void poll_network_once(void) {
+    if (__atomic_exchange_n(&poll_net_busy, 1, __ATOMIC_ACQUIRE))
+        return;
     uint8_t pkt[1600];
     while (net_has_pending_receive()) {
-        uint32_t len = net_receive_packet(pkt, sizeof(pkt));
-        if (len > 0) ethernet_process_frame(pkt, len);
+        int len = (int)net_receive_packet(pkt, sizeof(pkt));
+        if (len > 0) ethernet_process_frame(pkt, (uint32_t)len);
         else break;
     }
+    __atomic_store_n(&poll_net_busy, 0, __ATOMIC_RELEASE);
 }
 
 /* ── Helper: allocate a free fd slot ────────────────────────────────────── */
@@ -100,8 +107,8 @@ int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen) {
     if (!addr || addrlen < sizeof(sockaddr_in_t)) return -EINVAL;
 
     kernel_socket_t *sock = (kernel_socket_t *)proc->fds[fd].file_handle;
-    if (!sock || sock->connected)
-        return -EISCONN;
+    if (!sock) return -ENOTSOCK;
+    if (sock->connected) return -EISCONN;
     if (sock->type == SOCK_DGRAM) {
         sockaddr_in_t kaddr;
         if (copy_from_user(&kaddr, addr, sizeof(kaddr)) != 0) return -EFAULT;
@@ -135,6 +142,29 @@ int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen) {
     ip[3] = (uint8_t)((a >> 24) & 0xFF);
     uint16_t port = (uint16_t)((kaddr.sin_port >> 8) | (kaddr.sin_port << 8));
 
+    /* Already started (nonblocking EINPROGRESS redo)? */
+    if (sock->transport) {
+        tcp_socket_t *tcp_sock = (tcp_socket_t *)sock->transport;
+        poll_network_once();
+        if (tcp_sock->connection &&
+            tcp_sock->connection->state == TCP_STATE_ESTABLISHED) {
+            sock->connected = true;
+            return 0;
+        }
+        if (tcp_sock->connection &&
+            (tcp_sock->connection->state == TCP_STATE_CLOSED ||
+             tcp_sock->connection->state == TCP_STATE_SYN_SENT)) {
+            /* still handshaking, or failed */
+            if (tcp_sock->connection->state == TCP_STATE_SYN_SENT) {
+                if (proc->fds[fd].flags & O_NONBLOCK) return -EINPROGRESS;
+            }
+        }
+        if (!tcp_sock->connection ||
+            tcp_sock->connection->state == TCP_STATE_CLOSED)
+            return -ECONNREFUSED;
+        if (proc->fds[fd].flags & O_NONBLOCK) return -EINPROGRESS;
+    }
+
     tcp_socket_t *tcp_sock = tcp_socket_create();
     if (!tcp_sock) return -ENOBUFS;
 
@@ -143,7 +173,21 @@ int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen) {
         return -ECONNREFUSED;
     }
 
-    /* Wait for the TCP handshake to complete (max ~5 s), yielding CPU */
+    sock->transport  = tcp_sock;
+    sock->remote_port = port;
+    memcpy(sock->remote_ip, ip, 4);
+
+    /* Nonblocking sockets must return EINPROGRESS and complete via poll(POLLOUT).
+     * Returning 0 after a blocking wait breaks curl Happy Eyeballs: it never
+     * sees "Connected" and never writes the TLS ClientHello. */
+    if (proc->fds[fd].flags & O_NONBLOCK) {
+        /* Always EINPROGRESS on the first connect() of a nonblocking socket so
+         * userland (curl Happy Eyeballs) parks on poll(POLLOUT). A second
+         * connect() after ESTABLISHED returns 0 via the redo path above. */
+        return -EINPROGRESS;
+    }
+
+    /* Blocking: wait for the TCP handshake (max ~5 s) */
     {
         extern uint64_t ktime_deadline_ms(uint64_t);
         extern bool     ktime_expired(uint64_t);
@@ -163,13 +207,11 @@ int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen) {
     if (!tcp_sock->connection ||
         tcp_sock->connection->state != TCP_STATE_ESTABLISHED) {
         tcp_socket_close(tcp_sock);
+        sock->transport = NULL;
         return -ETIMEDOUT;
     }
 
-    sock->transport  = tcp_sock;
-    sock->connected  = true;
-    sock->remote_port = port;
-    memcpy(sock->remote_ip, ip, 4);
+    sock->connected = true;
     return 0;
 }
 
@@ -201,6 +243,7 @@ int sys_send(int fd, const void *buf, uint32_t len, int flags) {
     return rc;
 }
 
+bool tcp_conn_at_eof(tcp_connection_t *c);
 /* ── sys_recv ───────────────────────────────────────────────────────────── */
 int sys_recv(int fd, void *buf, uint32_t len, int flags) {
     (void)flags;
@@ -236,8 +279,7 @@ int sys_recv(int fd, void *buf, uint32_t len, int flags) {
                 kfree(kbuf);
                 return n;
             }
-            if (!tcp_sock->connection ||
-                tcp_sock->connection->state == TCP_STATE_CLOSED) {
+            if (tcp_conn_at_eof(tcp_sock->connection)) {
                 kfree(kbuf);
                 return 0;
             }
@@ -371,8 +413,8 @@ int sys_recvfrom(int fd, void *buf, uint32_t len, int flags,
         int n = udp_pcb_recvfrom((udp_pcb_t *)sock->transport, kbuf,
                                  (uint16_t)(len > 65535 ? 65535 : len),
                                  sip, &sport);
-        if (n > 0) {
-            if (kbuf && copy_to_user(buf, kbuf, (size_t)n) != 0) {
+        if (n >= 0) {  /* datagram dequeued (payload may be 0 bytes) */
+            if (n > 0 && kbuf && copy_to_user(buf, kbuf, (size_t)n) != 0) {
                 kfree(kbuf);
                 return -EFAULT;
             }
@@ -384,6 +426,11 @@ int sys_recvfrom(int fd, void *buf, uint32_t len, int flags,
                     return -EFAULT;
                 }
             }
+            if (kbuf) kfree(kbuf);
+            return n;
+        }
+        /* n < 0: -EAGAIN when empty */
+        if (proc->fds[fd].flags & O_NONBLOCK) {
             if (kbuf) kfree(kbuf);
             return n;
         }
@@ -527,3 +574,221 @@ int sys_shutdown(int fd, int how) {
     return 0;
 }
 
+
+/* ── Linux socket ABI glue (static musl programs: curl, busybox wget, …) ───
+ * Linux and inDevOS share the AF_INET sockaddr layout, so addresses are passed
+ * through; here we add the Linux type flags, non-blocking I/O, EOF reporting,
+ * the generic read/write paths and the name/option queries. */
+extern bool proc_kill_pending(process_t *p);
+#define LXS_SOCK_NONBLOCK 04000
+#define LXS_SOCK_CLOEXEC  02000000
+#define LXS_MSG_PEEK      0x2
+#define LXS_MSG_DONTWAIT  0x40
+
+static kernel_socket_t *lxs_get(process_t *p, int fd) {
+    if (!p || fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL) return NULL;
+    if (!p->fds[fd].in_use || p->fds[fd].fd_type != FD_TYPE_SOCKET) return NULL;
+    return (kernel_socket_t *)p->fds[fd].file_handle;
+}
+
+bool tcp_conn_at_eof(tcp_connection_t *c) {
+    if (!c) return false;  /* no connection yet: not EOF, just not readable */
+    return c->state == TCP_STATE_CLOSE_WAIT || c->state == TCP_STATE_LAST_ACK ||
+           c->state == TCP_STATE_CLOSED || c->state == TCP_STATE_TIME_WAIT ||
+           c->state == TCP_STATE_CLOSING;
+}
+
+long lx_sock_socket(long domain, long type, long protocol) {
+    int base = (int)(type & 0xF);
+    if (domain != AF_INET) return -EAFNOSUPPORT;
+    int fd = sys_socket((int)domain, base, (int)protocol);
+    if (fd < 0) return fd;
+    process_t *p = get_current_process();
+    if (type & LXS_SOCK_NONBLOCK) p->fds[fd].flags |= O_NONBLOCK;
+    if (type & LXS_SOCK_CLOEXEC) p->fds[fd].cloexec = true;
+    return fd;
+}
+
+/* Stream receive honouring O_NONBLOCK / MSG_DONTWAIT; 0 means EOF. */
+long lx_sock_recv(int fd, void *ubuf, size_t len, int flags) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    bool nb = (p->fds[fd].flags & O_NONBLOCK) || (flags & LXS_MSG_DONTWAIT);
+    if (s->type == SOCK_DGRAM) {
+        if (nb) {
+            poll_network_once();
+            if (!s->transport || udp_pcb_rx_ready((udp_pcb_t *)s->transport) <= 0) return -EAGAIN;
+        }
+        return sys_recvfrom(fd, ubuf, (uint32_t)len, 0, NULL);
+    }
+    if (!s->connected || !s->transport) return -ENOTCONN;
+    if (len == 0) return 0;
+    if (len > 65536) len = 65536;
+    if (!ubuf || !access_ok_user_range((uint64_t)ubuf, len)) return -EFAULT;
+    tcp_socket_t *ts = (tcp_socket_t *)s->transport;
+    uint8_t *k = (uint8_t *)kalloc(len);
+    if (!k) return -ENOMEM;
+    extern uint64_t ktime_deadline_ms(uint64_t);
+    extern bool     ktime_expired(uint64_t);
+    uint64_t deadline = ktime_deadline_ms(60000);
+    long r = -EAGAIN;
+    for (;;) {
+        poll_network_once();
+        int n = ts->connection ? tcp_socket_recv(ts, k, (uint32_t)len) : 0;
+        if (n > 0) {
+            r = copy_to_user(ubuf, k, (size_t)n) ? -EFAULT : n;
+            break;
+        }
+        if (n < 0 || tcp_conn_at_eof(ts->connection)) { r = 0; break; }
+        if (nb) { r = -EAGAIN; break; }
+        if (ktime_expired(deadline)) { r = -ETIMEDOUT; break; }
+        if (proc_kill_pending(p)) { r = -EINTR; break; }
+        if (global_scheduler.scheduler_running) thread_sleep(1);
+        else __asm__ volatile("hlt");
+    }
+    kfree(k);
+    return r;
+}
+
+long lx_sock_send(int fd, const void *ubuf, size_t len, int flags) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    if (s->type == SOCK_DGRAM) return sys_sendto(fd, ubuf, (uint32_t)len, 0, NULL);
+    if (!s->transport) return -ENOTCONN;
+    tcp_socket_t *ts = (tcp_socket_t *)s->transport;
+    if (!ts->connection || ts->connection->state != TCP_STATE_ESTABLISHED) return -ENOTCONN;
+    s->connected = true;
+    if (len > 65536) len = 65536;
+    if (len == 0) return 0;
+    bool nb = (p->fds[fd].flags & O_NONBLOCK) || (flags & LXS_MSG_DONTWAIT);
+    extern uint64_t ktime_deadline_ms(uint64_t);
+    extern bool     ktime_expired(uint64_t);
+    uint64_t deadline = ktime_deadline_ms(60000);
+    for (;;) {
+        /* tcp_send returns 0 when the peer's window is full: never hand a
+         * 0 back to the program (OpenSSL would spin); wait or EAGAIN. */
+        int r = sys_send(fd, ubuf, (uint32_t)len, 0);
+        if (r != 0) return r;
+        if (nb) return -EAGAIN;
+        if (!ts->connection || ts->connection->state != TCP_STATE_ESTABLISHED) return -EPIPE;
+        if (ktime_expired(deadline)) return -ETIMEDOUT;
+        if (proc_kill_pending(p)) return -EINTR;
+        poll_network_once();
+        if (global_scheduler.scheduler_running) thread_sleep(1);
+        else __asm__ volatile("hlt");
+    }
+}
+
+long lx_sock_sendto(int fd, const void *ubuf, size_t len, int flags,
+                    const void *uaddr, uint32_t alen) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    if (s->type == SOCK_DGRAM && uaddr) {
+        if (alen < sizeof(sockaddr_in_t)) return -EINVAL;
+        return sys_sendto(fd, ubuf, (uint32_t)len, 0, (const sockaddr_in_t *)uaddr);
+    }
+    return lx_sock_send(fd, ubuf, len, flags);
+}
+
+long lx_sock_recvfrom(int fd, void *ubuf, size_t len, int flags, void *uaddr, uint32_t *ualen) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    if (s->type != SOCK_DGRAM) return lx_sock_recv(fd, ubuf, len, flags);
+    bool nb = (p->fds[fd].flags & O_NONBLOCK) || (flags & LXS_MSG_DONTWAIT);
+    if (!s->transport) return nb ? -EAGAIN : -EINVAL;
+    if (nb) {
+        poll_network_once();
+        if (udp_pcb_rx_ready((udp_pcb_t *)s->transport) <= 0) return -EAGAIN;
+    }
+    sockaddr_in_t *tmp = NULL;
+    uint32_t al = 0;
+    if (uaddr && ualen) {
+        if (copy_from_user(&al, ualen, sizeof(al))) return -EFAULT;
+        if (al >= sizeof(sockaddr_in_t)) tmp = (sockaddr_in_t *)uaddr;
+    }
+    long r = sys_recvfrom(fd, ubuf, (uint32_t)len, 0, tmp);
+    if (r >= 0 && tmp) {
+        al = sizeof(sockaddr_in_t);
+        copy_to_user(ualen, &al, sizeof(al));
+    }
+    return r;
+}
+
+static long lxs_put_name(void *uaddr, uint32_t *ualen, const uint8_t ip[4], uint16_t port) {
+    if (!uaddr || !ualen) return -EFAULT;
+    uint32_t al;
+    if (copy_from_user(&al, ualen, sizeof(al))) return -EFAULT;
+    sockaddr_in_t o;
+    sock_encode_addr(&o, ip, port);
+    uint32_t n = al < sizeof(o) ? al : sizeof(o);
+    if (copy_to_user(uaddr, &o, n)) return -EFAULT;
+    al = sizeof(o);
+    if (copy_to_user(ualen, &al, sizeof(al))) return -EFAULT;
+    return 0;
+}
+
+long lx_sock_name(int fd, void *uaddr, uint32_t *ualen, bool peer) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    uint8_t ip[4] = {0, 0, 0, 0};
+    uint16_t port = 0;
+    if (s->type == SOCK_STREAM && s->transport && ((tcp_socket_t *)s->transport)->connection) {
+        tcp_connection_t *c = ((tcp_socket_t *)s->transport)->connection;
+        if (peer) { memcpy(ip, c->remote_ip, 4); port = c->remote_port; }
+        else      { memcpy(ip, c->local_ip, 4);  port = c->local_port; }
+    } else if (peer) {
+        if (!s->connected) return -ENOTCONN;
+        memcpy(ip, s->remote_ip, 4); port = s->remote_port;
+    } else {
+        port = s->local_port;
+        if (s->type == SOCK_DGRAM && s->transport) port = udp_pcb_local_port((udp_pcb_t *)s->transport);
+    }
+    return lxs_put_name(uaddr, ualen, ip, port);
+}
+
+long lx_sock_getsockopt(int fd, int level, int opt, void *uval, uint32_t *ulen) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    int v = 0;
+    if (level == 1 && opt == 3) v = s->type;                 /* SO_TYPE */
+    else if (level == 1 && opt == 4) {                       /* SO_ERROR */
+        v = 0;
+        if (s->type == SOCK_STREAM && s->transport) {
+            tcp_connection_t *c = ((tcp_socket_t *)s->transport)->connection;
+            if (c && c->state == TCP_STATE_ESTABLISHED) s->connected = true;
+            else if (!c || c->state == TCP_STATE_CLOSED) v = ECONNREFUSED;
+            /* SYN_SENT: SO_ERROR stays 0; completion is POLLOUT */
+        }
+    }
+    else if (level == 1 && (opt == 7 || opt == 8)) v = 65536; /* SO_SNDBUF/RCVBUF */
+    if (!uval || !ulen) return -EFAULT;
+    uint32_t l;
+    if (copy_from_user(&l, ulen, sizeof(l))) return -EFAULT;
+    if (l > sizeof(v)) l = sizeof(v);
+    if (copy_to_user(uval, &v, l)) return -EFAULT;
+    return copy_to_user(ulen, &l, sizeof(l)) ? -EFAULT : 0;
+}
+
+long lx_sock_setsockopt(int fd, int level, int opt, const void *uval, uint32_t len) {
+    process_t *p = get_current_process();
+    return lxs_get(p, fd) ? 0 : -ENOTSOCK;   /* accepted and ignored */
+}
+
+long lx_sock_shutdown(int fd, int how) {
+    process_t *p = get_current_process();
+    kernel_socket_t *s = lxs_get(p, fd);
+    if (!s) return -ENOTSOCK;
+    /* Accepted but deferred: sending our FIN here would let the FIN_WAIT_1
+     * path free the connection while the program still reads from it. The
+     * FIN goes out when the descriptor is closed. */
+    (void)how;
+    return 0;
+}
+
+bool lx_fd_is_socket(process_t *p, int fd) { return lxs_get(p, fd) != NULL; }

@@ -55,6 +55,9 @@ typedef struct {
     volatile bool     force_kill_flag;
     volatile bool     program_running;
     volatile bool     raw_mode;
+    /* A Linux program cleared ICANON (vi, less, ash line editing): special
+     * keys are queued as VT100 escape sequences instead of Zeus key flags. */
+    volatile bool     lx_noncanon;
     volatile uint64_t last_ctrlc_tick;
 } vconsole_t;
 
@@ -66,6 +69,12 @@ void vconsole_request_switch(int id);
 /** True when the graphical desktop may own the framebuffer (tty0). */
 bool vconsole_graphics_active(void);
 bool vconsole_desktop_owns_display(void);
+/** True while the desktop or non-blocking LuaDE owns VT 0's framebuffer. */
+bool vconsole_gfx_owner_running(void);
+/** process_t.cont_tty value for a process attached to no VT (desktop
+ *  terminal shell): its console output goes to serial only. */
+#define VC_TTY_DETACHED (-2)
+bool vconsole_thread_detached(void);
 int  vconsole_get_active(void);
 /* Session TTY: process_t.cont_tty for current task, else active VC (see term_write). */
 int  vconsole_get_thread_console(void);

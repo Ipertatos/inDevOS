@@ -15,7 +15,7 @@ void net_device_init(void) {
     printf("Network device abstraction layer initialized\n");
 }
 
-int net_device_pci_bringup(void)
+static int pci_bringup_inner(void)
 {
     e1000_init();
     if (e1000_dev.initialized) {
@@ -34,6 +34,17 @@ int net_device_pci_bringup(void)
     }
     printf("net: no supported PCI ethernet adapter initialized\n");
     return -1;
+}
+
+/* PCI first, then USB ethernet found during USB enumeration (CDC-ECM/NCM, RNDIS). */
+int net_device_pci_bringup(void)
+{
+    extern int usb_net_bringup(void);
+    int r = pci_bringup_inner();
+    /* Also marks the stack ready, so an adapter hot-plugged later registers
+     * itself. A PCI NIC stays the current device if there is one. */
+    int u = usb_net_bringup();
+    return (r == 0 || u == 0) ? 0 : -1;
 }
 
 // Register a network device

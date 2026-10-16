@@ -100,7 +100,9 @@ void I_Quit(void)
     
     // In a real OS we'd exit, but in inDevOS we might just return to kernel
     printf("DOOM exiting...\n");
-    while(1);  // Halt for now
+    /* Spinning here left the program owning the console/framebuffer with
+     * interrupts on; return to the shell like the Ctrl+C path does. */
+    exit(0);
 }
 
 void I_WaitVBL(int count)
