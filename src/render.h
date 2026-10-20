@@ -50,6 +50,8 @@ void r_shadow(r_target_t *t, int x, int y, int w, int h, int rad, int spread);
 
 void r_blit(r_target_t *t, int dx, int dy,
             const uint32_t *src, int sw, int sh, int spitch);
+void r_blit_premul(r_target_t *t, int dx, int dy,
+                   const uint32_t *src, int sw, int sh, int spitch);
 void r_blit_keyed(r_target_t *t, int dx, int dy,
                   const uint32_t *src, int sw, int sh, int spitch);
 

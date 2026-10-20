@@ -62,6 +62,13 @@
 #define DT_COL_ACCENT          0xFF3DDC97
 #define DT_COL_SURFACE         0xFF12161E
 
+/* ---- Window types and pixel formats ---- */
+#define DESKTOP_WIN_NORMAL 0     /* decorated, resizable, in switcher       */
+#define DESKTOP_WIN_DIALOG 1     /* decorated, fixed size, owned by parent  */
+#define DESKTOP_WIN_POPUP  2     /* menu/tooltip: no chrome, not in switcher */
+#define DESKTOP_FMT_KEYED  0     /* XRGB, alpha 0 = transparent (legacy)    */
+#define DESKTOP_FMT_ARGB   1     /* premultiplied ARGB, alpha-composited     */
+
 /* ---- Window ---- */
 typedef struct desktop_window {
     uint32_t  id;
@@ -86,9 +93,30 @@ typedef struct desktop_window {
     int32_t   resize_orig_x, resize_orig_y, resize_orig_w, resize_orig_h;
     int32_t   resize_anchor_x, resize_anchor_y;
     spinlock_t content_lock;     /* SMP: user composite vs blit             */
+    uint8_t   type;              /* DESKTOP_WIN_*                            */
+    uint8_t   format;            /* DESKTOP_FMT_*                            */
+    uint32_t  parent_id;         /* dialog/popup owner window (0 = none)     */
     struct desktop_window *prev; /* lower Z                                */
     struct desktop_window *next; /* higher Z                               */
 } desktop_window_t;
+
+/* ---- Pointer events for kernel-side app windows ---- */
+#define DESKTOP_PTR_MOVE  1
+#define DESKTOP_PTR_DOWN  2
+#define DESKTOP_PTR_UP    3
+#define DESKTOP_PTR_WHEEL 4
+#define DESKTOP_MOD_SHIFT 0x1
+#define DESKTOP_MOD_CTRL  0x2
+#define DESKTOP_MOD_ALT   0x4
+#define DESKTOP_MOD_SUPER 0x8
+typedef struct {
+    int32_t  type;     /* DESKTOP_PTR_*                                  */
+    int32_t  x, y;     /* client-relative                                */
+    int32_t  button;   /* 1 left, 2 right, 3 middle; 0 for move/wheel    */
+    int32_t  clicks;   /* 1 single, 2 double, ... (press/release only)   */
+    int32_t  wheel;    /* wheel steps, positive = up                     */
+    uint32_t mods;     /* DESKTOP_MOD_*                                  */
+} desktop_ptr_event_t;
 
 /* ---- Public API (kernel-side) ---- */
 void desktop_init(void);
@@ -118,6 +146,15 @@ void desktop_unfocus_all(void);
 /* Window management */
 desktop_window_t *desktop_create_window(uint32_t pid, int x, int y,
                                         int w, int h, const char *title);
+desktop_window_t *desktop_create_window_ex(uint32_t pid, int x, int y,
+                                           int w, int h, const char *title,
+                                           int type, uint32_t parent_id,
+                                           int format);
+desktop_window_t *desktop_find_window_by_id(uint32_t id);
+/** Window whose pixel buffer is @pixels (SDL windows share their surface). */
+desktop_window_t *desktop_find_window_by_pixels(const void *pixels);
+/** Small transient notification above the dock (copied; ~3.5 s). */
+void  desktop_toast(const char *msg);
 void  desktop_destroy_window(desktop_window_t *win);
 void  desktop_destroy_windows_for_pid(uint32_t pid);
 void  desktop_raise_window(desktop_window_t *win);

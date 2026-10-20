@@ -38,6 +38,7 @@ static bool    kt_sh_dead;   /* shell exited; empty Enter restarts */
 static char    kt_part[KT_COLS];   /* current (unterminated) output line */
 static int     kt_partlen;
 static int     kt_esc;             /* 0 none, 1 got ESC, 2 in CSI */
+static char    kt_start_dir[256];  /* cwd for the next shell (kterm_open_in) */
 static char    kt_csi[16];
 static int     kt_csilen;
 
@@ -198,7 +199,8 @@ static bool kt_shell_start(void) {
         }
         static char *argv[] = { "sh", "-i", NULL };
         exec_spawn_set_stdio_pipes(in, out);
-        int pid = exec_spawn(paths[i], argv);
+        int pid = exec_spawn_ex(paths[i], argv,
+                                kt_start_dir[0] ? kt_start_dir : NULL, NULL);
         if (pid > 0) {
             kt_sh_in = in;
             kt_sh_out = out;
@@ -549,4 +551,27 @@ bool kterm_tick(void) {
     kt_redraw();
     spinlock_unlock(&kt_win->content_lock);
     return true;
+}
+
+/* Open the terminal with its shell in @dir: a new shell starts there; a
+ * running one gets a cd. */
+void kterm_open_in(const char *dir) {
+    if (dir && dir[0]) {
+        kstrncpy(kt_start_dir, dir, sizeof(kt_start_dir));
+        if (kt_sh_in && kt_sh_pid > 0) {
+            char cmd[300];
+            int n = 0;
+            const char *p = "cd '";
+            while (*p) cmd[n++] = *p++;
+            for (p = dir; *p && n < (int)sizeof(cmd) - 4; p++) cmd[n++] = *p;
+            cmd[n++] = '\'';
+            cmd[n++] = '\n';
+            if (kt_txlen + n <= (int)sizeof(kt_txq)) {
+                memcpy(kt_txq + kt_txlen, cmd, (size_t)n);
+                kt_txlen += n;
+            }
+        }
+        serial_printf("[kterm] open in %s\n", dir);
+    }
+    kterm_open();
 }

@@ -80,7 +80,7 @@ VIRTIO_VGA_DEV     = $(VIRTIO_GPU_DISPLAY)
 C_SOURCES = $(shell find src -name '*.c' ! -name 'kernel_symtab.c')
 # Exclude Lua-related files when ENABLE_LUA=0
 ifeq ($(ENABLE_LUA),0)
-    C_SOURCES := $(filter-out src/luade.c src/luade_graphics.c src/luade_input.c src/lua_runtime.c, $(C_SOURCES))
+    C_SOURCES := $(filter-out src/lua_runtime.c, $(C_SOURCES))
 endif
 # In-kernel SDL shim (SYS_SDL_* syscalls for user apps) — not host SDL.
 SDL_SOURCES = src/sdl_main.c src/sdl_video.c src/sdl_renderer.c src/sdl_events.c src/sdl_timer.c src/sdl_integration.c src/sdl_kernel_log.c

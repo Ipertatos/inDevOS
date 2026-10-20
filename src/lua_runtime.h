@@ -18,8 +18,11 @@ int lua_run_script_from_buffer(const char *name,
                                const void *script_bytes,
                                uint32_t script_size);
 
+/* Fault dumps (idt.c): print the last Lua script/line, if any. */
+void luade_print_last_lua_location(void);
+
 #ifdef ENABLE_LUA
-/* Lua kernel allocator function for LuaDE */
+/* Lua kernel allocator function */
 void *lua_kernel_allocator(void *ud, void *ptr, size_t osize, size_t nsize);
 #endif
 

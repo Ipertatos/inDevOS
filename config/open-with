@@ -1,0 +1,22 @@
+# inDevOS file associations (read by the desktop and Files).
+# Format:  ext <extension> -> <action>      or      dir -> <action>
+# Actions: run | notepad | files | lua | doom | toast <message>
+#          or a program with arguments (%f = the file, %d = its folder).
+# Programs start with the file's folder as their working directory.
+dir -> files
+ext exe -> run
+ext elf -> run
+ext txt -> notepad
+ext md -> notepad
+ext c -> notepad
+ext h -> notepad
+ext sh -> notepad
+ext cfg -> notepad
+ext conf -> notepad
+ext log -> notepad
+ext ini -> notepad
+ext lua -> lua
+ext wad -> doom
+ext png -> toast Image viewer is not available yet
+ext bmp -> toast Image viewer is not available yet
+ext jpg -> toast Image viewer is not available yet

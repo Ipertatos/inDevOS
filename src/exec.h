@@ -79,6 +79,10 @@ extern bool exec_did_swapgs;
  * Returns the child PID (>0) on success, negative on error.
  * The caller is NOT blocked; the child runs when the scheduler picks it. */
 int exec_spawn(const char *filename, char *const argv[]);
+/** exec_spawn() in working directory @cwd with extra environment @envp
+ *  (KEY=VALUE strings, NULL-terminated).  Either may be NULL. */
+int exec_spawn_ex(const char *filename, char *const argv[], const char *cwd,
+                  const char *const envp[]);
 struct pipe;
 /** Give the next exec_spawn() child stdin=@in (read end) and stdout+stderr=
  *  @out (write end). The child takes the pipes' initial reader/writer

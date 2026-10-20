@@ -360,6 +360,47 @@ void r_blit(r_target_t *t, int dx, int dy,
     }
 }
 
+/* Premultiplied-ARGB source over opaque destination.  Opaque runs are
+ * memcpy'd (fast path); alpha 0 is skipped; the rest blend per channel. */
+void r_blit_premul(r_target_t *t, int dx, int dy,
+                   const uint32_t *src, int sw, int sh, int spitch)
+{
+    if (!t->pixels || !src || sw <= 0 || sh <= 0) return;
+    int x0 = 0, y0 = 0, x1 = sw, y1 = sh;
+    if (dx + x0 < t->clip_x0) x0 = t->clip_x0 - dx;
+    if (dy + y0 < t->clip_y0) y0 = t->clip_y0 - dy;
+    if (dx + x1 > t->clip_x1) x1 = t->clip_x1 - dx;
+    if (dy + y1 > t->clip_y1) y1 = t->clip_y1 - dy;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x0 >= x1 || y0 >= y1) return;
+    for (int row = y0; row < y1; row++) {
+        const uint32_t *s = src + (uint32_t)row * (uint32_t)spitch;
+        uint32_t *d = t->pixels + (uint32_t)(dy + row) * (uint32_t)t->pitch + (uint32_t)dx;
+        int col = x0;
+        while (col < x1) {
+            uint32_t a = s[col] >> 24;
+            if (a == 255) {
+                int run = col;
+                while (col < x1 && (s[col] >> 24) == 255) col++;
+                memcpy(d + run, s + run, (size_t)(col - run) * 4u);
+                continue;
+            }
+            if (a != 0) {
+                uint32_t sp = s[col], dp = d[col], inv = 255 - a;
+                uint32_t r = ((sp >> 16) & 255) + (((dp >> 16) & 255) * inv + 127) / 255;
+                uint32_t g = ((sp >> 8) & 255) + (((dp >> 8) & 255) * inv + 127) / 255;
+                uint32_t b = (sp & 255) + ((dp & 255) * inv + 127) / 255;
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+                d[col] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+            col++;
+        }
+    }
+}
+
 void r_blit_keyed(r_target_t *t, int dx, int dy,
                   const uint32_t *src, int sw, int sh, int spitch)
 {

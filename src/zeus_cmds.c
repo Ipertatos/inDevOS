@@ -259,7 +259,7 @@ void zeus_cmd_help(ZeusShell* shell, int argc, char* argv[]) {
     printf("  timertest  timeraccuracy  stopwatch  hpet  fputest\n");
     printf("  prof start [div]|stop|reset|stats|dump|overlay on|off|sample <n>\n");
     printf("  threadtest [n] [iter]  memtest [n] [size]\n");
-    printf("  tcpinfo  tcpclean  luade  cachestats\n");
+    printf("  tcpinfo  tcpclean  cachestats\n");
 
     printf("\nScripting:\n");
     printf("  Pipe:     cmd1 | cmd2 | cmd3\n");

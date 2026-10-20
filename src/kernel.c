@@ -425,13 +425,6 @@ void kmain(void) {
             did_work = true;
         }
 
-#ifdef ENABLE_LUA
-        /* Non-blocking LuaDE: one script time slice while VT 0 is shown. */
-        {
-            extern bool luade_tick(void);
-            if (!fbdev_display_owned() && luade_tick()) did_work = true;
-        }
-#endif
         /* Desktop terminal window: keep draining its shell's output even
          * while a text VT is on screen, so the shell never blocks on a full
          * pipe. */

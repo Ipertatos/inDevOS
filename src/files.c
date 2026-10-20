@@ -6,6 +6,7 @@
 #include "utils.h"
 extern int snprintf(char *str, size_t size, const char *fmt, ...);
 #include "../include/SDL.h"
+#include "launch.h"
 
 #define FILES_W 560
 #define FILES_H 420
@@ -124,7 +125,12 @@ static void fb_reveal_sel(void) {
 static void fb_enter_sel(void) {
     if (fb_sel < 0 || fb_sel >= fb_count) return;
     if (fb_ents[fb_sel].type != VFS_DIRECTORY) {
-        fb_set_status("Not a folder");
+        char full[600];
+        snprintf(full, sizeof(full), "%s%s%s", fb_path,
+                 (fb_path[0] && fb_path[strlen(fb_path) - 1] == '/') ? "" : "/",
+                 fb_ents[fb_sel].name);
+        fb_set_status("Opening...");
+        launch_open_path(full, false);
         return;
     }
     fb_join(fb_ents[fb_sel].name);
@@ -194,6 +200,23 @@ void files_open(void) {
     serial_puts("[files] opened\n");
 }
 
+/* Open (or retarget) the Files window at folder @path. */
+void files_open_path(const char *path) {
+    if (path && path[0]) {
+        kstrncpy(fb_path, path, sizeof(fb_path));
+        int l = (int)strlen(fb_path);
+        while (l > 1 && fb_path[l - 1] == '/') fb_path[--l] = '\0';
+    }
+    serial_printf("[files] open %s\n", fb_path);
+    if (fb_win && fb_win->id) {
+        fb_reload();
+        fb_request();
+        desktop_focus_window(fb_win);
+        return;
+    }
+    files_open();
+}
+
 bool files_is_open(void) { return fb_win && fb_win->id != 0; }
 bool files_is_window(const desktop_window_t *win) {
     return win && fb_win && win == fb_win && fb_win->id != 0;
@@ -243,6 +266,18 @@ void files_on_mouse(int rx, int ry, bool down) {
     if (idx < 0 || idx >= fb_count) return;
     fb_sel = idx;
     fb_enter_sel();
+    fb_request();
+}
+
+/* Wheel: positive = up; 3 rows per step. */
+void files_on_wheel(int steps) {
+    if (!files_is_open() || !steps) return;
+    int vis = fb_rows_visible();
+    int max = fb_count - vis;
+    if (max < 0) max = 0;
+    fb_scroll -= steps * 3;
+    if (fb_scroll < 0) fb_scroll = 0;
+    if (fb_scroll > max) fb_scroll = max;
     fb_request();
 }
 

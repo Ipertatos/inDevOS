@@ -653,3 +653,18 @@ bool notepad_tick(void)
     spinlock_unlock(&np_win->content_lock);
     return true;
 }
+
+/* Open @path in the notepad window (launch service).  Refuses to replace a
+ * document with unsaved changes. */
+void notepad_open_path(const char *path)
+{
+    if (np_modified && np_win && np_win->id) {
+        desktop_toast("Notepad has unsaved changes; save first (Ctrl+S)");
+        desktop_focus_window(np_win);
+        return;
+    }
+    np_copy_path(path);
+    notepad_open();
+    np_do_open();
+    serial_printf("[notepad] open %s (%d bytes)\n", np_path, np_len);
+}

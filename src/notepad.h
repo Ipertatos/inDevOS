@@ -6,6 +6,7 @@
 #include "desktop.h"
 
 void notepad_open(void);
+void notepad_open_path(const char *path);
 bool notepad_is_open(void);
 bool notepad_is_window(const desktop_window_t *win);
 void notepad_on_key(int32_t keycode, bool pressed);

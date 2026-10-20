@@ -81,6 +81,11 @@ static exec_auxinfo_t exec_cur_aux;
 
 /* Environment handed to every new program (Linux binaries read it through
  * envp/environ; the inDevOS crt0 ignores it). */
+/* exec_spawn_ex(): extra environment for the stack being built (NULL when
+ * none), and the working directory / envp for the next exec_spawn(). */
+static const char *const *exec_abi_extra_env;
+static char exec_spawn_cwd[256];
+static const char *const *exec_spawn_envp;
 static const char *const exec_default_envp[] = {
     "PATH=/bin:/",
     "HOME=/",
@@ -200,15 +205,28 @@ static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
     }
     argc = stored_args;
 
-    uint64_t env_virt[8];
+    uint64_t env_virt[16];
     int envc = 0;
-    for (int i = 0; exec_default_envp[i] && envc < 8; i++) {
-        size_t nlen = strlen(exec_default_envp[i]) + 1;
-        if (str_off < nlen + reserve)
-            break;
-        str_off -= (uint32_t)nlen;
-        memcpy(page + str_off, exec_default_envp[i], nlen);
-        env_virt[envc++] = ustack_top + str_off;
+    /* exec_spawn_ex() extras (PWD, caller envp) first, then the defaults
+     * whose keys the extras did not set. */
+    for (int pass = 0; pass < 2; pass++) {
+        const char *const *list = pass == 0 ? exec_abi_extra_env : exec_default_envp;
+        for (int i = 0; list && list[i] && envc < 16; i++) {
+            bool dup = false;
+            if (pass == 1 && exec_abi_extra_env) {
+                const char *eq = strchr(list[i], '=');
+                size_t kl = eq ? (size_t)(eq - list[i]) + 1 : strlen(list[i]);
+                for (int k = 0; exec_abi_extra_env[k]; k++)
+                    if (strncmp(exec_abi_extra_env[k], list[i], kl) == 0) dup = true;
+            }
+            if (dup) continue;
+            size_t nlen = strlen(list[i]) + 1;
+            if (str_off < nlen + reserve)
+                break;
+            str_off -= (uint32_t)nlen;
+            memcpy(page + str_off, list[i], nlen);
+            env_virt[envc++] = ustack_top + str_off;
+        }
     }
 
     uint64_t uid = user_current_uid(), gid = user_current_gid();
@@ -1632,11 +1650,26 @@ void exec_spawn_set_stdio_pipes(pipe_t *in, pipe_t *out) {
     exec_spawn_out_pipe = out;
 }
 
+/* exec_spawn() with a working directory and extra environment (KEY=VALUE,
+ * NULL-terminated; PWD is added for @cwd).  Either may be NULL. */
+int exec_spawn_ex(const char *filename, char *const argv[], const char *cwd,
+                  const char *const envp[]) {
+    exec_spawn_cwd[0] = '\0';
+    if (cwd && cwd[0]) kstrncpy(exec_spawn_cwd, cwd, sizeof(exec_spawn_cwd));
+    exec_spawn_envp = envp;
+    return exec_spawn(filename, argv);
+}
+
 int exec_spawn(const char *filename, char *const argv[]) {
     exec_current_argv = argv;
     pipe_t *spawn_in  = exec_spawn_in_pipe;
     pipe_t *spawn_out = exec_spawn_out_pipe;
     exec_spawn_in_pipe = exec_spawn_out_pipe = NULL;
+    char spawn_cwd[256];
+    kstrncpy(spawn_cwd, exec_spawn_cwd, sizeof(spawn_cwd));
+    exec_spawn_cwd[0] = '\0';
+    const char *const *spawn_envp = exec_spawn_envp;
+    exec_spawn_envp = NULL;
     exec_dbg_reset();
     exec_dbg_mark(filename);
 
@@ -1783,7 +1816,23 @@ int exec_spawn(const char *filename, char *const argv[]) {
     }
 
     exec_collect_auxinfo(image);
-    ustack_top = exec_build_abi_stack(user_pml4, ustack_top, filename);
+    {
+        /* PWD + caller envp for exec_spawn_ex(). */
+        static char pwd_env[268];
+        static const char *extra[12];
+        int ne = 0;
+        if (spawn_cwd[0]) {
+            kstrncpy(pwd_env, "PWD=", sizeof(pwd_env));
+            kstrncpy(pwd_env + 4, spawn_cwd, sizeof(pwd_env) - 4);
+            extra[ne++] = pwd_env;
+        }
+        for (int i = 0; spawn_envp && spawn_envp[i] && ne < 11; i++)
+            extra[ne++] = spawn_envp[i];
+        extra[ne] = NULL;
+        exec_abi_extra_env = ne ? extra : NULL;
+        ustack_top = exec_build_abi_stack(user_pml4, ustack_top, filename);
+        exec_abi_extra_env = NULL;
+    }
 
     /* ---- Step 5: Allocate per-process kernel stack ---- */
     uint8_t *kstack = (uint8_t *)kalloc(KSTACK_SIZE);
@@ -1825,6 +1874,10 @@ int exec_spawn(const char *filename, char *const argv[]) {
     if (proc->parent) {
         proc->sibling       = proc->parent->child;
         proc->parent->child = proc;
+    }
+    if (spawn_cwd[0]) {
+        process_set_cwd(proc, spawn_cwd);
+        serial_printf("[exec] spawn %s cwd %s\n", filename, spawn_cwd);
     }
 
     if (spawn_in || spawn_out) {
@@ -1952,6 +2005,18 @@ void exec_spawned_exit(int status) {
     }
 
     exec_free_user_symbols(proc);
+
+    /* A background process (e.g. a forked user-mode driver) exiting while a
+     * foreground sync program still owns the console must not touch the
+     * console state.  keyboard_restore_shell_input() cleared program_running
+     * under the running program, so its own sys_exit no longer recognised it
+     * as the sync program and sent it down this path, which terminated the
+     * Zeus thread it was running on: the shell went deaf. */
+    bool fg_busy = exec_fg_sync_proc && exec_fg_sync_proc != proc;
+    if (fg_busy) {
+        serial_printf("exec_spawned_exit: PID %d is background (fg PID %d still running); console left alone\n",
+                      (int)proc->pid, (int)exec_fg_sync_proc->pid);
+    } else {
     keyboard_restore_shell_input();
 
     /* App drew over the framebuffer (e.g. dvd.exe); restore the shell — unless
@@ -1967,6 +2032,7 @@ void exec_spawned_exit(int status) {
         }
     }
     printf("%s", tty_get_prompt());
+    }
 
     /* Mark thread terminated so the scheduler skips it.  Not switchable
      * until the hlt loop below: a TERMINATED thread is never resumed, so a

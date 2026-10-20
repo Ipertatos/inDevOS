@@ -271,13 +271,19 @@ bool sdl_destroy_window_sharing_pixels(uint32_t *pixels) {
     return false;
 }
 
+static void *surface_pixels_of(SDL_Window *w) {
+    return (w && w->surface) ? w->surface->pixels : NULL;
+}
+
 // Destroy a window
 void SDL_DestroyWindow(SDL_Window* window) {
     if (!window) return;
 
     if (desktop_is_running()) {
         process_t *proc = get_current_process();
-        desktop_window_t *dw = proc ? desktop_find_window_by_pid(proc->pid) : NULL;
+        desktop_window_t *dw = window->surface
+            ? desktop_find_window_by_pixels(window->surface->pixels) : NULL;
+        if (!dw && proc) dw = desktop_find_window_by_pid(proc->pid);
         if (dw) {
             if (window->surface && dw->pixels == (uint32_t *)window->surface->pixels)
                 dw->pixels = NULL; /* SDL_FreeSurface owns this buffer. */
@@ -320,7 +326,8 @@ int SDL_UpdateWindowSurface(SDL_Window* window) {
     if (desktop_is_running()) {
         process_t *proc = get_current_process();
         if (proc) {
-            desktop_window_t *dw = desktop_find_window_by_pid(proc->pid);
+            desktop_window_t *dw = desktop_find_window_by_pixels(surface_pixels_of(window));
+            if (!dw) dw = desktop_find_window_by_pid(proc->pid);
             if (dw) dw->dirty = true;
             if (desktop_present_window_now(proc->pid))
                 return SDL_SUCCESS;

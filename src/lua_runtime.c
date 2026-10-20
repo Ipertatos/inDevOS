@@ -1,6 +1,7 @@
 #include "lua_runtime.h"
 #include "term.h"
 #include "utils.h"
+#include "serial.h"
 
 /*
  * Minimal shim. Real Lua integration is optional to keep default build small.
@@ -10,6 +11,10 @@
  
 
 #ifndef ENABLE_LUA
+
+void luade_print_last_lua_location(void) {
+    serial_puts("   Lua support not compiled in\n");
+}
 
 int lua_run_script_from_buffer(const char *name,
                                const void *script_bytes,
@@ -168,11 +173,25 @@ static const char *lua_reader_once(lua_State *Lr, void *ud, size_t *sz) {
 /* Ctrl+C hook: fires every N VM instructions and raises an error if
  * the terminate flag has been set by the keyboard ISR. */
 extern bool get_terminate_flag(void);
+/* Fault-dump context (was in the removed LuaDE): the script the kernel Lua
+ * runtime ran last and the last line the Ctrl-C count hook sampled. */
+static char lr_script[128];
+static volatile int lr_line;
+
 static void lua_ctrlc_hook(lua_State *L2, lua_Debug *ar) {
-    (void)ar;
+    if (ar && lua_getinfo(L2, "l", ar) && ar->currentline > 0)
+        lr_line = ar->currentline;
     if (get_terminate_flag()) {
         luaL_error(L2, "interrupted (^C)");
     }
+}
+
+void luade_print_last_lua_location(void) {
+    if (!lr_script[0]) {
+        serial_puts("   No Lua script has run\n");
+        return;
+    }
+    serial_printf("   Last Lua script: %s (line ~%d)\n", lr_script, lr_line);
 }
 
 int lua_run_script_from_buffer(const char *name,
@@ -184,6 +203,9 @@ int lua_run_script_from_buffer(const char *name,
 
     set_program_running(true);
     set_terminate_flag(false);
+    lr_line = 0;
+    { size_t i = 0; for (; name && name[i] && i < sizeof(lr_script) - 1; i++) lr_script[i] = name[i];
+      lr_script[i] = '\0'; }
 
     lua_State *L = lua_newstate(lua_kernel_allocator, NULL);
     if (!L) {

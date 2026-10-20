@@ -2830,7 +2830,16 @@ int fat32_rename(const char *oldpath, const char *newpath) {
         FS_UNLOCK(); return -ENOENT;
     }
 
-    if (fat32_dir_place_named_entry(&fat32_filesystem, new_parent, new_base,
+    /* Place the caller's spelling of the leaf (resolve_path may fold case),
+     * so lowercase 8.3 names keep their NT case flags / LFN. */
+    const char *new_leaf = new_base;
+    {
+        const char *sl = newpath;
+        for (const char *q = newpath; *q; q++)
+            if (*q == '/') sl = q + 1;
+        if (*sl && fat32_name_eq_ci(sl, new_base)) new_leaf = sl;
+    }
+    if (fat32_dir_place_named_entry(&fat32_filesystem, new_parent, new_leaf,
                                     attr, first_cluster, file_size) != 0) {
         /* Best-effort rollback: put the old name back. */
         (void)fat32_dir_place_named_entry(&fat32_filesystem, old_parent, old_base,

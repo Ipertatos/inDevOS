@@ -76,6 +76,12 @@ done
 MUSL_TESTS=(hello_musl musltest)
 # fbdev smoke test (tests/fbdev/fbgrad.c), same install rule.
 [[ -f tests/fbdev/build/fbgrad.exe ]] && mcopy -o -i "$ROOTFS" tests/fbdev/build/fbgrad.exe ::/bin/fbgrad.exe && echo "    /bin/fbgrad.exe (static musl, fbdev test)"
+# evdev checker (tests/evdev/evdump.c), same install rule.
+[[ -f tests/evdev/build/evdump.exe ]] && mcopy -o -i "$ROOTFS" tests/evdev/build/evdump.exe ::/bin/evdump.exe && echo "    /bin/evdump.exe (static musl, evdev test)"
+# uinput fake drivers (tests/uinput/fakemouse.c, fakekbd.c), same install rule.
+for t in fakemouse fakekbd faketablet; do
+    [[ -f tests/uinput/build/${t}.exe ]] && mcopy -o -i "$ROOTFS" tests/uinput/build/${t}.exe ::/bin/${t}.exe && echo "    /bin/${t}.exe (static musl, uinput test)"
+done
 for t in "${MUSL_TESTS[@]}"; do
     if [[ -f "tests/musl/build/${t}.exe" ]]; then
         mcopy -o -i "$ROOTFS" "tests/musl/build/${t}.exe" "::/bin/${t}.exe"
@@ -96,6 +102,9 @@ printf "127.0.0.1 localhost\n" > "$NETTMP/hosts"
 mmd -D s -i "$ROOTFS" ::/etc ::/etc/ssl ::/etc/ssl/certs 2>/dev/null || true
 mcopy -o -i "$ROOTFS" "$NETTMP/resolv.conf" ::/etc/resolv.conf
 mcopy -o -i "$ROOTFS" "$NETTMP/hosts" ::/etc/hosts
+# Desktop file associations (src/launch.c has the same built-in default).
+mmd -D s -i "$ROOTFS" ::/etc/indevos 2>/dev/null || true
+mcopy -o -i "$ROOTFS" config/open-with ::/etc/indevos/open-with
 if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
     mcopy -o -i "$ROOTFS" /etc/ssl/certs/ca-certificates.crt ::/etc/ssl/certs/ca-certificates.crt
     echo "    /etc/ssl/certs/ca-certificates.crt (CA bundle)"

@@ -41,6 +41,7 @@
 #include "uaccess.h"
 #include "settings.h"
 #include "vconsole.h"
+#include "launch.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -113,8 +114,69 @@ static bool      dt_wp_cache_failed;
 static vfs_dirent_t dt_icon_entries[DT_ICON_MAX];
 static int          dt_icon_count;
 static char         dt_icon_base_path[256] = "/os";
-static uint64_t     dt_icon_last_click_tick;
 static int          dt_icon_last_idx;
+static int          dt_icon_sel = -1;           /* selected icon or -1 */
+static int          dt_icon_cls[DT_ICON_MAX];   /* LAUNCH_ICON_* per entry */
+/* Grid slot per icon (persisted in /home/user/.config/desktop-layout). */
+static int          dt_icon_col[DT_ICON_MAX];
+static int          dt_icon_row[DT_ICON_MAX];
+static char         dt_icon_label[DT_ICON_MAX][40];   /* shown text */
+/* Icon drag: press on an icon arms it, >4 px of motion starts the drag. */
+static int          dt_icon_drag = -1;
+static bool         dt_icon_dragging;
+static int          dt_drag_sx, dt_drag_sy, dt_drag_lx, dt_drag_ly;
+
+/* Built-in 32x32 icon set (premultiplied ARGB), drawn once in code. */
+#define DT_ICON_PX 32
+static uint32_t dt_iconset[LAUNCH_ICON_COUNT][DT_ICON_PX * DT_ICON_PX];
+static bool     dt_iconset_ready;
+
+static void dt_build_iconset(void) {
+    for (int k = 0; k < LAUNCH_ICON_COUNT; k++) {
+        r_target_t t;
+        r_target_init(&t, dt_iconset[k], DT_ICON_PX, DT_ICON_PX, DT_ICON_PX);
+        r_fill(&t, 0, 0, DT_ICON_PX, DT_ICON_PX, 0);
+        switch (k) {
+        case LAUNCH_ICON_FOLDER:
+            r_rrect(&t, 2, 5, 14, 8, 3, 0xFFD99A2B);
+            r_rrect(&t, 2, 9, 28, 20, 3, 0xFFF2B640);
+            r_fill(&t, 4, 12, 24, 1, 0xFFF8D27A);
+            break;
+        case LAUNCH_ICON_EXE:
+            r_rrect(&t, 2, 5, 28, 23, 4, 0xFF0F172A);
+            r_rrect_outline(&t, 2, 5, 28, 23, 4, 0xFF3DDC97);
+            r_fill(&t, 4, 9, 24, 1, 0xFF1E293B);
+            r_text(&t, 7, 11, ">_", 0xFF3DDC97);
+            break;
+        case LAUNCH_ICON_LUA:
+            r_circle(&t, 15, 17, 13, 0xFF1E3A8A);
+            r_circle(&t, 25, 6, 4, 0xFF60A5FA);
+            r_text(&t, 11, 9, "L", 0xFFFFFFFF);
+            break;
+        case LAUNCH_ICON_WAD:
+            r_rrect(&t, 3, 3, 26, 26, 5, 0xFF991B1B);
+            r_rrect_outline(&t, 3, 3, 26, 26, 5, 0xFFF87171);
+            r_text(&t, 12, 8, "D", 0xFFFDE68A);
+            break;
+        default:   /* page shapes: text, image, generic */
+            r_rrect(&t, 6, 2, 20, 28, 3, 0xFFF4F4F5);
+            r_rrect_outline(&t, 6, 2, 20, 28, 3, 0xFF94A3B8);
+            r_fill(&t, 20, 3, 5, 5, 0xFFCBD5E1);
+            if (k == LAUNCH_ICON_TEXT) {
+                for (int i = 0; i < 5; i++)
+                    r_fill(&t, 10, 10 + 4 * i, i == 4 ? 7 : 12, 2, 0xFF64748B);
+            } else if (k == LAUNCH_ICON_IMAGE) {
+                r_fill(&t, 9, 10, 14, 14, 0xFFBAE6FD);
+                r_fill(&t, 9, 19, 14, 5, 0xFF22C55E);
+                r_circle(&t, 18, 14, 2, 0xFFFACC15);
+            } else {
+                r_fill(&t, 10, 14, 12, 2, 0xFFCBD5E1);
+            }
+            break;
+        }
+    }
+    dt_iconset_ready = true;
+}
 
 static const char *const dt_wallpaper_try_paths[DESKTOP_WALLPAPER_PATHS] = {
     "/os/wallpaper.png",
@@ -156,9 +218,6 @@ static inline void dt_putpixel(int x, int y, uint32_t c);
 static void dt_fill(uint32_t c, int x, int y, int w, int h);
 static void dt_draw_text(int x, int y, const char *s, uint32_t color, int scr_w, int scr_h);
 static void dt_open_kernel_text_window(const char *title, const char *const *lines);
-static void dt_launch_terminal(void);
-static void dt_launch_files(void);
-static void dt_launch_settings(void);
 static void dt_draw_dock_glyph(int x, int y, int slot, uint32_t col);
 static void dt_blit_icon(int dx, int dy, int dw, int dh, const uint32_t *src, int sw, int sh);
 static void dt_draw_start_menu(int scr_w, int scr_h);
@@ -188,10 +247,67 @@ static bool       dt_rt_ready;
 #define DT_EDGE_E        8
 #define DT_MIN_CONTENT_W 160
 #define DT_MIN_CONTENT_H 80
-#define DT_TITLE_DBLCLK_MS 400
 
-static uint64_t dt_title_last_click;
 static uint32_t dt_title_last_id;
+
+/* Pointer click counting, one place for all double-click users.  A press of
+ * the same button within DT_DBLCLK_MS and DT_DBLCLK_PX of the previous one
+ * increments dt_ptr_clicks (1 = single, 2 = double, ...). */
+#define DT_DBLCLK_MS 400
+#define DT_DBLCLK_PX 4
+static int      dt_ptr_clicks;
+static int      dt_ptr_last_btn;
+static int      dt_ptr_last_x, dt_ptr_last_y;
+static uint64_t dt_ptr_last_ms;
+extern bool keyboard_get_shift(void);
+extern bool keyboard_get_ctrl(void);
+extern bool process_pid_alive(uint32_t pid);
+extern int8_t mouse_get_scroll_delta(void);
+
+static uint32_t dt_mods_now(void) {
+    uint32_t m = 0;
+    if (keyboard_get_shift()) m |= DESKTOP_MOD_SHIFT;
+    if (keyboard_get_ctrl())  m |= DESKTOP_MOD_CTRL;
+    if (keyboard_get_alt())   m |= DESKTOP_MOD_ALT;
+    if (keyboard_get_super()) m |= DESKTOP_MOD_SUPER;
+    return m;
+}
+
+static int dt_count_click(int button, int x, int y) {
+    uint64_t now = hpet_get_ticks();
+    int ddx = x - dt_ptr_last_x, ddy = y - dt_ptr_last_y;
+    if (ddx < 0) ddx = -ddx;
+    if (ddy < 0) ddy = -ddy;
+    if (button == dt_ptr_last_btn && (now - dt_ptr_last_ms) < DT_DBLCLK_MS &&
+        ddx <= DT_DBLCLK_PX && ddy <= DT_DBLCLK_PX)
+        dt_ptr_clicks++;
+    else
+        dt_ptr_clicks = 1;
+    dt_ptr_last_btn = button;
+    dt_ptr_last_x = x;
+    dt_ptr_last_y = y;
+    dt_ptr_last_ms = now;
+    return dt_ptr_clicks;
+}
+
+/* Deliver a pointer event to a kernel-side app window.  Every event type goes
+ * through here; each app takes what it uses (today: left press only). */
+static void dt_kapp_pointer(desktop_window_t *w, const desktop_ptr_event_t *ev) {
+    if (!w || w->pid != 0) return;
+    if (ev->type == DESKTOP_PTR_WHEEL) {
+        if (files_is_window(w)) files_on_wheel(ev->wheel);
+        return;
+    }
+    if (ev->type != DESKTOP_PTR_DOWN || ev->button != 1) return;
+    if (notepad_is_window(w))
+        notepad_on_mouse(ev->x, ev->y, true);
+    else if (files_is_window(w))
+        files_on_mouse(ev->x, ev->y, true);
+    else if (kterm_is_window(w))
+        kterm_on_mouse(ev->x, ev->y, true);
+    else if (settings_app_is_window(w))
+        settings_app_on_mouse(ev->x, ev->y, true);
+}
 static int dt_hover_btn = -1;
 static uint32_t dt_hover_win_id;
 
@@ -441,6 +557,171 @@ void desktop_gui_enqueue_key_sdl(int32_t keycode, bool pressed) {
     process_gui_enqueue_by_pid(fw->pid, &ev);
 }
 
+/* ---- Icon grid layout ---------------------------------------------------
+ * Every icon sits in a grid slot (col,row).  Slots are remembered by name in
+ * /home/user/.config/desktop-layout ("<col> <row> <name>" per line); icons
+ * without a saved slot take the first free one in row-major order. */
+#define DT_LAYOUT_DIR  "/home/user/.config"
+#define DT_LAYOUT_PATH "/home/user/.config/desktop-layout"
+#define DT_LAY_MAX     64
+#define DT_GRID_MAXC   64
+#define DT_GRID_MAXR   32
+typedef struct { char name[VFS_MAX_NAME]; int col, row; } dt_lay_t;
+static dt_lay_t dt_lay[DT_LAY_MAX];
+static int      dt_lay_n;
+static bool     dt_lay_loaded;
+extern int fat32_sync(void);
+
+/* FAT names are case-insensitive. */
+static bool dt_name_eq_ci(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return false;
+    }
+    return *a == *b;
+}
+
+static void dt_grid_dims(int *cols, int *rows) {
+    int scr_w = (int)fb_get_width(), scr_h = (int)fb_get_height();
+    int c = (scr_w - DESKTOP_ICON_GRID) / DESKTOP_ICON_COL_W;
+    int r = (scr_h - DESKTOP_TOP_DEADSPACE - DESKTOP_ICON_GRID - DESKTOP_PANEL_H) /
+            DESKTOP_ICON_ROW_H;
+    if (c < 1) c = 1;
+    if (r < 1) r = 1;
+    if (c > DT_GRID_MAXC) c = DT_GRID_MAXC;
+    if (r > DT_GRID_MAXR) r = DT_GRID_MAXR;
+    *cols = c;
+    *rows = r;
+}
+
+static void dt_icon_xy(int i, int *x, int *y) {
+    *x = DESKTOP_ICON_GRID + dt_icon_col[i] * DESKTOP_ICON_COL_W;
+    *y = DESKTOP_TOP_DEADSPACE + DESKTOP_ICON_GRID + dt_icon_row[i] * DESKTOP_ICON_ROW_H;
+}
+
+static void dt_layout_load(void) {
+    dt_lay_loaded = true;
+    dt_lay_n = 0;
+    void *buf = NULL;
+    int n = vfs_read_file_alloc(DT_LAYOUT_PATH, &buf, 32768);
+    if (n <= 0 || !buf) {
+        if (buf) kfree(buf);
+        serial_puts("[desktop] layout: none saved\n");
+        return;
+    }
+    const char *p = (const char *)buf, *end = p + n;
+    while (p < end && dt_lay_n < DT_LAY_MAX) {
+        const char *ls = p;
+        while (p < end && *p != '\n') p++;
+        const char *le = p;
+        if (p < end) p++;
+        if (le > ls && le[-1] == '\r') le--;
+        if (ls >= le || *ls == '#') continue;
+        const char *q = ls;
+        int c = 0, r = 0;
+        bool ok = q < le && *q >= '0' && *q <= '9';
+        while (q < le && *q >= '0' && *q <= '9') c = c * 10 + (*q++ - '0');
+        ok = ok && q < le && *q == ' ';
+        q++;
+        ok = ok && q < le && *q >= '0' && *q <= '9';
+        while (q < le && *q >= '0' && *q <= '9') r = r * 10 + (*q++ - '0');
+        ok = ok && q < le && *q == ' ';
+        q++;
+        if (!ok || q >= le) continue;
+        int nl = (int)(le - q);
+        if (nl >= VFS_MAX_NAME) nl = VFS_MAX_NAME - 1;
+        memcpy(dt_lay[dt_lay_n].name, q, (size_t)nl);
+        dt_lay[dt_lay_n].name[nl] = '\0';
+        dt_lay[dt_lay_n].col = c;
+        dt_lay[dt_lay_n].row = r;
+        dt_lay_n++;
+    }
+    kfree(buf);
+    serial_printf("[desktop] layout: loaded %d entries from %s\n", dt_lay_n, DT_LAYOUT_PATH);
+}
+
+/* The in-memory table follows the icons currently on the desktop. */
+static void dt_layout_capture(void) {
+    dt_lay_n = 0;
+    for (int i = 0; i < dt_icon_count && dt_lay_n < DT_LAY_MAX; i++) {
+        kstrncpy(dt_lay[dt_lay_n].name, dt_icon_entries[i].name, VFS_MAX_NAME);
+        dt_lay[dt_lay_n].col = dt_icon_col[i];
+        dt_lay[dt_lay_n].row = dt_icon_row[i];
+        dt_lay_n++;
+    }
+}
+
+static void dt_layout_save(void) {
+    uint32_t cap = 96 + (uint32_t)dt_lay_n * (VFS_MAX_NAME + 24);
+    char *buf = (char *)kalloc(cap);
+    if (!buf) return;
+    int o = snprintf(buf, cap, "# inDevOS desktop icon layout: <col> <row> <name>\n");
+    for (int i = 0; i < dt_lay_n && o < (int)cap - 1; i++)
+        o += snprintf(buf + o, cap - (uint32_t)o, "%d %d %s\n",
+                      dt_lay[i].col, dt_lay[i].row, dt_lay[i].name);
+    vfs_mkdir_p(DT_LAYOUT_DIR);
+    int rc = vfs_write_file(DT_LAYOUT_PATH, buf, (uint32_t)o);
+    fat32_sync();
+    kfree(buf);
+    serial_printf("[desktop] layout: saved %d icons to %s rc=%d\n", dt_lay_n, DT_LAYOUT_PATH, rc);
+}
+
+static void dt_icon_assign_slots(void) {
+    if (!dt_lay_loaded) dt_layout_load();
+    int cols, rows;
+    dt_grid_dims(&cols, &rows);
+    static uint8_t occ[DT_GRID_MAXR][DT_GRID_MAXC];
+    memset(occ, 0, sizeof(occ));
+    for (int i = 0; i < dt_icon_count; i++) {
+        dt_icon_col[i] = dt_icon_row[i] = -1;
+        for (int j = 0; j < dt_lay_n; j++) {
+            if (!dt_name_eq_ci(dt_lay[j].name, dt_icon_entries[i].name)) continue;
+            int c = dt_lay[j].col, r = dt_lay[j].row;
+            if (c < cols && r < rows && !occ[r][c]) {
+                dt_icon_col[i] = c;
+                dt_icon_row[i] = r;
+                occ[r][c] = 1;
+            }
+            break;
+        }
+    }
+    for (int i = 0; i < dt_icon_count; i++) {
+        if (dt_icon_col[i] >= 0) continue;
+        bool found = false;
+        for (int r = 0; r < rows && !found; r++)
+            for (int c = 0; c < cols && !found; c++)
+                if (!occ[r][c]) {
+                    dt_icon_col[i] = c;
+                    dt_icon_row[i] = r;
+                    occ[r][c] = 1;
+                    found = true;
+                }
+        if (!found) { dt_icon_col[i] = 0; dt_icon_row[i] = 0; }
+    }
+    dt_layout_capture();
+    for (int i = 0; i < dt_icon_count; i++)
+        serial_printf("[desktop] icon %s at %d,%d\n", dt_icon_entries[i].name,
+                      dt_icon_col[i], dt_icon_row[i]);
+}
+
+/* Labels and icon classes; .desktop shortcuts show their Name and Icon. */
+static void dt_icon_labels(void) {
+    for (int k = 0; k < dt_icon_count; k++) {
+        bool dir = dt_icon_entries[k].type == VFS_DIRECTORY;
+        dt_icon_cls[k] = launch_icon_for(dt_icon_entries[k].name, dir);
+        kstrncpy(dt_icon_label[k], dt_icon_entries[k].name, sizeof(dt_icon_label[k]));
+        if (!dir) {
+            char path[320];
+            int cls = LAUNCH_ICON_GENERIC;
+            snprintf(path, sizeof(path), "%s/%s", dt_icon_base_path, dt_icon_entries[k].name);
+            if (launch_shortcut_info(path, dt_icon_label[k], sizeof(dt_icon_label[k]), &cls) == 0)
+                dt_icon_cls[k] = cls;
+        }
+    }
+}
+
 static void dt_refresh_desktop_icons(void) {
     dt_icon_count = 0;
     vfs_dirent_t tmp[DT_ICON_MAX];
@@ -463,6 +744,11 @@ static void dt_refresh_desktop_icons(void) {
                 dt_icon_entries[wn++] = tmp[i];
             }
             dt_icon_count = wn;
+            dt_icon_drag = -1;
+            dt_icon_dragging = false;
+            dt_icon_labels();
+            dt_icon_assign_slots();
+            if (dt_icon_sel >= wn) dt_icon_sel = -1;
             serial_printf("[desktop] desktop icons from %s (%d entries)\n", paths[p], dt_icon_count);
             return;
         }
@@ -590,17 +876,12 @@ static void dt_bake_wallpaper(int w, int h)
 }
 
 static int dt_icon_hit(int mx, int my, int scr_w, int scr_h) {
+    (void)scr_w;
     if (my < DESKTOP_TOP_DEADSPACE || my >= scr_h - DESKTOP_PANEL_H)
         return -1;
-    int col0 = DESKTOP_ICON_GRID;
-    int row0 = DESKTOP_TOP_DEADSPACE + DESKTOP_ICON_GRID;
-    int maxcols = (scr_w - col0) / DESKTOP_ICON_COL_W;
-    if (maxcols < 1) maxcols = 1;
-    for (int i = 0; i < dt_icon_count; i++) {
-        int col = i % maxcols;
-        int row = i / maxcols;
-        int ix = col0 + col * DESKTOP_ICON_COL_W;
-        int iy = row0 + row * DESKTOP_ICON_ROW_H;
+    for (int i = dt_icon_count - 1; i >= 0; i--) {
+        int ix, iy;
+        dt_icon_xy(i, &ix, &iy);
         if (mx >= ix && mx < ix + DESKTOP_ICON_COL_W - DESKTOP_ICON_GRID &&
             my >= iy && my < iy + DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID)
             return i;
@@ -608,34 +889,129 @@ static int dt_icon_hit(int mx, int my, int scr_w, int scr_h) {
     return -1;
 }
 
+/* Slot under the dragged icon's current top-left (rounded to the nearest). */
+static void dt_icon_drop_slot(int *col, int *row) {
+    int cols, rows;
+    dt_grid_dims(&cols, &rows);
+    int i = dt_icon_drag;
+    int ix, iy;
+    dt_icon_xy(i, &ix, &iy);
+    int x = ix + (dt_mouse_x - dt_drag_sx) - DESKTOP_ICON_GRID + DESKTOP_ICON_COL_W / 2;
+    int y = iy + (dt_mouse_y - dt_drag_sy) - DESKTOP_TOP_DEADSPACE - DESKTOP_ICON_GRID +
+            DESKTOP_ICON_ROW_H / 2;
+    int c = x < 0 ? 0 : x / DESKTOP_ICON_COL_W;
+    int r = y < 0 ? 0 : y / DESKTOP_ICON_ROW_H;
+    if (c >= cols) c = cols - 1;
+    if (r >= rows) r = rows - 1;
+    *col = c;
+    *row = r;
+}
+
+static void dt_draw_one_icon(int i, int ix, int iy, bool ghost, int scr_w, int scr_h) {
+    const int cell_w = DESKTOP_ICON_COL_W - DESKTOP_ICON_GRID;   /* 72 */
+    char lab[16];
+    const char *nm = dt_icon_label[i];
+    int maxch = cell_w / 8;                 /* 9 */
+    int l = 0;
+    while (nm[l] && l < maxch) { lab[l] = nm[l]; l++; }
+    if (nm[l]) { l = maxch - 2; lab[l++] = '.'; lab[l++] = '.'; }
+    lab[l] = '\0';
+    int tw = l * 8;
+    int lx = ix + (cell_w - tw) / 2;
+    if (dt_rt_ready) {
+        bool sel = i == dt_icon_sel;
+        if (sel && !ghost)
+            r_rrect_blend(&dt_rt, ix - 2, iy - 2, cell_w + 4,
+                          DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8, 0x663DDC97);
+        int cls = dt_icon_cls[i];
+        if (cls < 0 || cls >= LAUNCH_ICON_COUNT) cls = LAUNCH_ICON_GENERIC;
+        r_blit_premul(&dt_rt, ix + (cell_w - DT_ICON_PX) / 2, iy + 4,
+                      dt_iconset[cls], DT_ICON_PX, DT_ICON_PX, DT_ICON_PX);
+        r_rrect_blend(&dt_rt, lx - 4, iy + 40, tw + 8, 20, 6,
+                      sel ? 0xE0166B4F : 0xB4101418);
+        r_text(&dt_rt, lx, iy + 42, lab, DT_COL_TEXT_WHITE);
+    } else {
+        dt_fill(DT_COL_PANEL_ACTIVE, ix + 20, iy + 4, 32, 32);
+        dt_draw_text(lx, iy + 42, lab, DT_COL_TEXT_WHITE, scr_w, scr_h);
+    }
+}
+
 static void dt_draw_desktop_icons(int scr_w, int scr_h) {
-    (void)scr_w;
-    (void)scr_h;
-    int col0 = DESKTOP_ICON_GRID;
-    int row0 = DESKTOP_TOP_DEADSPACE + DESKTOP_ICON_GRID;
-    int maxcols = (scr_w - col0) / DESKTOP_ICON_COL_W;
-    if (maxcols < 1) maxcols = 1;
-    static const uint32_t badge[] = {
-        0xFF2DD4BF, 0xFF60A5FA, 0xFFA78BFA, 0xFFF87171, 0xFFFBBF24
-    };
+    if (!dt_iconset_ready) dt_build_iconset();
+    bool dragging = dt_icon_dragging && dt_icon_drag >= 0 && dt_icon_drag < dt_icon_count;
     for (int i = 0; i < dt_icon_count; i++) {
-        int col = i % maxcols;
-        int row = i / maxcols;
-        int ix = col0 + col * DESKTOP_ICON_COL_W;
-        int iy = row0 + row * DESKTOP_ICON_ROW_H;
-        uint32_t colr = badge[i % 5];
+        if (dragging && i == dt_icon_drag) continue;
+        int ix, iy;
+        dt_icon_xy(i, &ix, &iy);
+        dt_draw_one_icon(i, ix, iy, false, scr_w, scr_h);
+    }
+    if (dragging) {
+        int c, r;
+        dt_icon_drop_slot(&c, &r);
+        int tx = DESKTOP_ICON_GRID + c * DESKTOP_ICON_COL_W;
+        int ty = DESKTOP_TOP_DEADSPACE + DESKTOP_ICON_GRID + r * DESKTOP_ICON_ROW_H;
         if (dt_rt_ready) {
-            r_rrect_blend(&dt_rt, ix, iy, 56, 40, 8, 0xCC1A2035);
-            r_rrect(&dt_rt, ix + 14, iy + 6, 28, 22, 6, colr);
-            char ch[2] = { dt_icon_entries[i].name[0], 0 };
-            if (ch[0] >= 'a' && ch[0] <= 'z') ch[0] = (char)(ch[0] - 32);
-            r_text(&dt_rt, ix + 24, iy + 8, ch, DT_COL_TEXT_WHITE);
-            r_text(&dt_rt, ix, iy + 48, dt_icon_entries[i].name, DT_COL_TEXT_WHITE);
-        } else {
-            dt_fill(DT_COL_PANEL_ACTIVE, ix, iy, 56, 40);
-            dt_draw_text(ix + 4, iy + 48, dt_icon_entries[i].name, DT_COL_TEXT_WHITE, scr_w, scr_h);
+            r_rrect_blend(&dt_rt, tx - 2, ty - 2, DESKTOP_ICON_COL_W - DESKTOP_ICON_GRID + 4,
+                          DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8, 0x403DDC97);
+            r_rrect_outline(&dt_rt, tx - 2, ty - 2, DESKTOP_ICON_COL_W - DESKTOP_ICON_GRID + 4,
+                            DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8, 0xFF3DDC97);
+        }
+        int ix, iy;
+        dt_icon_xy(dt_icon_drag, &ix, &iy);
+        dt_draw_one_icon(dt_icon_drag, ix + dt_mouse_x - dt_drag_sx,
+                         iy + dt_mouse_y - dt_drag_sy, true, scr_w, scr_h);
+    }
+}
+
+static void dt_icon_drop(void) {
+    int i = dt_icon_drag;
+    if (i < 0 || i >= dt_icon_count) return;
+    int c, r;
+    dt_icon_drop_slot(&c, &r);
+    int oc = dt_icon_col[i], orow = dt_icon_row[i];
+    if (c == oc && r == orow) {
+        serial_printf("[desktop] drag %s: same slot %d,%d\n", dt_icon_entries[i].name, c, r);
+        return;
+    }
+    for (int j = 0; j < dt_icon_count; j++) {
+        if (j != i && dt_icon_col[j] == c && dt_icon_row[j] == r) {
+            dt_icon_col[j] = oc;
+            dt_icon_row[j] = orow;
+            serial_printf("[desktop] drag: %s swapped to %d,%d\n",
+                          dt_icon_entries[j].name, oc, orow);
         }
     }
+    dt_icon_col[i] = c;
+    dt_icon_row[i] = r;
+    serial_printf("[desktop] drag %s -> slot %d,%d (from %d,%d)\n",
+                  dt_icon_entries[i].name, c, r, oc, orow);
+    dt_layout_capture();
+    dt_layout_save();
+}
+
+/* Pointer frames while an icon is armed or being dragged. */
+static void dt_icon_drag_frame(void) {
+    if (dt_icon_drag < 0) return;
+    if (dt_mouse_btn & 1) {
+        int ddx = dt_mouse_x - dt_drag_sx, ddy = dt_mouse_y - dt_drag_sy;
+        if (!dt_icon_dragging && (ddx > 4 || ddx < -4 || ddy > 4 || ddy < -4)) {
+            dt_icon_dragging = true;
+            if (dt_icon_drag < dt_icon_count)
+                serial_printf("[desktop] drag start %s\n", dt_icon_entries[dt_icon_drag].name);
+        }
+        if (dt_icon_dragging && (dt_mouse_x != dt_drag_lx || dt_mouse_y != dt_drag_ly)) {
+            dt_drag_lx = dt_mouse_x;
+            dt_drag_ly = dt_mouse_y;
+            dt_dirty = true;
+        }
+        return;
+    }
+    if (dt_icon_dragging) {
+        dt_icon_drop();
+        dt_dirty = true;
+    }
+    dt_icon_drag = -1;
+    dt_icon_dragging = false;
 }
 
 static void dt_icon_double_click(int idx) {
@@ -650,27 +1026,28 @@ static void dt_icon_double_click(int idx) {
     while (name[ni] && bl < (int)sizeof(path) - 1) { path[bl++] = name[ni++]; }
     path[bl] = '\0';
 
-    if (dt_icon_entries[idx].type == VFS_DIRECTORY) {
-        serial_printf("[desktop] open folder %s\n", path);
-        return;
-    }
-    int pid = exec_spawn(path, NULL);
-    if (pid > 0)
-        serial_printf("[desktop] launched %s pid %d\n", path, pid);
-    else
-        serial_printf("[desktop] could not exec %s\n", path);
+    int pid = launch_open_path(path, dt_icon_entries[idx].type == VFS_DIRECTORY);
+    serial_printf("[desktop] open %s -> %d\n", path, pid);
 }
 
 static void dt_handle_desktop_icon_click(int mx, int my, int scr_w, int scr_h) {
     int idx = dt_icon_hit(mx, my, scr_w, scr_h);
+    if (idx != dt_icon_sel) {
+        dt_icon_sel = idx;
+        dt_dirty = true;
+    }
     if (idx < 0) return;
-    uint64_t now = hpet_get_ticks();
-    if (idx == dt_icon_last_idx && (now - dt_icon_last_click_tick) < 400) {
+    if (dt_ptr_clicks >= 2 && idx == dt_icon_last_idx) {
+        serial_printf("[desktop] icon %d double-click (%s)\n", idx,
+                      dt_icon_entries[idx].name);
         dt_icon_double_click(idx);
         dt_icon_last_idx = -1;
     } else {
         dt_icon_last_idx = idx;
-        dt_icon_last_click_tick = now;
+        dt_icon_drag = idx;            /* armed: motion > 4 px starts a drag */
+        dt_icon_dragging = false;
+        dt_drag_sx = dt_drag_lx = mx;
+        dt_drag_sy = dt_drag_ly = my;
     }
 }
 
@@ -739,22 +1116,36 @@ static inline void dt_clip_clear(void) {
     dt_clip_set(0, 0, 1 << 30, 1 << 30);
 }
 
-/* Per-frame damage accumulator (exclusive x1/y1). */
-static int  dt_dmg_x0, dt_dmg_y0, dt_dmg_x1, dt_dmg_y1;
+/* Per-frame damage list (exclusive x1/y1).  Overlapping or touching rects
+ * are merged; past DT_DMG_MAX separate rects the frame falls back to a full
+ * repaint. */
+#define DT_DMG_MAX 8
+typedef struct { int x0, y0, x1, y1; } dt_rect_t;
+static dt_rect_t dt_dmg[DT_DMG_MAX];
+static int  dt_dmg_n = 0;
 static bool dt_dmg_any = false;
+static bool dt_dmg_overflow = false;
 
 static void dt_damage_add(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
-    if (!dt_dmg_any) {
-        dt_dmg_x0 = x; dt_dmg_y0 = y;
-        dt_dmg_x1 = x + w; dt_dmg_y1 = y + h;
-        dt_dmg_any = true;
-        return;
+    dt_dmg_any = true;
+    if (dt_dmg_overflow) return;
+    dt_rect_t r = { x, y, x + w, y + h };
+    for (int i = 0; i < dt_dmg_n; ) {
+        dt_rect_t *o = &dt_dmg[i];
+        if (r.x0 <= o->x1 && o->x0 <= r.x1 && r.y0 <= o->y1 && o->y0 <= r.y1) {
+            if (o->x0 < r.x0) r.x0 = o->x0;
+            if (o->y0 < r.y0) r.y0 = o->y0;
+            if (o->x1 > r.x1) r.x1 = o->x1;
+            if (o->y1 > r.y1) r.y1 = o->y1;
+            dt_dmg[i] = dt_dmg[--dt_dmg_n];
+            i = 0;              /* the grown rect may now touch others */
+            continue;
+        }
+        i++;
     }
-    if (x < dt_dmg_x0) dt_dmg_x0 = x;
-    if (y < dt_dmg_y0) dt_dmg_y0 = y;
-    if (x + w > dt_dmg_x1) dt_dmg_x1 = x + w;
-    if (y + h > dt_dmg_y1) dt_dmg_y1 = y + h;
+    if (dt_dmg_n >= DT_DMG_MAX) { dt_dmg_overflow = true; return; }
+    dt_dmg[dt_dmg_n++] = r;
 }
 
 static inline void dt_putpixel(int x, int y, uint32_t c) {
@@ -1000,7 +1391,14 @@ static void dt_dock_spawn(int slot) {
         return;
     }
 
-    /* Prevent double-launching the same dock slot */
+    /* Prevent double-launching the same dock slot (a pid whose process has
+     * exited on its own no longer counts). */
+    if (dt_dock_spawned_pid[slot] > 0 &&
+        !process_pid_alive((uint32_t)dt_dock_spawned_pid[slot])) {
+        serial_printf("[desktop] dock: slot %d pid %d has exited\n",
+                      slot, dt_dock_spawned_pid[slot]);
+        dt_dock_spawned_pid[slot] = 0;
+    }
     if (dt_dock_spawned_pid[slot] > 0) {
         serial_printf("[desktop] dock: slot %d already running (pid %d)\n",
                       slot, dt_dock_spawned_pid[slot]);
@@ -1044,7 +1442,12 @@ static void dt_dock_spawn(int slot) {
     lines[2] = "";
     lines[3] = "Build user apps and copy them onto the FAT image.";
     lines[4] = NULL;
-    dt_open_kernel_text_window("Launch failed", lines);
+    (void)lines;
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Could not launch %s", dt_dock_apps[slot].label);
+        desktop_toast(msg);
+    }
 }
 
 static void dt_fmt_clock(char *clock_buf) {
@@ -1130,6 +1533,9 @@ static void dt_draw_panel(int scr_w, int scr_h) {
     int ty = dy + (dh - DT_DOCK_TILE) / 2;
     for (int d = 0; d < DT_DOCK_COUNT; d++) {
         uint32_t col = dt_dock_tile_col[d % 5];
+        if (dt_dock_spawned_pid[d] > 0 &&
+            !process_pid_alive((uint32_t)dt_dock_spawned_pid[d]))
+            dt_dock_spawned_pid[d] = 0;
         bool running = dt_dock_spawned_pid[d] > 0;
         if (dt_dock_apps[d].launch == notepad_open)
             running = notepad_is_open();
@@ -1340,7 +1746,12 @@ static void dt_dock_click(int mx, int my, int scr_w, int scr_h) {
  * =================================================================== */
 
 static void dt_draw_decoration(desktop_window_t *win, int scr_w, int scr_h) {
-    if (!win->decorated) return;
+    if (!win->decorated) {
+        if (win->type == DESKTOP_WIN_POPUP && dt_rt_ready)
+            r_shadow(&dt_rt, win->x, win->y, win->content_w, win->content_h,
+                     8, 8);
+        return;
+    }
 
     int fx, fy, fw, fh;
     dt_win_frame(win, &fx, &fy, &fw, &fh);
@@ -1400,7 +1811,10 @@ static void dt_blit_window(desktop_window_t *win, int scr_w, int scr_h) {
     uint32_t src_pitch_pix = win->pixel_pitch / 4;
 
     spinlock_lock(&win->content_lock);
-    if (dt_rt_ready) {
+    if (dt_rt_ready && win->format == DESKTOP_FMT_ARGB) {
+        r_blit_premul(&dt_rt, cx, cy, win->pixels,
+                      win->content_w, win->content_h, (int)src_pitch_pix);
+    } else if (dt_rt_ready) {
         r_blit_keyed(&dt_rt, cx, cy, win->pixels,
                      win->content_w, win->content_h, (int)src_pitch_pix);
     } else if (dt_backbuffer) {
@@ -1541,12 +1955,14 @@ static void dt_wm_apply_drag_resize(void) {
 /* Route pointer events to the focused window's client rect only.
  * Coordinates are client-relative. Chrome / grab swallows delivery. */
 static void dt_deliver_client_pointer_events(bool btn1_down, bool btn1_up,
-                                             bool btn2_down, bool btn2_up) {
+                                             bool btn2_down, bool btn2_up,
+                                             bool btn3_down, bool btn3_up,
+                                             int wheel) {
     if (dt_grab_id)
         return; /* title-bar move / resize owns the pointer */
 
     desktop_window_t *fw = desktop_get_focused();
-    if (!fw || !fw->pid)
+    if (!fw)
         return;
 
     int cx, cy, cw, ch;
@@ -1555,6 +1971,28 @@ static void dt_deliver_client_pointer_events(bool btn1_down, bool btn1_up,
     int ry = dt_mouse_y - cy;
     bool in_client = (dt_mouse_x >= cx && dt_mouse_x < cx + cw &&
                       dt_mouse_y >= cy && dt_mouse_y < cy + ch);
+
+    if (!fw->pid) {
+        /* Kernel app.  The left press is delivered by desktop_handle_mouse
+         * (it also focuses/raises); everything else is routed here. */
+        static int k_last_rx = -1, k_last_ry = -1;
+        static uint32_t k_last_id;
+        if (!in_client) { k_last_rx = k_last_ry = -1; return; }
+        uint32_t mods = dt_mods_now();
+        desktop_ptr_event_t ev = { DESKTOP_PTR_MOVE, rx, ry, 0, 0, 0, mods };
+        if (fw->id != k_last_id || rx != k_last_rx || ry != k_last_ry) {
+            k_last_id = fw->id; k_last_rx = rx; k_last_ry = ry;
+            dt_kapp_pointer(fw, &ev);
+        }
+        ev.clicks = dt_ptr_clicks;
+        if (btn1_up)   { ev.type = DESKTOP_PTR_UP;   ev.button = 1; dt_kapp_pointer(fw, &ev); }
+        if (btn2_down) { ev.type = DESKTOP_PTR_DOWN; ev.button = 2; dt_kapp_pointer(fw, &ev); }
+        if (btn2_up)   { ev.type = DESKTOP_PTR_UP;   ev.button = 2; dt_kapp_pointer(fw, &ev); }
+        if (btn3_down) { ev.type = DESKTOP_PTR_DOWN; ev.button = 3; dt_kapp_pointer(fw, &ev); }
+        if (btn3_up)   { ev.type = DESKTOP_PTR_UP;   ev.button = 3; dt_kapp_pointer(fw, &ev); }
+        if (wheel)     { ev.type = DESKTOP_PTR_WHEEL; ev.button = 0; ev.wheel = wheel; dt_kapp_pointer(fw, &ev); }
+        return;
+    }
 
     if (fw->pid != dt_last_gui_pid) {
         dt_last_gui_rx = -1;
@@ -1594,6 +2032,18 @@ static void dt_deliver_client_pointer_events(bool btn1_down, bool btn1_up,
         gui_event_t ev = { GUI_EVENT_MOUSE_UP, rx, ry, 2 };
         process_gui_enqueue_by_pid(fw->pid, &ev);
     }
+    if (btn3_down) {
+        gui_event_t ev = { GUI_EVENT_MOUSE_DOWN, rx, ry, 3 };
+        process_gui_enqueue_by_pid(fw->pid, &ev);
+    }
+    if (btn3_up) {
+        gui_event_t ev = { GUI_EVENT_MOUSE_UP, rx, ry, 3 };
+        process_gui_enqueue_by_pid(fw->pid, &ev);
+    }
+    if (wheel) {
+        gui_event_t ev = { GUI_EVENT_MOUSE_WHEEL, rx, ry, wheel };
+        process_gui_enqueue_by_pid(fw->pid, &ev);
+    }
 }
 
 static void dt_wm_super_toggle(void) {
@@ -1608,6 +2058,592 @@ static void dt_wm_super_toggle(void) {
     prev_super = now_super;
 }
 
+/* ===================================================================
+ * Toasts: small notifications above the dock, newest at the bottom.
+ * =================================================================== */
+#define DT_TOAST_MAX 3
+#define DT_TOAST_MS  3500
+#define DT_TOAST_W   420
+#define DT_TOAST_H   34
+#define DT_TOAST_GAP 8
+static struct { char text[96]; uint64_t expire; } dt_toasts[DT_TOAST_MAX];
+static int  dt_toast_n;
+static volatile bool dt_toast_changed;
+
+void desktop_toast(const char *msg) {
+    if (!msg) return;
+    if (dt_toast_n == DT_TOAST_MAX) {
+        for (int i = 1; i < DT_TOAST_MAX; i++) dt_toasts[i - 1] = dt_toasts[i];
+        dt_toast_n--;
+    }
+    int i = 0;
+    for (; msg[i] && i < (int)sizeof(dt_toasts[0].text) - 1; i++)
+        dt_toasts[dt_toast_n].text[i] = msg[i];
+    dt_toasts[dt_toast_n].text[i] = '\0';
+    dt_toasts[dt_toast_n].expire = hpet_get_ticks() + DT_TOAST_MS;
+    dt_toast_n++;
+    dt_toast_changed = true;
+    serial_printf("[toast] %s\n", msg);
+}
+
+static void dt_toast_area(int scr_w, int scr_h, int *x, int *y, int *w, int *h) {
+    *w = DT_TOAST_W + 24;
+    *h = DT_TOAST_MAX * (DT_TOAST_H + DT_TOAST_GAP) + 16;
+    *x = scr_w - *w;
+    *y = scr_h - DESKTOP_PANEL_H - *h;
+}
+
+/* Expire old toasts; damage the toast column when anything changed. */
+static bool dt_toast_tick(int scr_w, int scr_h) {
+    uint64_t now = hpet_get_ticks();
+    int k = 0;
+    for (int i = 0; i < dt_toast_n; i++) {
+        if (dt_toasts[i].expire > now) dt_toasts[k++] = dt_toasts[i];
+        else dt_toast_changed = true;
+    }
+    dt_toast_n = k;
+    if (!dt_toast_changed) return false;
+    dt_toast_changed = false;
+    int x, y, w, h;
+    dt_toast_area(scr_w, scr_h, &x, &y, &w, &h);
+    dt_damage_add(x, y, w, h);
+    return true;
+}
+
+static void dt_draw_toasts(int scr_w, int scr_h) {
+    if (!dt_toast_n || !dt_rt_ready) return;
+    int ax, ay, aw, ah;
+    dt_toast_area(scr_w, scr_h, &ax, &ay, &aw, &ah);
+    if (!dt_intersects_clip(ax, ay, aw, ah)) return;
+    for (int i = 0; i < dt_toast_n; i++) {
+        int slot = dt_toast_n - 1 - i;          /* newest lowest */
+        int x = scr_w - DT_TOAST_W - 16;
+        int y = scr_h - DESKTOP_PANEL_H - 8 - (slot + 1) * (DT_TOAST_H + DT_TOAST_GAP);
+        r_shadow(&dt_rt, x, y, DT_TOAST_W, DT_TOAST_H, 8, 6);
+        r_rrect_blend(&dt_rt, x, y, DT_TOAST_W, DT_TOAST_H, 8, 0xEE1A2035);
+        r_fill(&dt_rt, x + 10, y + 9, 4, DT_TOAST_H - 18, DT_COL_ACCENT);
+        r_text(&dt_rt, x + 24, y + (DT_TOAST_H - 16) / 2, dt_toasts[i].text,
+               DT_COL_TEXT_WHITE);
+    }
+}
+
+/* ===================================================================
+ * Context menu: a popup window (ARGB, no chrome) with mouse hover/click and
+ * Up/Down/Enter/Esc.  Any press outside closes it.
+ * =================================================================== */
+#define DT_MENU_MAX    10
+#define DT_MENU_W      220
+#define DT_MENU_ITEM_H 26
+#define DT_MENU_PAD    6
+typedef void (*dt_menu_cb_t)(int idx);
+static uint32_t     dt_menu_id;
+static const char  *dt_menu_labels[DT_MENU_MAX];
+static int          dt_menu_n;
+static int          dt_menu_sel = -1;
+static dt_menu_cb_t dt_menu_cb;
+static uint32_t     dt_menu_prev_focus;
+
+static uint32_t dt_premul(uint32_t c) {
+    uint32_t a = c >> 24;
+    if (a == 255) return c;
+    uint32_t r = ((c >> 16) & 255) * a / 255;
+    uint32_t g = ((c >> 8) & 255) * a / 255;
+    uint32_t b = (c & 255) * a / 255;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static desktop_window_t *dt_menu_window(void) {
+    return dt_menu_id ? desktop_find_window_by_id(dt_menu_id) : NULL;
+}
+
+static void dt_menu_draw(void) {
+    desktop_window_t *w = dt_menu_window();
+    if (!w || !w->pixels) return;
+    r_target_t t;
+    r_target_init(&t, w->pixels, w->content_w, w->content_h, (int)(w->pixel_pitch / 4));
+    spinlock_lock(&w->content_lock);
+    r_fill(&t, 0, 0, w->content_w, w->content_h, 0);   /* transparent corners */
+    r_rrect(&t, 0, 0, w->content_w, w->content_h, 8, dt_premul(0xF0161B2A));
+    r_rrect_outline(&t, 0, 0, w->content_w, w->content_h, 8, 0xFF2A3148);
+    for (int i = 0; i < dt_menu_n; i++) {
+        int y = DT_MENU_PAD + i * DT_MENU_ITEM_H;
+        if (i == dt_menu_sel)
+            r_rrect(&t, 4, y, w->content_w - 8, DT_MENU_ITEM_H, 6, 0xFF1E3A4A);
+        r_text(&t, 16, y + (DT_MENU_ITEM_H - 16) / 2, dt_menu_labels[i],
+               i == dt_menu_sel ? 0xFFFFFFFF : 0xFFE5E9F0);
+    }
+    spinlock_unlock(&w->content_lock);
+    w->dirty = true;
+}
+
+static void dt_menu_close(void) {
+    desktop_window_t *w = dt_menu_window();
+    dt_menu_id = 0;
+    dt_menu_sel = -1;
+    if (w) {
+        desktop_destroy_window(w);
+        serial_puts("[menu] closed\n");
+    }
+    desktop_window_t *prev = desktop_find_window_by_id(dt_menu_prev_focus);
+    if (prev) desktop_focus_window(prev);
+    dt_menu_prev_focus = 0;
+}
+
+static void dt_menu_open(int x, int y, const char *const *labels, int n,
+                         dt_menu_cb_t cb) {
+    if (dt_menu_id) dt_menu_close();
+    if (n > DT_MENU_MAX) n = DT_MENU_MAX;
+    int scr_w = (int)fb_get_width(), scr_h = (int)fb_get_height();
+    int h = 2 * DT_MENU_PAD + n * DT_MENU_ITEM_H;
+    if (x + DT_MENU_W > scr_w - 4) x = scr_w - 4 - DT_MENU_W;
+    if (y + h > scr_h - DESKTOP_PANEL_H) y = scr_h - DESKTOP_PANEL_H - h;
+    if (x < 0) x = 0;
+    if (y < DESKTOP_MENUBAR_H) y = DESKTOP_MENUBAR_H;
+    dt_menu_prev_focus = dt_focused_id;
+    desktop_window_t *w = desktop_create_window_ex(0, x, y, DT_MENU_W, h, "Menu",
+                                                   DESKTOP_WIN_POPUP, 0,
+                                                   DESKTOP_FMT_ARGB);
+    if (!w) return;
+    for (int i = 0; i < n; i++) dt_menu_labels[i] = labels[i];
+    dt_menu_n = n;
+    dt_menu_sel = -1;
+    dt_menu_cb = cb;
+    dt_menu_id = w->id;
+    dt_menu_draw();
+    serial_printf("[menu] open %d items at %d,%d (window %u)\n", n, w->x, w->y, w->id);
+}
+
+/* -1 = inside but not on an item, -2 = outside the menu. */
+static int dt_menu_item_at(int mx, int my) {
+    desktop_window_t *w = dt_menu_window();
+    if (!w) return -2;
+    if (mx < w->x || mx >= w->x + w->content_w ||
+        my < w->y || my >= w->y + w->content_h)
+        return -2;
+    int ry = my - w->y - DT_MENU_PAD;
+    if (ry < 0) return -1;
+    int idx = ry / DT_MENU_ITEM_H;
+    return idx < dt_menu_n ? idx : -1;
+}
+
+static void dt_menu_activate(int idx) {
+    if (idx < 0 || idx >= dt_menu_n) return;
+    dt_menu_cb_t cb = dt_menu_cb;
+    serial_printf("[menu] choose %d '%s'\n", idx, dt_menu_labels[idx]);
+    dt_menu_close();
+    if (cb) cb(idx);
+}
+
+/* Pointer handling while a menu is open.  True = event consumed. */
+static bool dt_menu_pointer(bool btn1_down, bool any_down) {
+    if (!dt_menu_id) return false;
+    if (!dt_menu_window()) { dt_menu_id = 0; return false; }
+    int idx = dt_menu_item_at(dt_mouse_x, dt_mouse_y);
+    if (idx >= 0 && idx != dt_menu_sel) {
+        dt_menu_sel = idx;
+        dt_menu_draw();
+    }
+    if (!any_down) return idx != -2;
+    if (idx == -2) {            /* outside: close, let the press through */
+        dt_menu_close();
+        return false;
+    }
+    if (btn1_down && idx >= 0) dt_menu_activate(idx);
+    return true;
+}
+
+static bool dt_menu_key(uint8_t scancode, bool pressed) {
+    if (!dt_menu_id) return false;
+    if (!pressed) return true;
+    switch (scancode) {
+    case 0x48: dt_menu_sel = dt_menu_sel <= 0 ? dt_menu_n - 1 : dt_menu_sel - 1;
+               dt_menu_draw(); break;
+    case 0x50: dt_menu_sel = (dt_menu_sel + 1) % dt_menu_n; dt_menu_draw(); break;
+    case 0x1C: if (dt_menu_sel >= 0) dt_menu_activate(dt_menu_sel); break;
+    case 0x01: dt_menu_close(); break;
+    default: break;
+    }
+    return true;
+}
+
+/* ---- Desktop background menu ---- */
+#define DT_DESKTOP_DIR "/home/user/Desktop"
+static const char *const dt_desk_menu_items[] = {
+    "New folder", "New text file", "Open terminal here", "Refresh", "Settings",
+};
+
+static bool dt_unique_path(const char *base, const char *ext, char *out, int n) {
+    for (int k = 1; k < 100; k++) {
+        if (k == 1) snprintf(out, (size_t)n, "%s/%s%s", DT_DESKTOP_DIR, base, ext);
+        else        snprintf(out, (size_t)n, "%s/%s%d%s", DT_DESKTOP_DIR, base, k, ext);
+        if (!vfs_exists(out)) return true;
+    }
+    return false;
+}
+
+static void dt_desk_menu_cb(int idx) {
+    char path[160], msg[96];
+    int rc;
+    switch (idx) {
+    case 0:
+    case 1:
+        vfs_mkdir_p(DT_DESKTOP_DIR);
+        if (!dt_unique_path(idx == 0 ? "NewFolder" : "new", idx == 0 ? "" : ".txt",
+                            path, sizeof(path))) {
+            desktop_toast("No free name on the Desktop");
+            return;
+        }
+        rc = idx == 0 ? vfs_mkdir(path) : vfs_create(path);
+        serial_printf("[desktop] menu: %s %s rc=%d\n",
+                      idx == 0 ? "new folder" : "new file", path, rc);
+        snprintf(msg, sizeof(msg), rc == 0 ? "Created %s" : "Could not create %s", path);
+        desktop_toast(msg);
+        dt_refresh_desktop_icons();
+        dt_layout_save();
+        dt_dirty = true;
+        break;
+    case 2:
+        /* kterm has no per-window cwd yet; the shell starts in the session cwd. */
+        serial_printf("[desktop] menu: terminal in %s\n", DT_DESKTOP_DIR);
+        kterm_open_in(DT_DESKTOP_DIR);
+        break;
+    case 3:
+        dt_refresh_desktop_icons();
+        dt_dirty = true;
+        serial_puts("[desktop] menu: refresh\n");
+        desktop_toast("Desktop refreshed");
+        break;
+    case 4:
+        serial_puts("[desktop] menu: settings\n");
+        dt_launch_settings();
+        break;
+    }
+}
+
+
+/* ===================================================================
+ * Modal dialog (popup ARGB window): a message, an optional one-line text
+ * field, and Cancel / OK buttons.  Enter = OK, Esc = Cancel.  While open it
+ * takes every press and key.
+ * =================================================================== */
+#define DT_DLG_W 420
+#define DT_DLG_H 160
+#define DT_DLG_BTN_W 100
+#define DT_DLG_BTN_H 32
+enum { DT_DLG_NONE = 0, DT_DLG_DELETE, DT_DLG_RENAME };
+static uint32_t dt_dlg_id;
+static int      dt_dlg_kind;
+static char     dt_dlg_title[48];
+static char     dt_dlg_msg[96];
+static char     dt_dlg_text[64];
+static int      dt_dlg_len;
+static bool     dt_dlg_fresh;       /* text still "selected": typing replaces */
+static int      dt_dlg_hover;       /* 0 none, 1 Cancel, 2 OK */
+static uint32_t dt_dlg_prev_focus;
+static char     dt_dlg_path[320];   /* target */
+static bool     dt_dlg_isdir;
+
+static desktop_window_t *dt_dlg_window(void) {
+    return dt_dlg_id ? desktop_find_window_by_id(dt_dlg_id) : NULL;
+}
+
+static void dt_dlg_btn_rect(int which, int *x, int *y) {
+    *y = DT_DLG_H - 16 - DT_DLG_BTN_H;
+    *x = which == 1 ? DT_DLG_W - 2 * DT_DLG_BTN_W - 28 : DT_DLG_W - DT_DLG_BTN_W - 20;
+}
+
+static void dt_dlg_draw(void) {
+    desktop_window_t *w = dt_dlg_window();
+    if (!w || !w->pixels) return;
+    r_target_t t;
+    r_target_init(&t, w->pixels, w->content_w, w->content_h, (int)(w->pixel_pitch / 4));
+    spinlock_lock(&w->content_lock);
+    r_fill(&t, 0, 0, w->content_w, w->content_h, 0);
+    r_rrect(&t, 0, 0, w->content_w, w->content_h, 10, dt_premul(0xF8161B2A));
+    r_rrect_outline(&t, 0, 0, w->content_w, w->content_h, 10, 0xFF3A4360);
+    r_text(&t, 20, 16, dt_dlg_title, 0xFFFFFFFF);
+    r_hline(&t, 20, 38, w->content_w - 40, 0xFF2A3148);
+    r_text(&t, 20, 48, dt_dlg_msg, 0xFFC8CED8);
+    if (dt_dlg_kind == DT_DLG_RENAME) {
+        int fx = 20, fy = 72, fw = w->content_w - 40, fh = 28;
+        r_rrect(&t, fx, fy, fw, fh, 5, 0xFF0D111A);
+        r_rrect_outline(&t, fx, fy, fw, fh, 5, 0xFF3DDC97);
+        int shown = dt_dlg_len, max = (fw - 20) / 8;
+        const char *txt = dt_dlg_text;
+        if (shown > max) { txt += shown - max; shown = max; }
+        if (dt_dlg_fresh && shown > 0)
+            r_fill(&t, fx + 8, fy + 5, shown * 8, 18, 0xFF1E5A7A);
+        r_text(&t, fx + 8, fy + 6, txt, 0xFFFFFFFF);
+        if (!dt_dlg_fresh) r_fill(&t, fx + 9 + shown * 8, fy + 6, 2, 16, 0xFF3DDC97);
+    }
+    for (int b = 1; b <= 2; b++) {
+        int bx, by;
+        dt_dlg_btn_rect(b, &bx, &by);
+        const char *lab = b == 1 ? "Cancel" : (dt_dlg_kind == DT_DLG_DELETE ? "Delete" : "Rename");
+        uint32_t bg = b == 1 ? 0xFF2A3148 : (dt_dlg_kind == DT_DLG_DELETE ? 0xFFB03A3A : 0xFF1F8A62);
+        if (dt_dlg_hover == b) bg = b == 1 ? 0xFF3A4566 : (dt_dlg_kind == DT_DLG_DELETE ? 0xFFD04848 : 0xFF27A877);
+        r_rrect(&t, bx, by, DT_DLG_BTN_W, DT_DLG_BTN_H, 6, bg);
+        int lw = (int)strlen(lab) * 8;
+        r_text(&t, bx + (DT_DLG_BTN_W - lw) / 2, by + 8, lab, 0xFFFFFFFF);
+    }
+    spinlock_unlock(&w->content_lock);
+    w->dirty = true;
+}
+
+static void dt_dlg_close(void) {
+    desktop_window_t *w = dt_dlg_window();
+    dt_dlg_id = 0;
+    dt_dlg_kind = DT_DLG_NONE;
+    if (w) {
+        desktop_destroy_window(w);
+        serial_puts("[dialog] closed\n");
+    }
+    desktop_window_t *prev = desktop_find_window_by_id(dt_dlg_prev_focus);
+    if (prev) desktop_focus_window(prev);
+    dt_dlg_prev_focus = 0;
+}
+
+static void dt_dlg_open(int kind, const char *title, const char *msg,
+                        const char *text, const char *path, bool isdir) {
+    if (dt_menu_id) dt_menu_close();
+    if (dt_dlg_id) dt_dlg_close();
+    int scr_w = (int)fb_get_width(), scr_h = (int)fb_get_height();
+    int x = (scr_w - DT_DLG_W) / 2, y = (scr_h - DT_DLG_H) / 2 - 40;
+    dt_dlg_prev_focus = dt_focused_id;
+    desktop_window_t *w = desktop_create_window_ex(0, x, y, DT_DLG_W, DT_DLG_H, "Dialog",
+                                                   DESKTOP_WIN_POPUP, 0, DESKTOP_FMT_ARGB);
+    if (!w) return;
+    dt_dlg_kind = kind;
+    kstrncpy(dt_dlg_title, title, sizeof(dt_dlg_title));
+    kstrncpy(dt_dlg_msg, msg, sizeof(dt_dlg_msg));
+    kstrncpy(dt_dlg_text, text ? text : "", sizeof(dt_dlg_text));
+    dt_dlg_len = (int)strlen(dt_dlg_text);
+    dt_dlg_fresh = true;
+    dt_dlg_hover = 0;
+    kstrncpy(dt_dlg_path, path, sizeof(dt_dlg_path));
+    dt_dlg_isdir = isdir;
+    dt_dlg_id = w->id;
+    dt_dlg_draw();
+    serial_printf("[dialog] open '%s' at %d,%d %dx%d (window %u): %s\n",
+                  dt_dlg_title, w->x, w->y, DT_DLG_W, DT_DLG_H, w->id, dt_dlg_msg);
+}
+
+static const char *dt_basename(const char *p) {
+    const char *b = p;
+    for (; *p; p++) if (*p == '/') b = p + 1;
+    return b;
+}
+
+static void dt_dlg_do_delete(void) {
+    extern int fat32_remove_empty_directory(const char *path);
+    char msg[96];
+    const char *nm = dt_basename(dt_dlg_path);
+    int rc = dt_dlg_isdir ? fat32_remove_empty_directory(dt_dlg_path) : vfs_unlink(dt_dlg_path);
+    fat32_sync();
+    serial_printf("[desktop] delete %s%s rc=%d\n", dt_dlg_path, dt_dlg_isdir ? " (dir)" : "", rc);
+    snprintf(msg, sizeof(msg), rc == 0 ? "Deleted %s" : "Could not delete %s", nm);
+    desktop_toast(msg);
+    dt_icon_sel = -1;
+    dt_refresh_desktop_icons();
+    dt_layout_save();
+    dt_dirty = true;
+}
+
+static void dt_dlg_do_rename(void) {
+    char msg[96], np[320], dir[320];
+    const char *old = dt_basename(dt_dlg_path);
+    if (dt_dlg_len == 0 || strcmp(dt_dlg_text, ".") == 0 || strcmp(dt_dlg_text, "..") == 0) {
+        desktop_toast("Rename: the name is empty or invalid");
+        return;
+    }
+    if (strcmp(dt_dlg_text, old) == 0) return;
+    kstrncpy(dir, dt_dlg_path, sizeof(dir));
+    int cut = -1;
+    for (int i = 0; dir[i]; i++) if (dir[i] == '/') cut = i;
+    if (cut <= 0) { dir[0] = '/'; dir[1] = '\0'; } else dir[cut] = '\0';
+    snprintf(np, sizeof(np), "%s/%s", dir, dt_dlg_text);
+    if (vfs_exists(np)) {
+        snprintf(msg, sizeof(msg), "%s already exists", dt_dlg_text);
+        desktop_toast(msg);
+        serial_printf("[desktop] rename %s -> %s refused (exists)\n", dt_dlg_path, np);
+        return;
+    }
+    int rc = vfs_rename(dt_dlg_path, np);
+    fat32_sync();
+    serial_printf("[desktop] rename %s -> %s rc=%d\n", dt_dlg_path, np, rc);
+    if (rc == 0) {
+        for (int j = 0; j < dt_lay_n; j++)      /* keep the slot */
+            if (dt_name_eq_ci(dt_lay[j].name, old))
+                kstrncpy(dt_lay[j].name, dt_dlg_text, VFS_MAX_NAME);
+        snprintf(msg, sizeof(msg), "Renamed to %s", dt_dlg_text);
+    } else {
+        snprintf(msg, sizeof(msg), "Could not rename %s", old);
+    }
+    desktop_toast(msg);
+    dt_icon_sel = -1;
+    dt_refresh_desktop_icons();
+    dt_layout_save();
+    dt_dirty = true;
+}
+
+static void dt_dlg_accept(void) {
+    int kind = dt_dlg_kind;
+    serial_printf("[dialog] ok '%s'%s%s\n", dt_dlg_title,
+                  kind == DT_DLG_RENAME ? " text=" : "", kind == DT_DLG_RENAME ? dt_dlg_text : "");
+    dt_dlg_close();
+    if (kind == DT_DLG_DELETE) dt_dlg_do_delete();
+    else if (kind == DT_DLG_RENAME) dt_dlg_do_rename();
+}
+
+static void dt_dlg_cancel(void) {
+    serial_printf("[dialog] cancel '%s'\n", dt_dlg_title);
+    dt_dlg_close();
+}
+
+static int dt_dlg_btn_at(int mx, int my) {
+    desktop_window_t *w = dt_dlg_window();
+    if (!w) return -2;
+    int rx = mx - w->x, ry = my - w->y;
+    if (rx < 0 || ry < 0 || rx >= w->content_w || ry >= w->content_h) return -2;
+    for (int b = 1; b <= 2; b++) {
+        int bx, by;
+        dt_dlg_btn_rect(b, &bx, &by);
+        if (rx >= bx && rx < bx + DT_DLG_BTN_W && ry >= by && ry < by + DT_DLG_BTN_H)
+            return b;
+    }
+    return 0;
+}
+
+static bool dt_dlg_pointer(bool btn1_down, bool any_down) {
+    if (!dt_dlg_id) return false;
+    if (!dt_dlg_window()) { dt_dlg_id = 0; dt_dlg_kind = DT_DLG_NONE; return false; }
+    int b = dt_dlg_btn_at(dt_mouse_x, dt_mouse_y);
+    int hv = b > 0 ? b : 0;
+    if (hv != dt_dlg_hover) { dt_dlg_hover = hv; dt_dlg_draw(); }
+    if (btn1_down && b == 1) dt_dlg_cancel();
+    else if (btn1_down && b == 2) dt_dlg_accept();
+    return any_down || b != -2;     /* modal: presses never fall through */
+}
+
+static bool dt_dlg_key(uint8_t scancode, bool pressed) {
+    if (!dt_dlg_id) return false;
+    if (!pressed) return true;
+    if (scancode == 0x01) { dt_dlg_cancel(); return true; }
+    if (scancode == 0x1C) { dt_dlg_accept(); return true; }
+    if (dt_dlg_kind != DT_DLG_RENAME) return true;
+    if (scancode == 0x0E) {
+        if (dt_dlg_fresh) dt_dlg_len = 0;
+        else if (dt_dlg_len > 0) dt_dlg_len--;
+        dt_dlg_text[dt_dlg_len] = '\0';
+        dt_dlg_fresh = false;
+        dt_dlg_draw();
+        return true;
+    }
+    if (scancode >= 0x47 && scancode <= 0x53) return true;   /* keypad / arrows */
+    char c = ps2_translate2ascii(scancode, keyboard_get_shift(), false);
+    if (c < 32 || c > 126 || c == '/' || c == '\\' || c == ':' || c == '*' ||
+        c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+        return true;
+    if (dt_dlg_fresh) { dt_dlg_len = 0; dt_dlg_fresh = false; }
+    if (dt_dlg_len < (int)sizeof(dt_dlg_text) - 1) {
+        dt_dlg_text[dt_dlg_len++] = c;
+        dt_dlg_text[dt_dlg_len] = '\0';
+    }
+    dt_dlg_draw();
+    return true;
+}
+
+/* ---- Icon context menu ---- */
+static const char *const dt_icon_menu_items[] = { "Open", "Rename", "Delete", "Properties" };
+static char dt_ctx_path[320];
+static char dt_ctx_name[VFS_MAX_NAME];
+static bool dt_ctx_dir;
+static int  dt_ctx_cls;
+static uint32_t dt_ctx_size;
+
+static int dt_dir_count(const char *path) {
+    static vfs_dirent_t ents[64];
+    int n = vfs_readdir(path, ents, 64);
+    if (n < 0) return -1;
+    int c = 0;
+    for (int i = 0; i < n; i++) {
+        const char *s = ents[i].name;
+        if (s[0] == '.' && (s[1] == '\0' || (s[1] == '.' && s[2] == '\0'))) continue;
+        c++;
+    }
+    return c;
+}
+
+static void dt_icon_menu_cb(int idx) {
+    char msg[96], shown[32];
+    kstrncpy(shown, dt_ctx_name, sizeof(shown));
+    if (strlen(dt_ctx_name) > 28) { shown[25] = shown[26] = shown[27] = '.'; shown[28] = '\0'; }
+    serial_printf("[desktop] icon menu %d on %s\n", idx, dt_ctx_path);
+    switch (idx) {
+    case 0: {
+        int pid = launch_open_path(dt_ctx_path, dt_ctx_dir);
+        serial_printf("[desktop] open %s -> %d\n", dt_ctx_path, pid);
+        break;
+    }
+    case 1:
+        snprintf(msg, sizeof(msg), "New name for %s:", shown);
+        dt_dlg_open(DT_DLG_RENAME, "Rename", msg, dt_ctx_name, dt_ctx_path, dt_ctx_dir);
+        break;
+    case 2:
+        if (dt_ctx_dir) {
+            int n = dt_dir_count(dt_ctx_path);
+            if (n != 0) {
+                snprintf(msg, sizeof(msg), "%s is not empty (only empty folders)", shown);
+                desktop_toast(msg);
+                serial_printf("[desktop] delete %s refused: %d entries\n", dt_ctx_path, n);
+                break;
+            }
+        }
+        snprintf(msg, sizeof(msg), "Delete %s %s? This cannot be undone.",
+                 dt_ctx_dir ? "folder" : "file", shown);
+        dt_dlg_open(DT_DLG_DELETE, dt_ctx_dir ? "Delete folder" : "Delete file", msg,
+                    NULL, dt_ctx_path, dt_ctx_dir);
+        break;
+    case 3: {
+        static const char *const kinds[LAUNCH_ICON_COUNT] = {
+            "File", "Folder", "Text file", "Program", "Image", "Lua script", "Doom WAD" };
+        const char *e = dt_ctx_name;
+        for (const char *p = dt_ctx_name; *p; p++) if (*p == '.') e = p + 1;
+        bool shortcut = !dt_ctx_dir && e != dt_ctx_name &&
+                        (strcmp(e, "desktop") == 0 || strcmp(e, "DESKTOP") == 0);
+        const char *kind = shortcut ? "Shortcut" :
+                           (dt_ctx_cls >= 0 && dt_ctx_cls < LAUNCH_ICON_COUNT ? kinds[dt_ctx_cls] : "File");
+        if (dt_ctx_dir) {
+            int n = dt_dir_count(dt_ctx_path);
+            snprintf(msg, sizeof(msg), "%s: Folder, %d item%s", shown, n, n == 1 ? "" : "s");
+        } else if (dt_ctx_size < 10240) {
+            snprintf(msg, sizeof(msg), "%s: %s, %u bytes", shown, kind, dt_ctx_size);
+        } else {
+            snprintf(msg, sizeof(msg), "%s: %s, %u KB (%u bytes)", shown, kind,
+                     (dt_ctx_size + 1023) / 1024, dt_ctx_size);
+        }
+        serial_printf("[desktop] properties %s\n", msg);
+        desktop_toast(msg);
+        break;
+    }
+    }
+}
+
+static void dt_icon_menu_open(int idx, int x, int y) {
+    if (idx < 0 || idx >= dt_icon_count) return;
+    dt_icon_sel = idx;
+    dt_dirty = true;
+    kstrncpy(dt_ctx_name, dt_icon_entries[idx].name, sizeof(dt_ctx_name));
+    snprintf(dt_ctx_path, sizeof(dt_ctx_path), "%s/%s", dt_icon_base_path, dt_ctx_name);
+    dt_ctx_dir = dt_icon_entries[idx].type == VFS_DIRECTORY;
+    dt_ctx_cls = dt_icon_cls[idx];
+    dt_ctx_size = dt_icon_entries[idx].size;
+    serial_printf("[desktop] right-click on icon %d (%s)\n", idx, dt_ctx_name);
+    dt_menu_open(x, y, dt_icon_menu_items,
+                 (int)(sizeof(dt_icon_menu_items) / sizeof(dt_icon_menu_items[0])),
+                 dt_icon_menu_cb);
+}
+
 /** Sample mouse, run WM chrome/focus, drag/resize, and client routing. */
 static void dt_wm_pointer_frame(void) {
     mouse_get_position(&dt_mouse_x, &dt_mouse_y);
@@ -1619,6 +2655,49 @@ static void dt_wm_pointer_frame(void) {
     bool btn1_up   = !(dt_mouse_btn & 1) && (dt_prev_btn & 1);
     bool btn2_down = (dt_mouse_btn & 2) && !(dt_prev_btn & 2);
     bool btn2_up   = !(dt_mouse_btn & 2) && (dt_prev_btn & 2);
+    bool btn3_down = (dt_mouse_btn & 4) && !(dt_prev_btn & 4);
+    bool btn3_up   = !(dt_mouse_btn & 4) && (dt_prev_btn & 4);
+    int  wheel     = -(int)mouse_get_scroll_delta();   /* positive = up */
+
+    /* One click counter for every double-click user (icons, title bars). */
+    if (btn1_down || btn2_down || btn3_down) {
+        int b = btn1_down ? 1 : (btn2_down ? 2 : 3);
+        int clicks = dt_count_click(b, dt_mouse_x, dt_mouse_y);
+        serial_printf("[wm] down b=%d at %d,%d clicks=%d mods=%x\n",
+                      b, dt_mouse_x, dt_mouse_y, clicks, dt_mods_now());
+    }
+    if (btn1_up || btn2_up || btn3_up)
+        serial_printf("[wm] up b=%d at %d,%d\n",
+                      btn1_up ? 1 : (btn2_up ? 2 : 3), dt_mouse_x, dt_mouse_y);
+    if (wheel)
+        serial_printf("[wm] wheel %d at %d,%d\n", wheel, dt_mouse_x, dt_mouse_y);
+
+    /* Icon drag (armed by a press on an icon in desktop_handle_mouse). */
+    dt_icon_drag_frame();
+
+    /* An open popup menu sees the pointer first, then a modal dialog. */
+    if (dt_menu_pointer(btn1_down, btn1_down || btn2_down || btn3_down))
+        return;
+    if (dt_dlg_pointer(btn1_down, btn1_down || btn2_down || btn3_down)) {
+        if (btn1_up) dt_clear_pointer_grab();
+        return;
+    }
+
+    /* Right press on the bare desktop: background context menu. */
+    if (btn2_down && !dt_grab_id && !desktop_window_at(dt_mouse_x, dt_mouse_y)) {
+        int scr_w = (int)fb_get_width(), scr_h = (int)fb_get_height();
+        serial_printf("[desktop] right-click on desktop at %d,%d icon=%d\n",
+                      dt_mouse_x, dt_mouse_y,
+                      dt_icon_hit(dt_mouse_x, dt_mouse_y, scr_w, scr_h));
+        int icon = dt_icon_hit(dt_mouse_x, dt_mouse_y, scr_w, scr_h);
+        if (icon >= 0)
+            dt_icon_menu_open(icon, dt_mouse_x, dt_mouse_y);
+        else
+            dt_menu_open(dt_mouse_x, dt_mouse_y, dt_desk_menu_items,
+                         (int)(sizeof(dt_desk_menu_items) / sizeof(dt_desk_menu_items[0])),
+                         dt_desk_menu_cb);
+        return;
+    }
 
     /* While grabbed, ignore raise/focus retargeting from further downs. */
     if (btn1_down && !dt_grab_id)
@@ -1627,7 +2706,8 @@ static void dt_wm_pointer_frame(void) {
         dt_clear_pointer_grab();
 
     dt_wm_apply_drag_resize();
-    dt_deliver_client_pointer_events(btn1_down, btn1_up, btn2_down, btn2_up);
+    dt_deliver_client_pointer_events(btn1_down, btn1_up, btn2_down, btn2_up,
+                                     btn3_down, btn3_up, wheel);
 }
 
 void desktop_poll_input(void) {
@@ -1687,6 +2767,109 @@ bool desktop_wm_needs_composite(void) {
     /* Single focused Ring-3 client: allow client fast-present; WM still
      * runs via desktop_poll_input() for focus/chrome/input. */
     return false;
+}
+
+/* Draw the whole scene clipped to one damage region (exclusive x1/y1). */
+static void dt_render_region(int dmg_x0, int dmg_y0, int dmg_x1, int dmg_y1,
+                             int scr_w, int scr_h) {
+    dt_clip_set(dmg_x0, dmg_y0, dmg_x1, dmg_y1);
+    dt_rt_bind();
+    dt_draw_wallpaper(scr_w, scr_h);
+    if (dt_intersects_clip(0, DESKTOP_MENUBAR_H, scr_w,
+                           scr_h - DESKTOP_MENUBAR_H - DESKTOP_PANEL_H))
+        dt_draw_desktop_icons(scr_w, scr_h);
+
+    spinlock_lock(&desktop_lock);
+    for (desktop_window_t *w = win_bottom; w; w = w->next) {
+        if (!w->visible || w->minimized) continue;
+        if (w->fullscreen && w->pixels && dt_backbuffer) {
+            /* No window chrome. Client fills everything under the menubar;
+             * the dock is omitted below so it cannot sit on top of the game. */
+            dt_scale_client_to(w, dt_backbuffer, (int)dt_bb_pitch_pix,
+                               0, DESKTOP_MENUBAR_H, scr_w,
+                               scr_h - DESKTOP_MENUBAR_H,
+                               dt_clip_x0, dt_clip_y0, dt_clip_x1, dt_clip_y1);
+        } else {
+            int fx, fy, fw, fh;
+            dt_win_frame(w, &fx, &fy, &fw, &fh);
+            if (dt_intersects_clip(fx - 2, fy, fw + 8, fh + 8)) {
+                dt_draw_decoration(w, scr_w, scr_h);
+                dt_blit_window(w, scr_w, scr_h);
+            }
+        }
+    }
+    bool any_fullscreen = false;
+    for (desktop_window_t *w = win_bottom; w; w = w->next) {
+        if (w->visible && !w->minimized && w->fullscreen)
+            any_fullscreen = true;
+    }
+    spinlock_unlock(&desktop_lock);
+
+    dt_draw_menubar(scr_w, scr_h);
+    if (!any_fullscreen)
+        dt_draw_panel(scr_w, scr_h);
+    dt_draw_start_menu(scr_w, scr_h);
+    dt_draw_switcher(scr_w, scr_h);
+    dt_draw_toasts(scr_w, scr_h);
+    dt_draw_cursor(dt_mouse_x, dt_mouse_y, scr_w, scr_h);
+    dt_clip_clear();
+}
+
+/* Push one composited region to the framebuffer / GPU scanout. */
+static void dt_output_region(int dmg_x0, int dmg_y0, int dmg_x1, int dmg_y1) {
+    dt_present_backbuffer(dmg_x0, dmg_y0, dmg_x1, dmg_y1);
+
+    /* Forward to virtio-GPU (or other HAL) when its scanout is a separate
+     * buffer.  Use the backbuffer if we have one (already complete & same
+     * pitch as fb).  Falls back to fb_get_composite_buffer otherwise. */
+    {
+        gpu_surface_t *hal = gpu_hal_get_primary_surface();
+        const void *src;
+        uint32_t src_pitch;
+        if (dt_backbuffer) {
+            src = dt_backbuffer;
+            src_pitch = dt_bb_pitch_pix * 4;
+        } else {
+            src = fb_get_composite_buffer();
+            src_pitch = fb ? fb->pitch : 0;
+        }
+        if (hal && hal->pixels && fb && src && src_pitch &&
+            hal->pixels != (uint32_t *)fb->address) {
+            uint32_t fw = fb->width < hal->width  ? fb->width  : hal->width;
+            uint32_t fh = fb->height < hal->height ? fb->height : hal->height;
+            int hx0 = dmg_x0, hy0 = dmg_y0;
+            int hx1 = dmg_x1 < (int)fw ? dmg_x1 : (int)fw;
+            int hy1 = dmg_y1 < (int)fh ? dmg_y1 : (int)fh;
+            const uint8_t *srcb = (const uint8_t *)src;
+            uint8_t *dst = (uint8_t *)hal->pixels;
+            for (int row = hy0; row < hy1; row++) {
+                if (hx0 >= hx1) break;
+                memcpy(dst + (uint32_t)row * hal->pitch + (uint32_t)hx0 * 4,
+                       srcb + (uint32_t)row * src_pitch + (uint32_t)hx0 * 4,
+                       (size_t)(hx1 - hx0) * 4);
+            }
+        }
+    }
+    gpu_hal_present_rect((uint32_t)dmg_x0, (uint32_t)dmg_y0,
+                         (uint32_t)(dmg_x1 - dmg_x0),
+                         (uint32_t)(dmg_y1 - dmg_y0));
+
+    /* With a compositor backbuffer the frame is already on the real
+     * framebuffer (dt_present_backbuffer above) and on the GPU scanout
+     * (gpu_hal_present_rect above).
+     *
+     * Do NOT call fb_flush() in that case: fb_flush() copies from the *console*
+     * backbuffer, which still holds the pre-desktop screen (boot log / shell
+     * prompt), so flushing here painted the old console text straight back over
+     * the freshly composited frame — starting the desktop looked like a no-op
+     * except for the rows of the last damage rect.
+     *
+     * The direct-draw fallback (no dt_backbuffer) really does need it, because
+     * there putpixel/fillrect write into the console backbuffer. */
+    if (!dt_backbuffer) {
+        fb_mark_dirty_rows((uint32_t)dmg_y0, (uint32_t)(dmg_y1 - dmg_y0));
+        fb_flush();
+    }
 }
 
 void desktop_composite_frame(void) {
@@ -1766,6 +2949,8 @@ void desktop_composite_frame(void) {
     }
     /* Reset per-frame damage accumulation */
     dt_dmg_any = false;
+    dt_dmg_n = 0;
+    dt_dmg_overflow = false;
 
     /* Caret blink / notepad pixels only dirty that window — never the
      * whole desktop (that used to force a full-screen recomposite). */
@@ -1786,8 +2971,9 @@ void desktop_composite_frame(void) {
     }
     spinlock_unlock(&desktop_lock);
 
+    bool toast_changed = dt_toast_tick(scr_w, scr_h);
     bool need_render = dt_dirty || mouse_moved || buttons_diff ||
-                       clock_changed || any_window_dirty;
+                       clock_changed || any_window_dirty || toast_changed;
     if (!need_render) {
         return;
     }
@@ -1821,126 +3007,50 @@ void desktop_composite_frame(void) {
         }
     }
 
-    /* ---- Determine the frame's damage region and set the clip rect ---- */
-    int dmg_x0, dmg_y0, dmg_x1, dmg_y1;
-    if (full_damage || !dt_dmg_any || !dt_backbuffer) {
+    /* ---- Damage list -> regions to repaint ---- */
+    dt_rect_t regs[DT_DMG_MAX];
+    int nreg = 0;
+    if (full_damage || !dt_dmg_any || dt_dmg_overflow || !dt_backbuffer) {
         /* Full-screen recomposite (window create/destroy/focus, first frame,
-         * or direct-FB fallback where partial restore isn't possible). */
-        dmg_x0 = 0; dmg_y0 = 0; dmg_x1 = scr_w; dmg_y1 = scr_h;
-        dt_clip_clear();
+         * too many separate rects, or direct-FB fallback). */
+        regs[0].x0 = 0; regs[0].y0 = 0; regs[0].x1 = scr_w; regs[0].y1 = scr_h;
+        nreg = 1;
     } else {
-        dmg_x0 = dt_dmg_x0 < 0 ? 0 : dt_dmg_x0;
-        dmg_y0 = dt_dmg_y0 < 0 ? 0 : dt_dmg_y0;
-        dmg_x1 = dt_dmg_x1 > scr_w ? scr_w : dt_dmg_x1;
-        dmg_y1 = dt_dmg_y1 > scr_h ? scr_h : dt_dmg_y1;
-        if (dmg_x0 >= dmg_x1 || dmg_y0 >= dmg_y1) {
+        for (int i = 0; i < dt_dmg_n; i++) {
+            dt_rect_t r = dt_dmg[i];
+            if (r.x0 < 0) r.x0 = 0;
+            if (r.y0 < 0) r.y0 = 0;
+            if (r.x1 > scr_w) r.x1 = scr_w;
+            if (r.y1 > scr_h) r.y1 = scr_h;
+            if (r.x0 < r.x1 && r.y0 < r.y1) regs[nreg++] = r;
+        }
+        if (nreg == 0) {
             dt_clip_clear();
             return;  /* damage entirely off-screen */
         }
-        dt_clip_set(dmg_x0, dmg_y0, dmg_x1, dmg_y1);
     }
-
-    /* ---- Render (into dt_backbuffer if available; otherwise direct FB) ----
-     * Everything is drawn back-to-front as before, but the clip rect means
-     * only pixels inside the damaged region are actually written. */
-    dt_rt_bind();
-    dt_draw_wallpaper(scr_w, scr_h);
-    if (dt_intersects_clip(0, DESKTOP_MENUBAR_H, scr_w,
-                           scr_h - DESKTOP_MENUBAR_H - DESKTOP_PANEL_H))
-        dt_draw_desktop_icons(scr_w, scr_h);
-
-    spinlock_lock(&desktop_lock);
-    for (desktop_window_t *w = win_bottom; w; w = w->next) {
-        if (!w->visible || w->minimized) continue;
-        if (w->fullscreen && w->pixels && dt_backbuffer) {
-            /* No window chrome. Client fills everything under the menubar;
-             * the dock is omitted below so it cannot sit on top of the game. */
-            dt_scale_client_to(w, dt_backbuffer, (int)dt_bb_pitch_pix,
-                               0, DESKTOP_MENUBAR_H, scr_w,
-                               scr_h - DESKTOP_MENUBAR_H,
-                               dt_clip_x0, dt_clip_y0, dt_clip_x1, dt_clip_y1);
-        } else {
-            int fx, fy, fw, fh;
-            dt_win_frame(w, &fx, &fy, &fw, &fh);
-            if (dt_intersects_clip(fx - 2, fy, fw + 8, fh + 8)) {
-                dt_draw_decoration(w, scr_w, scr_h);
-                dt_blit_window(w, scr_w, scr_h);
-            }
+    {
+        static uint32_t dt_multi_logged;
+        if (nreg > 1 && dt_multi_logged < 3) {
+            dt_multi_logged++;
+            serial_printf("[desktop] damage: %d regions this frame\n", nreg);
         }
-        w->dirty = false;
     }
-    bool any_fullscreen = false;
-    for (desktop_window_t *w = win_bottom; w; w = w->next) {
-        if (w->visible && !w->minimized && w->fullscreen)
-            any_fullscreen = true;
-    }
-    spinlock_unlock(&desktop_lock);
 
-    dt_draw_menubar(scr_w, scr_h);
-    if (!any_fullscreen)
-        dt_draw_panel(scr_w, scr_h);
-    dt_draw_start_menu(scr_w, scr_h);
-    dt_draw_switcher(scr_w, scr_h);
-    dt_draw_cursor(dt_mouse_x, dt_mouse_y, scr_w, scr_h);
+    /* Render every region into the backbuffer first, then push them all, so
+     * scanout never shows a half-composed frame. */
+    for (int i = 0; i < nreg; i++)
+        dt_render_region(regs[i].x0, regs[i].y0, regs[i].x1, regs[i].y1, scr_w, scr_h);
+    spinlock_lock(&desktop_lock);
+    for (desktop_window_t *w = win_bottom; w; w = w->next)
+        w->dirty = false;
+    spinlock_unlock(&desktop_lock);
 
     dt_dirty = false;
     dt_clip_clear();
 
-    /* Copy only the damaged rect backbuffer -> Limine FB so on-screen scanout
-     * sees a complete, consistent frame without full-screen traffic. */
-    dt_present_backbuffer(dmg_x0, dmg_y0, dmg_x1, dmg_y1);
-
-    /* Forward to virtio-GPU (or other HAL) when its scanout is a separate
-     * buffer.  Use the backbuffer if we have one (already complete & same
-     * pitch as fb).  Falls back to fb_get_composite_buffer otherwise. */
-    {
-        gpu_surface_t *hal = gpu_hal_get_primary_surface();
-        const void *src;
-        uint32_t src_pitch;
-        if (dt_backbuffer) {
-            src = dt_backbuffer;
-            src_pitch = dt_bb_pitch_pix * 4;
-        } else {
-            src = fb_get_composite_buffer();
-            src_pitch = fb ? fb->pitch : 0;
-        }
-        if (hal && hal->pixels && fb && src && src_pitch &&
-            hal->pixels != (uint32_t *)fb->address) {
-            uint32_t fw = fb->width < hal->width  ? fb->width  : hal->width;
-            uint32_t fh = fb->height < hal->height ? fb->height : hal->height;
-            int hx0 = dmg_x0, hy0 = dmg_y0;
-            int hx1 = dmg_x1 < (int)fw ? dmg_x1 : (int)fw;
-            int hy1 = dmg_y1 < (int)fh ? dmg_y1 : (int)fh;
-            const uint8_t *srcb = (const uint8_t *)src;
-            uint8_t *dst = (uint8_t *)hal->pixels;
-            for (int row = hy0; row < hy1; row++) {
-                if (hx0 >= hx1) break;
-                memcpy(dst + (uint32_t)row * hal->pitch + (uint32_t)hx0 * 4,
-                       srcb + (uint32_t)row * src_pitch + (uint32_t)hx0 * 4,
-                       (size_t)(hx1 - hx0) * 4);
-            }
-        }
-    }
-    gpu_hal_present_rect((uint32_t)dmg_x0, (uint32_t)dmg_y0,
-                         (uint32_t)(dmg_x1 - dmg_x0),
-                         (uint32_t)(dmg_y1 - dmg_y0));
-
-    /* With a compositor backbuffer the frame is already on the real
-     * framebuffer (dt_present_backbuffer above) and on the GPU scanout
-     * (gpu_hal_present_rect above).
-     *
-     * Do NOT call fb_flush() in that case: fb_flush() copies from the *console*
-     * backbuffer, which still holds the pre-desktop screen (boot log / shell
-     * prompt), so flushing here painted the old console text straight back over
-     * the freshly composited frame — starting the desktop looked like a no-op
-     * except for the rows of the last damage rect.
-     *
-     * The direct-draw fallback (no dt_backbuffer) really does need it, because
-     * there putpixel/fillrect write into the console backbuffer. */
-    if (!dt_backbuffer) {
-        fb_mark_dirty_rows((uint32_t)dmg_y0, (uint32_t)(dmg_y1 - dmg_y0));
-        fb_flush();
-    }
+    for (int i = 0; i < nreg; i++)
+        dt_output_region(regs[i].x0, regs[i].y0, regs[i].x1, regs[i].y1);
 }
 
 void desktop_present_now(void) {
@@ -2044,7 +3154,7 @@ static int dt_collect_windows(desktop_window_t **out, int max) {
     int n = 0;
     spinlock_lock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
-        if (w->id == 0) continue;
+        if (w->id == 0 || w->type == DESKTOP_WIN_POPUP) continue;
         if (n < max) out[n++] = w;
     }
     spinlock_unlock(&desktop_lock);
@@ -2452,6 +3562,14 @@ bool desktop_is_running(void) {
 
 desktop_window_t *desktop_create_window(uint32_t pid, int x, int y,
                                         int w, int h, const char *title) {
+    return desktop_create_window_ex(pid, x, y, w, h, title,
+                                    DESKTOP_WIN_NORMAL, 0, DESKTOP_FMT_KEYED);
+}
+
+desktop_window_t *desktop_create_window_ex(uint32_t pid, int x, int y,
+                                           int w, int h, const char *title,
+                                           int type, uint32_t parent_id,
+                                           int format) {
     spinlock_lock(&desktop_lock);
 
     desktop_window_t *win = NULL;
@@ -2479,9 +3597,12 @@ desktop_window_t *desktop_create_window(uint32_t pid, int x, int y,
     win->pixel_pitch = (uint32_t)w * 4;
     win->pid = pid;
     win->visible = true;
-    win->decorated = true;
-    win->resizable = true;
+    win->decorated = (type != DESKTOP_WIN_POPUP);
+    win->resizable = (type == DESKTOP_WIN_NORMAL);
     win->dirty = true;
+    win->type = (uint8_t)type;
+    win->format = (uint8_t)format;
+    win->parent_id = parent_id;
 
     if (title) {
         int i;
@@ -2520,13 +3641,14 @@ desktop_window_t *desktop_create_window(uint32_t pid, int x, int y,
     dt_apply_keyboard_focus();
     dt_dirty = true;
 
-    serial_printf("[desktop] created window %u '%s' %dx%d at (%d,%d) pid=%u\n",
-                  win->id, win->title, w, h, x, y, pid);
+    serial_printf("[desktop] created window %u '%s' %dx%d at (%d,%d) pid=%u type=%d fmt=%d\n",
+                  win->id, win->title, w, h, x, y, pid, type, format);
     return win;
 }
 
 void desktop_destroy_window(desktop_window_t *win) {
     if (!win || win->id == 0) return;
+    uint32_t old_id = win->id;
 
     notepad_on_window_destroyed(win);
     files_on_window_destroyed(win);
@@ -2569,6 +3691,12 @@ void desktop_destroy_window(desktop_window_t *win) {
     if (was_focused)
         dt_apply_keyboard_focus();
     dt_dirty = true;
+
+    /* Dialogs and popups owned by this window go with it. */
+    for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
+        if (windows[i].id != 0 && windows[i].parent_id == old_id)
+            desktop_destroy_window(&windows[i]);
+    }
 }
 
 void desktop_destroy_windows_for_pid(uint32_t pid) {
@@ -2654,7 +3782,28 @@ void desktop_move_window(desktop_window_t *win, int x, int y) {
     dt_dirty = true;
 }
 
+desktop_window_t *desktop_find_window_by_id(uint32_t id) {
+    if (!id) return NULL;
+    for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++)
+        if (windows[i].id == id) return &windows[i];
+    return NULL;
+}
+
+desktop_window_t *desktop_find_window_by_pixels(const void *pixels) {
+    if (!pixels) return NULL;
+    for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++)
+        if (windows[i].id != 0 && windows[i].pixels == (const uint32_t *)pixels)
+            return &windows[i];
+    return NULL;
+}
+
+/* Legacy per-process lookup (SDL shim, SYS_DESKTOP_*): the process's first
+ * normal window, else any of its windows. */
 desktop_window_t *desktop_find_window_by_pid(uint32_t pid) {
+    for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++)
+        if (windows[i].id != 0 && windows[i].pid == pid &&
+            windows[i].type == DESKTOP_WIN_NORMAL)
+            return &windows[i];
     for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
         if (windows[i].id != 0 && windows[i].pid == pid)
             return &windows[i];
@@ -2790,16 +3939,13 @@ void desktop_handle_mouse(int mx, int my, uint8_t buttons) {
     int tbw = hit->content_w;
     if (mx >= tbx && mx < tbx + tbw &&
         my >= tby && my < tby + DESKTOP_TITLEBAR_H) {
-        uint64_t now = hpet_get_ticks();
-        if (hit->id == dt_title_last_id &&
-            (now - dt_title_last_click) < DT_TITLE_DBLCLK_MS) {
+        if (hit->id == dt_title_last_id && dt_ptr_clicks >= 2) {
             dt_title_last_id = 0;
             dt_toggle_fullscreen(hit);
             desktop_focus_window(hit);
             return;
         }
         dt_title_last_id = hit->id;
-        dt_title_last_click = now;
         if (!hit->maximized) {
             hit->dragging = true;
             hit->drag_off_x = mx - hit->x;
@@ -2812,20 +3958,16 @@ void desktop_handle_mouse(int mx, int my, uint8_t buttons) {
     int cx, cy, cw, ch;
     dt_get_client_rect(hit, &cx, &cy, &cw, &ch);
     if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch) {
-        int rx = mx - cx, ry = my - cy;
-        if (notepad_is_window(hit))
-            notepad_on_mouse(rx, ry, true);
-        else if (files_is_window(hit))
-            files_on_mouse(rx, ry, true);
-        else if (kterm_is_window(hit))
-            kterm_on_mouse(rx, ry, true);
-        else if (settings_app_is_window(hit))
-            settings_app_on_mouse(rx, ry, true);
+        desktop_ptr_event_t ev = { DESKTOP_PTR_DOWN, mx - cx, my - cy, 1,
+                                   dt_ptr_clicks, 0, dt_mods_now() };
+        dt_kapp_pointer(hit, &ev);
     }
 }
 
 bool desktop_handle_key(uint8_t scancode, bool pressed) {
     if (!desktop_running) return false;
+    if (dt_menu_key(scancode, pressed)) return true;
+    if (dt_dlg_key(scancode, pressed)) return true;
 
     if (scancode == 0x5B && pressed) {
         dt_start_open = !dt_start_open;

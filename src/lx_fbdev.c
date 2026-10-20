@@ -140,9 +140,6 @@ static void release_display(const char *why) {
     own_pid = 0; own_fds = 0; own_mapped = false; own_kdgfx = false;
     kd_mode_global = KD_TEXT;
     desktop_request_redraw();
-#ifdef ENABLE_LUA
-    { extern void luade_notify_vt_return(void); luade_notify_vt_return(); }
-#endif
     fb_mark_dirty_all();
     fb_flush();
 }

@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 void kterm_open(void);
+/** Open the terminal with the shell working in @dir. */
+void kterm_open_in(const char *dir);
 bool kterm_is_open(void);
 bool kterm_is_window(const desktop_window_t *win);
 void kterm_on_key(int32_t keycode, bool pressed);

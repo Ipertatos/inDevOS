@@ -181,10 +181,6 @@ static void vc_restore(int id) {
 bool vconsole_gfx_owner_running(void) {
     extern bool desktop_is_running(void);
     if (desktop_is_running()) return true;
-#ifdef ENABLE_LUA
-    extern bool luade_is_running(void);
-    if (luade_is_running()) return true;
-#endif
     return false;
 }
 
@@ -225,10 +221,6 @@ void vconsole_switch(int id) {
                       desk ? (id == 0 ? " (desktop resumes)" : " (desktop paused)") : "");
         if (id == 0) {
             extern void fb_mark_dirty_all(void);
-#ifdef ENABLE_LUA
-            extern void luade_notify_vt_return(void);
-            luade_notify_vt_return();
-#endif
             desktop_request_redraw();
             if (desk) fb_mark_dirty_all();
         }
