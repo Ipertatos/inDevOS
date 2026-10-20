@@ -18,6 +18,7 @@
  * NOTE: All interactive command dispatch has been moved to zeus.c.
  */
 
+#include "net_ethernet.h"
 #include "cmd.h"
 #include "zeus.h"
 #include "stdio.h"
@@ -637,6 +638,7 @@ void show_network_status(void) {
     int total, valid;
     arp_get_cache_info(&total, &valid);
     printf("ARP cache: %d total, %d valid\n", total, valid);
+    net_rx_print_drop_stats("");
 }
 
 void show_mac_address(void) {

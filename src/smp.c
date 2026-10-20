@@ -181,6 +181,7 @@ static void ap_entry(struct limine_smp_info *smp_info) {
                   processor_id, lapic_id);
 
     cpu_enable_protections();
+    { extern void fb_wc_pat_init_cpu(void); fb_wc_pat_init_cpu(); }
     gdt_init_ap(cpu_idx);
     idt_load_current();
     fpu_sse_init();

@@ -338,7 +338,8 @@ static uint16_t ip_header_checksum_bytes(const uint8_t *header_bytes, uint16_t h
 
 void ip_handle_packet(const uint8_t *frame, uint32_t len) {
     if (len < 34) { // Ethernet header (14) + minimum IP header (20)
-        printf("IP: Packet too short (%d bytes)\n", len);
+        net_rx_count_malformed();
+        NET_RX_LOG("IP: Packet too short (%d bytes)\n", len);
         return;
     }
     
@@ -348,11 +349,13 @@ void ip_handle_packet(const uint8_t *frame, uint32_t len) {
     uint8_t version = (ip_header->version_ihl >> 4) & 0xF;
     uint8_t header_len = (ip_header->version_ihl & 0xF) * 4;
     if (version != 4) {
-        printf("IP: Unsupported version %d\n", version);
+        net_rx_count_malformed();
+        NET_RX_LOG("IP: Unsupported version %d\n", version);
         return;
     }
-    if (header_len < 20 || (14 + header_len) > len) {
-        printf("IP: Invalid header length %d for frame length %d\n", header_len, len);
+    if (header_len < 20 || (uint32_t)(14 + header_len) > len) {
+        net_rx_count_malformed();
+        NET_RX_LOG("IP: Invalid header length %d for frame length %d\n", header_len, len);
         return;
     }
     
@@ -385,7 +388,8 @@ void ip_handle_packet(const uint8_t *frame, uint32_t len) {
     raw_header[10] = (uint8_t)(original_network_order >> 8);
     raw_header[11] = (uint8_t)(original_network_order & 0xFF);
     if (original_host != calculated_host) {
-        printf("IP: Invalid checksum (got 0x%04x, expected 0x%04x)\n", 
+        net_rx_count_malformed();
+        NET_RX_LOG("IP: Invalid checksum (got 0x%04x, expected 0x%04x)\n", 
                original_host, calculated_host);
         return;
     }
@@ -394,11 +398,13 @@ void ip_handle_packet(const uint8_t *frame, uint32_t len) {
     // Validate total length before any payload math
     uint16_t total_len = (ip_header->total_length >> 8) | ((ip_header->total_length & 0xFF) << 8);
     if (total_len < header_len) {
-        printf("IP: Invalid total length %u < header length %u\n", total_len, header_len);
+        net_rx_count_malformed();
+        NET_RX_LOG("IP: Invalid total length %u < header length %u\n", total_len, header_len);
         return;
     }
     if ((uint32_t)(14 + total_len) > len) {
-        printf("IP: Truncated frame (ip total %u, frame %u)\n", total_len, len);
+        net_rx_count_malformed();
+        NET_RX_LOG("IP: Truncated frame (ip total %u, frame %u)\n", total_len, len);
         return;
     }
     uint16_t payload_len = (uint16_t)(total_len - header_len);
@@ -535,7 +541,10 @@ void ip_handle_packet(const uint8_t *frame, uint32_t len) {
             udp_handle_packet(frame, len);
             break;
         default:
-            printf("IP: Unknown protocol %d\n", ip_header->protocol);
+            /* IGMP (2) and anything else unhandled: drop quietly. */
+            net_rx_count_ip_proto(ip_header->protocol);
+            if (ethernet_get_verbose())
+                printf("IP: Unknown protocol %d\n", ip_header->protocol);
             break;
     }
 }

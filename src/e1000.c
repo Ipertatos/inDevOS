@@ -1,3 +1,4 @@
+#include "net_ethernet.h"
 #include "e1000.h"
 #include "net_device.h"
 #include "pci.h"
@@ -468,7 +469,7 @@ int e1000_receive_packet(uint8_t *buffer, uint32_t max_length) {
     uint16_t length = e1000_dev.rx_descs[e1000_dev.rx_cur].length;
     
     if (length > max_length) {
-        printf("E1000: Received packet too large (%d bytes)\n", length);
+        NET_RX_LOG("E1000: Received packet too large (%d bytes)\n", length);
         return -1;
     }
     

@@ -101,10 +101,56 @@ static int path_has_ci(const char *path, const char *needle) {
 
 extern void unmount_filesystem(void);
 
+static int install_root_device(void) {
+    if (!fat32_is_mounted() || !fat32_filesystem.storage_dev)
+        return -1;
+    return fat32_filesystem.storage_dev->device_id;
+}
+
+/* The mounted root really is an install source. */
+static int install_root_is_live(void) {
+    return install_root_device() >= 0 && vfs_exists("/install/boot.bin");
+}
+
+static const char *install_dev_name(int id) {
+    storage_device_t *d = id >= 0 ? storage_get_device((uint8_t)id) : NULL;
+    return d ? d->name : "?";
+}
+
+/* Find the live disk. A certain Limine id match, or the one hybrid install
+ * image, is trusted. A mere guess (first FAT32 disk, device 0) is only
+ * accepted when that disk actually holds the live root files; otherwise
+ * nothing is marked live and install stops, because a wrong guess would
+ * protect the wrong disk and offer the real live disk as a target. */
 static int install_live_id(uint8_t *out) {
     int boot = storage_find_boot_device();
-    if (boot < 0)
+    int level = storage_boot_device_level();
+    if (boot < 0) {
+        printf("install: no boot disk found (%s). Boot the install image as a disk first.\n",
+               storage_boot_device_reason());
         return -1;
+    }
+    if (level < STORAGE_BOOT_LIKELY) {
+        int cur = install_root_device();
+        if (cur >= 0 && install_root_is_live()) {
+            if (cur != boot)
+                printf("install: Limine's boot id matched no disk; using the mounted root, device %d (%s), as the live disk.\n",
+                       cur, install_dev_name(cur));
+            boot = cur;
+        } else {
+            if (vfs_has_root_mount() || fat32_is_mounted())
+                unmount_filesystem();
+            mount_filesystem_device((uint8_t)boot);
+            if (!install_root_is_live()) {
+                printf("install: can't tell which disk is the live one. Limine's boot id matched no disk,\n");
+                printf("install: and the best guess, device %d (%s), has no /install/boot.bin.\n",
+                       boot, install_dev_name(boot));
+                printf("install: If you booted from a USB stick, unplug it, plug it back in, wait for\n");
+                printf("install: \"usbN: storage device N\", then run install again. Nothing was erased.\n");
+                return -1;
+            }
+        }
+    }
     *out = (uint8_t)boot;
     /* / must be the disk Limine booted, even if device 0 was mounted or
      * the user unmounted it. The hard disk is the install target. */
@@ -120,14 +166,19 @@ static int install_live_id(uint8_t *out) {
     return 0;
 }
 
+/* NULL if dev may be formatted, otherwise why not. */
+static const char *install_target_why_not(storage_device_t *dev, uint8_t live) {
+    if (!dev || !dev->is_initialized) return "no such disk (or it was unplugged)";
+    if (dev->device_id == live) return "it is the live disk this system booted from";
+    if (dev->optical) return "it is a CD/DVD drive"; /* DVD/ISO is the source, never a target */
+    if (dev->pci_dev == NULL) return "it is the RAM disk";
+    if (dev->sector_size != 0 && dev->sector_size != 512) return "its sector size is not 512 bytes";
+    if (dev->sector_count <= INSTALL_PART_START + INSTALL_MIN_PART_SECTORS) return "it is smaller than 64 MiB";
+    return NULL;
+}
+
 static int install_target_ok(storage_device_t *dev, uint8_t live) {
-    if (!dev || !dev->is_initialized) return 0;
-    if (dev->device_id == live) return 0;
-    if (dev->optical) return 0;      /* DVD/ISO is the source, never a target */
-    if (dev->pci_dev == NULL) return 0; /* RAM disk */
-    if (dev->sector_size != 0 && dev->sector_size != 512) return 0;
-    if (dev->sector_count <= INSTALL_PART_START + INSTALL_MIN_PART_SECTORS) return 0;
-    return 1;
+    return install_target_why_not(dev, live) == NULL;
 }
 
 static void install_detach_root(void) {
@@ -545,10 +596,8 @@ void cmd_install(int argc, char **argv) {
     int use_tui;
     int failed = 0;
 
-    if (install_live_id(&live) != 0) {
-        printf("No filesystem mounted. Boot the install image as a disk first.\n");
+    if (install_live_id(&live) != 0)
         return;
-    }
 
     for (i = 1; i < argc; i++) {
         if (kstrcmp(argv[i], "yes") == 0 || kstrcmp(argv[i], "-y") == 0 ||
@@ -578,8 +627,10 @@ void cmd_install(int argc, char **argv) {
         }
     }
 
-    printf("install: live disk is device %u (%s). It will not be formatted.\n",
-           live, storage_get_device(live) ? storage_get_device(live)->name : "?");
+    printf("install: live disk is device %u (%s) [%s]. It will not be formatted.\n",
+           live, install_dev_name(live),
+           storage_boot_device_level() >= STORAGE_BOOT_LIKELY ? storage_boot_device_reason()
+                                                               : "holds the mounted live root");
     for (i = 0; i < (int)storage_device_count; i++) {
         storage_device_t *dev = &storage_devices[i];
         uint64_t size_mb;
@@ -629,8 +680,10 @@ void cmd_install(int argc, char **argv) {
     }
 
     if (target == live || !install_target_ok(storage_get_device(target), live)) {
-        printf("install: refusing device %u. Pick a real disk that is not the live one.\n",
-               target);
+        const char *why = install_target_why_not(storage_get_device(target), live);
+        printf("install: refusing device %u (%s): %s.\n", target, install_dev_name(target),
+               why ? why : "not a target");
+        printf("install: the live disk is device %u (%s).\n", live, install_dev_name(live));
         return;
     }
 

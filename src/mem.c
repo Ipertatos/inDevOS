@@ -1049,8 +1049,8 @@ int vmm_unmap_range_release_in(uint64_t *pml4, uint64_t virtual_addr,
             b.need_flush = true;
             cleared++;
             uint64_t phys = ent & PTE_ADDR_MASK;
-            if (!(ent & VMM_USER) || !phys)
-                continue;           /* never release kernel/supervisor frames */
+            if (!(ent & VMM_USER) || !phys || (ent & VMM_DEVICE))
+                continue;  /* kernel frames and device memory are never released */           /* never release kernel/supervisor frames */
             if (b.nf == VMM_UNMAP_BATCH)
                 vmm_unmap_batch_flush(&b);
             b.frames[b.nf++] = phys;
@@ -1188,6 +1188,12 @@ static uint64_t* vmm_clone_table(uint64_t *src, int level) {
             uint64_t pte = src[i];
             uint64_t phys = pte & PTE_ADDR_MASK;
 
+            if (pte & VMM_DEVICE) {
+                /* Device memory (framebuffer mmap): share it as-is, no
+                 * COW and no refcount -- the PMM does not own it. */
+                dst[i] = pte;
+                continue;
+            }
             if ((pte & VMM_USER) && (pte & VMM_WRITABLE)) {
                 /* Mark both entries read-only + COW */
                 pte = (pte & ~VMM_WRITABLE) | VMM_COW;
@@ -1281,7 +1287,8 @@ static void vmm_free_table(uint64_t *table, int level) {
                 (uint64_t*)phys_to_virt(table[i] & PTE_ADDR_MASK),
                 level - 1);
         } else {
-            vmm_leaf_release(table[i] & PTE_ADDR_MASK);
+            if (!(table[i] & VMM_DEVICE))   /* fb mmap: not a PMM frame */
+                vmm_leaf_release(table[i] & PTE_ADDR_MASK);
         }
     }
     kfree(table);

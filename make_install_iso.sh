@@ -74,6 +74,8 @@ done
 # Linux-ABI test programs (static musl), built by tests/musl/build_musl_tests.sh.
 # Optional: skipped when they have not been built.
 MUSL_TESTS=(hello_musl musltest)
+# fbdev smoke test (tests/fbdev/fbgrad.c), same install rule.
+[[ -f tests/fbdev/build/fbgrad.exe ]] && mcopy -o -i "$ROOTFS" tests/fbdev/build/fbgrad.exe ::/bin/fbgrad.exe && echo "    /bin/fbgrad.exe (static musl, fbdev test)"
 for t in "${MUSL_TESTS[@]}"; do
     if [[ -f "tests/musl/build/${t}.exe" ]]; then
         mcopy -o -i "$ROOTFS" "tests/musl/build/${t}.exe" "::/bin/${t}.exe"

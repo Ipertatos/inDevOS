@@ -747,11 +747,45 @@ static volatile struct limine_kernel_file_request boot_file_request = {
     .revision = 0
 };
 
-static int boot_dev_cached = -2;
+/* Boot (live) disk detection.
+ *
+ * The live disk is the one Limine loaded the kernel from, not the largest
+ * FAT32 volume and not device 0. Only an exact Limine id match is certain:
+ * the non-zero GPT disk GUID, a non-zero MBR disk id that exactly one disk
+ * carries, or an optical boot with one DVD. Certain results are cached.
+ *
+ * Anything else is a guess and is re-evaluated on every call, because USB
+ * sticks can register after the root was mounted (late enumeration, or a
+ * replug). A guess prefers the install image itself (ISO9660 + FAT32 root,
+ * which an installed disk never has), then the first FAT32 disk, then
+ * device 0. Callers that format disks must check storage_boot_device_level(). */
+static int boot_dev_cached = -2;       /* set only for STORAGE_BOOT_CERTAIN */
+static int boot_dev_printed = -3;
+static int boot_dev_level = STORAGE_BOOT_NONE;
+static const char *boot_dev_why = "not checked yet";
 
-/* The live disk is the one Limine loaded the kernel from, not the largest
- * FAT32 volume. Optical boot (Hyper-V DVD on the second IDE channel) must
- * win over a hard disk that happens to be device 0. */
+static int storage_uuid_nonzero(const void *u) {
+    const uint8_t *b = (const uint8_t *)u;
+    for (int k = 0; k < 16; k++)
+        if (b[k]) return 1;
+    return 0;
+}
+
+/* Hybrid install image: ISO9660 primary volume descriptor at byte 32768. */
+static int storage_has_iso9660(uint8_t device_id) {
+    uint8_t *pvd = kalloc(512);
+    int r = 0;
+    if (!pvd) return 0;
+    if (storage_read_sectors(device_id, 64, 1, pvd) == 0 &&
+        pvd[0] == 0x01 && memcmp(pvd + 1, "CD001", 5) == 0)
+        r = 1;
+    kfree(pvd);
+    return r;
+}
+
+int storage_boot_device_level(void) { return boot_dev_level; }
+const char *storage_boot_device_reason(void) { return boot_dev_why; }
+
 /* "3" -> 3; "usb0" / "nvme0n1" / "SATA0" -> the device whose name starts
  * with that word (case-insensitive). -1 if none. */
 int storage_resolve_name(const char *arg) {
@@ -782,14 +816,17 @@ int storage_resolve_name(const char *arg) {
 int storage_find_boot_device(void) {
     const struct limine_file *file = NULL;
     uint8_t i;
-    int optical = -1;
+    int optical = -1, n_optical = 0;
     int optical_fat = -1;
     int optical_sig = -1;
-    int disk_sig = -1;
+    int disk_sig = -1, n_sig = 0;
     int disk_fat = -1;
-    int disk_gpt = -1;
+    int disk_gpt = -1, n_gpt = 0;
+    int disk_img = -1, n_img = 0;
     uint32_t want;
+    int uuid_ok;
     int chosen;
+    int level;
     const char *why;
 
     if (boot_dev_cached != -2)
@@ -798,6 +835,9 @@ int storage_find_boot_device(void) {
     if (boot_file_request.response && boot_file_request.response->kernel_file)
         file = boot_file_request.response->kernel_file;
     want = file ? file->mbr_disk_id : 0;
+    /* An all-zero GUID means Limine had none (MBR or ISO boot); it would
+     * match any disk with a zeroed GPT header field. */
+    uuid_ok = file && storage_uuid_nonzero(&file->gpt_disk_uuid);
 
     for (i = 0; i < storage_device_count; i++) {
         storage_device_t *dev = &storage_devices[i];
@@ -824,13 +864,13 @@ int storage_find_boot_device(void) {
                                ((uint32_t)sec[446 + part * 16 + 11] << 24);
                 if ((typ == 0x0B || typ == 0x0C) && lba)
                     fat = 1;
-                /* GPT disk (UEFI install): protective MBR + ESP/basic FAT32.
-                 * Limine reports the GPT disk GUID instead of an MBR id. */
+                /* GPT disk (UEFI install, or the hybrid ISO's GPT): Limine
+                 * reports the GPT disk GUID. Compare all 16 bytes. */
                 if (typ == 0xEE && part == 0) {
                     uint8_t hdr[512];
                     if (storage_gpt_find_fat32(dev->device_id, hdr) != 0)
                         fat = 1;
-                    if (file && storage_read_sectors(dev->device_id, 1, 1, hdr) == 0 &&
+                    if (uuid_ok && storage_read_sectors(dev->device_id, 1, 1, hdr) == 0 &&
                         memcmp(hdr, "EFI PART", 8) == 0 &&
                         memcmp(hdr + 56, &file->gpt_disk_uuid, 16) == 0) {
                         gpt_match = 1;
@@ -838,9 +878,12 @@ int storage_find_boot_device(void) {
                 }
             }
         }
-        if (gpt_match && !dev->optical && disk_gpt < 0)
-            disk_gpt = dev->device_id;
+        if (gpt_match && !dev->optical) {
+            if (disk_gpt < 0) disk_gpt = dev->device_id;
+            n_gpt++;
+        }
         if (dev->optical) {
+            n_optical++;
             if (optical < 0)
                 optical = dev->device_id;
             if (fat && optical_fat < 0)
@@ -848,64 +891,108 @@ int storage_find_boot_device(void) {
             if (got && want && sig == want)
                 optical_sig = dev->device_id;
         } else {
-            if (got && want && sig == want && disk_sig < 0)
-                disk_sig = dev->device_id;
+            if (got && want && sig == want) {
+                if (disk_sig < 0) disk_sig = dev->device_id;
+                n_sig++;
+            }
             if (fat && disk_fat < 0)
                 disk_fat = dev->device_id;
+            if (fat && storage_has_iso9660(dev->device_id)) {
+                if (disk_img < 0) disk_img = dev->device_id;
+                n_img++;
+            }
         }
     }
 
     chosen = -1;
-    why = "none";
+    level = STORAGE_BOOT_NONE;
+    why = "no storage devices";
     if (file && file->media_type == LIMINE_MEDIA_TYPE_OPTICAL) {
         if (optical_sig >= 0) {
-            chosen = optical_sig;
+            chosen = optical_sig; level = STORAGE_BOOT_CERTAIN;
             why = "Limine optical boot, MBR id match";
         } else if (optical_fat >= 0) {
             chosen = optical_fat;
+            level = n_optical == 1 ? STORAGE_BOOT_CERTAIN : STORAGE_BOOT_LIKELY;
             why = "Limine optical boot, FAT32 DVD";
         } else if (optical >= 0) {
             chosen = optical;
+            level = n_optical == 1 ? STORAGE_BOOT_CERTAIN : STORAGE_BOOT_LIKELY;
             why = "Limine optical boot, ATAPI device";
         } else {
             why = "Limine optical boot, but no ATAPI DVD was found";
         }
-    } else if (disk_gpt >= 0) {
-        chosen = disk_gpt;
+    }
+    if (chosen < 0 && n_gpt == 1) {
+        chosen = disk_gpt; level = STORAGE_BOOT_CERTAIN;
         why = "Limine GPT disk GUID";
-    } else if (want && disk_sig >= 0) {
-        chosen = disk_sig;
+    }
+    if (chosen < 0 && want && n_sig == 1) {
+        chosen = disk_sig; level = STORAGE_BOOT_CERTAIN;
         why = "Limine MBR disk id";
-    } else if (want && optical_sig >= 0) {
-        chosen = optical_sig;
+    }
+    if (chosen < 0 && want && optical_sig >= 0) {
+        chosen = optical_sig; level = STORAGE_BOOT_CERTAIN;
         why = "Limine MBR disk id on DVD";
-    } else if (!file && optical_fat >= 0) {
-        chosen = optical_fat;
+    }
+    if (chosen < 0 && n_img == 1) {
+        /* Limine's id matched nothing (or matched several disks), but
+         * exactly one disk is the hybrid install image. */
+        chosen = disk_img; level = STORAGE_BOOT_LIKELY;
+        why = "no unique Limine id match; the one install image (ISO9660 + FAT32)";
+    }
+    if (chosen < 0 && !file && optical_fat >= 0) {
+        chosen = optical_fat; level = STORAGE_BOOT_GUESS;
         why = "FAT32 DVD (Limine reported no kernel file)";
-    } else if (disk_fat >= 0) {
+    }
+    if (chosen < 0 && n_gpt > 1) {
+        chosen = disk_gpt; level = STORAGE_BOOT_GUESS;
+        why = "several disks carry the Limine GPT GUID; guessing the first";
+    }
+    if (chosen < 0 && want && n_sig > 1) {
+        chosen = disk_sig; level = STORAGE_BOOT_GUESS;
+        why = "several disks carry the Limine MBR id; guessing the first";
+    }
+    if (chosen < 0 && disk_img >= 0) {
+        chosen = disk_img; level = STORAGE_BOOT_GUESS;
+        why = "several install images; guessing the first";
+    }
+    if (chosen < 0 && disk_fat >= 0) {
         /* Device order follows PCI order, so a blank or foreign NVMe disk
          * can be device 0. Prefer a disk that actually holds a FAT32 volume. */
-        chosen = disk_fat;
-        why = "no Limine disk id match; first disk with a FAT32 partition";
-    } else if (storage_device_count > 0) {
-        chosen = 0;
-        why = "no Limine disk id; device 0";
+        chosen = disk_fat; level = STORAGE_BOOT_GUESS;
+        why = "no Limine disk id match; guessing the first disk with a FAT32 partition";
+    }
+    if (chosen < 0 && storage_device_count > 0) {
+        chosen = 0; level = STORAGE_BOOT_GUESS;
+        why = "no Limine disk id match and no FAT32 disk; guessing device 0";
     }
 
-    if (file) {
-        printf("storage: Limine boot file media=%u (0=disk 1=optical) mbr_id=%08x\n",
-               file->media_type, file->mbr_disk_id);
-    } else {
-        printf("storage: Limine did not report the kernel file\n");
+    if (chosen != boot_dev_printed) {
+        if (file) {
+            const uint8_t *g = (const uint8_t *)&file->gpt_disk_uuid;
+            printf("storage: Limine boot file media=%u (0=disk 1=optical) mbr_id=%08x "
+                   "gpt_disk=%02x%02x%02x%02x-...-%02x%02x%s\n",
+                   file->media_type, file->mbr_disk_id, g[3], g[2], g[1], g[0],
+                   g[14], g[15], uuid_ok ? "" : " (none)");
+        } else {
+            printf("storage: Limine did not report the kernel file\n");
+        }
+        if (chosen >= 0) {
+            storage_device_t *d = storage_get_device((uint8_t)chosen);
+            printf("storage: boot disk is device %d (%s) [%s]%s\n",
+                   chosen, d ? d->name : "?", why,
+                   level == STORAGE_BOOT_CERTAIN ? "" :
+                   level == STORAGE_BOOT_LIKELY ? " (likely)" : " (guess)");
+        } else {
+            printf("storage: boot disk not found (%s)\n", why);
+        }
+        boot_dev_printed = chosen;
     }
-    if (chosen >= 0) {
-        storage_device_t *d = storage_get_device((uint8_t)chosen);
-        printf("storage: boot disk is device %d (%s) [%s]\n",
-               chosen, d ? d->name : "?", why);
-    } else {
-        printf("storage: boot disk not found (%s)\n", why);
-    }
-    boot_dev_cached = chosen;
+    boot_dev_level = level;
+    boot_dev_why = why;
+    if (level == STORAGE_BOOT_CERTAIN)
+        boot_dev_cached = chosen;
     return chosen;
 }
 

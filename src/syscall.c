@@ -1647,6 +1647,44 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
 #undef MMAP_ERR
 }
 
+/* Map physical device memory (the framebuffer for /dev/fb0) into the
+ * caller.  PTEs carry VMM_DEVICE so munmap/exit/fork never free or COW the
+ * frames; pte_extra selects the memory type (fb_wc_pte_flags()). */
+long sys_mmap_device(uint64_t addr, uint64_t length, int prot, int fixed,
+                     uint64_t phys, uint64_t pte_extra) {
+    process_t *proc = exec_user_as_process();
+    proc = mm_syscall_owner(proc);
+    if (!proc || !proc->pml4 || !proc->is_usermode) return -EINVAL;
+    if (length == 0 || length > (256ull << 20) || (phys & (PAGE_SIZE - 1))) return -EINVAL;
+    size_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t v0;
+    if (addr && fixed) {
+        v0 = addr & ~(uint64_t)(PAGE_SIZE - 1);
+        if (!is_user_address(v0) || !is_user_address(v0 + pages * PAGE_SIZE - 1))
+            return -EINVAL;
+        vmm_unmap_range_release_in(proc->pml4, v0, pages);
+    } else {
+        if (proc->mmap_anon_next == 0)
+            proc->mmap_anon_next = 0x20000000ULL;
+        v0 = (proc->mmap_anon_next + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+        proc->mmap_anon_next = v0 + pages * PAGE_SIZE;
+    }
+    uint64_t f = VMM_PRESENT | VMM_USER | VMM_DEVICE | VMM_NX | pte_extra;
+    if (prot & PROT_WRITE) f |= VMM_WRITABLE;
+    for (size_t i = 0; i < pages; i++) {
+        if (vmm_map_page_in(proc->pml4, v0 + i * PAGE_SIZE, phys + i * PAGE_SIZE, f) != 0) {
+            vmm_unmap_range_release_in(proc->pml4, v0, i);
+            return -ENOMEM;
+        }
+        __asm__ volatile("invlpg (%0)" : : "r"(v0 + i * PAGE_SIZE) : "memory");
+    }
+    if (mmap_region_prepend(proc, v0, pages * PAGE_SIZE) != 0) {
+        vmm_unmap_range_release_in(proc->pml4, v0, pages);
+        return -ENOMEM;
+    }
+    return (long)v0;
+}
+
 /* Change protection bits on an existing user mapping (needed by tcc -run). */
 int sys_mprotect(void *addr, size_t length, int prot) {
     process_t *proc = exec_user_as_process();
@@ -1669,6 +1707,9 @@ int sys_mprotect(void *addr, size_t length, int prot) {
             flags |= VMM_WRITABLE;
         if (!(prot & PROT_EXEC))
             flags |= VMM_NX;
+        /* Device mappings keep their marker and memory type (PAT/PCD/PWT). */
+        if (*pte & VMM_DEVICE)
+            flags |= *pte & (VMM_DEVICE | VMM_WRITETHRU | VMM_NOCACHE | (1ULL << 7));
         /* Preserve COW bit if set so fork semantics stay intact. */
         if (*pte & VMM_COW)
             flags = (flags & ~VMM_WRITABLE) | VMM_COW;
@@ -2523,7 +2564,7 @@ int sys_kill(pid_t pid, int signum) {
     
     process_t *target = NULL;
     for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (processes[i].pid == pid && processes[i].is_running) {
+        if (processes[i].pid == (uint32_t)pid && processes[i].is_running) {
             target = &processes[i];
             break;
         }
@@ -3227,6 +3268,9 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
                 if ((kfds[i].events & POLLIN) && v) kfds[i].revents |= POLLIN;
                 if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
             }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 9 /* FD_TYPE_DEV_FB: always ready */)
+                kfds[i].revents |= kfds[i].events & (POLLIN | POLLOUT);
             if ((kfds[i].events & POLLOUT) && fd >= 1 && fd <= 2)
                 kfds[i].revents |= POLLOUT;
             /* POSIX: return value is the number of fds with nonzero revents */

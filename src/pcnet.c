@@ -1,3 +1,4 @@
+#include "net_ethernet.h"
 #include "string.h"
 #include "pcnet.h"
 #include "pci.h"
@@ -264,7 +265,7 @@ int pcnet_receive_packet(uint8_t *buffer, uint32_t max_length) {
     // Packet received
     // Check for errors (ERR bit)
     if (pcnet_dev.rx_ring[cur].status_length & 0x40000000) {
-        printf("PCnet: RX Error\n");
+        NET_RX_LOG("PCnet: RX Error\n");
     }
     
     // Read MCNT (Message Byte Count) - bits 0-11 of unaligned structure? 

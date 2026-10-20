@@ -178,6 +178,7 @@ void kmain(void) {
 
     // GPU HAL: unify all display backends behind one interface
     gpu_hal_init();
+    { extern void fb_wc_init(void); fb_wc_init(); }
     drm_init();
 
     /* Console drew to the Limine FB before virtio-gpu came up; push it once
@@ -391,7 +392,9 @@ void kmain(void) {
      * focused Ring-3 client can fast-present its own pixels. Always keep WM
      * input (poll_input) so focus/chrome/routing stay live.
      * Text TTYs (tty1-3) own the framebuffer — do not composite over them. */
-    bool desktop_may_paint = desktop_is_running() && vconsole_graphics_active();
+    extern bool fbdev_display_owned(void);
+    bool desktop_may_paint = desktop_is_running() && vconsole_graphics_active() &&
+                             !fbdev_display_owned();   /* /dev/fb0 client owns it */
     bool app_fast_present = desktop_may_paint && !desktop_wm_needs_composite();
 
         /* USB HID mice update canonical cursor state in mouse.c; run before compositor
@@ -426,7 +429,7 @@ void kmain(void) {
         /* Non-blocking LuaDE: one script time slice while VT 0 is shown. */
         {
             extern bool luade_tick(void);
-            if (luade_tick()) did_work = true;
+            if (!fbdev_display_owned() && luade_tick()) did_work = true;
         }
 #endif
         /* Desktop terminal window: keep draining its shell's output even
@@ -436,6 +439,8 @@ void kmain(void) {
             extern bool kterm_pump(void);
             if (kterm_pump()) did_work = true;
         }
+
+        { extern void fbdev_tick(void); fbdev_tick(); }   /* /dev/fb0 scanout */
 
         if (desktop_may_paint && !app_fast_present) {
             desktop_composite_frame();

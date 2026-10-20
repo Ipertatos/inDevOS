@@ -189,6 +189,16 @@ static void fb_sync_virtio_scanout(uint32_t ymin, uint32_t ymax) {
 
 void fb_flush(void) {
     if (!fb) return;
+    /* A Linux fbdev client (/dev/fb0 or KD_GRAPHICS) owns the screen. */
+    {
+        extern bool fbdev_display_owned(void);
+        if (fbdev_display_owned()) {
+            dirty_y_min = 0xFFFFFFFF;
+            dirty_y_max = 0;
+            fb_flush_waiting = false;
+            return;
+        }
+    }
     if (dirty_y_min >= dirty_y_max) return;
 
     /* The desktop compositor owns the screen (VT 0 active, compositing from

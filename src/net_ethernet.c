@@ -7,6 +7,39 @@
 
 static volatile int g_eth_verbose = 0;
 
+/* Drop counters: frames the stack ignores on purpose (LLDP, RRCP, IGMP...). */
+static volatile uint32_t g_drop_unknown_l2, g_drop_igmp, g_drop_unknown_ip, g_drop_malformed;
+static volatile uint32_t g_rx_log_suppressed;
+static volatile uint16_t g_last_ethertype;
+static volatile uint8_t  g_last_ip_proto;
+
+void net_rx_count_unknown_l2(uint16_t ethertype) { g_drop_unknown_l2++; g_last_ethertype = ethertype; }
+void net_rx_count_ip_proto(uint8_t proto) {
+    if (proto == 2) g_drop_igmp++;
+    else { g_drop_unknown_ip++; g_last_ip_proto = proto; }
+}
+void net_rx_count_malformed(void) { g_drop_malformed++; }
+
+int net_rx_log_allow(void) {
+    if (g_eth_verbose) return 2;
+    static uint64_t last_ms = 0;
+    static int primed = 0;
+    uint64_t now = hpet_get_ticks();
+    if (!primed || now - last_ms >= 1000) { primed = 1; last_ms = now; return 1; }
+    g_rx_log_suppressed++;
+    return 0;
+}
+
+void net_rx_print_drop_stats(const char *indent) {
+    printf("%sdropped: igmp %u, unknown-ip %u", indent ? indent : "",
+           (unsigned)g_drop_igmp, (unsigned)g_drop_unknown_ip);
+    if (g_drop_unknown_ip) printf(" (last proto %u)", (unsigned)g_last_ip_proto);
+    printf(", unknown-l2 %u", (unsigned)g_drop_unknown_l2);
+    if (g_drop_unknown_l2) printf(" (last ethertype 0x%04x)", (unsigned)g_last_ethertype);
+    printf(", malformed %u, rate-limited log lines %u\n",
+           (unsigned)g_drop_malformed, (unsigned)g_rx_log_suppressed);
+}
+
 void ethernet_set_verbose(int enabled) {
     g_eth_verbose = enabled ? 1 : 0;
 }
@@ -67,20 +100,11 @@ void ethernet_process_frame(const uint8_t *frame, uint32_t length) {
         }
             
         default:
-            // Quiet by default; rate-limit if verbose is off to avoid log spam.
+            /* LLDP 0x88cc, Realtek RRCP 0x8899, 0x8ffd, ...: count, never print
+             * unless 'netverbose on'. */
+            net_rx_count_unknown_l2(ethertype);
             if (g_eth_verbose) {
                 printf("Ethernet: Unknown ethertype 0x%04x (%d bytes)\n", ethertype, length);
-            } else {
-                static uint64_t last_print_ms = 0;
-                static uint32_t suppressed = 0;
-                suppressed++;
-                uint64_t now = hpet_get_ticks();
-                if (now - last_print_ms >= 1000) {
-                    printf("Ethernet: Suppressed %u unknown L2 frames (last ethertype=0x%04x)\n",
-                           (unsigned)suppressed, ethertype);
-                    suppressed = 0;
-                    last_print_ms = now;
-                }
             }
             break;
     }

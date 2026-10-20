@@ -1,3 +1,4 @@
+#include "net_ethernet.h"
 #include "net_arp.h"
 #include "string.h"
 #include "net_device.h"
@@ -18,7 +19,7 @@ void arp_init() {
 
 void arp_handle_packet(const uint8_t *frame, uint32_t len) {
     if (len < 42) { // Ethernet header (14) + ARP header (28)
-        printf("ARP: Packet too short (%d bytes)\n", len);
+        NET_RX_LOG("ARP: Packet too short (%d bytes)\n", len);
         return;
     }
     

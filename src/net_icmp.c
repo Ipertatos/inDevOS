@@ -1,3 +1,4 @@
+#include "net_ethernet.h"
 #include "net_icmp.h"
 #include "string.h"
 #include "stdio.h"
@@ -52,7 +53,7 @@ static uint16_t icmp_checksum(const uint8_t *data, uint16_t len) {
 
 void icmp_handle_packet(const uint8_t *data, uint32_t len) {
     if (len < 8) { // Minimum ICMP header size
-        printf("ICMP: Packet too short (%d bytes)\n", len);
+        NET_RX_LOG("ICMP: Packet too short (%d bytes)\n", len);
         return;
     }
     
@@ -89,15 +90,15 @@ void icmp_handle_packet(const uint8_t *data, uint32_t len) {
             break;
             
         case ICMP_TYPE_DEST_UNREACH:
-            printf("ICMP: Destination unreachable (code %d)\n", icmp->code);
+            NET_RX_LOG("ICMP: Destination unreachable (code %d)\n", icmp->code);
             break;
             
         case ICMP_TYPE_TIME_EXCEEDED:
-            printf("ICMP: Time exceeded\n");
+            NET_RX_LOG("ICMP: Time exceeded\n");
             break;
             
         default:
-            printf("ICMP: Unknown type %d\n", icmp->type);
+            NET_RX_LOG("ICMP: Unknown type %d\n", icmp->type);
             break;
     }
 }

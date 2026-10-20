@@ -16,6 +16,7 @@
  * syscall number ("linux: unimplemented syscall ..."), so running a new
  * program shows exactly what it still needs.
  */
+#include "lx_fbdev.h"
 #include "linux_syscall.h"
 #include "syscall.h"
 #include "syscall_internal.h"
@@ -325,6 +326,8 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
     uint8_t ty = p->fds[fd].fd_type;
     if (ty == FD_TYPE_DEV_NULL)
         return 0;
+    if (ty == FD_TYPE_DEV_FB)
+        return fbdev_read(p, &p->fds[fd].position, ubuf, count);
     if (ty == FD_TYPE_DEV_TTY || lx_fd_is_tty(p, fd))
         return lx_read_tty(p, fd, ubuf, count);
     if (ty == FD_TYPE_SOCKET)
@@ -478,8 +481,37 @@ static void lx_fill_stat(lx_stat_t *ls, const stat_t *st) {
     ls->st_atime_sec = ls->st_mtime_sec = ls->st_ctime_sec = now;
 }
 
+/* Synthetic character devices: stat/access by path (fbdev apps, isatty
+ * helpers).  Returns st_rdev = (major << 8) | minor, 0 if not a device. */
+static uint32_t lx_dev_path(const char *path, uint32_t *mode) {
+    static const struct { const char *p; uint32_t rdev, mode; } devs[] = {
+        { "/dev/fb0", (29u << 8) | 0, 0660 }, { "/dev/fb/0", (29u << 8) | 0, 0660 },
+        { "/dev/tty0", (4u << 8) | 0, 0620 }, { "/dev/tty1", (4u << 8) | 1, 0620 },
+        { "/dev/tty2", (4u << 8) | 2, 0620 }, { "/dev/tty3", (4u << 8) | 3, 0620 },
+        { "/dev/tty4", (4u << 8) | 4, 0620 }, { "/dev/tty", (5u << 8) | 0, 0666 },
+        { "/dev/console", (5u << 8) | 1, 0600 }, { "/dev/null", (1u << 8) | 3, 0666 },
+    };
+    for (unsigned i = 0; i < sizeof(devs) / sizeof(devs[0]); i++)
+        if (kstrcmp(path, devs[i].p) == 0) { if (mode) *mode = devs[i].mode; return devs[i].rdev; }
+    return 0;
+}
+
 static long lx_stat_path(const char *abspath, void *ubuf) {
     stat_t st;
+    {
+        uint32_t dmode = 0, rdev = lx_dev_path(abspath, &dmode);
+        if (rdev) {
+            memset(&st, 0, sizeof(st));
+            st.st_mode = S_IFCHR | dmode;
+            st.st_nlink = 1;
+            st.st_blksize = 4096;
+            st.st_rdev = rdev;
+            st.st_ino = 0x10000 + rdev;
+            lx_stat_t ls;
+            lx_fill_stat(&ls, &st);
+            return lx_put(ubuf, &ls, sizeof(ls));
+        }
+    }
     if (!lx_path_kind(abspath, &st))
         return -ENOENT;
     lx_stat_t ls;
@@ -493,6 +525,15 @@ static long lx_fstat(process_t *p, long fd, void *ubuf) {
     file_descriptor_t *f = &p->fds[fd];
     stat_t st;
     memset(&st, 0, sizeof(st));
+    if (f->fd_type == FD_TYPE_DEV_FB) {
+        st.st_mode = 0660 | S_IFCHR;
+        st.st_nlink = 1;
+        st.st_blksize = 4096;
+        st.st_rdev = (29u << 8) | 0;            /* fb0 = 29,0 */
+        lx_stat_t ls;
+        lx_fill_stat(&ls, &st);
+        return lx_put(ubuf, &ls, sizeof(ls));
+    }
     if (f->fd_type == FD_TYPE_DEV_NULL || f->fd_type == FD_TYPE_DEV_TTY) {
         st.st_mode = (f->fd_type == FD_TYPE_DEV_NULL ? 0666 : 0622) | S_IFCHR;
         st.st_nlink = 1;
@@ -558,6 +599,8 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     if (p->fds[fd].fd_type == FD_TYPE_DEV_NULL)
         return (long)len;
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_FB)
+        return fbdev_write(p, &p->fds[fd].position, ubuf, len);
     if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
         return lx_sock_send((int)fd, ubuf, len, 0);
     if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
@@ -622,7 +665,23 @@ static long lx_open_special(process_t *p, const char *path, long lflags) {
         p->fds[fd].in_use = true;
         return fd;
     }
-    if (kstrcmp(path, "/dev/tty") == 0 || kstrcmp(path, "/dev/console") == 0) {
+    if (kstrcmp(path, "/dev/fb0") == 0 || kstrcmp(path, "/dev/fb/0") == 0) {
+        int r = fbdev_open(p);
+        if (r < 0) return r;
+        int fd = allocate_fd(p);
+        if (fd < 0) { fbdev_close(p); return -EMFILE; }
+        p->fds[fd].fd_type = FD_TYPE_DEV_FB;
+        p->fds[fd].file_handle = NULL;
+        p->fds[fd].flags = (uint32_t)(lflags & 3);
+        p->fds[fd].position = 0;
+        p->fds[fd].cloexec = (lflags & LX_O_CLOEXEC) != 0;
+        p->fds[fd].in_use = true;
+        return fd;
+    }
+    if (kstrcmp(path, "/dev/tty") == 0 || kstrcmp(path, "/dev/console") == 0 ||
+        kstrcmp(path, "/dev/tty0") == 0 || kstrcmp(path, "/dev/tty1") == 0 ||
+        kstrcmp(path, "/dev/tty2") == 0 || kstrcmp(path, "/dev/tty3") == 0 ||
+        kstrcmp(path, "/dev/tty4") == 0) {
         int fd = allocate_fd(p);
         if (fd < 0) return -EMFILE;
         p->fds[fd].fd_type = FD_TYPE_DEV_TTY;
@@ -728,6 +787,8 @@ static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
 static long lx_lseek(process_t *p, long fd, int64_t off, long whence) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     file_descriptor_t *f = &p->fds[fd];
+    if (f->fd_type == FD_TYPE_DEV_FB)
+        return fbdev_lseek(&f->position, off, whence);
     if (f->fd_type == FD_TYPE_VFS_DIR) {         /* rewinddir / seekdir */
         if (whence == SEEK_SET && off >= 0) { f->position = (uint32_t)off; return off; }
         if (whence == SEEK_CUR && off == 0) return f->position;
@@ -740,7 +801,14 @@ static long lx_lseek(process_t *p, long fd, int64_t off, long whence) {
 
 static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_FB)
+        return fbdev_ioctl(p, req, arg);
     bool tty = lx_fd_is_tty(p, fd);
+    if (tty) {                                  /* KD / VT ioctls (fbdev apps) */
+        bool handled = false;
+        long kr = fbdev_tty_ioctl(p, req, arg, &handled);
+        if (handled) return kr;
+    }
     switch (req) {
         case LX_TCGETS: {
             if (!tty) return -ENOTTY;
@@ -856,6 +924,8 @@ static long lx_mmap(process_t *p, uint64_t addr, uint64_t len, long prot, long f
         int kf = MAP_ANONYMOUS | MAP_PRIVATE | ((flags & LX_MAP_FIXED) ? MAP_FIXED : 0);
         return (long)sys_mmap((void *)addr, (size_t)len, (int)prot, kf);
     }
+    if (lx_fd_ok(p, fd) && p->fds[fd].fd_type == FD_TYPE_DEV_FB)
+        return fbdev_mmap(p, addr, len, prot, flags, off);
     /* File mapping: private copy of the file contents (no write-back). */
     if (!lx_fd_ok(p, fd) || p->fds[fd].fd_type != FD_TYPE_VFS)
         return -EBADF;
@@ -997,6 +1067,12 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_close:
         if (lx_fd_ok(p, (long)a1) && (long)a1 <= 2 && lx_fd_is_tty(p, (long)a1))
             return 0;                           /* keep the console fds */
+        if (lx_fd_ok(p, (long)a1) && p->fds[a1].fd_type == FD_TYPE_DEV_FB) {
+            p->fds[a1].in_use = false;
+            p->fds[a1].fd_type = 0;
+            fbdev_close(p);
+            return 0;
+        }
         if (lx_fd_ok(p, (long)a1) &&
             (p->fds[a1].fd_type == FD_TYPE_DEV_NULL ||
              p->fds[a1].fd_type == FD_TYPE_DEV_TTY)) {
@@ -1120,10 +1196,12 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
     case LX_access:
         if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false))) return r;
+        if (lx_dev_path(path, NULL)) return 0;
         lx_exe_alias(path, sizeof(path));
         return lx_path_kind(path, NULL) ? 0 : -ENOENT;
     case LX_faccessat: case LX_faccessat2:
         if ((r = lx_resolve(p, (long)(int)a1, (const char *)a2, path, sizeof(path), false))) return r;
+        if (lx_dev_path(path, NULL)) return 0;
         lx_exe_alias(path, sizeof(path));
         return lx_path_kind(path, NULL) ? 0 : -ENOENT;
     case LX_readlink: case LX_readlinkat: {

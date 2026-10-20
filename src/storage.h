@@ -31,6 +31,14 @@ extern storage_ops_t storage_ops;
 // Function declarations
 void storage_init();
 int storage_find_boot_device(void);
+/* How sure storage_find_boot_device() is. Only CERTAIN is cached; the
+ * rest are re-checked on each call (USB disks can register late). */
+#define STORAGE_BOOT_NONE    0
+#define STORAGE_BOOT_GUESS   1   /* no Limine id match: first FAT32 disk / device 0 */
+#define STORAGE_BOOT_LIKELY  2   /* the only hybrid install image (ISO9660 + FAT32) */
+#define STORAGE_BOOT_CERTAIN 3   /* exact Limine GPT GUID / unique MBR id / single DVD */
+int storage_boot_device_level(void);
+const char *storage_boot_device_reason(void);
 int storage_resolve_name(const char *arg);
 storage_device_t* storage_get_device(uint8_t device_id);
 int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer);

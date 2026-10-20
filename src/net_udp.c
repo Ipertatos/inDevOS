@@ -13,6 +13,7 @@
  * @date 2024
  */
 
+#include "net_ethernet.h"
 #include "net_udp.h"
 #include "../include/indevos_errno.h"
 #include "net_ip.h"
@@ -171,16 +172,16 @@ int udp_send(const uint8_t *dst_ip, uint16_t src_port, uint16_t dst_port, const 
 void udp_handle_packet(const uint8_t *frame, uint32_t len) {
     // Validate minimum packet size (Ethernet + IPv4 + UDP headers)
     if (len < 14 + 20 + 8) {
-        printf("UDP: Frame too short (%u bytes, minimum %u)\n", len, 14 + 20 + 8);
+        NET_RX_LOG("UDP: Frame too short (%u bytes, minimum %u)\n", len, 14 + 20 + 8);
         return;
     }
     const uint8_t *ip = frame + 14;
     uint8_t ihl = (ip[0] & 0x0F) * 4;
-    if (len < 14 + ihl + 8) { printf("UDP: Invalid IHL\n"); return; }
+    if (len < (uint32_t)(14 + ihl + 8)) { NET_RX_LOG("UDP: Invalid IHL\n"); return; }
     const uint8_t *udp = frame + 14 + ihl;
     uint16_t total_len = ((uint16_t)udp[4] << 8) | udp[5];
-    if (total_len < 8) { printf("UDP: Invalid UDP length %u\n", total_len); return; }
-    if (14 + ihl + total_len > len) { printf("UDP: Truncated packet\n"); return; }
+    if (total_len < 8) { NET_RX_LOG("UDP: Invalid UDP length %u\n", total_len); return; }
+    if ((uint32_t)(14 + ihl + total_len) > len) { NET_RX_LOG("UDP: Truncated packet\n"); return; }
     uint16_t src_port = ((uint16_t)udp[0] << 8) | udp[1];
     uint16_t dst_port = ((uint16_t)udp[2] << 8) | udp[3];
 
@@ -211,7 +212,7 @@ void udp_handle_packet(const uint8_t *frame, uint32_t len) {
                 bad_csum_n++;
                 uint64_t now = hpet_get_ticks();
                 if (!bad_csum_printed || now - bad_csum_ms >= 1000) {
-                    printf("UDP: Bad rx checksum %u->%u, dropping (%u)\n",
+                    NET_RX_LOG("UDP: Bad rx checksum %u->%u, dropping (%u)\n",
                            src_port, dst_port, (unsigned)bad_csum_n);
                     bad_csum_n = 0;
                     bad_csum_ms = now;

@@ -18,6 +18,7 @@
  * usb_poll() (main loop) and from the stack's receive path, split into
  * frames and put in a small ring. TX is a synchronous bulk OUT.
  */
+#include "net_ethernet.h"
 #include "usb_core.h"
 #include "net_device.h"
 #include "mem.h"
@@ -537,4 +538,5 @@ void usb_net_status(void) {
            (unsigned)n->dev->id, n->mac[0], n->mac[1], n->mac[2], n->mac[3], n->mac[4], n->mac[5]);
     printf("  rx %u frames (%u dropped, %u errors), tx %u frames (%u errors)\n", n->rx_frames,
            n->rx_drop, n->rx_err, n->tx_frames, n->tx_err);
+    net_rx_print_drop_stats("  ");
 }

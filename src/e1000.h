@@ -264,13 +264,3 @@ void e1000_write_reg32(e1000_device_t *dev, uint32_t offset, uint32_t value);
 
 // External device instance
 extern e1000_device_t e1000_dev;
-
-// Internal functions
-static void e1000_reset(e1000_device_t *dev);
-static void e1000_setup_rx(e1000_device_t *dev);
-static void e1000_setup_tx(e1000_device_t *dev);
-static void e1000_set_mac_address(e1000_device_t *dev, const uint8_t *mac);
-static void e1000_enable_interrupts(e1000_device_t *dev);
-static void e1000_disable_interrupts(e1000_device_t *dev);
-static int e1000_read_eeprom(e1000_device_t *dev, uint8_t addr, uint16_t *out);
-static void e1000_configure_flow_control(e1000_device_t *dev); 

@@ -1,3 +1,4 @@
+#include "net_ethernet.h"
 #include "net_tcp.h"
 #include "../include/indevos_errno.h"
 #include "net_ip.h"
@@ -527,7 +528,7 @@ void tcp_retransmit_check(void) {
                 }
 
                 // Retransmit: resend the segment
-                printf("TCP: Retransmitting seq %u (attempt %d, rto=%u ms)\n",
+                NET_RX_LOG("TCP: Retransmitting seq %u (attempt %d, rto=%u ms)\n",
                        entry->seq_start, entry->retries + 1, entry->rto_ms);
 
                 // Save and restore seq_num to resend with the original sequence
@@ -570,7 +571,7 @@ static void tcp_parse_options(tcp_connection_t *conn, const uint8_t *opts, uint3
             uint16_t mss = ((uint16_t)opts[i + 2] << 8) | opts[i + 3];
             if (mss > 0) {
                 conn->remote_mss = mss;
-                printf("TCP: Peer MSS = %u\n", mss);
+                NET_RX_LOG("TCP: Peer MSS = %u\n", mss);
             }
         }
 
@@ -1200,12 +1201,12 @@ static uint32_t tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uin
 static void tcp_handle_ack(tcp_connection_t *conn, const tcp_header_t *tcp_header) {
     // Update our sequence number based on acknowledgment
     if (tcp_header->ack_num > conn->seq_num) {
-        printf("TCP: ACK for sequence number %u\n", tcp_header->ack_num);
+        NET_RX_LOG("TCP: ACK for sequence number %u\n", tcp_header->ack_num);
     }
 }
 
 static void tcp_handle_syn(tcp_connection_t *conn, const tcp_header_t *tcp_header, uint32_t payload_len) {
-    printf("TCP: Received SYN packet\n");
+    NET_RX_LOG("TCP: Received SYN packet\n");
 
     if (conn->state == TCP_STATE_LISTEN) {
         // Send SYN-ACK with MSS option (many clients expect it; improves interoperability)
@@ -1222,7 +1223,7 @@ static void tcp_handle_syn(tcp_connection_t *conn, const tcp_header_t *tcp_heade
 }
 
 static void tcp_handle_fin(tcp_connection_t *conn, const tcp_header_t *tcp_header) {
-    printf("TCP: Received FIN packet\n");
+    NET_RX_LOG("TCP: Received FIN packet\n");
 
     if (conn->state == TCP_STATE_ESTABLISHED) {
         // Send ACK and move to CLOSE_WAIT
