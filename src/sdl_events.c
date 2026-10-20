@@ -199,6 +199,7 @@ SDL_Keycode SDL_Ps2ScancodeToKeycode(uint8_t scancode) {
         case 0x51: return SDLK_PAGEDOWN;
         case 0x47: return SDLK_HOME;
         case 0x4F: return SDLK_END;
+        case 0x53: return 127;          /* Delete key = SDLK_DELETE */
         case 0x0C: return SDLK_MINUS;
         case 0x0D: return SDLK_EQUALS;
         case 0x33: return SDLK_COMMA;

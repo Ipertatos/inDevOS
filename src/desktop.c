@@ -17,6 +17,7 @@
  * stack redraw is required (multi-window, drag, menus, dirty chrome).
  */
 #include "desktop.h"
+#include "wm_dev.h"
 #include "notepad.h"
 #include "files.h"
 #include "kterm.h"
@@ -110,7 +111,7 @@ static uint32_t  dt_wp_cw, dt_wp_ch;
 static bool      dt_wp_cache_failed;
 
 /* Desktop folder icons (VFS) */
-#define DT_ICON_MAX 32
+#define DT_ICON_MAX 1024   /* matches the Files listing cap */
 static vfs_dirent_t dt_icon_entries[DT_ICON_MAX];
 static int          dt_icon_count;
 static char         dt_icon_base_path[256] = "/os";
@@ -121,6 +122,7 @@ static int          dt_icon_cls[DT_ICON_MAX];   /* LAUNCH_ICON_* per entry */
 static int          dt_icon_col[DT_ICON_MAX];
 static int          dt_icon_row[DT_ICON_MAX];
 static char         dt_icon_label[DT_ICON_MAX][40];   /* shown text */
+static int dt_icon_folder_at_slot(int c, int r, int except);
 /* Icon drag: press on an icon arms it, >4 px of motion starts the drag. */
 static int          dt_icon_drag = -1;
 static bool         dt_icon_dragging;
@@ -294,10 +296,8 @@ static int dt_count_click(int button, int x, int y) {
  * through here; each app takes what it uses (today: left press only). */
 static void dt_kapp_pointer(desktop_window_t *w, const desktop_ptr_event_t *ev) {
     if (!w || w->pid != 0) return;
-    if (ev->type == DESKTOP_PTR_WHEEL) {
-        if (files_is_window(w)) files_on_wheel(ev->wheel);
-        return;
-    }
+    if (files_is_window(w)) { files_on_pointer(ev); return; }   /* all events */
+    if (ev->type == DESKTOP_PTR_WHEEL) return;
     if (ev->type != DESKTOP_PTR_DOWN || ev->button != 1) return;
     if (notepad_is_window(w))
         notepad_on_mouse(ev->x, ev->y, true);
@@ -426,6 +426,14 @@ static bool dt_set_content_size(desktop_window_t *w, int nw, int nh) {
                    (size_t)cw * 4);
         kfree(w->pixels);
     }
+    if (w->format == DESKTOP_FMT_ARGB && wm_dev_owns_window(w->id)) {
+        /* /dev/wm client: until it presents at the new size, pad the old
+         * (clipped) pixels with the window background, not transparency. */
+        int ow = w->content_w, oh = w->content_h;
+        for (int yy = 0; yy < nh; yy++)
+            for (int xx = (yy < oh ? ow : 0); xx < nw; xx++)
+                np[(size_t)yy * (size_t)nw + (size_t)xx] = 0xFF12161Eu;
+    }
     w->pixels = np;
     w->content_w = nw;
     w->content_h = nh;
@@ -436,6 +444,7 @@ static bool dt_set_content_size(desktop_window_t *w, int nw, int nh) {
         gui_event_t ev = { GUI_EVENT_RESIZE, nw, nh, 0 };
         process_gui_enqueue_by_pid(w->pid, &ev);
     }
+    wm_dev_resized(w->id, nw, nh);
     return true;
 }
 
@@ -549,6 +558,7 @@ void desktop_gui_enqueue_key_sdl(int32_t keycode, bool pressed) {
         return;
     }
     if (!fw->pid) return;
+    if (wm_dev_key(fw->id, keycode, pressed)) return;
     gui_event_t ev;
     ev.type = pressed ? GUI_EVENT_KEY : GUI_EVENT_KEYUP;
     ev.arg1 = keycode;
@@ -563,7 +573,7 @@ void desktop_gui_enqueue_key_sdl(int32_t keycode, bool pressed) {
  * without a saved slot take the first free one in row-major order. */
 #define DT_LAYOUT_DIR  "/home/user/.config"
 #define DT_LAYOUT_PATH "/home/user/.config/desktop-layout"
-#define DT_LAY_MAX     64
+#define DT_LAY_MAX     DT_ICON_MAX
 #define DT_GRID_MAXC   64
 #define DT_GRID_MAXR   32
 typedef struct { char name[VFS_MAX_NAME]; int col, row; } dt_lay_t;
@@ -724,7 +734,9 @@ static void dt_icon_labels(void) {
 
 static void dt_refresh_desktop_icons(void) {
     dt_icon_count = 0;
-    vfs_dirent_t tmp[DT_ICON_MAX];
+    static vfs_dirent_t *tmp;
+    if (!tmp) tmp = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * DT_ICON_MAX);
+    if (!tmp) return;
     static const char *paths[] = {
         "/home/user/Desktop", "/Desktop", "/os/Desktop"
     };
@@ -951,10 +963,13 @@ static void dt_draw_desktop_icons(int scr_w, int scr_h) {
         int tx = DESKTOP_ICON_GRID + c * DESKTOP_ICON_COL_W;
         int ty = DESKTOP_TOP_DEADSPACE + DESKTOP_ICON_GRID + r * DESKTOP_ICON_ROW_H;
         if (dt_rt_ready) {
+            bool into = dt_icon_folder_at_slot(c, r, dt_icon_drag) >= 0;
             r_rrect_blend(&dt_rt, tx - 2, ty - 2, DESKTOP_ICON_COL_W - DESKTOP_ICON_GRID + 4,
-                          DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8, 0x403DDC97);
+                          DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8,
+                          into ? 0x607DD3FC : 0x403DDC97);
             r_rrect_outline(&dt_rt, tx - 2, ty - 2, DESKTOP_ICON_COL_W - DESKTOP_ICON_GRID + 4,
-                            DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8, 0xFF3DDC97);
+                            DESKTOP_ICON_ROW_H - DESKTOP_ICON_GRID + 4, 8,
+                            into ? 0xFF7DD3FC : 0xFF3DDC97);
         }
         int ix, iy;
         dt_icon_xy(dt_icon_drag, &ix, &iy);
@@ -963,12 +978,35 @@ static void dt_draw_desktop_icons(int scr_w, int scr_h) {
     }
 }
 
+/* Folder icon (other than @except) occupying grid slot c,r, or -1. */
+static int dt_icon_folder_at_slot(int c, int r, int except) {
+    for (int j = 0; j < dt_icon_count; j++)
+        if (j != except && dt_icon_col[j] == c && dt_icon_row[j] == r &&
+            dt_icon_entries[j].type == VFS_DIRECTORY)
+            return j;
+    return -1;
+}
+
+static void dt_refresh_desktop_icons(void);
+
 static void dt_icon_drop(void) {
     int i = dt_icon_drag;
     if (i < 0 || i >= dt_icon_count) return;
     int c, r;
     dt_icon_drop_slot(&c, &r);
     int oc = dt_icon_col[i], orow = dt_icon_row[i];
+    int tgt = dt_icon_folder_at_slot(c, r, i);
+    if (tgt >= 0) {
+        char src[600], dstd[600], m[200];
+        snprintf(src, sizeof(src), "%s/%s", dt_icon_base_path, dt_icon_entries[i].name);
+        snprintf(dstd, sizeof(dstd), "%s/%s", dt_icon_base_path, dt_icon_entries[tgt].name);
+        int rc = files_move_into(src, dstd, m, sizeof(m));
+        serial_printf("[desktop] drop %s onto folder %s rc=%d\n", dt_icon_entries[i].name,
+                      dt_icon_entries[tgt].name, rc);
+        desktop_toast(m);
+        if (rc == 0) dt_refresh_desktop_icons();
+        return;
+    }
     if (c == oc && r == orow) {
         serial_printf("[desktop] drag %s: same slot %d,%d\n", dt_icon_entries[i].name, c, r);
         return;
@@ -1994,6 +2032,27 @@ static void dt_deliver_client_pointer_events(bool btn1_down, bool btn1_up,
         return;
     }
 
+    if (wm_dev_owns_window(fw->id)) {
+        /* /dev/wm client window: every pointer event goes to its queue. */
+        static int w_last_rx = -1, w_last_ry = -1;
+        static uint32_t w_last_id;
+        if (!in_client) { w_last_rx = w_last_ry = -1; return; }
+        desktop_ptr_event_t ev = { DESKTOP_PTR_MOVE, rx, ry, 0, 0, 0, dt_mods_now() };
+        if (fw->id != w_last_id || rx != w_last_rx || ry != w_last_ry) {
+            w_last_id = fw->id; w_last_rx = rx; w_last_ry = ry;
+            wm_dev_pointer(fw->id, &ev);
+        }
+        ev.clicks = dt_ptr_clicks;
+        if (btn1_down) { ev.type = DESKTOP_PTR_DOWN; ev.button = 1; wm_dev_pointer(fw->id, &ev); }
+        if (btn1_up)   { ev.type = DESKTOP_PTR_UP;   ev.button = 1; wm_dev_pointer(fw->id, &ev); }
+        if (btn2_down) { ev.type = DESKTOP_PTR_DOWN; ev.button = 2; wm_dev_pointer(fw->id, &ev); }
+        if (btn2_up)   { ev.type = DESKTOP_PTR_UP;   ev.button = 2; wm_dev_pointer(fw->id, &ev); }
+        if (btn3_down) { ev.type = DESKTOP_PTR_DOWN; ev.button = 3; wm_dev_pointer(fw->id, &ev); }
+        if (btn3_up)   { ev.type = DESKTOP_PTR_UP;   ev.button = 3; wm_dev_pointer(fw->id, &ev); }
+        if (wheel)     { ev.type = DESKTOP_PTR_WHEEL; ev.button = 0; ev.wheel = wheel; wm_dev_pointer(fw->id, &ev); }
+        return;
+    }
+
     if (fw->pid != dt_last_gui_pid) {
         dt_last_gui_rx = -1;
         dt_last_gui_ry = -1;
@@ -2069,6 +2128,12 @@ static void dt_wm_super_toggle(void) {
 static struct { char text[96]; uint64_t expire; } dt_toasts[DT_TOAST_MAX];
 static int  dt_toast_n;
 static volatile bool dt_toast_changed;
+
+/* Something (e.g. a Files move) changed the Desktop folder: rescan icons. */
+void desktop_icons_changed(void) {
+    dt_refresh_desktop_icons();
+    dt_dirty = true;
+}
 
 void desktop_toast(const char *msg) {
     if (!msg) return;
@@ -2874,6 +2939,11 @@ static void dt_output_region(int dmg_x0, int dmg_y0, int dmg_x1, int dmg_y1) {
 
 void desktop_composite_frame(void) {
     if (!desktop_running) return;
+    wm_dev_focus_update(dt_focused_id);
+    {   /* never paint over a text VT (sync-program present paths call us) */
+        extern bool vconsole_graphics_active(void);
+        if (!vconsole_graphics_active()) return;
+    }
 
     /* Throttle to ~60 fps (every 16 ticks at 1 kHz HPET).
      *
@@ -3183,6 +3253,8 @@ static void dt_toggle_fullscreen(desktop_window_t *w) {
 static void dt_close_window(desktop_window_t *w) {
     if (!w || w->id == 0)
         return;
+    if (wm_dev_close_request(w->id))
+        return;   /* /dev/wm client decides (CLOSE_REQUEST event) */
 
     uint32_t pid = w->pid;
     if (pid) {
@@ -4075,6 +4147,13 @@ int desktop_sys_composite(uint32_t pid, const void *user_pixels,
     /* Blocking exec_file never returns to kmain, so chrome clicks are
      * sampled on the present syscall. This may destroy the window. */
     desktop_poll_input();
+    /* ...and VT switches (Ctrl+F1..F4, Ctrl+Q) are polled here too, or a
+     * sync SDL program would keep the user on its VT. */
+    {
+        extern bool exec_current_is_sync_program(void);
+        extern void vconsole_poll_switch(void);
+        if (exec_current_is_sync_program()) vconsole_poll_switch();
+    }
 
     desktop_window_t *win = desktop_find_window_by_pid(pid);
     if (!win || !win->pixels || !user_pixels || w == 0 || h == 0 ||
@@ -4174,4 +4253,39 @@ int desktop_sys_composite(uint32_t pid, const void *user_pixels,
     win->dirty = true;
     desktop_present_now();
     return 0;
+}
+
+/* /dev/wm (wm_dev.c): a client presented new pixels in client-relative
+ * rect (x,y,ww,hh) of @w; add it to the compositor damage. */
+void desktop_damage_client_rect(desktop_window_t *w, int x, int y, int ww, int hh) {
+    if (!w || w->id == 0) return;
+    int cx, cy, cw, ch;
+    dt_get_client_rect(w, &cx, &cy, &cw, &ch);
+    if (x < 0) { ww += x; x = 0; }
+    if (y < 0) { hh += y; y = 0; }
+    if (x + ww > cw) ww = cw - x;
+    if (y + hh > ch) hh = ch - y;
+    if (ww <= 0 || hh <= 0) return;
+    w->dirty = true;
+    dt_damage_add(cx + x, cy + y, ww, hh);
+    dt_dirty = true;
+}
+
+/* A foreground (sync) program started from a text VT blocks kmain, so
+ * nothing polls VT switches, drains SDL key events or composites while it
+ * waits.  Its blocking /dev/wm waits and presents call this (syscall
+ * context, like desktop_sys_composite's input sampling).  Only call it when
+ * exec_current_is_sync_program(); otherwise kmain does this work. */
+void desktop_sync_pump(void) {
+    extern void vconsole_poll_switch(void);
+    extern bool vconsole_graphics_active(void);
+    extern bool fbdev_display_owned(void);
+    static volatile int busy;
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return;
+    if (keyboard_has_sdl_pending())
+        keyboard_process_sdl_events();
+    vconsole_poll_switch();
+    if (desktop_running && vconsole_graphics_active() && !fbdev_display_owned())
+        desktop_composite_frame();
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }

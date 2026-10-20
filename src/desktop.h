@@ -155,6 +155,7 @@ desktop_window_t *desktop_find_window_by_id(uint32_t id);
 desktop_window_t *desktop_find_window_by_pixels(const void *pixels);
 /** Small transient notification above the dock (copied; ~3.5 s). */
 void  desktop_toast(const char *msg);
+void  desktop_icons_changed(void);
 void  desktop_destroy_window(desktop_window_t *win);
 void  desktop_destroy_windows_for_pid(uint32_t pid);
 void  desktop_raise_window(desktop_window_t *win);
@@ -180,5 +181,11 @@ void desktop_gui_enqueue_key_sdl(int32_t keycode, bool pressed);
 
 /* Find window by PID (first match) */
 desktop_window_t *desktop_find_window_by_pid(uint32_t pid);
+
+/* /dev/wm: add client-relative damage for a window (wm_dev.c). */
+void desktop_damage_client_rect(desktop_window_t *w, int x, int y, int ww, int hh);
+
+/* Sync-program wait/present hook: VT switch poll, SDL keys, composite. */
+void desktop_sync_pump(void);
 
 #endif /* DESKTOP_H */
