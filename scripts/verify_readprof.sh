@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Profile the read path: how much time does a large file read cost per syscall,
 # and in which syscall does it go?
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-readprof.log shot-readprof-*.png qemu-readprof.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4464 /mnt/c/osproj/shot-readprof \
+python3 ${OSPROJ}/qmp_scenario.py 4464 ${OSPROJ}/shot-readprof \
     "wait:2" "type:prof reset"     "wait:3" \
     "wait:2" "type:prof start 4"   "wait:3" \
     "wait:2" "type:wc /doom1.wad"  "wait:70" \

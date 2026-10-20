@@ -37,7 +37,6 @@ static inline uint32_t inl(uint16_t port) {
 static vmware_svga_device_t svga_device = {0};
 
 // SVGA framebuffer structure to replace the global fb
-static struct limine_framebuffer svga_fb = {0};
 
 // Low-level register access functions
 void vmware_svga_write_reg(uint32_t reg, uint32_t value) {

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Workstream copy: build stage copy with tcc sources + static musl GNU make.
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
 set -euo pipefail
-export PATH="/home/ipertatos/.local/musl/bin:/usr/bin:/bin:$PATH"
-WS=/mnt/c/Users/froze/ws_tcc
-ORIG=/home/ipertatos/indev_tcc/stage
-STAGE=/home/ipertatos/indev_tcc_ws/stage
-SRC=/home/ipertatos/src/tinycc
-W=/home/ipertatos/indev_tcc_ws/work
+export PATH="${HOME}/.local/musl/bin:/usr/bin:/bin:$PATH"
+WS=${WINHOME}/ws_tcc
+ORIG=${HOME}/indev_tcc/stage
+STAGE=${HOME}/indev_tcc_ws/stage
+SRC=${HOME}/src/tinycc
+W=${HOME}/indev_tcc_ws/work
 mkdir -p "$W"
 if [ ! -d "$STAGE" ]; then mkdir -p "$(dirname "$STAGE")"; cp -a "$ORIG" "$STAGE"; fi
 # --- tcc sources (configured as on-OS build) ---

@@ -25,7 +25,6 @@ static bool ide_initialized = false;
 static bool e1000_initialized = false;
 static bool rtl8139_initialized = false;
 static bool amd_gpu_initialized = false;
-static bool vmware_svga_initialized = false;
 static bool usb_initialized = false;
 static bool pcnet_initialized = false;
 

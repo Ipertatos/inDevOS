@@ -124,33 +124,6 @@ static void rtl8139_setup_rx_buffer(rtl8139_device_t *dev) {
     // Clear entire buffer
     memset((void*)dev->rx_buffer, 0, buffer_size);
     
-    // DEBUG: Test buffer read/write functionality
-    printf("RTL8139: Testing buffer memory access...\n");
-    // Write test pattern
-    for (int i = 0; i < 16; i++) {
-        dev->rx_buffer[i] = 0xAA + i;
-    }
-    // Read back and verify
-    printf("RTL8139: Test pattern written, reading back: ");
-    for (int i = 0; i < 16; i++) {
-        printf("%02x ", dev->rx_buffer[i]);
-        if (dev->rx_buffer[i] != (uint8_t)(0xAA + i)) {
-            printf("\nRTL8139: ERROR: Buffer test failed at offset %d: expected 0x%02x, got 0x%02x\n", 
-                   i, (uint8_t)(0xAA + i), dev->rx_buffer[i]);
-        }
-    }
-    printf("\n");
-    
-    // Clear buffer again
-    memset((void*)dev->rx_buffer, 0, buffer_size);
-    
-    // DEBUG: Verify buffer clearing worked
-    printf("RTL8139: DEBUG: After memset(0), first 16 bytes: ");
-    for (int i = 0; i < 16; i++) {
-        printf("%02x ", dev->rx_buffer[i]);
-    }
-    printf("\n");
-    
     // Calculate proper physical address for DMA
     // For kernel virtual addresses, subtract the higher half offset
     uint64_t virt_addr = (uint64_t)dev->rx_buffer;
@@ -675,7 +648,6 @@ int rtl8139_send_packet(const uint8_t *data, uint32_t length) {
     // CRITICAL FIX: Ensure packet data reaches memory before DMA reads it
     __asm__ volatile ("mfence" ::: "memory");
     
-    // DEBUG: Dump packet header to confirm content
     DEBUG_PRINT(RTL8139, "RTL8139: TX Header: dest=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
            rtl8139_dev.tx_buffers[buffer_index][0], rtl8139_dev.tx_buffers[buffer_index][1],
            rtl8139_dev.tx_buffers[buffer_index][2], rtl8139_dev.tx_buffers[buffer_index][3],
@@ -696,7 +668,6 @@ int rtl8139_send_packet(const uint8_t *data, uint32_t length) {
     // Ensure we are not accidentally setting the OWN bit (which would inhibit transmission)
     tsd &= ~RTL8139_TSD_OWN; 
     
-    uint64_t virt_addr = (uint64_t)rtl8139_dev.tx_buffers[buffer_index];
     uint64_t phys_addr = rtl8139_read_reg32(&rtl8139_dev, RTL8139_TSAD0 + (buffer_index * 4));
     
     SERIAL_DEBUG_PRINT(RTL8139, "RTL8139: Sending %d bytes (buf %d). TSD=0x%08x. Phys=0x%08x\n", 
@@ -714,24 +685,18 @@ int rtl8139_send_packet(const uint8_t *data, uint32_t length) {
 
 // Receive a packet
 int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
-    // DEBUG: Unconditional entry print
-    // serial_printf("RTL8139: receive_packet enter\n");
     
     uint64_t flags = irq_save();
     spinlock_lock(&rtl8139_rx_lock);
 
-    // DEBUG: Check rtl8139_dev state
-    // serial_printf("RTL8139: DEBUG: rtl8139_dev.initialized=%d\n", rtl8139_dev.initialized);
     
     if (!rtl8139_dev.initialized) {
-        // serial_printf("RTL8139: ERROR: Device not initialized in receive_packet\n");
         spinlock_unlock(&rtl8139_rx_lock);
         irq_restore(flags);
         return -1;
     }
     
     if (!rtl8139_dev.rx_buffer || !rtl8139_dev.io_base) {
-        // serial_printf("RTL8139: ERROR: Invalid buffer or io_base\n");
         spinlock_unlock(&rtl8139_rx_lock);
         irq_restore(flags);
         return -1;
@@ -741,15 +706,11 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     uint32_t packet_ptr = rtl8139_dev.current_packet_ptr;
     uint16_t cbr = rtl8139_read_reg16(&rtl8139_dev, RTL8139_CBR);
 
-    // DEBUG: Always print for now to debug missing packets
-    // serial_printf("RTL8139: receive check - cbr=0x%x, ptr=0x%x, pending=%d\n", 
-    //               cbr, packet_ptr, rtl8139_dev.rx_pending_flag);
     
     // Check if we have a packet by comparing CBR with our current position
     // CBR = Current Buffer Address (write pointer)
     // packet_ptr = Current Read Pointer
     // If they are equal, the buffer is empty
-    // DEBUG: If we have a pending flag but CBR==ptr, check if there's data anyway
     if (cbr == packet_ptr) {
         /* Empty ring. The old "valid header found, forcing process" path
          * re-read an already-consumed header and desynced the ring. */
@@ -769,8 +730,6 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     uint16_t length = (header >> 16) & 0xFFFF;
     
     // Debug: Print packet detection info
-    // serial_printf("RTL8139: PACKET DETECTED! packet_ptr=0x%x, cbr=0x%x, header=0x%08x, status=0x%04x, length=%d\n", 
-    //        packet_ptr, cbr, header, status, length);
     
     // Additional debug: Check if this looks like a valid packet
     if (header == 0) {
@@ -843,7 +802,6 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
     uint16_t new_capr = (rtl8139_dev.current_packet_ptr - 0x10) & 0xFFFF;
     rtl8139_write_reg16(&rtl8139_dev, RTL8139_CAPR, new_capr);
     
-    // DEBUG: Print EtherType to see what type of packet this is
     if (length >= 14) {
         uint16_t ethertype = (buffer[12] << 8) | buffer[13];
         SERIAL_DEBUG_PRINT(RTL8139, "RTL8139: Processed received packet of %d bytes, EtherType=0x%04x\n", length, ethertype);
@@ -871,9 +829,6 @@ int rtl8139_has_pending_receive() {
         return 0;
     }
     
-    // DEBUG: excessive logging to trace flow
-    // serial_printf("RTL8139: check pending - flag=%d, isr=0x%04x\n", 
-    //               rtl8139_dev.rx_pending_flag, rtl8139_read_reg16(&rtl8139_dev, RTL8139_ISR));
 
     // Check software flag first (set by interrupt handler)
     if (rtl8139_dev.rx_pending_flag) {
@@ -892,8 +847,6 @@ int rtl8139_has_pending_receive() {
     uint16_t cbr = rtl8139_read_reg16(&rtl8139_dev, RTL8139_CBR);
     
     if (cbr != packet_ptr) {
-         // DEBUG: Logic found packet via pointers
-         // serial_printf("RTL8139: Pending via pointers: cbr=0x%x, ptr=0x%x\n", cbr, packet_ptr);
          return 1;
     }
 
@@ -903,7 +856,6 @@ int rtl8139_has_pending_receive() {
 // Handle network interrupt
 extern uint8_t virtio_gpu_ack_irq(void) __attribute__((weak));
 void rtl8139_handle_interrupt() {
-    // serial_printf("RTL8139: Interrupt handler called!\n");
     
     if (!rtl8139_dev.initialized) {
         serial_printf("RTL8139: Device not initialized in interrupt handler\n");
@@ -919,7 +871,6 @@ void rtl8139_handle_interrupt() {
         apic_eoi();
         return;
     }
-    // serial_printf("RTL8139: Interrupt status: 0x%04x\n", isr);
     
     // Clear interrupt status
     rtl8139_write_reg16(&rtl8139_dev, RTL8139_ISR, isr);
@@ -938,7 +889,6 @@ void rtl8139_handle_interrupt() {
         // for(int i=0; i<4; i++) {
         //    uint32_t tsd = rtl8139_read_reg32(&rtl8139_dev, RTL8139_TSD0 + i*4);
         //    if (tsd & RTL8139_TSD_TOK) {
-        //        serial_printf("RTL8139: Buffer %d finished OK (TSD=0x%08x)\n", i, tsd);
         //    }
         // }
     }

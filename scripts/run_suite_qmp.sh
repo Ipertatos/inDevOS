@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
 set -uo pipefail
-LOG=/mnt/c/Users/froze/forksig_tests_nohup.log
+LOG=${WINHOME}/forksig_tests_nohup.log
 exec > >(tee "$LOG") 2>&1
 echo "==== START $(date) ===="
-cd /mnt/c/osproj
+cd ${OSPROJ}
 
 echo "==== BUILD ===="
-make -j"$(nproc)" kernel_final.bin os.iso 2>&1 | tee /mnt/c/Users/froze/forksig_build_suite.log | tail -12
+make -j"$(nproc)" kernel_final.bin os.iso 2>&1 | tee ${WINHOME}/forksig_build_suite.log | tail -12
 echo BUILD:$?
 
-mcopy -o -i sata_disk.img /mnt/c/Users/froze/suite.sh ::/home/user/forksig/suite.sh
-mcopy -o -i sata_disk.img /mnt/c/Users/froze/pipeok.sh ::/home/user/forksig/pipeok.sh
-mcopy -o -i sata_disk.img /mnt/c/Users/froze/yeshead.sh ::/home/user/forksig/yeshead.sh
+mcopy -o -i sata_disk.img ${WINHOME}/suite.sh ::/home/user/forksig/suite.sh
+mcopy -o -i sata_disk.img ${WINHOME}/pipeok.sh ::/home/user/forksig/pipeok.sh
+mcopy -o -i sata_disk.img ${WINHOME}/yeshead.sh ::/home/user/forksig/yeshead.sh
 for f in fork_stack sig_self fork_print fork_cow pipe_sigpipe nest_fork sigchld_flag; do
-  src=""; [ -f tests/forksig/build/${f}.exe ] && src=tests/forksig/build/${f}.exe; [ -f /mnt/c/Users/froze/forksig_tests_src/build/${f}.exe ] && src=/mnt/c/Users/froze/forksig_tests_src/build/${f}.exe; [ -n "$src" ] && mcopy -o -i sata_disk.img "$src" ::/home/user/forksig/${f}.exe || true
+  src=""; [ -f tests/forksig/build/${f}.exe ] && src=tests/forksig/build/${f}.exe; [ -f ${WINHOME}/forksig_tests_src/build/${f}.exe ] && src=${WINHOME}/forksig_tests_src/build/${f}.exe; [ -n "$src" ] && mcopy -o -i sata_disk.img "$src" ::/home/user/forksig/${f}.exe || true
 done
 
 T=/tmp/indev_suite
@@ -40,13 +42,13 @@ python3 qmp_scenario.py 4498 "$T/shot" \
 
 kill "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
-cp -f "$T/serial.log" /mnt/c/Users/froze/serial-suite.log
+cp -f "$T/serial.log" ${WINHOME}/serial-suite.log
 
 echo "==== HIGHLIGHTS ===="
 grep -aE "SUITE_|pipe_sigpipe n=|fork_stack OK|YESHEAD|hit=|waited|parent g=|hello from|Page fault|write: EPIPE|SUITE_END" "$T/serial.log" | grep -v kfree | tail -n 100 || true
 
 python3 - << 'PY'
-import re
+import re, os
 s=open("/tmp/indev_suite/serial.log","rb").read().decode("latin1","replace")
 ended="SUITE_END" in s
 sigs=re.findall(r"pipe_sigpipe n=(-?\d+) errno=(\d+) got=(\d+)", s)
@@ -63,16 +65,16 @@ core=all(x in s for x in ("hit=1","waited","parent g=","hello from"))
 sigchld=("sigchld_flag flag=1" in s or "PASS SIGCHLDFLAG" in s)
 pf=s.count("Page fault")
 print(f"ended={ended} SIGPIPE={sig_ok}/5({sigs}) FORKSTACK={fs_ok}/5 PIPE={int(pipe)} CORE={int(core)} YES={int(yes)} SIGCHLD={int(sigchld)} PF={pf}")
-open("/mnt/c/Users/froze/forksig_score.txt","w").write(
+open(os.environ["WINHOME"]+"/forksig_score.txt","w").write(
   f"SUITE SIGPIPE={sig_ok}/5 FORKSTACK={fs_ok}/5 PIPE={int(pipe)} CORE={int(core)} YES={int(yes)} SIGCHLD={int(sigchld)} PF={pf} END={int(ended)}\n")
 if pipe and core and sig_ok>=4:
-    open("/mnt/c/Users/froze/forksig_score.txt","a").write("MILESTONE_GREEN\n")
+    open(os.environ["WINHOME"]+"/forksig_score.txt","a").write("MILESTONE_GREEN\n")
 PY
 
-if grep -q MILESTONE_GREEN /mnt/c/Users/froze/forksig_score.txt; then
+if grep -q MILESTONE_GREEN ${WINHOME}/forksig_score.txt; then
   echo "==== INSTALL ISO ===="
-  bash make_install_iso.sh 2>&1 | tee /mnt/c/Users/froze/forksig_install_iso.log | tail -15
-  ls -la os_install.iso | tee -a /mnt/c/Users/froze/forksig_score.txt
+  bash make_install_iso.sh 2>&1 | tee ${WINHOME}/forksig_install_iso.log | tail -15
+  ls -la os_install.iso | tee -a ${WINHOME}/forksig_score.txt
 fi
-echo SUITE_DONE | tee -a /mnt/c/Users/froze/forksig_score.txt
+echo SUITE_DONE | tee -a ${WINHOME}/forksig_score.txt
 echo "==== END $(date) ===="

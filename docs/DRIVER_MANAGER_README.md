@@ -215,7 +215,7 @@ make
 ### Run Tests
 
 ```bash
-./test_driver_manager.sh
+./scripts/test_driver_manager.sh
 ```
 
 ### Manual Testing

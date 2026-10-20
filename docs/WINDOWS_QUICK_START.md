@@ -104,7 +104,7 @@ linker accepts it, and reports the exact path of each tool it found (`-Clang`,
 | `run_windows.bat` | Run the built `os.iso` in QEMU | Every time you test |
 | `build_windows.bat` | *Obsolete MinGW build* -- cannot link the ELF64 kernel | Historical only |
 | `Makefile.windows` | *Obsolete MSYS2 Makefile* -- same limitation | Historical only |
-| `MINGW_SETUP.md`, `WINDOWS_SETUP.md`, `WINDOWS_NATIVE_SETUP.md` | *Obsolete MinGW setup guides* | Historical only |
+| `archive/MINGW_SETUP.md`, `archive/WINDOWS_SETUP.md`, `archive/WINDOWS_NATIVE_SETUP.md` | *Obsolete MinGW setup guides* | Historical only |
 | `TROUBLESHOOTING_WINDOWS.md` | Fix problems | When things break |
 
 ### Run a headless boot smoke test

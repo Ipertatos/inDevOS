@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Rebuild os.iso only (limine.cfg / ISO layout changed; kernel untouched) and
 # capture the Limine boot menu so the config change can be verified.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 echo "=== rebuilding os.iso ==="
 # The os.iso rule does not list limine.cfg as a prerequisite, so make thinks the
@@ -25,7 +26,7 @@ QPID=$!
 sleep 3
 # Screenshot before the 5 s TIMEOUT auto-boots, then press a key to hold the
 # menu and take a second shot.
-python3 /mnt/c/osproj/qmp_scenario.py 4450 /mnt/c/osproj/shot-menu "wait:2" "shot:menu-early" \
+python3 ${OSPROJ}/qmp_scenario.py 4450 ${OSPROJ}/shot-menu "wait:2" "shot:menu-early" \
     "key:down" "wait:1" "shot:menu"
 sleep 1
 kill "$QPID" 2>/dev/null

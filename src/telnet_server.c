@@ -42,7 +42,6 @@
 
 /* ── Server state ────────────────────────────────────────────────────────── */
 static tcp_connection_t *active_conn    = NULL;  /* current live session  */
-static tcp_connection_t *listen_conn    = NULL;  /* port-23 listen socket */
 
 static char  line_buf[LINE_BUF_SIZE];            /* inbound line buffer   */
 static int   line_len = 0;

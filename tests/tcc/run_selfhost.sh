@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build ws ISO and run self-host scenario in QEMU (unique paths/port).
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
 set -u
-WS=/mnt/c/Users/froze/ws_tcc
+WS=${WINHOME}/ws_tcc
 T=/tmp/indev_tcc_ws_q
 PORT=${PORT:-4473}
 TAG=${1:-sh1}

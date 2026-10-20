@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Headless QEMU smoke for TCC on inDevOS.
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/../.." && pwd)}"; export OSPROJ  # repo root
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
 set -euo pipefail
-cd /mnt/c/osproj || exit 1
-cp /mnt/c/Users/froze/qmp_scenario.py /mnt/c/osproj/qmp_scenario.py 2>/dev/null || true
+cd ${OSPROJ} || exit 1
+cp ${WINHOME}/qmp_scenario.py ${OSPROJ}/qmp_scenario.py 2>/dev/null || true
 T=/tmp/indev_tcc
 rm -rf "$T"; mkdir -p "$T"
 cp os_install.iso "$T/boot.iso"
@@ -21,12 +23,12 @@ run_qemu() {
     >"$T/qemu-$tag.log" 2>&1 &
   local QPID=$!
   sleep "${BOOTWAIT:-40}"
-  python3 /mnt/c/osproj/qmp_scenario.py 4471 "$T/shot-$tag" "$@" || true
+  python3 ${OSPROJ}/qmp_scenario.py 4471 "$T/shot-$tag" "$@" || true
   sleep 2
   kill "$QPID" 2>/dev/null || true
   wait "$QPID" 2>/dev/null || true
-  cp "$serial" "/mnt/c/osproj/serial-tcc-$tag.log"
-  cp "$serial" "/mnt/c/Users/froze/serial-tcc-$tag.log" 2>/dev/null || true
+  cp "$serial" "${OSPROJ}/serial-tcc-$tag.log"
+  cp "$serial" "${WINHOME}/serial-tcc-$tag.log" 2>/dev/null || true
   echo "==== $tag ===="
   grep -naE "zeus:/|tcc|hello|work|multi|unimplemented|Page fault|Stack smash|exit_group|Created|error|Error|ENOENT|PIPE|neofetch|musl|mprotect|mmap|ENOSYS|criterion|ok" "$serial" | tail -150
 }

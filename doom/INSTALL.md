@@ -5,7 +5,7 @@
 ### 1. Copy DOOM to Disk Image
 
 ```bash
-cd /home/ipertatos/inDevOS-bak
+cd /path/to/inDevOS
 ./putfilesinsata.sh doom/doom.exe
 ```
 
@@ -113,7 +113,7 @@ exec doom.exe
 View detailed logs:
 ```bash
 # On host machine
-tail -f /home/ipertatos/inDevOS-bak/serial.log
+tail -f /path/to/inDevOS/serial.log
 ```
 
 Look for:

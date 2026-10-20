@@ -3,7 +3,8 @@
 #   * mkdir /X9   - prints nothing (pure exec)
 #   * ls /        - 54 lines: the first run has to scroll the screen, the second
 #                   is measured again after `clear` when the screen is empty.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-t2.log shot-t2-*.png qemu-t2.log
 
@@ -21,7 +22,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4468 /mnt/c/osproj/shot-t2 \
+python3 ${OSPROJ}/qmp_scenario.py 4468 ${OSPROJ}/shot-t2 \
     "wait:2" "type:time mkdir /X9"    "wait:8" \
     "wait:2" "type:clear"             "wait:3" \
     "wait:2" "type:time ls /"         "wait:12" "shot:1-cleared" \

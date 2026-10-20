@@ -27,7 +27,6 @@ static spinlock_t mouse_lock = {0};
 // Mouse packet parsing
 static uint8_t mouse_packet[4];       // 4 bytes for IntelliMouse scroll wheel
 static int mouse_packet_pos = 0;
-static bool mouse_packet_ready = false;
 
 // IntelliMouse (scroll wheel) support
 static bool intellimouse_enabled = false;

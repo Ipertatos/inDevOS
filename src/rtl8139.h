@@ -158,12 +158,3 @@ void rtl8139_write_reg32(rtl8139_device_t *dev, uint32_t offset, uint32_t value)
 
 // External device instance
 extern rtl8139_device_t rtl8139_dev;
-
-// Internal functions
-static void rtl8139_reset(rtl8139_device_t *dev);
-static void rtl8139_setup_rx_buffer(rtl8139_device_t *dev);
-static void rtl8139_configure_rx_buffer(rtl8139_device_t *dev);
-static void rtl8139_setup_tx_buffers(rtl8139_device_t *dev);
-static void rtl8139_set_mac_address(rtl8139_device_t *dev, const uint8_t *mac);
-static void rtl8139_enable_interrupts(rtl8139_device_t *dev);
-static void rtl8139_disable_interrupts(rtl8139_device_t *dev); 

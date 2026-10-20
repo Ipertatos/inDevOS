@@ -3,7 +3,8 @@
 #    (an independent FAT32 implementation) that the file really shrank.
 # 2. matrix: the ported program's window must be visible on the desktop and it
 #    must exit when a key is pressed.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-trunc.log shot-trunc-*.png qemu-trunc.log
 mdel -i sata_disk.img ::/BIG.TXT 2>/dev/null   # clean any earlier run
@@ -22,7 +23,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4459 /mnt/c/osproj/shot-trunc \
+python3 ${OSPROJ}/qmp_scenario.py 4459 ${OSPROJ}/shot-trunc \
     "wait:2" "type:cp /test.png /BIG.TXT"    "wait:12" \
     "wait:2" "type:cp /SCORES.TXT /BIG.TXT"  "wait:8"  "shot:1-truncated" \
     "wait:2" "type:wc /BIG.TXT"              "wait:5" \

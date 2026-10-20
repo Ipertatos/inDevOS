@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Verify that the shell dispatches utility commands to the programs installed
 # on the filesystem (apps/*.c -> /<name>.exe) and that the kernel survives.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-apps.log shot-apps-*.png qemu-apps.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4452 /mnt/c/osproj/shot-apps \
+python3 ${OSPROJ}/qmp_scenario.py 4452 ${OSPROJ}/shot-apps \
     "wait:2" "type:pwd"                  "wait:5" \
     "wait:2" "type:neofetch"             "wait:5" "shot:1-neofetch" \
     "wait:2" "type:help"                 "wait:5" "shot:2-help" \

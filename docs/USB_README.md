@@ -141,7 +141,7 @@ The USB driver is tested using QEMU with USB emulation:
 
 ```bash
 # Run the test script
-./test_usb.sh
+./scripts/test_usb.sh
 
 # Or manually with QEMU
 qemu-system-x86_64 -boot d -cdrom os.iso -usb -device usb-tablet

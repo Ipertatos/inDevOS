@@ -4,7 +4,8 @@
 # difference between two stamps is real time (not guest HPET time).
 #
 #   compare_scan.sh [mode]     mode = wsl (default)
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-scan.log qemu-scan.log
 
@@ -22,7 +23,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4466 /mnt/c/osproj/shot-scan \
+python3 ${OSPROJ}/qmp_scenario.py 4466 ${OSPROJ}/shot-scan \
     "wait:2" "type:wc /doom1.wad"       "wait:12" \
     "wait:2" "type:grep WAD /doom1.wad" "wait:12" \
     "wait:2" "type:wc /SCORES.TXT"      "wait:6"

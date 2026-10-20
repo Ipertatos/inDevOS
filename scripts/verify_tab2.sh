@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unique-prefix Tab completion: "neo" + Tab must complete to "neofetch " and
 # Enter must then run /neofetch.exe (which prints "uid=").
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-tab2.log shot-tab2-*.png qemu-tab2.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4457 /mnt/c/osproj/shot-tab2 \
+python3 ${OSPROJ}/qmp_scenario.py 4457 ${OSPROJ}/shot-tab2 \
     "wait:2" "raw:neo" "key:tab" "wait:1" "shot:1-completed" "key:ret" "wait:8" "shot:2-ran"
 
 sleep 1

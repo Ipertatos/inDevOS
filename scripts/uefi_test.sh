@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Private UEFI install test for ws_uefi. QMP ports 4551/4552. No global kills.
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
 set -u
-W=/mnt/c/Users/froze/ws_uefi
+W=${WINHOME}/ws_uefi
 T=/tmp/indev_uefi_t
 MODE=${1:-gpt}
 cd "$W"

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Headless mkdir / cp / mv / rm / touch / ash-create harness after mount 0.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
+cd ${OSPROJ} || exit 1
 T=/tmp/indev_mkdir; rm -rf "$T"; mkdir -p "$T"
 cp os_install.iso "$T/boot.iso"
 cp sata_disk.img "$T/sata_disk.img"
@@ -18,11 +20,11 @@ run_qemu() {
     >"$T/qemu-$tag.log" 2>&1 &
   local QPID=$!
   sleep "${BOOTWAIT:-35}"
-  python3 /mnt/c/osproj/qmp_scenario.py 4460 "$T/shot-$tag" "$@"
+  python3 ${OSPROJ}/qmp_scenario.py 4460 "$T/shot-$tag" "$@"
   kill "$QPID" 2>/dev/null
   wait "$QPID" 2>/dev/null
-  cp "$serial" "/mnt/c/osproj/serial-mkdir-$tag.log"
-  cp "$serial" "/mnt/c/Users/froze/serial-mkdir-$tag.log" 2>/dev/null || true
+  cp "$serial" "${OSPROJ}/serial-mkdir-$tag.log"
+  cp "$serial" "${WINHOME}/serial-mkdir-$tag.log" 2>/dev/null || true
   echo "==== serial-$tag highlights ===="
   grep -naE "Unmount|VFS: FAT32|Created directory|mkdir:|Directory grew|tmpbb|tmpz|not visible|Failed to|exit_group|cp:|mv:|rm:|touch|hiash|BusyBox|File |neofetch|Page fault|unimplemented|/tmpbb|/tmpz" "$serial" | tail -120
 }

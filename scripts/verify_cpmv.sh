@@ -4,7 +4,8 @@
 #   * tab completion (registry owned by zeus.c)
 # Afterwards it uses mtools - an independent FAT32 implementation - to prove
 # the kernel's writes are laid out correctly for other systems to read.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-cpmv.log shot-cpmv-*.png qemu-cpmv.log
 rm -f /tmp/copy-check.txt
@@ -23,7 +24,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4455 /mnt/c/osproj/shot-cpmv \
+python3 ${OSPROJ}/qmp_scenario.py 4455 ${OSPROJ}/shot-cpmv \
     "wait:2" "type:cp /SCORES.TXT /COPY.TXT"  "wait:6" \
     "wait:2" "type:wc /COPY.TXT"              "wait:5" \
     "wait:2" "type:head -3 /COPY.TXT"         "wait:5" "shot:1-copy" \

@@ -5,20 +5,21 @@ param(
     [int]$RunSecs = 20
 )
 $ErrorActionPreference = "Stop"
-Set-Location C:\osproj
+$OSPROJ = if ($env:OSPROJ) { $env:OSPROJ } else { Split-Path -Parent $PSScriptRoot }
+Set-Location $OSPROJ
 
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
-$serial = "C:\osproj\serial-winfast.log"
-foreach ($f in @($serial, "C:\osproj\qemu-winfast.log")) {
+$serial = "$OSPROJ\serial-winfast.log"
+foreach ($f in @($serial, "$OSPROJ\qemu-winfast.log")) {
     if (Test-Path $f) { Remove-Item $f -Force }
 }
 
 $qargs = @(
     "-M", "q35", "-accel", "whpx", "-m", "1G", "-smp", "4",
-    "-boot", "d", "-cdrom", "C:/osproj/os.iso",
+    "-boot", "d", "-cdrom", "$OSPROJ/os.iso",
     "-netdev", "user,id=net0", "-device", "rtl8139,netdev=net0",
-    "-drive", "file=C:/osproj/sata_disk.img,format=raw,index=0",
-    "-drive", "file=C:/osproj/nvme_disk.img,format=raw,index=1,media=disk",
+    "-drive", "file=$OSPROJ/sata_disk.img,format=raw,index=0",
+    "-drive", "file=$OSPROJ/nvme_disk.img,format=raw,index=1,media=disk",
     "-device", "virtio-vga,xres=1920,yres=1080",
     "-display", "none", "-no-reboot",
     "-serial", "file:$serial",
@@ -27,13 +28,13 @@ $qargs = @(
 
 Write-Host "starting Windows QEMU (whpx)..."
 $p = Start-Process -FilePath $qemu -ArgumentList $qargs -PassThru -WindowStyle Hidden `
-                   -RedirectStandardError "C:\osproj\qemu-winfast.log"
+                   -RedirectStandardError "$OSPROJ\qemu-winfast.log"
 Start-Sleep -Seconds $BootWait
 
 $py = (Get-Command py -ErrorAction SilentlyContinue).Source
 if (-not $py) { $py = (Get-Command python -ErrorAction SilentlyContinue).Source }
 
-& $py "C:\osproj\qmp_scenario.py" 4465 "C:\osproj\shot-winfast" `
+& $py "$OSPROJ\qmp_scenario.py" 4465 "$OSPROJ\shot-winfast" `
     "wait:2" "type:wc /doom1.wad"      "wait:$RunSecs" `
     "wait:2" "type:grep WAD /doom1.wad" "wait:$RunSecs" `
     "wait:2" "type:cp /doom1.wad /BIG.WAD" "wait:$RunSecs"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Verify the last three ported programs (grep / date / stopwatch) plus the new
 # SYS_RTC_TIME syscall, and confirm the fork-free shell still works.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-gds.log shot-gds-*.png qemu-gds.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4462 /mnt/c/osproj/shot-gds \
+python3 ${OSPROJ}/qmp_scenario.py 4462 ${OSPROJ}/shot-gds \
     "wait:2" "type:date"                             "wait:6"  "shot:1-date" \
     "wait:2" "type:grep 10 /SCORES.TXT"              "wait:6" \
     "wait:2" "type:grep zzz /SCORES.TXT"             "wait:6" \

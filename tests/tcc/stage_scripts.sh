@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-M=/home/ipertatos/indev_tcc_ws/stage/home/user/mk
+M=${HOME}/indev_tcc_ws/stage/home/user/mk
 cat > $M/self.sh <<'S'
 cd /usr/src/tcc
 echo SELF_BEGIN

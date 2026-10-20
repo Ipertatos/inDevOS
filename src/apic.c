@@ -183,7 +183,7 @@ void apic_eoi(){
 
 void apic_asleep(int ms){
     uint64_t curcnt = atomic_get(&apic_timer_ticks);
-    while(atomic_get(&apic_timer_ticks) - curcnt < ms){
+    while(atomic_get(&apic_timer_ticks) - curcnt < (uint64_t)ms){
         __asm__ ("nop");
     }
 }
@@ -249,7 +249,7 @@ madt_ioapic_t* find_gsi(int leg_pin){
         serial_printf("Checking IOAPIC %d: GSI range %d-%d\n", 
                      i, pIOApic->gsi, pIOApic->gsi + max_gsi);
 
-        if(leg_pin >= pIOApic->gsi && leg_pin < pIOApic->gsi + max_gsi){
+        if((uint32_t)leg_pin >= pIOApic->gsi && (uint64_t)leg_pin < pIOApic->gsi + max_gsi){
             DEBUG_SERIAL("Found IOAPIC for GSI %d\n");
             serial_printf("Found IOAPIC for GSI %d\n", leg_pin);
             return pIOApic;

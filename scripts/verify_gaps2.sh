@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-cd /mnt/c/osproj || exit 1
-cp /mnt/c/Users/froze/qmp_scenario.py /mnt/c/osproj/qmp_scenario.py
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
+cd ${OSPROJ} || exit 1
+cp ${WINHOME}/qmp_scenario.py ${OSPROJ}/qmp_scenario.py
 T=/tmp/indev_gaps2; rm -rf "$T"; mkdir -p "$T"
 cp os_install.iso "$T/boot.iso"
 cp sata_disk.img "$T/sata_disk.img"
@@ -18,10 +20,10 @@ run_qemu() {
     >"$T/qemu-$tag.log" 2>&1 &
   local QPID=$!
   sleep "${BOOTWAIT:-35}"
-  python3 /mnt/c/osproj/qmp_scenario.py 4462 "$T/shot-$tag" "$@"
+  python3 ${OSPROJ}/qmp_scenario.py 4462 "$T/shot-$tag" "$@"
   kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
-  cp "$serial" "/mnt/c/osproj/serial-gaps2-$tag.log"
-  cp "$serial" "/mnt/c/Users/froze/serial-gaps2-$tag.log" 2>/dev/null || true
+  cp "$serial" "${OSPROJ}/serial-gaps2-$tag.log"
+  cp "$serial" "${WINHOME}/serial-gaps2-$tag.log" 2>/dev/null || true
   echo "==== $tag ===="
   grep -naE "zeus:/|Created|Renamed|exit_group|can't |unimplemented|hiash|PIPE|Function|T\.TXT|A\.TXT|X\.EXE|H\.EXE|neofetch|wc:|Page fault|Directory grew" "$serial" | tail -160
 }

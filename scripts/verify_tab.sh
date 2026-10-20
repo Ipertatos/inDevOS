@@ -2,7 +2,8 @@
 # Verify Tab completion now that zeus.c owns the command vocabulary:
 #   "ne" + Tab  -> unique match, completes to "neofetch " (then Enter runs it)
 #   "cl" + Tab  -> ambiguous, prints the matching names
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-tab.log shot-tab-*.png qemu-tab.log
 
@@ -20,7 +21,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4456 /mnt/c/osproj/shot-tab \
+python3 ${OSPROJ}/qmp_scenario.py 4456 ${OSPROJ}/shot-tab \
     "wait:2" "raw:ne" "key:tab" "wait:1" "shot:1-completed" "key:ret" "wait:6" \
     "wait:1" "raw:cl" "key:tab" "wait:2" "shot:2-ambiguous" \
     "wait:1" "key:esc" "key:ret" "wait:3"

@@ -3,7 +3,8 @@
 # (desktop -> app window -> after the app exits -> shell still alive).
 #
 #   desktop_app_probe.sh [boot_wait] [app]
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 BOOT_WAIT="${1:-16}"
 APP="${2:-minimal_sdl_test.exe}"
@@ -24,7 +25,7 @@ QPID=$!
 
 sleep "$BOOT_WAIT"
 
-python3 /mnt/c/osproj/qmp_scenario.py 4447 /mnt/c/osproj/shot-app \
+python3 ${OSPROJ}/qmp_scenario.py 4447 ${OSPROJ}/shot-app \
     "type:desktop" "wait:13" "shot:1-desktop" \
     "type:spawn $APP" "wait:2" "shot:2-app" \
     "wait:4" "shot:3-after" \

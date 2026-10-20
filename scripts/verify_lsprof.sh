@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Profile one `ls /` run to see where its time actually goes (per-symbol).
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-lsprof.log shot-lsprof-*.png qemu-lsprof.log
 
@@ -18,7 +19,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4470 /mnt/c/osproj/shot-lsprof \
+python3 ${OSPROJ}/qmp_scenario.py 4470 ${OSPROJ}/shot-lsprof \
     "wait:2" "type:prof reset"      "wait:3" \
     "wait:2" "type:prof start 1"    "wait:3" \
     "wait:2" "type:ls /"            "wait:10" \

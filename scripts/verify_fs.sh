@@ -3,7 +3,8 @@
 #   file create (open O_CREAT + write), unlink, mkdir, rmdir.
 # Reads (cat/wc/head) are already known-good, so every failure here is a
 # write-path bug.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-fs.log shot-fs-*.png qemu-fs.log
 
@@ -21,7 +22,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4453 /mnt/c/osproj/shot-fs \
+python3 ${OSPROJ}/qmp_scenario.py 4453 ${OSPROJ}/shot-fs \
     "wait:2" "type:ls /"                  "wait:5" "shot:1-before" \
     "wait:2" "type:touch /NEWFILE.TXT"    "wait:5" \
     "wait:2" "type:wc /NEWFILE.TXT"       "wait:5" \

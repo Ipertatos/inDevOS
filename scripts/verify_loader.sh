@@ -3,7 +3,8 @@
 #   * execsym off/on        - ELF symtab loading is now opt-in
 #   * time <program>        - launch cost comparison
 #   * plain utility sweep   - nothing regressed, no faults
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-loader.log shot-loader-*.png qemu-loader.log
 
@@ -21,7 +22,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4471 /mnt/c/osproj/shot-loader \
+python3 ${OSPROJ}/qmp_scenario.py 4471 ${OSPROJ}/shot-loader \
     "wait:2" "type:execsym"                "wait:5" \
     "wait:2" "type:time ls /"              "wait:12" \
     "wait:2" "type:time ls /"              "wait:12" "shot:1-time" \

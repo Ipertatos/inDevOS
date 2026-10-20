@@ -4,7 +4,8 @@
 #   * dot entries hidden by ls
 #   * matrix runs as a windowed program and exits on a key
 #   * the shell and console survive everything
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-final.log shot-final-*.png qemu-final.log
 mdel -i sata_disk.img ::/FINAL 2>/dev/null
@@ -23,7 +24,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4461 /mnt/c/osproj/shot-final \
+python3 ${OSPROJ}/qmp_scenario.py 4461 ${OSPROJ}/shot-final \
     "wait:2" "type:mkdir /FINAL"            "wait:6" \
     "wait:2" "type:ls /FINAL"               "wait:6" "shot:1-empty-dir" \
     "wait:2" "type:touch /FINAL/one.txt"    "wait:6" \

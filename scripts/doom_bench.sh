@@ -5,7 +5,8 @@
 #     mode = exec   -> 'exec doom.exe'  (standalone, full screen; shell blocked)
 #     mode = spawn  -> 'spawn doom.exe' (preemptively scheduled thread)
 #     mode = desk   -> start the desktop, then spawn doom (dock-style launch)
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 MODE="${1:-exec}"
 BOOT_WAIT="${2:-16}"
@@ -49,7 +50,7 @@ case "$MODE" in
     ;;
 esac
 
-python3 /mnt/c/osproj/qmp_scenario.py 4448 /mnt/c/osproj/shot-doom "${STEPS[@]}"
+python3 ${OSPROJ}/qmp_scenario.py 4448 ${OSPROJ}/shot-doom "${STEPS[@]}"
 
 sleep 1
 kill "$QPID" 2>/dev/null

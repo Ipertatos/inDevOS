@@ -1,13 +1,46 @@
-A simple operating system made in C and ASM
+# inDevOS
 
-Currently working:
-APIC, PIC, boot, ISRs/IRQs, HPET/LAPIC timers, RTC, keyboard+mouse, SMP,
-PCI, storage (AHCI/IDE/NVMe), FAT32 + ext2/ext4 with a VFS, networking
-(RTL8139/E1000, IP/UDP/TCP/DHCP/DNS, telnet), USB (xHCI), AC'97 audio,
-framebuffer console + a Lua-driven desktop environment (LuaDE).
+A hobby x86-64 operating system written in C and assembly, booted by Limine
+(BIOS and UEFI). It runs its own shell (Zeus), a Lua-driven desktop (LuaDE),
+and unmodified static Linux x86-64 binaries such as BusyBox, TinyCC and curl.
 
-Still early development, needs time to get to a good working state before the
-first polishing steps.
+Still early development; expect rough edges.
+
+## Features
+
+- **Core:** SMP, APIC/IOAPIC, HPET/LAPIC timers, RTC, ACPI tables, PCI/PCIe
+  (ECAM), paging with copy-on-write, kernel threads and preemptive scheduling.
+- **Processes:** real COW `fork`/`vfork`/`clone`, `execve`, `wait` and zombies,
+  process groups, POSIX signals (Ctrl-C to the foreground group, `kill(-pgid)`,
+  `SA_RESTART`/`EINTR`), pipes, deferred safe remote kill.
+- **Linux ABI:** a Linux-compatible x86-64 syscall layer (files, mmap/brk,
+  futex, poll, eventfd, sockets, ioctls, `/dev/fb0`). Static **musl** binaries
+  run unchanged: **BusyBox** (`ash` and applets), **TinyCC** (compiles and runs
+  C on the OS, including itself), **curl** (HTTP/HTTPS).
+- **Storage:** AHCI (SATA), IDE/ATAPI, **NVMe** (multi-controller, 4K LBA),
+  USB mass storage; MBR and **GPT**; FAT32 (LFN, case-preserving) and ext2/ext4
+  behind a VFS.
+- **USB:** xHCI with hubs and hotplug, `lsusb`, **HID** keyboard and mouse,
+  **mass storage** (BOT/SCSI), **USB Ethernet** (CDC-ECM, RNDIS; NCM untested).
+- **Networking:** RTL8139, E1000, PCnet and USB Ethernet; Ethernet/ARP/IPv4/
+  ICMP/UDP/TCP, DHCP, DNS, ping, telnet server.
+- **Graphics and desktop:** framebuffer console (flanterm), virtual terminals,
+  software compositor with LuaDE desktop and a desktop terminal, write-combined
+  framebuffer, Linux fbdev **`/dev/fb0`** (mode ioctls + `mmap`) so framebuffer
+  programs can take over the screen; virtio-gpu.
+- **Audio:** AC'97, PC speaker.
+- **Install:** the in-OS `install` command installs to a disk with an MBR or
+  **GPT/UEFI** layout; a bootable install image (`os_install.iso`) carries the
+  root filesystem.
+- **DOOM:** a port of linuxdoom-1.10. The game data is **not** included; supply
+  your own `doom1.wad` (the shareware WAD is freely available).
+
+## Real hardware
+
+inDevOS boots from a USB stick on an AMD Ryzen (APU) laptop with the USB
+keyboard working. A USB Ethernet adapter, plugged in through a hub, gets an
+address via DHCP, and `ping` and `curl` work from there. AMD GPU
+acceleration is not implemented (firmware framebuffer only).
 
 ## Building and running
 
@@ -43,7 +76,7 @@ require, and its `gcc` emits COFF objects rather than ELF64. Use clang + lld:
 ```
 
 Requires LLVM (`clang`, `ld.lld`, `llvm-objdump`), NASM, Python 3, QEMU and
-xorriso (for `os.iso`). See `WINDOWS_QUICK_START.md` for install steps.
+xorriso (for `os.iso`). See [`docs/WINDOWS_QUICK_START.md`](docs/WINDOWS_QUICK_START.md) for install steps.
 
 ### Install ISO (bootable rootfs for a PC or VM)
 
@@ -64,6 +97,20 @@ Boot the image as a hard disk or USB stick (Rufus or dd in DD mode, or QEMU
 kernel has no ISO9660 driver, so it will not see the rootfs unless the image is
 the storage device it mounts. The in-OS install command copies only the kernel
 and Limine from /install/; it does not clone /bin or Doom onto another drive.
+
+### Tests and helper scripts
+
+One-off QEMU verification and benchmark scripts live in `scripts/`. They find the
+repo from their own location; override with `OSPROJ=...`. Log/scratch locations
+default to your Windows profile under WSL (`WINHOME=...` to override).
+`qmp_step.py` / `qmp_scenario.py` (repo root) drive QEMU over QMP.
+
+## Licence
+
+inDevOS is free software under the **GNU General Public License, version 2 or
+(at your option) any later version**; see [`LICENSE`](LICENSE). Bundled and
+related third-party components and their licences are listed in
+[`THIRD_PARTY.md`](THIRD_PARTY.md).
 
 ## Credits / inspiration
 

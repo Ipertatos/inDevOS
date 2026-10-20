@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Exercise the new `time` built-in and `uptime`, and use them to locate where
 # program start-up time actually goes.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-time.log shot-time-*.png qemu-time.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4467 /mnt/c/osproj/shot-time \
+python3 ${OSPROJ}/qmp_scenario.py 4467 ${OSPROJ}/shot-time \
     "wait:2" "type:time"                    "wait:5"  "shot:1-usage" \
     "wait:2" "type:uptime"                  "wait:5" \
     "wait:2" "type:time echo hi"            "wait:6" \

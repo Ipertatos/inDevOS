@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot os_install.iso DVD + sata, mount writable disk, exercise busybox.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 T=/tmp/indev_bb; rm -rf "$T"; mkdir -p "$T"
 ISO=${ISO:-os_install.iso}
 cp "$ISO" "$T/boot.iso"
@@ -18,7 +19,7 @@ qemu-system-x86_64 $ACC \
     > $T/qemu.log 2>&1 &
 QPID=$!
 sleep ${BOOTWAIT:-35}
-python3 /mnt/c/osproj/qmp_scenario.py 4455 /mnt/c/osproj/shot-bb \
+python3 ${OSPROJ}/qmp_scenario.py 4455 ${OSPROJ}/shot-bb \
     "wait:2" "type:storage" "wait:5" \
     "wait:2" "type:mount 0" "wait:10" \
     "wait:2" "type:ls /bin" "wait:6" "shot:0-ls" \
@@ -34,7 +35,7 @@ python3 /mnt/c/osproj/qmp_scenario.py 4455 /mnt/c/osproj/shot-bb \
     "wait:2" "type:hello_musl" "wait:6"
 sleep 1
 kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
-cp "$T/serial.log" /mnt/c/osproj/serial-busybox.log
+cp "$T/serial.log" ${OSPROJ}/serial-busybox.log
 echo "--- evidence ---"
 grep -naE "storage:|Mount|linux:|busybox|hello|ash|unimplemented|Page fault|PANIC|uid=|ALL OK|Command not found|exit_group|from_ash|BusyBox" "$T/serial.log" | tail -120
 echo "--- tail ---"; tail -60 "$T/serial.log"

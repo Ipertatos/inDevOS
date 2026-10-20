@@ -128,7 +128,7 @@ void zeus_cmd_cd(ZeusShell* shell, int argc, char* argv[]) {
         } else {
             // Relative path
             int len = strlen(shell->current_dir);
-            if (len > 1 && len < sizeof(shell->current_dir) - 1) {
+            if (len > 1 && (size_t)len < sizeof(shell->current_dir) - 1) {
                 shell->current_dir[len] = '/';
                 shell->current_dir[len + 1] = '\0';
             }

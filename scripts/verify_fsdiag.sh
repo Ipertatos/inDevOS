@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Short probe: one failed file create and one failed mkdir, to capture the
 # fat32 directory-state diagnostics on the serial log.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-fsdiag.log shot-fsdiag-*.png qemu-fsdiag.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4454 /mnt/c/osproj/shot-fsdiag \
+python3 ${OSPROJ}/qmp_scenario.py 4454 ${OSPROJ}/shot-fsdiag \
     "wait:2" "type:touch /A.TXT" "wait:6" \
     "wait:2" "type:mkdir /B"     "wait:6"
 

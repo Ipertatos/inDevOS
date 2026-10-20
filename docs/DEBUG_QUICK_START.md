@@ -4,7 +4,7 @@
 
 1. **`src/debug_config.h`** - Central debug configuration file
 2. **`DEBUG_SYSTEM_USAGE.md`** - Complete usage documentation
-3. **`convert_debug.sh`** - Helper script for converting files
+3. **`scripts/convert_debug.sh`** - Helper script for converting files
 4. **Example integration** - RTL8139 driver partially converted
 
 ## 🚀 Quick Example

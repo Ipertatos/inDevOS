@@ -1,0 +1,15 @@
+DOOM source licence note
+========================
+
+The files in this directory are a port of id Software's Linux DOOM source
+(linuxdoom-1.10). Many file headers still carry the original 1997 "DOOM Source
+Code License" text.
+
+On 1999-10-03 id Software re-released the DOOM source code under the GNU
+General Public License, version 2 (or later). That GPL release supersedes the
+older DOOM Source Code License, and this port is distributed under the
+GPL-2.0-or-later terms. See ../LICENSE for the full GPL-2.0 text.
+
+The game data (doom1.wad / doom.wad) is NOT covered by this and is NOT included
+in this repository. The shareware doom1.wad may be obtained separately; copy it
+next to doom.exe (or into the install image) yourself.

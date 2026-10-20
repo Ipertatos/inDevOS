@@ -3,7 +3,8 @@
 #   * time ls /          -> launches the mcopy-written /ls.exe (possibly fragmented)
 #   * cp /ls.exe /LSC.EXE -> an in-OS copy, written sequentially by our allocator
 #   * time /LSC.EXE /     -> same program, freshly laid out
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-frag.log shot-frag-*.png qemu-frag.log
 mdel -i sata_disk.img ::/LSC.EXE 2>/dev/null
@@ -22,7 +23,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4469 /mnt/c/osproj/shot-frag \
+python3 ${OSPROJ}/qmp_scenario.py 4469 ${OSPROJ}/shot-frag \
     "wait:2" "type:clear"                  "wait:3" \
     "wait:2" "type:time ls /"              "wait:12" \
     "wait:2" "type:time ls /"              "wait:12" \

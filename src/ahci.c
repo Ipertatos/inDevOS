@@ -22,9 +22,6 @@ static uint8_t ahci_port_of(storage_device_t *dev) {
 }
 
 // Global AHCI buffers - guaranteed to be in mapped kernel memory
-static uint8_t ahci_global_cmd_list[1024] __attribute__((aligned(1024)));
-static uint8_t ahci_global_fis[256] __attribute__((aligned(256)));
-static uint8_t ahci_global_cmd_table[128] __attribute__((aligned(128)));
 #define AHCI_DMA_BOUNCE_BYTES (128 * 512)
 
 static spinlock_t ahci_lock = {0};

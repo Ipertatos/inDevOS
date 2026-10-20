@@ -38,7 +38,6 @@ void* luade_malloc(uint64_t size) {
     }
     void* ptr = &luade_memory_pool[luade_memory_offset];
     luade_memory_offset += size;
-    printf("[luade] DEBUG: Allocated %llu bytes at %p\n", size, ptr);
     return ptr;
 }
 
@@ -52,7 +51,6 @@ int luade_init_double_buffer() {
     luade_buffer_width = fb->width;
     luade_buffer_height = fb->height;
     
-    printf("[luade] DEBUG: Screen dimensions: %llux%llu\n", luade_buffer_width, luade_buffer_height);
     
     if (luade_buffer_width == 0 || luade_buffer_height == 0) {
         printf("[luade] ERROR: Invalid screen dimensions\n");
@@ -69,7 +67,6 @@ int luade_init_double_buffer() {
     luade_pixels_per_line = luade_buffer_width;
     uint64_t buffer_size = luade_buffer_width * luade_buffer_height * 4;
     
-    printf("[luade] DEBUG: Allocating %llu bytes for back buffer\n", buffer_size);
     
     luade_back_buffer = (uint32_t*)luade_malloc(buffer_size);
     
@@ -78,7 +75,6 @@ int luade_init_double_buffer() {
         return 0;  // Failed to allocate
     }
     
-    printf("[luade] DEBUG: Back buffer allocated at %p\n", luade_back_buffer);
     
     // Clear back buffer to black
     for (uint64_t i = 0; i < luade_buffer_width * luade_buffer_height; i++) {
@@ -150,16 +146,13 @@ void luade_swap_buffers() {
 
 // Lua function: gfx.get_screen_size() -> width, height
 static int l_get_screen_size(lua_State *L) {
-    printf("[gfx] DEBUG: Entering gfx.get_screen_size()\n");
 
     if (!fb) {
-        printf("[gfx] DEBUG: fb is NULL, using fallback\n");
         lua_pushinteger(L, 80);   // fallback to VGA text dimensions
         lua_pushinteger(L, 25);
         return 2;
     }
 
-    printf("[gfx] DEBUG: fb pointer is: %p\n", fb);
 
     // Validate framebuffer pointer sanity before touching fields
     if ((uintptr_t)fb < 0x1000 || (uintptr_t)fb == 0xdeadbeef || (uintptr_t)fb == 0xffffffff) {
@@ -173,14 +166,9 @@ static int l_get_screen_size(lua_State *L) {
     uint64_t width = 0;
     uint64_t height = 0;
 
-    printf("[gfx] DEBUG: fb pointer validation passed, about to access fb->width\n");
     uint64_t flags = irq_save();
-    printf("[gfx] DEBUG: About to read fb->width\n");
     width = fb->width;
-    printf("[gfx] DEBUG: Successfully read width: %llu\n", width);
-    printf("[gfx] DEBUG: About to read fb->height\n");
     height = fb->height;
-    printf("[gfx] DEBUG: Successfully read height: %llu\n", height);
     irq_restore(flags);
 
     // Basic sanity on dimensions
@@ -191,7 +179,6 @@ static int l_get_screen_size(lua_State *L) {
         return 2;
     }
 
-    printf("[gfx] DEBUG: Dimensions validation passed, returning %llux%llu\n", width, height);
     // Push as integers; avoid any other Lua calls here
     lua_pushinteger(L, (lua_Integer)width);
     lua_pushinteger(L, (lua_Integer)height);
@@ -468,26 +455,15 @@ static int l_swap_buffers(lua_State *L) {
 
 // Register graphics functions with Lua
 void luade_register_graphics(lua_State *L) {
-    printf("[gfx] DEBUG: Starting graphics registration\n");
     
     // Check framebuffer status
-    printf("[gfx] DEBUG: Framebuffer status - fb pointer: %p\n", fb);
-    if (fb) {
-        printf("[gfx] DEBUG: Framebuffer seems valid, dimensions: %llux%llu\n", fb->width, fb->height);
-    } else {
-        printf("[gfx] DEBUG: Framebuffer is NULL!\n");
-    }
     
     // Create gfx table
     lua_newtable(L);
-    printf("[gfx] DEBUG: Created gfx table\n");
     
     // Register functions
-    printf("[gfx] DEBUG: About to register get_screen_size function\n");
     lua_pushcfunction(L, l_get_screen_size);
-    printf("[gfx] DEBUG: Pushed l_get_screen_size function\n");
     lua_setfield(L, -2, "get_screen_size");
-    printf("[gfx] DEBUG: Set get_screen_size field\n");
     
     lua_pushcfunction(L, l_put_pixel);
     lua_setfield(L, -2, "put_pixel");
@@ -540,7 +516,5 @@ void luade_register_graphics(lua_State *L) {
     lua_pushinteger(L, 0x404040); lua_setfield(L, -2, "DARK_GRAY");
     
     // Set as global gfx
-    printf("[gfx] DEBUG: About to set gfx as global\n");
     lua_setglobal(L, "gfx");
-    printf("[gfx] DEBUG: Graphics registration complete\n");
 }

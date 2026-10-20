@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compare the time the read path takes for the same 4 MB file through different
 # programs, to tell an I/O cost apart from a program's own CPU cost.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-speed.log shot-speed-*.png qemu-speed.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4463 /mnt/c/osproj/shot-speed \
+python3 ${OSPROJ}/qmp_scenario.py 4463 ${OSPROJ}/shot-speed \
     "wait:2" "type:wc /doom1.wad"          "wait:25" \
     "wait:2" "type:grep WAD /doom1.wad"    "wait:25" \
     "wait:2" "type:head -1 /doom1.wad"     "wait:12"

@@ -32,4 +32,20 @@ doom.speedscope.json
 *.speedscope.json
 
 # Vendored Lua (fetched by scripts/fetch_lua.sh)
-third_party/lua-5.4/
+third_party/lua-5.4
+
+# Scratch output / local data (not part of the source tree)
+*.out
+*.wad
+ref/
+forksig_backups_*/
+tests/curl/
+tests/tcc/stage
+tests/fbdev/build/
+tests/forksig/build/
+tests/busybox/build/
+tests/musl/build/
+*.ko
+shot-*/
+serial-*.txt
+third_party/lua-5.4.7.tar.gz

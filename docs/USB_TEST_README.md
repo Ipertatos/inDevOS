@@ -72,7 +72,7 @@ When `DISABLE_PS2_INPUT` is defined:
 
 Run the automated test:
 ```bash
-./test_usb_build.sh
+./scripts/test_usb_build.sh
 ```
 
 This will:

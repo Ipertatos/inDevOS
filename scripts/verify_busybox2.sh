@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 T=/tmp/indev_bb2; rm -rf "$T"; mkdir -p "$T"
 cp os_install.iso "$T/boot.iso"
 cp sata_disk.img "$T/"
@@ -15,7 +16,7 @@ qemu-system-x86_64 $ACC \
     > $T/qemu.log 2>&1 &
 QPID=$!
 sleep ${BOOTWAIT:-35}
-python3 /mnt/c/osproj/qmp_scenario.py 4456 /mnt/c/osproj/shot-bb2 \
+python3 ${OSPROJ}/qmp_scenario.py 4456 ${OSPROJ}/shot-bb2 \
     "wait:2" "type:mount 0" "wait:10" \
     "wait:2" "type:busybox sh -c echo hi_from_ash" "wait:6" \
     "wait:2" "type:busybox sh -c printf hiash" "wait:6" "shot:1-ashc" \
@@ -35,6 +36,6 @@ python3 /mnt/c/osproj/qmp_scenario.py 4456 /mnt/c/osproj/shot-bb2 \
     "wait:2" "type:neofetch" "wait:6"
 sleep 1
 kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
-cp "$T/serial.log" /mnt/c/osproj/serial-busybox2.log
+cp "$T/serial.log" ${OSPROJ}/serial-busybox2.log
 grep -naE "linux:|hiash|hi_from|hello|tmpbb|unimplemented|Page fault|PANIC|exit_group|uid=|Command not found|BusyBox|wc:|PATH=|from_ash" "$T/serial.log" | tail -100
 echo "--- tail ---"; tail -50 "$T/serial.log"

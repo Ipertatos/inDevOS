@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Old forksig suite + KILLPGID (suite.sh) + QMP Ctrl-C tests (interactive ash).
+WINHOME="${WINHOME:-$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')" 2>/dev/null || echo "$HOME")}"; export WINHOME  # Windows user profile (logs, ws_* scratch)
 set -u
 T=/tmp/indev_uefi_suite
-LOG=/mnt/c/Users/froze/ws_uefi/uefi_ctrlc.log
+LOG=${WINHOME}/ws_uefi/uefi_ctrlc.log
 exec > >(tee "$LOG") 2>&1
 echo "==== START $(date) ===="
-cd /mnt/c/Users/froze/ws_uefi
-SRCD=/mnt/c/Users/froze/forksig_tests_src
+cd ${WINHOME}/ws_uefi
+SRCD=${WINHOME}/forksig_tests_src
 : # private copy: reuse already-built forksig exes
 for f in suite.sh loop.sh; do :; done
-mcopy -o -i sata_disk.img /mnt/c/Users/froze/suite.sh ::/home/user/forksig/suite.sh
-mcopy -o -i sata_disk.img /mnt/c/Users/froze/ctrlc_loop.sh ::/home/user/forksig/loop.sh
+mcopy -o -i sata_disk.img ${WINHOME}/suite.sh ::/home/user/forksig/suite.sh
+mcopy -o -i sata_disk.img ${WINHOME}/ctrlc_loop.sh ::/home/user/forksig/loop.sh
 for f in sigint_count kill_pgid; do mcopy -o -i sata_disk.img "$SRCD/build/$f.exe" ::/home/user/forksig/$f.exe; done
 : # private copy: never kill other streams QEMU
 rm -rf "$T"; mkdir -p "$T"
@@ -51,10 +52,10 @@ for i in $(seq 1 420); do grep -aq "SUITE_END" "$T/serial.log" && break; sleep 1
 echo "SUITE_END after ${i}s"; sleep 4
 sleep 2
 kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
-cp -f "$T/serial.log" /mnt/c/Users/froze/ws_uefi/uefi_serial_ctrlc.log
+cp -f "$T/serial.log" ${WINHOME}/ws_uefi/uefi_serial_ctrlc.log
 grep -aE "ASH_UP|ZEUS_NATIVE|kill_pgid.exe|zeus:/|SUITE_END|PASS |FAIL |tty: |kbd: Ctrl|CTRLC_|SIGC_|KILLPGID|kill_pgid|status=1[34][0-9]|Page fault|exception" "$T/serial.log" | grep -v kfree | tail -n 120
 python3 - << 'PY'
-import re
+import re, os
 s=open("/tmp/indev_uefi_suite/serial.log","rb").read().decode("latin1","replace")
 lines=s.splitlines()
 def ts(l):
@@ -86,14 +87,14 @@ zn = any(re.search(r"\]\s*ZEUS_NATIVE_OK\s*$", l) for l in lines)
 line=(f"ZEUSNATIVE={int(zn)} CTRLC A={int(A)} B={int(B)} C={int(C)} D={int(old['KILLPGID'])} sigs={len(sig_idx)} {detail} | "
       f"OLD {old} SIGPIPE={sigp}/5 FORKSTACK={fst}/5 PF={pf}")
 print(line)
-open("/mnt/c/Users/froze/ws_uefi/uefi_score.txt","w").write(line+"\n")
+open(os.environ["WINHOME"]+"/ws_uefi/uefi_score.txt","w").write(line+"\n")
 if all(old.values()) and sigp>=4 and fst==5 and A and B and C:
-    open("/mnt/c/Users/froze/ws_uefi/uefi_score.txt","a").write("MILESTONE_GREEN\n")
+    open(os.environ["WINHOME"]+"/ws_uefi/uefi_score.txt","a").write("MILESTONE_GREEN\n")
 PY
-if grep -q MILESTONE_GREEN /mnt/c/Users/froze/ws_uefi/uefi_score.txt && [ "${BUILD_ISO:-0}" = 1 ]; then
+if grep -q MILESTONE_GREEN ${WINHOME}/ws_uefi/uefi_score.txt && [ "${BUILD_ISO:-0}" = 1 ]; then
   echo "==== INSTALL ISO ===="
-  bash make_install_iso.sh 2>&1 | tee /mnt/c/Users/froze/forksig_install_iso.log | tail -5
-  ls -la os_install.iso | tee -a /mnt/c/Users/froze/ws_uefi/uefi_score.txt
+  bash make_install_iso.sh 2>&1 | tee ${WINHOME}/forksig_install_iso.log | tail -5
+  ls -la os_install.iso | tee -a ${WINHOME}/ws_uefi/uefi_score.txt
 fi
-echo CTRLC_SUITE_DONE | tee -a /mnt/c/Users/froze/ws_uefi/uefi_score.txt
+echo CTRLC_SUITE_DONE | tee -a ${WINHOME}/ws_uefi/uefi_score.txt
 echo "==== END $(date) ===="

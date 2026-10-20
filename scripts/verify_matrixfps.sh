@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Measure how fast the matrix program actually animates, and grab a desktop
 # screenshot while it is running.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-matrixfps.log shot-matrixfps-*.png qemu-matrixfps.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4460 /mnt/c/osproj/shot-matrixfps \
+python3 ${OSPROJ}/qmp_scenario.py 4460 ${OSPROJ}/shot-matrixfps \
     "wait:2" "type:matrix" "wait:3" \
     "key:ctrl,q" "wait:10" "shot:1-matrix" \
     "key:spc" "wait:4"

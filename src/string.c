@@ -101,7 +101,7 @@ uint32_t kstrtoul(const char *str, char **endptr, int base) {
             break;
         }
         
-        if (digit >= base) break;
+        if (digit >= (uint32_t)base) break;
         
         result = result * base + digit;
         str++;

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Build a static musl-linked TCC for inDevOS (x86_64 Linux ABI).
 set -euo pipefail
-export PATH="/home/ipertatos/.local/musl/bin:/usr/bin:/bin:$PATH"
+export PATH="${HOME}/.local/musl/bin:/usr/bin:/bin:$PATH"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 OSPROJ="$(cd "$ROOT/../.." && pwd)"
-SRC_DIR="${TCC_SRC:-/home/ipertatos/src/tinycc}"
+SRC_DIR="${TCC_SRC:-${HOME}/src/tinycc}"
 # Stage on Linux FS — /mnt/c is NTFS and collides on musl linux/*.h case variants.
-BUILD="${TCC_BUILD:-/home/ipertatos/indev_tcc/build}"
-STAGE="${TCC_STAGE:-/home/ipertatos/indev_tcc/stage}"
+BUILD="${TCC_BUILD:-${HOME}/indev_tcc/build}"
+STAGE="${TCC_STAGE:-${HOME}/indev_tcc/stage}"
 # Keep a convenience symlink/copy pointer under tests/tcc for install scripts
 LINK_STAGE="$ROOT/stage"
 LOG="$OSPROJ/tcc_build.log"
@@ -66,7 +66,7 @@ if [ ! -f libtcc1.a ]; then
 fi
 if [ ! -f libtcc1.a ]; then
   log "Building libtcc1.a with explicit musl includes..."
-  MUSL_INC=/home/ipertatos/.local/musl/include
+  MUSL_INC=${HOME}/.local/musl/include
   (
     cd lib
     for src in libtcc1.c stdatomic.c builtin.c dsohandle.c va_list.c runmain.c tcov.c; do
@@ -107,7 +107,7 @@ cp -f "$BUILD/tcc.exe" "$STAGE/bin/tcc.exe"
 cp -f "$BUILD/libtcc1.a" "$STAGE/usr/lib/tcc/libtcc1.a"
 cp -a "$BUILD/tcc_include/." "$STAGE/usr/lib/tcc/include/" 2>/dev/null || true
 
-MUSL=/home/ipertatos/.local/musl
+MUSL=${HOME}/.local/musl
 # Skip linux/ UAPI (case-colliding names; not needed for libc stdio/stdlib).
 mkdir -p "$STAGE/usr/include"
 if command -v rsync >/dev/null; then

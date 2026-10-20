@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Verify the ported matrix program (SDL window + single CopyPixels per frame)
 # and re-check the rest of the shell/file utilities after the src/usoft removal.
-cd /mnt/c/osproj || exit 1
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/.." && pwd)}"; export OSPROJ  # repo root
+cd ${OSPROJ} || exit 1
 
 rm -f serial-matrix.log shot-matrix-*.png qemu-matrix.log
 
@@ -19,7 +20,7 @@ QPID=$!
 
 sleep 16
 
-python3 /mnt/c/osproj/qmp_scenario.py 4458 /mnt/c/osproj/shot-matrix \
+python3 ${OSPROJ}/qmp_scenario.py 4458 ${OSPROJ}/shot-matrix \
     "wait:2" "type:matrix"                  "wait:12" "shot:1-matrix" \
     "key:spc" "wait:4" "shot:2-after-matrix" \
     "wait:2" "type:mkdir /REGTEST"          "wait:6" \

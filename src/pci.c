@@ -215,8 +215,6 @@ uint32_t pci_device_read(struct pci_device *dev, uint32_t offset, uint8_t size){
         DEBUG_SERIAL("PCI: Invalid read size %d\n", size);
         return 0;
     }
-    // DEBUG_SERIAL("PCI: reading from offset 0x%x from bus=%d, device=%d, func=%d, result=0x%x\n", 
-    //              offset, dev->bus, dev->device, dev->function, result);
     return result;
 }
 
@@ -360,8 +358,6 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
 
     printf("PCI: %02x:%02x.%x %s (Class %02x:%02x)\n", bus, device, function,
            dev->description, classcode, subclass);
-    // DEBUG_SERIAL("PCI: %s (Class %02x:%02x) at bus=%d, device=%d, func=%d\n", 
-    //              dev->description, classcode, subclass, bus, device, function);
     
     // Debug storage controllers
     if (classcode == 0x01) {
@@ -384,15 +380,11 @@ void check_function(uint8_t bus, uint8_t device, uint8_t function, uint16_t head
 */
 void check_device(uint8_t bus, uint8_t device)
 {
-    // DEBUG_SERIAL("PCI: Checking device on bus %d device %d\n", bus, device);
     uint8_t function = 0;
 
     struct pci_device temp_dev = {.bus = bus, .device = device, .function = function};
-    // DEBUG_SERIAL("PCI: Reading vendor ID for bus %d device %d function %d\n", bus, device, function);
     uint16_t vendorID = pci_mm_read_vendor_id(bus, device, function);
-    // DEBUG_SERIAL("PCI: Vendor ID read: 0x%x\n", vendorID);
     if (vendorID == 0xFFFF) {
-        // DEBUG_SERIAL("PCI: No device found (vendor 0xFFFF)\n");
         return;
     }
 
@@ -435,7 +427,6 @@ void scan_all_buses()
 
 void pci_init()
 {
-    // DEBUG_SERIAL("PCI: Starting initialization\n");
     if (mcfg == NULL) {
         serial_printf("PCI: MCFG/ECAM absent, scanning via legacy 0xCF8/0xCFC\n");
         printf("PCI: no MCFG, using legacy config mechanism\n");

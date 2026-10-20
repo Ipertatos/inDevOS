@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/../.." && pwd)}"; export OSPROJ  # repo root
 set -e
-cd /mnt/c/osproj
+cd ${OSPROJ}
 IMG=sata_disk.img
 BB=tests/busybox/build/busybox.exe
 ls -la "$BB" "$IMG"

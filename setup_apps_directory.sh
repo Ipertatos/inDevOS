@@ -5,7 +5,7 @@ set -euo pipefail
 
 IMG="sata_disk.img"
 MOUNT_DIR="$(mktemp -d)"
-APPS_DIR="/home/ipertatos/inDevOS-bak/apps"
+APPS_DIR="${APPS_DIR:-$(cd "$(dirname "$0")" && pwd)/apps}"
 
 if [[ ! -f "$IMG" ]]; then
     echo "Error: $IMG not found. Run create_disk_images.sh first."

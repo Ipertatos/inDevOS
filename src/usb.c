@@ -445,10 +445,7 @@ int usb_keyboard_process_report(usb_keyboard_report_t *report) {
                  report->key_codes[2], report->key_codes[3], report->key_codes[4], report->key_codes[5]);
     
     // Check for modifier keys
-    bool ctrl_pressed = (report->modifier_keys & 0x01) != 0;
     bool shift_pressed = (report->modifier_keys & 0x02) != 0;
-    bool alt_pressed = (report->modifier_keys & 0x04) != 0;
-    bool gui_pressed = (report->modifier_keys & 0x08) != 0;
     
     // Process each key code
     for (int i = 0; i < 6; i++) {
@@ -550,7 +547,6 @@ static void usb_keyboard_process_report_to_buffer(usb_keyboard_report_t *report)
     // Check for modifier keys
     bool ctrl_pressed = (report->modifier_keys & 0x01) != 0;
     bool shift_pressed = (report->modifier_keys & 0x02) != 0;
-    bool alt_pressed = (report->modifier_keys & 0x04) != 0;
     
     // Process each key code
     for (int i = 0; i < 6; i++) {

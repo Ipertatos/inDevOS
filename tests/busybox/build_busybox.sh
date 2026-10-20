@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+OSPROJ="${OSPROJ:-$(cd "$(dirname "$0")/../.." && pwd)}"; export OSPROJ  # repo root
 set -e
-export PATH=/home/ipertatos/.local/musl/bin:/usr/bin:/bin
-cd /home/ipertatos/src/busybox-1.36.1
+export PATH=${HOME}/.local/musl/bin:/usr/bin:/bin
+cd ${HOME}/src/busybox-1.36.1
 
 # Provide linux/*.h for musl (no sudo): extract from ubuntu package into musl include
-HDR=/home/ipertatos/.local/musl/include
+HDR=${HOME}/.local/musl/include
 if [ ! -f "$HDR/linux/kd.h" ]; then
   mkdir -p /tmp/linuxhdr && cd /tmp/linuxhdr
   apt-get download linux-libc-dev 2>/dev/null || true
@@ -24,7 +25,7 @@ if [ ! -f "$HDR/linux/kd.h" ]; then
   else
     echo "WARN: could not download linux-libc-dev; will disable console applets"
   fi
-  cd /home/ipertatos/src/busybox-1.36.1
+  cd ${HOME}/src/busybox-1.36.1
 fi
 
 # Disable applets that need kernel UAPI we may still lack, and networking
@@ -64,7 +65,7 @@ grep -E "^CONFIG_STATIC=|^CONFIG_ASH=|^CONFIG_VI=|^CONFIG_FEATURE_SH_STANDALONE=
 grep CONFIG_INIT .config | head -3
 ls "$HDR/linux/kd.h" "$HDR/linux/vt.h" 2>/dev/null || echo "headers missing (ok if applets disabled)"
 
-LOG=/mnt/c/osproj/bb_build.log
+LOG=${OSPROJ}/bb_build.log
 echo "start $(date)" | tee "$LOG"
 make -j$(nproc) CC=musl-gcc HOSTCC=gcc SKIP_STRIP=y >> "$LOG" 2>&1
 EC=$?
@@ -72,9 +73,9 @@ echo "BUILD_EXIT=$EC" | tee -a "$LOG"
 tail -40 "$LOG"
 if [ $EC -eq 0 ] && [ -f busybox ]; then
   ls -la busybox | tee -a "$LOG"
-  mkdir -p /mnt/c/osproj/tests/busybox/build
-  cp -f busybox /mnt/c/osproj/tests/busybox/build/busybox.exe
-  cp -f .config /mnt/c/osproj/tests/busybox/busybox.config
+  mkdir -p ${OSPROJ}/tests/busybox/build
+  cp -f busybox ${OSPROJ}/tests/busybox/build/busybox.exe
+  cp -f .config ${OSPROJ}/tests/busybox/busybox.config
   ./busybox echo hello | tee -a "$LOG"
   ./busybox 2>&1 | head -30 | tee -a "$LOG"
 fi
