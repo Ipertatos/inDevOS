@@ -470,6 +470,14 @@ static int fd_close_entry(process_t *proc, int fd) {
     if (should_free_object && ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) {
         if (ty == 8 /* FD_TYPE_EVENTFD */) {
             if (fde->file_handle) kfree(fde->file_handle);
+        } else if (ty == 10 /* FD_TYPE_DEV_INPUT */) {
+            extern void evdev_release(void *handle);
+            evdev_release(fde->file_handle);
+            fde->file_handle = NULL;
+        } else if (ty == 11 /* FD_TYPE_DEV_UINPUT */) {
+            extern void uinput_release(void *handle);
+            uinput_release(fde->file_handle);   /* destroys the device */
+            fde->file_handle = NULL;
         } else if (ty == FD_TYPE_SOCKET) {
             kernel_socket_t *sock = (kernel_socket_t *)fde->file_handle;
             if (sock) {
@@ -1100,7 +1108,14 @@ int sys_exit(int status) {
         extern bool exec_current_is_sync_program(void);
         extern process_t *exec_get_sync_proc(void);
         extern void process_set_fg_pgid(uint32_t pgid);
-        if (proc && exec_current_is_sync_program() && proc == exec_get_sync_proc()) {
+        extern thread_t *exec_get_sync_thread_for(process_t *p);
+        /* Identify the sync program by process + thread, not only by the
+         * per-VC program_running flag, which other paths may clear. */
+        bool is_sync = proc && proc == exec_get_sync_proc() &&
+                       (exec_current_is_sync_program() ||
+                        (exec_get_sync_thread_for(proc) &&
+                         exec_get_sync_thread_for(proc) == scheduler_get_current_thread()));
+        if (is_sync) {
             thread_t *st = (thread_t *)proc->sched_thread;
             if (st && st->owner_process == (struct process *)proc)
                 st->owner_process = NULL;
@@ -3268,6 +3283,18 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
                 if ((kfds[i].events & POLLIN) && v) kfds[i].revents |= POLLIN;
                 if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
             }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 10 /* FD_TYPE_DEV_INPUT */) {
+                extern bool evdev_poll_ready(void *handle, bool *hup);
+                bool hup = false;
+                if (evdev_poll_ready(proc->fds[fd].file_handle, &hup)) {
+                    if (kfds[i].events & POLLIN) kfds[i].revents |= POLLIN;
+                    if (hup) kfds[i].revents |= POLLHUP | POLLERR;
+                }
+            }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 11 /* FD_TYPE_DEV_UINPUT: writable */)
+                kfds[i].revents |= kfds[i].events & POLLOUT;
             if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
                 proc->fds[fd].fd_type == 9 /* FD_TYPE_DEV_FB: always ready */)
                 kfds[i].revents |= kfds[i].events & (POLLIN | POLLOUT);

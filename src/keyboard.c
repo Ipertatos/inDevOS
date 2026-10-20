@@ -9,6 +9,7 @@ extern bool desktop_is_running(void);
 #include "debug.h"
 #include "serial.h"
 #include "term.h"
+#include "input.h"
 #include "hpet.h"
 #include "../include/SDL.h"
 #include "vconsole.h"
@@ -70,6 +71,15 @@ static volatile bool vconsole_switch_requested = false;
 // Spinlock to protect keyboard state and buffer with canaries for corruption detection
 static uint64_t canary_before = 0xDEADBEEFCAFEBABE;
 static spinlock_t keyboard_lock = {0};
+
+/* i8042 data port ownership.  IRQ1, IRQ12, keyboard_poll() and mouse_poll()
+ * all read port 0x60, possibly on different CPUs.  Reading 0x60 when the
+ * output buffer is already empty returns the previous byte again (QEMU and
+ * real 8042s), so a poll on one CPU racing the IRQ1 handler on another
+ * delivered the same make code twice ("eecho").  Every reader now takes this
+ * lock, checks OBF (status bit 0) and the AUX bit (5) and only then reads. */
+spinlock_t i8042_lock = {0};
+static volatile uint32_t kbd_irq_empty;       /* IRQ1 found OBF clear: byte already taken */
 static uint64_t canary_after = 0xFEEDFACEDEADC0DE;
 
 // Safe interrupt-context echo queue
@@ -340,6 +350,14 @@ void keyboard_init(){
         printf("PS/2 Keyboard: enable-scanning (0xF4) was not ACKed\n");
     }
 
+    if (!input_ps2_kbd) {
+        input_dev_t *d = input_allocate("AT Translated Set 2 keyboard", BUS_I8042, 0x0001, 0x0001);
+        if (d) {
+            input_setup_keyboard(d);
+            if (input_register(d) == 0) input_ps2_kbd = d;
+        }
+    }
+
     printf("PS/2 Keyboard: config 0x%02x, IOAPIC redirect (LAPIC ID: %d, Vector: 33, IRQ: 1)\n",
            config, bsp_lapic_id);
     ioapic_redirect_irq(bsp_lapic_id, 33, 1, true);
@@ -418,27 +436,6 @@ static void keyboard_process_byte(uint16_t scancode){
         }
     }
 
-#ifdef ENABLE_LUA
-    /* Non-blocking LuaDE owns VT 0's keys like the desktop does: they go
-     * to the script's event queue, not to the hidden Zeus line on VT 0.
-     * Ctrl+F1..F4 and Ctrl+Q still switch consoles. */
-    {
-        extern bool luade_owns_input(void);
-        extern void luade_keyboard_event(char key, int scancode, bool pressed);
-        if (luade_owns_input()) {
-            bool vt_chord = left_ctrl_pressed &&
-                            ((code >= 0x3B && code <= 0x3E) || code == 0x10 /*q*/);
-            bool modifier = code == 0x1D || code == 0x2A || code == 0x36 ||
-                            code == 0x38 || code == 0x3A;
-            if (!vt_chord && !modifier) {
-                char ch = (code == 0x01) ? 27 : ps2_translate2ascii(code, shift_pressed, capsLock);
-                if (ch == '\n') ch = 13;
-                luade_keyboard_event(ch, ext ? (code | 0x80) : code, !is_release);
-                if (!is_release) goto end;
-            }
-        }
-    }
-#endif
     /* Same for the native desktop: while it owns VT 0, presses reach it
      * through the SDL queue above only. Feeding them to the hidden Zeus
      * line on VT 0 as well made Zeus run half-typed commands (and block
@@ -643,7 +640,24 @@ void keyboard_inject_scancode(uint8_t b) {
 }
 
 void keyboard_handler(void) {
-    keyboard_process_byte(inb(0x60));
+    spinlock_lock(&i8042_lock);                 /* IRQs are off in the handler */
+    uint8_t st = inb(0x64);
+    if ((st & 0x01) == 0 || (st & 0x20)) {
+        /* Empty (a poller already took the byte) or a mouse byte (IRQ12 /
+         * mouse_poll owns it).  Reading 0x60 now would repeat a stale key. */
+        spinlock_unlock(&i8042_lock);
+        if ((st & 0x01) == 0) {
+            uint32_t n = ++kbd_irq_empty;
+            if (n <= 5 || (n & 0xFF) == 0)
+                serial_printf("kbd: IRQ1 with empty i8042 buffer #%u (byte already consumed; not re-read)\n", n);
+        }
+        apic_eoi();
+        return;
+    }
+    uint8_t b = inb(0x60);
+    spinlock_unlock(&i8042_lock);
+    keyboard_process_byte(b);
+    input_kbd_set1_byte(input_ps2_kbd, b);     /* /dev/input/eventN */
     apic_eoi();
 }
 
@@ -653,10 +667,13 @@ void keyboard_handler(void) {
 void keyboard_poll(void) {
     uint64_t flags = irq_save();
     for (int n = 0; n < 16; n++) {
+        spinlock_lock(&i8042_lock);
         uint8_t st = inb(0x64);
-        if ((st & 0x01) == 0) break;
-        if (st & 0x20) break;
-        keyboard_process_byte(inb(0x60));
+        if ((st & 0x01) == 0 || (st & 0x20)) { spinlock_unlock(&i8042_lock); break; }
+        uint8_t b = inb(0x60);
+        spinlock_unlock(&i8042_lock);
+        keyboard_process_byte(b);
+        input_kbd_set1_byte(input_ps2_kbd, b);
     }
     irq_restore(flags);
 }
@@ -1169,3 +1186,7 @@ const char* keyboard_get_layout_name(void) {
     if (l < 0 || l >= KB_LAYOUT_MAX) l = KB_LAYOUT_US;
     return layout_names[l];
 }
+
+/* Modifier state for the desktop (pointer events carry Shift/Ctrl). */
+bool keyboard_get_shift(void) { return shift_pressed; }
+bool keyboard_get_ctrl(void)  { return left_ctrl_pressed; }

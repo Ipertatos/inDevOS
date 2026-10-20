@@ -1,13 +1,11 @@
 #include "mouse.h"
 #include "utils.h"
 #include "keyboard.h"
-#ifdef ENABLE_LUA
-#include "luade_input.h"
-#endif
 #include "serial.h"
 #include "apic.h"
 #include "atomic.h"
 #include "cpuid.h"
+#include "input.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -22,7 +20,8 @@ static uint8_t mouse_buttons = 0;
 volatile int sdl_mouse_accum_dx = 0;
 volatile int sdl_mouse_accum_dy = 0;
 static bool mouse_initialized = false;
-static spinlock_t mouse_lock = {0};
+static spinlock_t mouse_lock = {0};       /* PS/2 packet assembly */
+static spinlock_t mouse_state_lock = {0}; /* pointer state: x/y/buttons/scroll */
 
 // Mouse packet parsing
 static uint8_t mouse_packet[4];       // 4 bytes for IntelliMouse scroll wheel
@@ -257,10 +256,26 @@ bool mouse_init(void) {
     extern void ioapic_redirect_irq(uint32_t lapic_id, uint8_t vector, uint8_t irq, bool enable);
     ioapic_redirect_irq(bsp_lapic_id, 45, 12, true);
     
+    if (!input_ps2_mouse) {
+        input_dev_t *d = input_allocate(intellimouse_enabled ? "ImExPS/2 Generic Explorer Mouse" : "PS/2 Generic Mouse",
+                                        BUS_I8042, 0x0002, intellimouse_enabled ? 0x0003 : 0x0001);
+        if (d) {
+            input_set_capability(d, EV_KEY, BTN_LEFT);
+            input_set_capability(d, EV_KEY, BTN_RIGHT);
+            input_set_capability(d, EV_KEY, BTN_MIDDLE);
+            input_set_capability(d, EV_REL, REL_X);
+            input_set_capability(d, EV_REL, REL_Y);
+            if (intellimouse_enabled) input_set_capability(d, EV_REL, REL_WHEEL);
+            if (input_register(d) == 0) input_ps2_mouse = d;
+        }
+    }
+
     mouse_initialized = true;
     printf("PS/2 Mouse: Initialization complete (packet size: %d bytes)\n", mouse_packet_size);
     return true;
 }
+
+static void mouse_apply(int dx, int dy_screen, uint8_t new_buttons, int wheel_up);
 
 // Process a complete mouse packet
 static void mouse_process_packet(void) {
@@ -297,79 +312,100 @@ static void mouse_process_packet(void) {
         dy = 0;
     }
     
-    // Extract scroll wheel delta (4th byte, only for IntelliMouse)
+    // Extract scroll wheel delta (4th byte, only for IntelliMouse; positive = down)
     int8_t scroll = 0;
-    if (intellimouse_enabled && mouse_packet_size >= 4) {
+    if (intellimouse_enabled && mouse_packet_size >= 4)
         scroll = (int8_t)mouse_packet[3];
-        if (scroll != 0) {
-            scroll_delta_accum += scroll;
-        }
-    }
 
-    // Extract button states
-    bool left_button = (status & 0x01) != 0;
-    bool right_button = (status & 0x02) != 0; 
-    bool middle_button = (status & 0x04) != 0;
-    
-    // Calculate new position
+    /* Screen convention: positive Y is down (Linux REL_Y too). */
     int y_screen = ps2_y_positive_is_down ? (int)dy : -(int)dy;
-    int new_x = mouse_x + dx;
-    int new_y = mouse_y + y_screen;
 
-    // Apply bounds checking
+    /* Report through the input core: /dev/input/eventN readers get the
+     * Linux events, and mouse_input_sync() below updates the desktop pointer. */
+    input_dev_t *d = input_ps2_mouse;
+    if (d) {
+        input_event(d, EV_KEY, BTN_LEFT, (status & 0x01) != 0);
+        input_event(d, EV_KEY, BTN_RIGHT, (status & 0x02) != 0);
+        input_event(d, EV_KEY, BTN_MIDDLE, (status & 0x04) != 0);
+        input_event(d, EV_REL, REL_X, dx);
+        input_event(d, EV_REL, REL_Y, y_screen);
+        if (scroll) input_event(d, EV_REL, REL_WHEEL, -(int)scroll);
+        input_sync(d);
+    } else {
+        mouse_apply(dx, y_screen, status & 7, -(int)scroll);
+    }
+}
+
+static inline uint64_t mouse_state_lock_irqsave(void) {
+    uint64_t flags = irq_save();
+    spinlock_lock(&mouse_state_lock);
+    return flags;
+}
+
+static inline void mouse_state_unlock_irqrestore(uint64_t flags) {
+    spinlock_unlock(&mouse_state_lock);
+    irq_restore(flags);
+}
+
+/* Apply one frame of relative motion to the shared pointer (desktop, LuaDE,
+ * SDL).  Same behaviour as the old per-source code paths. */
+static void mouse_apply(int dx, int dy_screen, uint8_t new_buttons, int wheel_up) {
+    uint64_t flags = mouse_state_lock_irqsave();
+    if (wheel_up) scroll_delta_accum += (int8_t)(-wheel_up);   /* accum: positive = down */
+
+    int new_x = mouse_x + dx;
+    int new_y = mouse_y + dy_screen;
     if (new_x < 0) new_x = 0;
     if (new_y < 0) new_y = 0;
     if (new_x >= screen_width) new_x = screen_width - 1;
     if (new_y >= screen_height) new_y = screen_height - 1;
 
-    // Detect button state changes
-    uint8_t new_buttons = 0;
-    if (left_button) new_buttons |= 0x01;
-    if (right_button) new_buttons |= 0x02;
-    if (middle_button) new_buttons |= 0x04;
-
-    // Generate move event if position changed
-    if (dx != 0 || dy != 0) {
-        /* Match SDL_MOUSEMOTION yrel: screen delta uses new_y - old_y = -(packet dy) for pure Y move. */
-        sdl_mouse_accum_dx += (int)dx;
-        sdl_mouse_accum_dy += y_screen;
-
-        // Update mouse position
+    if (dx != 0 || dy_screen != 0) {
+        /* Match SDL_MOUSEMOTION yrel: screen delta. */
+        sdl_mouse_accum_dx += dx;
+        sdl_mouse_accum_dy += dy_screen;
         mouse_x = new_x;
         mouse_y = new_y;
-
-#ifdef MOUSE_DEBUG_PACKETS
-        if (log_this) {
-            serial_printf("[mouse] PKT #%u pos_after=(%d,%d)  screen=%dx%d\n",
-                          pkt_count, mouse_x, mouse_y,
-                          screen_width, screen_height);
-        }
-#endif
-
-        // Generate LuaDE event (keep for compatibility)
-#ifdef ENABLE_LUA
-        luade_mouse_event(mouse_x, mouse_y, 0, false);
-#endif
-    }
-    
-    // Generate button events for changes
-    for (int button = 1; button <= 3; button++) {
-        uint8_t mask = 1 << (button - 1);
-        bool was_pressed = (mouse_buttons & mask) != 0;
-        bool is_pressed = (new_buttons & mask) != 0;
-
-        if (was_pressed != is_pressed) {
-#ifdef ENABLE_LUA
-            luade_mouse_event(mouse_x, mouse_y, button, is_pressed);
-#endif
-
-        }
     }
 
-    // Handle scroll wheel events
-    (void)scroll;
-    
     mouse_buttons = new_buttons;
+    mouse_state_unlock_irqrestore(flags);
+}
+
+/* Input-core handler: every relative pointer device (PS/2, USB, uinput)
+ * drives the one desktop pointer.  Not called while a client holds
+ * EVIOCGRAB on the device. */
+/* Absolute axis value -> screen pixel using the device's absinfo range. */
+static int abs_to_screen(const struct input_absinfo *a, int span) {
+    int64_t lo = a->minimum, hi = a->maximum;
+    if (hi <= lo || span <= 1) return -1;
+    int64_t v = a->value;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return (int)((v - lo) * (int64_t)(span - 1) / (hi - lo));
+}
+
+void mouse_input_sync(input_dev_t *d) {
+    bool abs_ptr = input_test_bit(d->absbit, ABS_X) && input_test_bit(d->absbit, ABS_Y);
+    if (!input_test_bit(d->relbit, REL_X) && !input_test_bit(d->keybit, BTN_LEFT) && !abs_ptr) return;
+    uint8_t b = 0;
+    if (input_test_bit(d->key, BTN_LEFT)) b |= 1;
+    if (input_test_bit(d->key, BTN_RIGHT)) b |= 2;
+    if (input_test_bit(d->key, BTN_MIDDLE)) b |= 4;
+    /* tablets / touchscreens without BTN_LEFT: contact = left button */
+    if (abs_ptr && !input_test_bit(d->keybit, BTN_LEFT) && input_test_bit(d->key, BTN_TOUCH)) b |= 1;
+    int dx = d->rel_accum[REL_X], dy = d->rel_accum[REL_Y];
+    if (abs_ptr && (d->abs_changed & 3)) {
+        /* absolute pointer: move to the scaled position (as a delta so the
+         * SDL/desktop accumulators see ordinary motion) */
+        int tx = abs_to_screen(&d->abs[ABS_X], screen_width);
+        int ty = abs_to_screen(&d->abs[ABS_Y], screen_height);
+        uint64_t f = mouse_state_lock_irqsave();
+        if (tx >= 0 && (d->abs_changed & 1)) dx = tx - mouse_x;
+        if (ty >= 0 && (d->abs_changed & 2)) dy = ty - mouse_y;
+        mouse_state_unlock_irqrestore(f);
+    }
+    mouse_apply(dx, dy, b, d->rel_accum[REL_WHEEL]);
 }
 
 // Mouse interrupt handler (called from IDT)
@@ -392,9 +428,21 @@ void mouse_handler(void) {
      * A plain spinlock is sufficient here; the readers below use irq_save so
      * we cannot be re-entered on the same CPU mid-critical-section. */
     spinlock_lock(&mouse_lock);
-    
-    // Read data from mouse
+
+    /* Read only if the i8042 really holds an AUX byte (see i8042_lock in
+     * keyboard.c): a poller on another CPU may already have taken it, and a
+     * keyboard byte belongs to IRQ1/keyboard_poll. */
+    extern spinlock_t i8042_lock;
+    spinlock_lock(&i8042_lock);
+    uint8_t st = inb(0x64);
+    if ((st & 0x21) != 0x21) {
+        spinlock_unlock(&i8042_lock);
+        spinlock_unlock(&mouse_lock);
+        apic_eoi();
+        return;
+    }
     uint8_t data = inb(0x60);
+    spinlock_unlock(&i8042_lock);
 
     /* PS/2 mouse: first byte of each packet always has bit 3 set (OSDev).  If we
      * start mid-packet after noise or a dropped byte, dx/dy misalign — often Y
@@ -471,16 +519,18 @@ void mouse_poll(void) {
 
     int drained = 0;
     /* Bound the work per call to avoid spending too long in one iteration. */
+    extern spinlock_t i8042_lock;
     while (drained < 16) {
+        spinlock_lock(&i8042_lock);
         uint8_t status = inb(0x64);
         /* Only consume AUX bytes (OBF and status bit 5). Keyboard scancodes
          * must stay in the buffer for IRQ1 / keyboard_poll. Treating every
          * OBF byte as a mouse packet swallowed Hyper-V keystrokes: Gen 1
          * often posts the byte before IRQ1 is delivered, and QEMU usually
          * delivers IRQ1 first so the race never showed up there. */
-        if ((status & 0x01) == 0) break;
-        if ((status & 0x20) == 0) break;
+        if ((status & 0x21) != 0x21) { spinlock_unlock(&i8042_lock); break; }
         uint8_t data = inb(0x60);
+        spinlock_unlock(&i8042_lock);
         polled_bytes++;
         drained++;
 
@@ -517,17 +567,17 @@ void mouse_poll(void) {
 
 // Get current mouse position (for debugging/status)
 void mouse_get_position(int *x, int *y) {
-    uint64_t flags = mouse_lock_irqsave();
+    uint64_t flags = mouse_state_lock_irqsave();
     if (x) *x = mouse_x;
     if (y) *y = mouse_y;
-    mouse_unlock_irqrestore(flags);
+    mouse_state_unlock_irqrestore(flags);
 }
 
 // Get current button states
 uint8_t mouse_get_buttons(void) {
-    uint64_t flags = mouse_lock_irqsave();
+    uint64_t flags = mouse_state_lock_irqsave();
     uint8_t b = mouse_buttons;
-    mouse_unlock_irqrestore(flags);
+    mouse_state_unlock_irqrestore(flags);
     return b;
 }
 
@@ -540,10 +590,10 @@ bool mouse_is_initialized(void) {
 
 // Scroll wheel support
 int8_t mouse_get_scroll_delta(void) {
-    uint64_t flags = mouse_lock_irqsave();
+    uint64_t flags = mouse_state_lock_irqsave();
     int8_t delta = scroll_delta_accum;
     scroll_delta_accum = 0;
-    mouse_unlock_irqrestore(flags);
+    mouse_state_unlock_irqrestore(flags);
     return delta;
 }
 
@@ -571,39 +621,25 @@ void mouse_sync_screen_bounds(void)
         mouse_y = 0;
 }
 
+/* Legacy entry for the old usb.c path: report through a shared input device. */
 void mouse_feed_usb_relative(int8_t dx, int8_t dy, uint8_t buttons)
 {
-    uint64_t flags = mouse_lock_irqsave();
-
-    int new_x = mouse_x + (int)dx;
-    int new_y = mouse_y + (int)dy;
-
-    if (new_x < 0) new_x = 0;
-    if (new_y < 0) new_y = 0;
-    if (new_x >= screen_width) new_x = screen_width - 1;
-    if (new_y >= screen_height) new_y = screen_height - 1;
-
-    if (dx != 0 || dy != 0) {
-        sdl_mouse_accum_dx += (int)dx;
-        sdl_mouse_accum_dy += (int)dy;
-        mouse_x = new_x;
-        mouse_y = new_y;
-#ifdef ENABLE_LUA
-        luade_mouse_event(mouse_x, mouse_y, 0, false);
-#endif
+    static input_dev_t *legacy;
+    if (!legacy) {
+        input_dev_t *d = input_allocate("USB legacy mouse", BUS_USB, 0, 0);
+        if (!d) return;
+        input_set_capability(d, EV_KEY, BTN_LEFT);
+        input_set_capability(d, EV_KEY, BTN_RIGHT);
+        input_set_capability(d, EV_KEY, BTN_MIDDLE);
+        input_set_capability(d, EV_REL, REL_X);
+        input_set_capability(d, EV_REL, REL_Y);
+        if (input_register(d) != 0) return;
+        legacy = d;
     }
-
-    for (int button = 1; button <= 3; button++) {
-        uint8_t mask = 1u << (button - 1);
-        bool was_pressed = (mouse_buttons & mask) != 0;
-        bool is_pressed = (buttons & mask) != 0;
-        if (was_pressed != is_pressed) {
-#ifdef ENABLE_LUA
-            luade_mouse_event(mouse_x, mouse_y, button, is_pressed);
-#endif
-        }
-    }
-
-    mouse_buttons = buttons;
-    mouse_unlock_irqrestore(flags);
+    input_event(legacy, EV_KEY, BTN_LEFT, (buttons & 1) != 0);
+    input_event(legacy, EV_KEY, BTN_RIGHT, (buttons & 2) != 0);
+    input_event(legacy, EV_KEY, BTN_MIDDLE, (buttons & 4) != 0);
+    input_event(legacy, EV_REL, REL_X, dx);
+    input_event(legacy, EV_REL, REL_Y, dy);
+    input_sync(legacy);
 }

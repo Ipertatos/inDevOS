@@ -17,6 +17,7 @@
  * program shows exactly what it still needs.
  */
 #include "lx_fbdev.h"
+#include "input.h"
 #include "linux_syscall.h"
 #include "syscall.h"
 #include "syscall_internal.h"
@@ -328,6 +329,10 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
         return 0;
     if (ty == FD_TYPE_DEV_FB)
         return fbdev_read(p, &p->fds[fd].position, ubuf, count);
+    if (ty == FD_TYPE_DEV_INPUT)
+        return evdev_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
+    if (ty == FD_TYPE_DEV_UINPUT)
+        return uinput_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
     if (ty == FD_TYPE_DEV_TTY || lx_fd_is_tty(p, fd))
         return lx_read_tty(p, fd, ubuf, count);
     if (ty == FD_TYPE_SOCKET)
@@ -493,7 +498,18 @@ static uint32_t lx_dev_path(const char *path, uint32_t *mode) {
     };
     for (unsigned i = 0; i < sizeof(devs) / sizeof(devs[0]); i++)
         if (kstrcmp(path, devs[i].p) == 0) { if (mode) *mode = devs[i].mode; return devs[i].rdev; }
+    {
+        int minor = evdev_parse_path(path);
+        if (minor >= 0) { if (mode) *mode = 0660; return (13u << 8) | (uint32_t)(64 + minor); }
+    }
+    if (kstrcmp(path, "/dev/uinput") == 0) { if (mode) *mode = 0660; return (10u << 8) | 223u; }
     return 0;
+}
+
+/* /dev/input (and /dev when the root fs has none) are synthetic dirs. */
+static bool lx_synth_dir(const char *path) {
+    char nm[1][16]; uint8_t isd[1];
+    return input_dev_dir_list(path, nm, isd, 0) >= 0;
 }
 
 static long lx_stat_path(const char *abspath, void *ubuf) {
@@ -512,8 +528,15 @@ static long lx_stat_path(const char *abspath, void *ubuf) {
             return lx_put(ubuf, &ls, sizeof(ls));
         }
     }
-    if (!lx_path_kind(abspath, &st))
-        return -ENOENT;
+    if (!lx_path_kind(abspath, &st)) {
+        if (!lx_synth_dir(abspath))
+            return -ENOENT;
+        memset(&st, 0, sizeof(st));             /* /dev, /dev/input */
+        st.st_mode = S_IFDIR | 0755;
+        st.st_nlink = 2;
+        st.st_blksize = 4096;
+        st.st_ino = kstrcmp(abspath, "/dev") == 0 ? 0xD000 : 0xD001;
+    }
     lx_stat_t ls;
     lx_fill_stat(&ls, &st);
     return lx_put(ubuf, &ls, sizeof(ls));
@@ -530,6 +553,26 @@ static long lx_fstat(process_t *p, long fd, void *ubuf) {
         st.st_nlink = 1;
         st.st_blksize = 4096;
         st.st_rdev = (29u << 8) | 0;            /* fb0 = 29,0 */
+        lx_stat_t ls;
+        lx_fill_stat(&ls, &st);
+        return lx_put(ubuf, &ls, sizeof(ls));
+    }
+    if (f->fd_type == FD_TYPE_DEV_INPUT) {
+        st.st_mode = 0660 | S_IFCHR;
+        st.st_nlink = 1;
+        st.st_blksize = 4096;
+        st.st_rdev = (13u << 8) | (uint32_t)(64 + evdev_minor(f->file_handle));   /* input: 13, 64+N */
+        st.st_ino = 0x10000 + st.st_rdev;
+        lx_stat_t ls;
+        lx_fill_stat(&ls, &st);
+        return lx_put(ubuf, &ls, sizeof(ls));
+    }
+    if (f->fd_type == FD_TYPE_DEV_UINPUT) {
+        st.st_mode = 0660 | S_IFCHR;
+        st.st_nlink = 1;
+        st.st_blksize = 4096;
+        st.st_rdev = (10u << 8) | 223u;         /* misc 10,223 */
+        st.st_ino = 0x10000 + st.st_rdev;
         lx_stat_t ls;
         lx_fill_stat(&ls, &st);
         return lx_put(ubuf, &ls, sizeof(ls));
@@ -601,6 +644,10 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
         return (long)len;
     if (p->fds[fd].fd_type == FD_TYPE_DEV_FB)
         return fbdev_write(p, &p->fds[fd].position, ubuf, len);
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_INPUT)
+        return evdev_write(p->fds[fd].file_handle, ubuf, len);
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_UINPUT)
+        return uinput_write(p->fds[fd].file_handle, ubuf, len);
     if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
         return lx_sock_send((int)fd, ubuf, len, 0);
     if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
@@ -678,6 +725,61 @@ static long lx_open_special(process_t *p, const char *path, long lflags) {
         p->fds[fd].in_use = true;
         return fd;
     }
+    {
+        int minor = evdev_parse_path(path);
+        if (minor >= 0) {
+            void *h = NULL;
+            long r = evdev_open(minor, &h);
+            if (r < 0) return r;
+            int fd = allocate_fd(p);
+            if (fd < 0) { evdev_release(h); return -EMFILE; }
+            p->fds[fd].ref_count = fd_refcount_create();   /* fork/dup share one client */
+            if (!p->fds[fd].ref_count) { evdev_release(h); p->fds[fd].in_use = false; return -ENOMEM; }
+            p->fds[fd].fd_type = FD_TYPE_DEV_INPUT;
+            p->fds[fd].file_handle = h;
+            p->fds[fd].flags = (uint32_t)(lflags & 3) | ((lflags & LX_O_NONBLOCK) ? O_NONBLOCK : 0);
+            p->fds[fd].position = 0;
+            p->fds[fd].cloexec = (lflags & LX_O_CLOEXEC) != 0;
+            p->fds[fd].in_use = true;
+            return fd;
+        }
+    }
+    if (kstrcmp(path, "/dev/uinput") == 0 || kstrcmp(path, "/dev/input/uinput") == 0) {
+        void *h = NULL;
+        long r = uinput_open(&h);
+        if (r < 0) return r;
+        int fd = allocate_fd(p);
+        if (fd < 0) { uinput_release(h); return -EMFILE; }
+        p->fds[fd].ref_count = fd_refcount_create();
+        if (!p->fds[fd].ref_count) { uinput_release(h); p->fds[fd].in_use = false; return -ENOMEM; }
+        p->fds[fd].fd_type = FD_TYPE_DEV_UINPUT;
+        p->fds[fd].file_handle = h;
+        p->fds[fd].flags = (uint32_t)(lflags & 3) | ((lflags & LX_O_NONBLOCK) ? O_NONBLOCK : 0);
+        p->fds[fd].position = 0;
+        p->fds[fd].cloexec = (lflags & LX_O_CLOEXEC) != 0;
+        p->fds[fd].in_use = true;
+        return fd;
+    }
+    if (lx_synth_dir(path) && lx_path_kind(path, NULL) != 2) {
+        /* /dev/input (and /dev if the root fs lacks it): directory fd whose
+         * entries come from input_dev_dir_list() in lx_getdents64 */
+        size_t pl = strlen(path) + 1;
+        char *copy = (char *)kalloc(pl);
+        if (!copy) return -ENOMEM;
+        memcpy(copy, path, pl);
+        int fd = allocate_fd(p);
+        if (fd < 0) { kfree(copy); return -EMFILE; }
+        p->fds[fd].ref_count = fd_refcount_create();
+        if (!p->fds[fd].ref_count) { kfree(copy); p->fds[fd].in_use = false; return -ENOMEM; }
+        p->fds[fd].fd_type = FD_TYPE_VFS_DIR;
+        p->fds[fd].file_handle = copy;
+        p->fds[fd].vfs_fd = -1;
+        p->fds[fd].flags = (uint32_t)(lflags & 3);
+        p->fds[fd].position = 0;
+        p->fds[fd].cloexec = (lflags & LX_O_CLOEXEC) != 0;
+        p->fds[fd].in_use = true;
+        return fd;
+    }
     if (kstrcmp(path, "/dev/tty") == 0 || kstrcmp(path, "/dev/console") == 0 ||
         kstrcmp(path, "/dev/tty0") == 0 || kstrcmp(path, "/dev/tty1") == 0 ||
         kstrcmp(path, "/dev/tty2") == 0 || kstrcmp(path, "/dev/tty3") == 0 ||
@@ -747,6 +849,25 @@ static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
         return -ENOMEM;
     }
     int total = vfs_readdir((const char *)f->file_handle, ents, MAXENT);
+    {
+        /* /dev, /dev/input: append synthetic device nodes not on disk */
+        enum { NSYN = 24 };
+        char sn[NSYN][16]; uint8_t sd[NSYN];
+        int ns = input_dev_dir_list((const char *)f->file_handle, sn, sd, NSYN);
+        if (ns >= 0) {
+            if (total < 0) total = 0;
+            for (int i = 0; i < ns && total < MAXENT; i++) {
+                bool dup = false;
+                for (int j = 0; j < total && !dup; j++) dup = strcmp(ents[j].name, sn[i]) == 0;
+                if (dup) continue;
+                memset(&ents[total], 0, sizeof(ents[total]));
+                memcpy(ents[total].name, sn[i], strlen(sn[i]) + 1);
+                ents[total].type = sd[i] ? VFS_DIRECTORY : 0;
+                ents[total].inode = 0xD100 + (uint32_t)total;
+                total++;
+            }
+        }
+    }
     if (total < 0) { kfree(ents); kfree(kbuf); return -EIO; }
 
     uint32_t pos = f->position;
@@ -765,7 +886,8 @@ static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
         memcpy(rec + 8, &doff, 8);
         memcpy(rec + 16, &rl, 2);
         rec[18] = (e->type & VFS_DIRECTORY) ? LX_DT_DIR :
-                  (e->type & VFS_FILE) ? LX_DT_REG : LX_DT_UNKNOWN;
+                  (e->type & VFS_FILE) ? LX_DT_REG :
+                  (e->inode >= 0xD100 && e->inode < 0xD200) ? 2 /* DT_CHR */ : LX_DT_UNKNOWN;
         memcpy(rec + 19, e->name, nl + 1);
         off += reclen;
         pos++;
@@ -803,6 +925,10 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     if (p->fds[fd].fd_type == FD_TYPE_DEV_FB)
         return fbdev_ioctl(p, req, arg);
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_INPUT)
+        return evdev_ioctl(p->fds[fd].file_handle, req, arg);
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_UINPUT)
+        return uinput_ioctl(p->fds[fd].file_handle, req, arg);
     bool tty = lx_fd_is_tty(p, fd);
     if (tty) {                                  /* KD / VT ioctls (fbdev apps) */
         bool handled = false;

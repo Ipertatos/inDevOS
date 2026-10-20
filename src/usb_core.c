@@ -274,7 +274,11 @@ static usb_dev_t *usb_attach(xhci_ctrl_t *hc, usb_dev_t *parent, uint8_t port, u
         void *data = NULL;
         if (ifc->cls == 9) {
             hub_attach(d, ifc);
-        } else if (ifc->cls == 3 && ifc->sub == 1 && (ifc->proto == 1 || ifc->proto == 2)) {
+        } else if (ifc->cls == 3 && ((ifc->sub == 1 && (ifc->proto == 1 || ifc->proto == 2)) ||
+                                     /* QEMU usb-tablet: non-boot HID with a fixed
+                                      * absolute report (see usb_hid.c) */
+                                     (ifc->sub == 0 && (ifc->proto == 2 || ifc->proto == 0) &&
+                                      d->desc.idVendor == 0x0627 && d->desc.idProduct == 0x0001))) {
             int drv = ifc->proto == 1 ? USB_DRV_KBD : USB_DRV_MOUSE;
             if (usb_hid_attach(d, ifc, drv, &data) == 0) {
                 d->bound[d->n_bound].drv = drv;

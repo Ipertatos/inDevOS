@@ -202,8 +202,8 @@ void pcnet_init() {
     // Note: IOAPIC routing should be done here if needed, similar to E1000
     // Assuming generic interrupt handling or legacy PIC for now, 
     // but the system seems to use IOAPIC.
-    // We'll route it to vector 45 just to be safe and distinct.
-    ioapic_redirect_irq(0, 45, irq, true);
+    // Vector 47: 45 belongs to the PS/2 mouse (IRQ12); idt.c dispatches 47 here.
+    ioapic_redirect_irq(0, 47, irq, true);
     
     // Set static IP for now
     pcnet_dev.ip_address[0] = 192;

@@ -17,7 +17,7 @@
 #include "kernel_symtab.h"
 #include "rtl8139.h"
 #include "e1000.h"
-#include "luade.h"
+#include "lua_runtime.h"
 #include "smp.h"
 #include "profiler.h"
 #include "vconsole.h"
@@ -118,9 +118,9 @@ void initIDT() {
     setIdtGate(35, isr35, 0x8E); //HPET timer
     setIdtGate(43, isr43, 0x8E); //RTL8139 network card
     setIdtGate(44, isr44, 0x8E); //E1000 network card
-    setIdtGate(45, isr45, 0x8E); //Reserved
+    setIdtGate(45, isr45, 0x8E); //PS/2 mouse (IRQ12)
     setIdtGate(46, isr46, 0x8E); //RTL810xE network card
-    setIdtGate(47, isr47, 0x8E); //Reserved
+    setIdtGate(47, isr47, 0x8E); //PCnet network card
     setIdtGate(48, isr48, 0x8E); //AHCI SATA controller
 
     /* SMP IPI vectors */
@@ -973,6 +973,10 @@ void isr_handler(registers_t* r) {
     if(r->int_no == 46){
         extern void rtl810x_handle_interrupt();
         rtl810x_handle_interrupt();
+    }
+    if(r->int_no == 47){
+        extern void pcnet_handle_interrupt(void);
+        pcnet_handle_interrupt();   /* PCnet (was on 45, shared with the PS/2 mouse) */
     }
     if(r->int_no == 48){
         extern void ahci_handle_interrupt(void);

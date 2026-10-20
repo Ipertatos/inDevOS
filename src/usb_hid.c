@@ -14,6 +14,7 @@
 #include "serial.h"
 #include "stdio.h"
 #include "ktime.h"
+#include "input.h"
 
 extern void *dma_alloc_pages(uint32_t bytes, uint64_t *phys);
 extern void dma_free_pages(void *p);
@@ -64,12 +65,15 @@ typedef struct {
     uint8_t rep_key;
     uint64_t rep_at;
     uint32_t reports;
+    input_dev_t *idev;          /* /dev/input/eventN for this keyboard/mouse */
+    bool tablet;                /* QEMU usb-tablet: btn, x16, y16 (0..32767), wheel */
 } usb_hid_t;
 
-static void send_code(uint16_t c, bool down) {
+static void send_code(usb_hid_t *h, uint16_t c, bool down) {
     if (!c) return;
     if (c & E0) keyboard_inject_scancode(0xE0);
     keyboard_inject_scancode((uint8_t)((c & 0x7F) | (down ? 0 : 0x80)));
+    if (h->idev) input_kbd_set1_key(h->idev, (c & E0) != 0, (uint8_t)(c & 0x7F), down);
 }
 
 static bool has_key(const uint8_t *r, uint8_t k) {
@@ -81,18 +85,18 @@ static void kbd_report(usb_hid_t *h, const uint8_t *r) {
     if (r[2] == 1) return;                      /* ErrorRollOver */
     uint8_t mchg = (uint8_t)(r[0] ^ h->prev[0]);
     for (int b = 0; b < 8; b++)
-        if (mchg & (1u << b)) send_code(mod_to_set1[b], (r[0] >> b) & 1);
+        if (mchg & (1u << b)) send_code(h, mod_to_set1[b], (r[0] >> b) & 1);
     for (int i = 2; i < 8; i++) {
         uint8_t k = h->prev[i];
         if (k >= 4 && k < 0x68 && !has_key(r, k)) {
-            send_code(hid_to_set1[k], false);
+            send_code(h, hid_to_set1[k], false);
             if (h->rep_key == k) h->rep_key = 0;
         }
     }
     for (int i = 2; i < 8; i++) {
         uint8_t k = r[i];
         if (k >= 4 && k < 0x68 && !has_key(h->prev, k)) {
-            send_code(hid_to_set1[k], true);
+            send_code(h, hid_to_set1[k], true);
             h->rep_key = k;
             h->rep_at = ktime_now_ms() + 500;
         }
@@ -116,13 +120,45 @@ int usb_hid_attach(usb_dev_t *d, usb_iface_info_t *ifc, int drv, void **data) {
     h->iface = ifc->number;
     h->ep = in->addr;
     h->len = in->mps > 64 ? 64 : (in->mps ? in->mps : 8);
+    h->tablet = drv == USB_DRV_MOUSE && ifc->sub == 0;
     /* Boot protocol (0) and idle 0 (report only on change). */
-    usb_ctrl(d, 0x21, 0x0B, 0, ifc->number, 0, NULL);
+    if (!h->tablet) usb_ctrl(d, 0x21, 0x0B, 0, ifc->number, 0, NULL);
     usb_ctrl(d, 0x21, 0x0A, 0, ifc->number, 0, NULL);
     if (xhci_configure_endpoint(d->slot, in->addr, 3, in->mps, in->interval, in->burst) != 0) {
         dma_free_pages(h->buf);
         kfree(h);
         return -1;
+    }
+    {
+        char nm[64];
+        if (h->tablet) snprintf(nm, sizeof(nm), "QEMU USB Tablet (dev %u)", (unsigned)d->id);
+        else snprintf(nm, sizeof(nm), "USB HID boot %s (dev %u)", drv == USB_DRV_KBD ? "keyboard" : "mouse", (unsigned)d->id);
+        input_dev_t *idev = input_allocate(nm, BUS_USB, 0, 0);
+        if (idev) {
+            if (drv == USB_DRV_KBD) {
+                input_setup_keyboard(idev);
+            } else if (h->tablet) {
+                input_set_capability(idev, EV_KEY, BTN_LEFT);
+                input_set_capability(idev, EV_KEY, BTN_RIGHT);
+                input_set_capability(idev, EV_KEY, BTN_MIDDLE);
+                input_set_capability(idev, EV_ABS, ABS_X);
+                input_set_capability(idev, EV_ABS, ABS_Y);
+                input_set_capability(idev, EV_REL, REL_WHEEL);
+                idev->abs[ABS_X].maximum = 0x7fff;
+                idev->abs[ABS_Y].maximum = 0x7fff;
+                idev->abs[ABS_X].value = idev->abs[ABS_Y].value = -1;   /* first report always counts */
+                idev->propbit[0] |= 1u << 1;                            /* INPUT_PROP_DIRECT */
+            } else {
+                input_set_capability(idev, EV_KEY, BTN_LEFT);
+                input_set_capability(idev, EV_KEY, BTN_RIGHT);
+                input_set_capability(idev, EV_KEY, BTN_MIDDLE);
+                input_set_capability(idev, EV_REL, REL_X);
+                input_set_capability(idev, EV_REL, REL_Y);
+                input_set_capability(idev, EV_REL, REL_WHEEL);
+            }
+            if (input_register(idev) == 0) h->idev = idev;
+            else kfree(idev);
+        }
     }
     h->queued = xhci_int_queue(d->slot, h->ep, h->buf, h->len) == 0;
     printf("usb: dev %u: HID boot %s on interface %u (ep 0x%02x, %u bytes)\n",
@@ -139,6 +175,7 @@ void usb_hid_detach(void *data) {
         uint8_t zero[8] = {0};
         kbd_report(h, zero);
     }
+    if (h->idev) input_unregister(h->idev);   /* slot (and struct) reused later */
     dma_free_pages(h->buf);
     kfree(h);
 }
@@ -159,8 +196,30 @@ void usb_hid_poll(void *data) {
                                   h->reports, n, h->buf[0], h->buf[1], h->buf[2], h->buf[3]);
                 if (h->drv == USB_DRV_KBD && n >= 8) {
                     kbd_report(h, h->buf);
+                } else if (h->drv == USB_DRV_MOUSE && h->tablet && n >= 5) {
+                    if (h->idev) {
+                        input_dev_t *m = h->idev;
+                        input_event(m, EV_KEY, BTN_LEFT, (h->buf[0] & 1) != 0);
+                        input_event(m, EV_KEY, BTN_RIGHT, (h->buf[0] & 2) != 0);
+                        input_event(m, EV_KEY, BTN_MIDDLE, (h->buf[0] & 4) != 0);
+                        input_event(m, EV_ABS, ABS_X, h->buf[1] | (h->buf[2] << 8));
+                        input_event(m, EV_ABS, ABS_Y, h->buf[3] | (h->buf[4] << 8));
+                        if (n >= 6) input_event(m, EV_REL, REL_WHEEL, (int8_t)h->buf[5]);
+                        input_sync(m);
+                    }
                 } else if (h->drv == USB_DRV_MOUSE && n >= 3) {
-                    mouse_feed_usb_relative((int8_t)h->buf[1], (int8_t)h->buf[2], h->buf[0] & 7);
+                    if (h->idev) {
+                        input_dev_t *m = h->idev;
+                        input_event(m, EV_KEY, BTN_LEFT, (h->buf[0] & 1) != 0);
+                        input_event(m, EV_KEY, BTN_RIGHT, (h->buf[0] & 2) != 0);
+                        input_event(m, EV_KEY, BTN_MIDDLE, (h->buf[0] & 4) != 0);
+                        input_event(m, EV_REL, REL_X, (int8_t)h->buf[1]);
+                        input_event(m, EV_REL, REL_Y, (int8_t)h->buf[2]);
+                        if (n >= 4) input_event(m, EV_REL, REL_WHEEL, (int8_t)h->buf[3]);
+                        input_sync(m);
+                    } else {
+                        mouse_feed_usb_relative((int8_t)h->buf[1], (int8_t)h->buf[2], h->buf[0] & 7);
+                    }
                 }
             }
         }
@@ -168,7 +227,7 @@ void usb_hid_poll(void *data) {
     if (!h->queued)
         h->queued = xhci_int_queue(h->dev->slot, h->ep, h->buf, h->len) == 0;
     if (h->drv == USB_DRV_KBD && h->rep_key && ktime_now_ms() >= h->rep_at) {
-        send_code(hid_to_set1[h->rep_key], true);
+        send_code(h, hid_to_set1[h->rep_key], true);
         h->rep_at = ktime_now_ms() + 33;
     }
 }
