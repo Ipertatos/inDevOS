@@ -82,6 +82,8 @@ MUSL_TESTS=(hello_musl musltest)
 for t in fakemouse fakekbd faketablet; do
     [[ -f tests/uinput/build/${t}.exe ]] && mcopy -o -i "$ROOTFS" tests/uinput/build/${t}.exe ::/bin/${t}.exe && echo "    /bin/${t}.exe (static musl, uinput test)"
 done
+# /dev/wm demo client (tests/wm/wmdemo.c + userlib/libwm), built by tests/wm/build_wm.sh.
+[[ -f tests/wm/build/wmdemo.exe ]] && mcopy -o -i "$ROOTFS" tests/wm/build/wmdemo.exe ::/bin/wmdemo.exe && echo "    /bin/wmdemo.exe (static musl, /dev/wm demo)"
 for t in "${MUSL_TESTS[@]}"; do
     if [[ -f "tests/musl/build/${t}.exe" ]]; then
         mcopy -o -i "$ROOTFS" "tests/musl/build/${t}.exe" "::/bin/${t}.exe"

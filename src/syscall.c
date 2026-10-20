@@ -478,6 +478,10 @@ static int fd_close_entry(process_t *proc, int fd) {
             extern void uinput_release(void *handle);
             uinput_release(fde->file_handle);   /* destroys the device */
             fde->file_handle = NULL;
+        } else if (ty == 12 /* FD_TYPE_DEV_WM */) {
+            extern void wm_dev_release(void *handle);
+            wm_dev_release(fde->file_handle);   /* destroys its windows */
+            fde->file_handle = NULL;
         } else if (ty == FD_TYPE_SOCKET) {
             kernel_socket_t *sock = (kernel_socket_t *)fde->file_handle;
             if (sock) {
@@ -3298,6 +3302,13 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
             if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
                 proc->fds[fd].fd_type == 9 /* FD_TYPE_DEV_FB: always ready */)
                 kfds[i].revents |= kfds[i].events & (POLLIN | POLLOUT);
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 12 /* FD_TYPE_DEV_WM */) {
+                extern bool wm_dev_poll_ready(void *handle);
+                if ((kfds[i].events & POLLIN) && wm_dev_poll_ready(proc->fds[fd].file_handle))
+                    kfds[i].revents |= POLLIN;
+                kfds[i].revents |= kfds[i].events & POLLOUT;
+            }
             if ((kfds[i].events & POLLOUT) && fd >= 1 && fd <= 2)
                 kfds[i].revents |= POLLOUT;
             /* POSIX: return value is the number of fds with nonzero revents */
@@ -3323,6 +3334,13 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
             break;
         if (proc_kill_pending(get_current_process()))
             return -EINTR;
+        {   /* sync /dev/wm client waiting: kmain is blocked, pump for it */
+            extern bool exec_current_is_sync_program(void);
+            extern bool wm_dev_pid_connected(uint32_t pid);
+            extern void desktop_sync_pump(void);
+            if (proc && exec_current_is_sync_program() && wm_dev_pid_connected(proc->pid))
+                desktop_sync_pump();
+        }
         if (global_scheduler.scheduler_running)
             thread_sleep(1);
         else

@@ -17,6 +17,7 @@
  * program shows exactly what it still needs.
  */
 #include "lx_fbdev.h"
+#include "wm_dev.h"
 #include "input.h"
 #include "linux_syscall.h"
 #include "syscall.h"
@@ -333,6 +334,8 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
         return evdev_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
     if (ty == FD_TYPE_DEV_UINPUT)
         return uinput_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
+    if (ty == FD_TYPE_DEV_WM)
+        return wm_dev_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
     if (ty == FD_TYPE_DEV_TTY || lx_fd_is_tty(p, fd))
         return lx_read_tty(p, fd, ubuf, count);
     if (ty == FD_TYPE_SOCKET)
@@ -503,6 +506,7 @@ static uint32_t lx_dev_path(const char *path, uint32_t *mode) {
         if (minor >= 0) { if (mode) *mode = 0660; return (13u << 8) | (uint32_t)(64 + minor); }
     }
     if (kstrcmp(path, "/dev/uinput") == 0) { if (mode) *mode = 0660; return (10u << 8) | 223u; }
+    if (kstrcmp(path, "/dev/wm") == 0) { if (mode) *mode = 0666; return (10u << 8) | 62u; }
     return 0;
 }
 
@@ -562,6 +566,16 @@ static long lx_fstat(process_t *p, long fd, void *ubuf) {
         st.st_nlink = 1;
         st.st_blksize = 4096;
         st.st_rdev = (13u << 8) | (uint32_t)(64 + evdev_minor(f->file_handle));   /* input: 13, 64+N */
+        st.st_ino = 0x10000 + st.st_rdev;
+        lx_stat_t ls;
+        lx_fill_stat(&ls, &st);
+        return lx_put(ubuf, &ls, sizeof(ls));
+    }
+    if (f->fd_type == FD_TYPE_DEV_WM) {
+        st.st_mode = 0666 | S_IFCHR;
+        st.st_nlink = 1;
+        st.st_blksize = 4096;
+        st.st_rdev = (10u << 8) | 62u;          /* misc 10,62 (inDevOS wm) */
         st.st_ino = 0x10000 + st.st_rdev;
         lx_stat_t ls;
         lx_fill_stat(&ls, &st);
@@ -648,6 +662,8 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
         return evdev_write(p->fds[fd].file_handle, ubuf, len);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_UINPUT)
         return uinput_write(p->fds[fd].file_handle, ubuf, len);
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_WM)
+        return -EINVAL;
     if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
         return lx_sock_send((int)fd, ubuf, len, 0);
     if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
@@ -743,6 +759,22 @@ static long lx_open_special(process_t *p, const char *path, long lflags) {
             p->fds[fd].in_use = true;
             return fd;
         }
+    }
+    if (kstrcmp(path, "/dev/wm") == 0) {
+        void *h = NULL;
+        long r = wm_dev_open(&h);
+        if (r < 0) return r;
+        int fd = allocate_fd(p);
+        if (fd < 0) { wm_dev_release(h); return -EMFILE; }
+        p->fds[fd].ref_count = fd_refcount_create();
+        if (!p->fds[fd].ref_count) { wm_dev_release(h); p->fds[fd].in_use = false; return -ENOMEM; }
+        p->fds[fd].fd_type = FD_TYPE_DEV_WM;
+        p->fds[fd].file_handle = h;
+        p->fds[fd].flags = (uint32_t)(lflags & 3) | ((lflags & LX_O_NONBLOCK) ? O_NONBLOCK : 0);
+        p->fds[fd].position = 0;
+        p->fds[fd].cloexec = (lflags & LX_O_CLOEXEC) != 0;
+        p->fds[fd].in_use = true;
+        return fd;
     }
     if (kstrcmp(path, "/dev/uinput") == 0 || kstrcmp(path, "/dev/input/uinput") == 0) {
         void *h = NULL;
@@ -929,6 +961,8 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
         return evdev_ioctl(p->fds[fd].file_handle, req, arg);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_UINPUT)
         return uinput_ioctl(p->fds[fd].file_handle, req, arg);
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_WM)
+        return wm_dev_ioctl(p->fds[fd].file_handle, req, arg);
     bool tty = lx_fd_is_tty(p, fd);
     if (tty) {                                  /* KD / VT ioctls (fbdev apps) */
         bool handled = false;
@@ -1052,6 +1086,8 @@ static long lx_mmap(process_t *p, uint64_t addr, uint64_t len, long prot, long f
     }
     if (lx_fd_ok(p, fd) && p->fds[fd].fd_type == FD_TYPE_DEV_FB)
         return fbdev_mmap(p, addr, len, prot, flags, off);
+    if (lx_fd_ok(p, fd) && p->fds[fd].fd_type == FD_TYPE_DEV_WM)
+        return wm_dev_mmap(p->fds[fd].file_handle, addr, len, prot, flags, off);
     /* File mapping: private copy of the file contents (no write-back). */
     if (!lx_fd_ok(p, fd) || p->fds[fd].fd_type != FD_TYPE_VFS)
         return -EBADF;

@@ -412,6 +412,24 @@ static void keyboard_process_byte(uint16_t scancode){
         return;
     }
 
+    /* Kernel chords - Ctrl+F1..F4 (VT switch) and Ctrl+Q (VT cycle) - belong
+     * to the kernel: neither the press nor its matching release (whenever it
+     * comes) is queued to apps (SDL state/queue -> desktop windows, /dev/wm,
+     * SDL programs).  Plain F-keys and other Ctrl chords still reach apps.
+     * Evdev readers keep seeing the raw keys, as on Linux. */
+    static bool kchord_held[128];
+    bool kchord = false;
+    if (!ext) {
+        if (!is_release && left_ctrl_pressed &&
+            ((code >= 0x3B && code <= 0x3E) || code == 0x10 /*q*/)) {
+            kchord_held[code] = true;
+            kchord = true;
+        } else if (is_release && kchord_held[code]) {
+            kchord_held[code] = false;
+            kchord = true;
+        }
+    }
+
     vconsole_t *vc = vconsole_get_by_id(vconsole_get_active());
 
     /* Update SDL keyboard state immediately so polling user apps (DOOM,
@@ -420,7 +438,8 @@ static void keyboard_process_byte(uint16_t scancode){
      * and lock-free, so it's safe from interrupt context. */
     /* With the desktop running, presses typed on a text VT belong to that
      * VT only; releases always pass so nothing sticks in the desktop. */
-    bool to_gfx = is_release || !vconsole_gfx_owner_running() || vconsole_get_active() == 0;
+    bool to_gfx = !kchord &&
+                  (is_release || !vconsole_gfx_owner_running() || vconsole_get_active() == 0);
     if (to_gfx)
         SDL_InjectKeyState_Fast(!is_release, code);
 

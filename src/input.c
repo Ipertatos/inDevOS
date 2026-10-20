@@ -776,7 +776,7 @@ int input_dev_dir_list(const char *path, char names[][16], uint8_t *is_dir, int 
     }
     if (kstrcmp_input(path, "/dev")) {
         static const char *const fixed[] = { "console", "fb0", "input", "null", "tty",
-                                             "tty0", "tty1", "tty2", "tty3", "tty4", "uinput" };
+                                             "tty0", "tty1", "tty2", "tty3", "tty4", "uinput", "wm" };
         for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]) && n < max; i++) {
             kcopy(names[n], fixed[i], 16);
             is_dir[n++] = fixed[i][0] == 'i' && fixed[i][1] == 'n';

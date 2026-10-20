@@ -49,3 +49,6 @@ tests/musl/build/
 shot-*/
 serial-*.txt
 third_party/lua-5.4.7.tar.gz
+# libwm / wm demo build output (tests/wm/build_wm.sh)
+userlib/libwm/build/
+tests/wm/build/
