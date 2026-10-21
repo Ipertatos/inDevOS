@@ -90,6 +90,14 @@ typedef struct vfs_fs_ops {
 
     /** Optional char-device ioctl; NULL makes vfs_ioctl return -ENOTTY */
     int   (*ioctl)(struct vfs_filesystem *fs, void *handle, unsigned long cmd, void *arg);
+
+    /* Optional (NULL = old FAT32 behaviour in vfs.c). Paths are relative to
+     * the mount; rename gets both paths on the same filesystem. */
+    int   (*rename)(struct vfs_filesystem *fs, const char *old_rel, const char *new_rel);
+    int   (*rmdir)(struct vfs_filesystem *fs, const char *rel_path);
+    int   (*truncate)(struct vfs_filesystem *fs, const char *rel_path, uint64_t len);
+    int   (*ftruncate)(struct vfs_filesystem *fs, void *handle, uint64_t len);
+    int   (*sync)(struct vfs_filesystem *fs);
 } vfs_fs_ops_t;
 
 // A mounted filesystem instance
@@ -143,6 +151,10 @@ int  vfs_ensure_parent(const char *path);
 void vfs_seed_standard_layout(void);
 int  vfs_unlink(const char *path);
 int  vfs_rename(const char *oldpath, const char *newpath);
+int  vfs_rmdir(const char *path);
+int  vfs_truncate(const char *path, uint64_t len);
+int  vfs_ftruncate(int fd, uint64_t len);
+int  vfs_sync_all(void);
 int  vfs_exists(const char *path);
 
 /** Copy open file's path into buf (for fchmod/fstat). Returns 0 or -1. */

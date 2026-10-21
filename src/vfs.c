@@ -5,6 +5,9 @@
 #include "mem.h"
 #include "atomic.h"
 #include "../include/indevos_errno.h"
+#ifndef EXDEV
+#define EXDEV 18
+#endif
 
 // Use kernel's strncmp
 #define strncmp kstrncmp
@@ -283,9 +286,33 @@ int vfs_readdir(const char *path, vfs_dirent_t *entries, uint32_t max) {
     VFS_LOCK();
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
-    if (!fs || !fs->ops || !fs->ops->readdir) { VFS_UNLOCK(); return -ENODEV; }
-    int ret = fs->ops->readdir(fs, rel, entries, max);
-    VFS_UNLOCK(); return ret;
+    int ret = (fs && fs->ops && fs->ops->readdir) ? fs->ops->readdir(fs, rel, entries, max)
+                                                   : -ENODEV;
+    /* Show mount points that live directly under @path (e.g. /mnt/ventoy
+     * in /mnt), even if the parent filesystem has no such directory. */
+    int n = ret > 0 ? ret : 0, added = 0;
+    size_t pl = strlen(path);
+    while (pl > 1 && path[pl - 1] == '/') pl--;
+    for (int i = 0; i < VFS_MAX_MOUNTPOINTS && (uint32_t)n < max; i++) {
+        vfs_filesystem_t *m = &mount_table[i];
+        if (!m->mounted || m->mount_path_len <= 1) continue;
+        int last = (int)m->mount_path_len - 1;
+        while (last > 0 && m->mount_path[last] != '/') last--;
+        size_t parent_len = last == 0 ? 1 : (size_t)last;
+        if (parent_len != pl || strncmp(m->mount_path, path, pl) != 0) continue;
+        const char *nm = m->mount_path + last + 1;
+        bool dup = false;
+        for (int k = 0; k < n; k++) if (strEql(entries[k].name, nm)) { dup = true; break; }
+        if (dup) continue;
+        memset(&entries[n], 0, sizeof(entries[n]));
+        size_t l = strlen(nm);
+        if (l >= VFS_MAX_NAME) l = VFS_MAX_NAME - 1;
+        memmove(entries[n].name, nm, l);
+        entries[n].type = VFS_DIRECTORY;
+        n++; added++;
+    }
+    if (ret < 0 && added == 0) { VFS_UNLOCK(); return ret; }
+    VFS_UNLOCK(); return n;
 }
 
 int vfs_create(const char *path) {
@@ -446,6 +473,18 @@ int vfs_fd_get_path(int fd, char *buf, size_t buflen) {
 int vfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || !newpath) return -EINVAL;
     if (!vfs_has_root_mount()) return -ENODEV;
+    {
+        VFS_LOCK();
+        const char *r1 = NULL, *r2 = NULL;
+        vfs_filesystem_t *f1 = vfs_find_mount(oldpath, &r1);
+        vfs_filesystem_t *f2 = vfs_find_mount(newpath, &r2);
+        if (f1 != f2) { VFS_UNLOCK(); return -EXDEV; }   /* mv falls back to copy */
+        if (f1 && f1->ops && f1->ops->rename) {
+            int rr = f1->ops->rename(f1, r1, r2);
+            VFS_UNLOCK(); return rr;
+        }
+        VFS_UNLOCK();
+    }
     /* Same-filesystem rename only for now (single FAT32 root mount). */
     extern int fat32_rename(const char *oldpath, const char *newpath);
     int r = fat32_rename(oldpath, newpath);
@@ -453,6 +492,48 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     if (r == -ENOENT || r == -ENOTEMPTY || r == -EIO || r == -EINVAL)
         return r;
     return r < 0 ? r : -EIO;
+}
+
+int vfs_rmdir(const char *path) {
+    if (!path) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    if (fs && fs->ops && fs->ops->rmdir) { int r = fs->ops->rmdir(fs, rel); VFS_UNLOCK(); return r; }
+    VFS_UNLOCK();
+    extern int fat32_remove_empty_directory(const char *path);
+    return fat32_remove_empty_directory(path);               /* FAT32: unchanged */
+}
+
+int vfs_truncate(const char *path, uint64_t len) {
+    if (!path) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    if (fs && fs->ops && fs->ops->truncate) { int r = fs->ops->truncate(fs, rel, len); VFS_UNLOCK(); return r; }
+    VFS_UNLOCK();
+    extern int fat32_truncate_file(const char *path);
+    return fat32_truncate_file(path) == 0 ? 0 : -EIO;       /* FAT32: unchanged (to 0) */
+}
+
+int vfs_ftruncate(int fd, uint64_t len) {
+    VFS_LOCK();
+    if (fd < 0 || fd >= VFS_MAX_OPEN_FILES || !open_files[fd].in_use) { VFS_UNLOCK(); return -EBADF; }
+    vfs_file_t *vf = &open_files[fd];
+    int r = 0;                                               /* FAT32: ignored as before */
+    if (vf->fs && vf->fs->ops && vf->fs->ops->ftruncate)
+        r = vf->fs->ops->ftruncate(vf->fs, vf->fs_handle, len);
+    VFS_UNLOCK(); return r;
+}
+
+int vfs_sync_all(void) {
+    VFS_LOCK();
+    int r = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTPOINTS; i++) {
+        vfs_filesystem_t *m = &mount_table[i];
+        if (m->mounted && m->ops && m->ops->sync && m->ops->sync(m) != 0) r = -EIO;
+    }
+    VFS_UNLOCK(); return r;
 }
 
 int vfs_has_root_mount(void) {

@@ -84,6 +84,8 @@ for t in fakemouse fakekbd faketablet; do
 done
 # /dev/wm demo client (tests/wm/wmdemo.c + userlib/libwm), built by tests/wm/build_wm.sh.
 [[ -f tests/wm/build/wmdemo.exe ]] && mcopy -o -i "$ROOTFS" tests/wm/build/wmdemo.exe ::/bin/wmdemo.exe && echo "    /bin/wmdemo.exe (static musl, /dev/wm demo)"
+# OS test suite (tests/ostest/ostest.c), built by tests/ostest/build_ostest.sh.
+[[ -f tests/ostest/build/ostest.exe ]] && mcopy -o -i "$ROOTFS" tests/ostest/build/ostest.exe ::/bin/ostest.exe && echo "    /bin/ostest.exe (static musl, OS test suite)"
 for t in "${MUSL_TESTS[@]}"; do
     if [[ -f "tests/musl/build/${t}.exe" ]]; then
         mcopy -o -i "$ROOTFS" "tests/musl/build/${t}.exe" "::/bin/${t}.exe"
@@ -197,6 +199,20 @@ The in-OS install command copies this whole root, then places the
 kernel and Limine under /boot so the target disk boots on its own.
 ENDREADME
 mcopy -o -i "$ROOTFS" "$readme" ::/README.txt
+
+# Persistent boot log: two preallocated 1 MiB files in the root. The kernel
+# overwrites their clusters in place while booting (no FAT/dir updates), so
+# after a hard power-off /BOOTLOG.TXT shows how far the boot got and
+# /BOOTLOG.OLD holds the boot before it.
+blog="$(mktemp)"
+python3 - "$blog" << 'ENDBLOG'
+import sys
+hdr = b"inDevOS boot log - no boot recorded yet\n"
+open(sys.argv[1], "wb").write(hdr + b" " * (1024 * 1024 - len(hdr) - 1) + b"\n")
+ENDBLOG
+mcopy -o -i "$ROOTFS" "$blog" ::/BOOTLOG.TXT
+mcopy -o -i "$ROOTFS" "$blog" ::/BOOTLOG.OLD
+rm -f "$blog"
 rm -f "$readme"
 
 echo ">>> staging Limine ISO tree (same layout as os.iso)"

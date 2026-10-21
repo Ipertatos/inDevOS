@@ -1,12 +1,40 @@
 #include "serial.h"
 #include "atomic.h"
 #include "hpet.h"
+#include "bootlog.h"
 #include <stdarg.h>
 #include <stddef.h>
 
 #define SERIAL_PORT 0x3F8  // COM1
 
 static spinlock_t serial_out_lock = {0};
+
+/* IRQ-safe serial lock.  ISR paths print too (exception/irqdiag/scheduler
+ * logs): with IRQs enabled, an interrupt arriving while this CPU holds the
+ * lock spins on it forever, and every other CPU that prints piles up behind
+ * it (ostest freeze: CPU3 ISR spinning in serial_printf on top of
+ * fork_child_zombie_exit's own serial_printf, CPU0 stuck in serial_putc).
+ * Hold it with IRQs off; the spin is bounded so an exception/NMI that
+ * re-enters on the holder's CPU still gets its text out. */
+static inline uint64_t serial_lock_irq(void) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+    uint64_t spins = 0;
+    while (__sync_lock_test_and_set(&serial_out_lock.lock, 1)) {
+        while (serial_out_lock.lock) {
+            __asm__ volatile("pause");
+            if (++spins > 200000000ULL)
+                return fl;          /* holder re-entered/stuck: print anyway */
+        }
+    }
+    return fl;
+}
+
+static inline void serial_unlock_irq(uint64_t fl) {
+    __sync_lock_release(&serial_out_lock.lock);
+    if (fl & 0x200)
+        __asm__ volatile("sti" ::: "memory");
+}
 
 /* dmesg-style line prefix: [    sec.usec] */
 #define SERIAL_LINE_PEEK 6
@@ -39,6 +67,7 @@ static char line_peek[SERIAL_LINE_PEEK];
 static int line_peek_len;
 
 static void serial_hw_putc(char c) {
+    bootlog_putc(c);           /* RAM boot log, written to /BOOTLOG.TXT */
     while ((inb(SERIAL_PORT + 5) & 0x20) == 0)
         ;
     outb(SERIAL_PORT, c);
@@ -222,24 +251,24 @@ void serial_putc(char c) {
     if (!serial_enabled)
         return;
 
-    spinlock_lock(&serial_out_lock);
+    uint64_t sfl_ = serial_lock_irq();
     serial_putc_unlocked(c);
-    spinlock_unlock(&serial_out_lock);
+    serial_unlock_irq(sfl_);
 }
 
 void serial_puts(const char *str) {
     if (!serial_enabled)
         return;
-    spinlock_lock(&serial_out_lock);
+    uint64_t sfl_ = serial_lock_irq();
     while (*str)
         serial_putc_unlocked(*str++);
-    spinlock_unlock(&serial_out_lock);
+    serial_unlock_irq(sfl_);
 }
 
 // Simple printf implementation for serial
 void serial_printf(const char *format, ...) {
     if (!serial_enabled) return;
-    spinlock_lock(&serial_out_lock);
+    uint64_t sfl_ = serial_lock_irq();
     const char *p = format;
     va_list args;
     va_start(args, format);
@@ -535,5 +564,5 @@ void serial_printf(const char *format, ...) {
     }
     
     va_end(args);
-    spinlock_unlock(&serial_out_lock);
+    serial_unlock_irq(sfl_);
 }

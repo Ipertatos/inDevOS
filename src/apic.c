@@ -370,7 +370,10 @@ void init_apic(madt_t *madt){
      * the desktop cursor draws but never moves. Remap the PIC vectors out of
      * the exception range and mask every line so the IOAPIC is the sole
      * delivery path. */
-    pic_remap(0x20, 0x28);
+    /* Offsets 0xE0/0xE8: a spurious IRQ7/IRQ15 from the masked 8259 lands
+     * on an otherwise unused vector (logged as unexpected), not on 0x27/0x2F
+     * which overlap our IOAPIC vectors (0x2F = PCnet). */
+    pic_remap(0xE0, 0xE8);
     pic_disable();
     /* IMCR: switch the legacy pair from PIC (virtual wire) to the I/O APIC.
      * QEMU ignores ports 0x22/0x23. Some Hyper-V Gen 1 chipsets keep IRQ1 on
@@ -378,14 +381,17 @@ void init_apic(madt_t *madt){
      * IOAPIC redirection entry. */
     outb(0x22, 0x70);
     outb(0x23, 0x01);
-    serial_puts("apic: legacy 8259 PIC remapped (0x20/0x28) and masked\n");
+    serial_puts("apic: legacy 8259 PIC remapped (0xE0/0xE8) and masked\n");
 
     serial_puts("apic: writing to SIV register\n");
     hpet_init();
     lapic_addr = (uint32_t*)(uintptr_t)madt->lapicaddr;
     uint32_t spurius_reg = apic_read(lapic_addr, LAPIC_SIVR_REG);
     serial_printf("madt lapic adr: 0x%llx\n", lapic_addr);
-    apic_write(lapic_addr, LAPIC_SIVR_REG,spurius_reg | (0x100));
+    /* Spurious vector explicitly 0xFF (isr_handler tells it apart from the
+     * panic IPI by the ISR bit), software-enable bit 8. */
+    apic_write(lapic_addr, LAPIC_SIVR_REG, (spurius_reg & ~0xFFu) | 0xFFu | 0x100u);
+    serial_printf("apic: SIVR was 0x%x, now 0x%x\n", spurius_reg, apic_read(lapic_addr, LAPIC_SIVR_REG));
 
     /* Mask LINT0/LINT1 on the BSP. After reset LINT0 is ExtINT (PIC) and
      * LINT1 is NMI; with the PIC disabled there is nothing useful to deliver
@@ -443,4 +449,15 @@ void apic_enable_timer(void) {
 void int_apic_ap(){
     uint32_t spurius_reg = apic_read((uint32_t*)(lapic_addr), 0xF0);
     calibrate_timer(madt);
+}
+
+/* Diagnostics helpers (idt.c / zeus irqtest). */
+bool apic_isr_bit(uint8_t v) {
+    if (!lapic_addr) return false;
+    return (apic_read(lapic_addr, 0x100 + 0x10 * (v >> 5)) >> (v & 31)) & 1;
+}
+void apic_self_ipi(uint8_t v) {
+    if (!lapic_addr) return;
+    apic_write(lapic_addr, 0x310, 0);
+    apic_write(lapic_addr, 0x300, (uint32_t)v | (1u << 18));   /* fixed, shorthand self */
 }

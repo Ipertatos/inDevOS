@@ -30,6 +30,86 @@
 // Forward declaration for print_stacktrace
 void print_stacktrace(uint64_t rbp);
 
+/* ---- interrupt diagnostics (laptop boot death right after the first sti) ----
+ * Every vector has a stub (isr_stub_table). Counts per vector, the first
+ * vectors seen after the first sti, unexpected vectors and LAPIC spurious
+ * interrupts are recorded here (no printing from IRQ context); kmain prints
+ * them (irq_trace_report / irq_trace_poll) and exc_report() includes them in
+ * a panic line that is flushed to the boot log before the CPU halts. */
+extern void *isr_stub_table[256];
+extern void bootlog_panic_puts(const char *s);
+extern void bootlog_flush_emergency(void);
+extern void bootlog_flush(void);
+extern bool apic_isr_bit(uint8_t v);
+extern int snprintf(char *str, size_t size, const char *fmt, ...);
+static volatile uint32_t irq_count[256];
+static volatile uint8_t  irq_first[24];
+static volatile uint32_t irq_first_n;
+static volatile bool     irq_armed;
+static volatile uint32_t irq_spurious;
+static volatile uint32_t irq_unknown_total;
+static uint32_t irq_unknown_reported[256];
+static uint64_t irq_unknown_last_ms;
+
+void irq_trace_arm(void) { irq_armed = true; }
+static inline void irq_note(uint8_t v) {
+    irq_count[v]++;
+    if (irq_armed) { uint32_t n = irq_first_n; if (n < 24) { irq_first[n] = v; irq_first_n = n + 1; } }
+}
+static bool irq_vector_known(uint64_t v) {
+    return v == 32 || v == 33 || v == 35 || (v >= 43 && v <= 48) || v == 128 || v == 177 || v >= 253;
+}
+static int irq_trace_format(char *b, int cap) {
+    int o = snprintf(b, cap, "first vectors after sti:");
+    for (uint32_t i = 0; i < irq_first_n && o < cap - 8; i++) o += snprintf(b + o, cap - o, " %u", irq_first[i]);
+    if (irq_first_n == 0 && o < cap - 8) o += snprintf(b + o, cap - o, " (none)");
+    if (o < cap - 8) o += snprintf(b + o, cap - o, "; counts:");
+    for (int v = 32; v < 256 && o < cap - 24; v++)
+        if (irq_count[v]) o += snprintf(b + o, cap - o, " v%d=%u", v, irq_count[v]);
+    if (o < cap - 40) o += snprintf(b + o, cap - o, "; unexpected=%u spurious=%u", irq_unknown_total, irq_spurious);
+    return o;
+}
+void irq_trace_report(const char *when) {
+    char b[700];
+    irq_trace_format(b, sizeof(b));
+    serial_printf("[irq] %s: %s\n", when, b);
+    bootlog_flush();
+}
+/* main loop: report unexpected vectors (first time per vector, then at most every 5 s) */
+void irq_trace_poll(void) {
+    if (!irq_unknown_total) return;
+    uint64_t now = hpet_get_ticks();
+    bool any = false;
+    for (int v = 0; v < 256; v++) {
+        uint32_t c = irq_count[v];
+        if (v < 32 || irq_vector_known(v) || c == irq_unknown_reported[v]) continue;
+        if (irq_unknown_reported[v] && now - irq_unknown_last_ms < 5000) continue;
+        serial_printf("[irq] unexpected vector %d (0x%x) count %u - EOI sent, ignored\n", v, v, c);
+        irq_unknown_reported[v] = c;
+        any = true;
+    }
+    if (any) { irq_unknown_last_ms = now; bootlog_flush(); }
+}
+
+/* Panic line for an unrecoverable CPU exception: lock-free output to COM1 +
+ * the RAM boot log, then a best-effort write of the boot log file. */
+static void exc_report(registers_t *r, const char *what) {
+    static char b[1024];
+    uint64_t cr2;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    per_cpu_t *cpu = smp_get_current_cpu();
+    int o = snprintf(b, sizeof(b),
+        "\n[PANIC] CPU exception %llu (%s) cpu=%u err=0x%llx RIP=0x%llx CR2=0x%llx RSP=0x%llx CS=0x%llx RFLAGS=0x%llx t=%llums\n",
+        r->int_no, what, cpu ? cpu->cpu_id : 0u, r->err_code, r->rip, cr2, r->rsp, r->cs, r->rflags,
+        (unsigned long long)hpet_get_ticks());
+    o += snprintf(b + o, sizeof(b) - o, "[PANIC] irq ");
+    irq_trace_format(b + o, (int)sizeof(b) - o - 64);
+    while (o < (int)sizeof(b) - 1 && b[o]) o++;
+    snprintf(b + o, sizeof(b) - o, "\n[PANIC] boot log flushed; CPU halted\n");
+    bootlog_panic_puts(b);
+    bootlog_flush_emergency();
+}
+
 __attribute__((aligned(0x10))) static idt_entry_t idt_entries[256];
 idtr_t idtr;
 
@@ -126,7 +206,15 @@ void initIDT() {
     /* SMP IPI vectors */
     setIdtGate(253, isr253, 0x8E); // IPI: Reschedule
     setIdtGate(254, isr254, 0x8E); // IPI: TLB Flush
-    setIdtGate(255, isr255, 0x8E); // IPI: Panic/Halt
+    setIdtGate(255, isr255, 0x8E); // IPI: Panic/Halt / LAPIC spurious
+
+    /* Machine check on its own stack (IST3) like #DF (IST1) and NMI (IST2). */
+    setIdtGateIST(18, isr18, 0x8E, 3);
+    /* Every other vector gets a stub too: an unexpected interrupt is now
+     * logged + EOI'd instead of raising #NP (not-present gate). */
+    for (int v = 0; v < 256; v++)
+        if (!idt_entries[v].attributes)
+            setIdtGate((uint8_t)v, isr_stub_table[v], 0x8E);
 
     __asm__ __volatile__("lidtq %0" : : "m"(idtr));
 }
@@ -207,6 +295,10 @@ static void tty_timer_hook(registers_t *r) {
     extern process_t *get_kernel_process(void);
     extern void exec_spawned_exit(int status) __attribute__((noreturn));
     tty_dispatch_pending();
+    {   /* alarm()/setitimer expiry -> SIGALRM pending + wake (BSP only) */
+        extern void process_alarm_tick(void);
+        process_alarm_tick();
+    }
     if ((r->cs & 3) != 3) return;
     thread_t *cth = scheduler_get_current_thread();
     process_t *op = (cth && cth->owner_process) ? (process_t *)cth->owner_process
@@ -765,6 +857,7 @@ static void handle_general_protection_fault(registers_t* r) {
 // A double fault means the CPU failed to invoke the primary exception handler,
 // typically due to stack corruption.  This handler should NEVER return.
 static void handle_double_fault(registers_t* r) {
+    exc_report(r, "Double Fault (#DF) - e.g. kernel stack overflow");
     serial_puts("\n");
     serial_puts("╔══════════════════════════════════════════════════════════════════════════════════════╗\n");
     serial_puts("║                              DOUBLE FAULT (#DF)                                      ║\n");
@@ -802,6 +895,7 @@ static void handle_double_fault(registers_t* r) {
 void isr_handler(registers_t* r) {
     // CRITICAL FIX: Track interrupt context to prevent flanterm corruption
     enter_interrupt_context();
+    if (r->int_no >= 32) irq_note((uint8_t)r->int_no);
     
     if(r->int_no < 32) {
         // Double fault (#8) has its own dedicated handler via IST
@@ -815,6 +909,10 @@ void isr_handler(registers_t* r) {
             exit_interrupt_context();
             return;
         }
+
+        /* Kernel-mode exceptions never return (halt below): log + flush first. */
+        if ((r->cs & 3) == 0)
+            exc_report(r, exception_messages[r->int_no]);
 
         printf("%s\n", exception_messages[r->int_no]);
 
@@ -945,9 +1043,10 @@ void isr_handler(registers_t* r) {
             serial_puts("[exception] No surviving threads -- halting\n");
         }
         
-        // Kernel-mode fault or no thread to switch to: unrecoverable
-        __asm__ volatile ("cli");
-        __asm__ volatile ("hlt");
+        // Kernel-mode fault or no thread to switch to: unrecoverable.
+        // Loop: an NMI wakes hlt, and falling through used to iretq back
+        // into the faulting instruction.
+        for (;;) __asm__ volatile ("cli; hlt");
     }
     if(r->int_no == 32){
         apic_timer();
@@ -1007,12 +1106,23 @@ void isr_handler(registers_t* r) {
         exit_interrupt_context();
         return;
     }
+    if (r->int_no == 255 && !apic_isr_bit(255)) {
+        /* LAPIC spurious interrupt (SIVR vector 0xFF): not in service, so
+         * no EOI. Before this, it was taken as the panic IPI and the BSP
+         * halted for good. */
+        irq_spurious++;
+        exit_interrupt_context();
+        return;
+    }
     if (r->int_no == 255) {
         /* IPI_VECTOR_PANIC: Halt this CPU immediately */
         apic_eoi();
         __asm__ volatile("cli");
         while (1) { __asm__ volatile("hlt"); }
     }
+
+    if (r->int_no >= 32 && !irq_vector_known(r->int_no))
+        irq_unknown_total++;      /* reported from the main loop (irq_trace_poll) */
 
     /* Safety net: ensure LAPIC EOI is sent for all external hardware interrupts.
      * Individual handlers (RTL8139, AHCI, etc.) may already send EOI themselves,

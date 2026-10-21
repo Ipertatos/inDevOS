@@ -365,6 +365,12 @@ typedef struct process {
      * point (syscall return, IRQ return to ring 3, or an interruptible sleep
      * that returns -EINTR first) -- it is never torn down from outside. */
     volatile int kill_sig;
+
+    /* alarm()/setitimer(ITIMER_REAL): absolute ktime deadline in ms (0 = not
+     * armed) and reload interval.  Fired from the BSP LAPIC tick by
+     * process_alarm_tick(), which posts SIGALRM like kill() does. */
+    volatile uint64_t alarm_deadline_ms;
+    uint64_t alarm_interval_ms;
 } process_t;
 
 /** @brief Virtual memory layout for processes */

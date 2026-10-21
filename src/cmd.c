@@ -32,6 +32,9 @@
 #include "vfs.h"
 #include "vfs_fat32.h"
 #include "vfs_ext4.h"
+#include "exfat.h"
+#include "ext4ro.h"
+#include "partscan.h"
 #include "serial.h"
 #include "net_device.h"
 #include "net_arp.h"
@@ -306,6 +309,23 @@ void mount_filesystem_ext(uint8_t device_id, uint32_t partition_lba,
     if (!mount_path) mount_path = "/";
 
     if (kstrcmp(fstype, "ext4") == 0) {
+        /* read-only multi-instance driver (ext4ro.c) */
+        uint32_t plba = partition_lba;
+        if (plba == 0 && !ext4ro_probe(device_id, 0)) {
+            uint32_t st[17]; int ns = partscan_starts(device_id, st, 17);
+            for (int i = 0; i < ns; i++) if (ext4ro_probe(device_id, st[i])) { plba = st[i]; break; }
+        }
+        const char *have = NULL;
+        if (ext4ro_find_mounted(device_id, plba, &have)) {
+            printf("ext4 volume already mounted at %s\n", have); return;
+        }
+        printf("Mounting ext4 (read-only) from device %d LBA %u at %s...\n", device_id, plba, mount_path);
+        e4_vol_t *ev = ext4ro_mount(device_id, plba);
+        if (!ev) { printf("Failed to mount ext4 from device %d\n", device_id); return; }
+        if (ext4ro_vfs_register(mount_path, ev) == 0) ext4ro_info(ev);
+        else { ext4ro_unmount(ev); printf("ext4: could not register at %s\n", mount_path); }
+    } else if (kstrcmp(fstype, "ext4rw") == 0) {
+        /* legacy single-instance read-write driver (ext4.c), unchanged */
         printf("Mounting ext4 from device %d partition LBA %u at %s...\n",
                device_id, partition_lba, mount_path);
         if (ext4_mount(device_id, partition_lba) == 0) {
@@ -319,6 +339,37 @@ void mount_filesystem_ext(uint8_t device_id, uint32_t partition_lba,
             }
         } else {
             printf("Failed to mount ext4 from device %d\n", device_id);
+        }
+    } else if (kstrcmp(fstype, "exfat") == 0 || kstrcmp(fstype, "exfatrw") == 0) {
+        uint32_t plba = partition_lba;
+        if (plba == 0 && !exfat_probe(device_id, 0)) {
+            int64_t f = exfat_find_partition(device_id);
+            if (f < 0) { printf("No exFAT volume on device %d\n", device_id); return; }
+            plba = (uint32_t)f;
+        }
+        {
+            const char *have = NULL;
+            exfat_vol_t *ex = exfat_find_mounted(device_id, plba, &have);
+            if (ex) {
+                if (kstrcmp(fstype, "exfatrw") == 0) {
+                    if (exfat_enable_rw(ex) == 0)
+                        printf("exFAT volume already mounted at %s - switched it to read-write\n", have);
+                    else printf("exFAT volume at %s: could not switch to read-write\n", have);
+                } else printf("exFAT volume already mounted at %s\n", have);
+                return;
+            }
+        }
+        printf("Mounting exFAT from device %d LBA %u at %s...\n", device_id, plba, mount_path);
+        exfat_vol_t *v = exfat_mount(device_id, plba);
+        if (!v) { printf("Failed to mount exFAT from device %d\n", device_id); return; }
+        if (kstrcmp(fstype, "exfatrw") == 0 && exfat_enable_rw(v) != 0) {
+            printf("exFAT: could not enable read-write - mounting read-only\n");
+        }
+        if (exfat_vfs_register(mount_path, v) == 0) {
+            exfat_info(v);
+        } else {
+            exfat_unmount(v);
+            printf("exFAT: could not register at %s\n", mount_path);
         }
     } else {
         printf("Mounting FAT32 from device %d at %s...\n", device_id, mount_path);
@@ -337,6 +388,71 @@ void mount_filesystem_ext(uint8_t device_id, uint32_t partition_lba,
     }
 }
 
+/* Boot: mount every exFAT volume found on a (non-optical) disk read-only at
+ * /mnt/<label> (a Ventoy stick's data partition shows up as /mnt/ventoy). */
+/* Auto-mount every ext2/3/4 partition read-only at /mnt/<label> or /mnt/ext4N. */
+static void mount_ext4_auto(void) {
+    int k = 0;
+    for (uint8_t d = 0; d < storage_device_count; d++) {
+        if (storage_devices[d].optical) continue;
+        uint8_t id = storage_devices[d].device_id;
+        uint32_t st[17]; int ns = partscan_starts(id, st, 17);
+        for (int pi = 0; pi < ns; pi++) {
+            if (!ext4ro_probe(id, st[pi]) || ext4ro_find_mounted(id, st[pi], NULL)) continue;
+            e4_vol_t *v = ext4ro_mount(id, st[pi]);
+            if (!v) continue;
+            char path[64];
+            const char *lab = ext4ro_label(v);
+            int o = 0;
+            const char *pre = "/mnt/";
+            while (pre[o]) { path[o] = pre[o]; o++; }
+            for (int i = 0; lab[i] && o < 40; i++) {
+                char c = lab[i];
+                if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') path[o++] = c;
+            }
+            path[o] = '\0';
+            if (o == 5 || ext4ro_vfs_register(path, v) != 0) {
+                snprintf(path, sizeof(path), "/mnt/ext4%d", k);
+                if (ext4ro_vfs_register(path, v) != 0) { ext4ro_unmount(v); continue; }
+            }
+            k++;
+            printf("ext4 '%s' (device %u, LBA %u) mounted read-only at %s\n", lab, id, st[pi], path);
+        }
+    }
+}
+
+void mount_exfat_auto(void) {
+    mount_ext4_auto();
+    int k = 0;
+    for (uint8_t d = 0; d < storage_device_count; d++) {
+        if (storage_devices[d].optical) continue;
+        uint8_t id = storage_devices[d].device_id;
+        int64_t p = exfat_find_partition(id);
+        if (p < 0) continue;
+        if (exfat_find_mounted(id, (uint32_t)p, NULL)) continue;
+        exfat_vol_t *v = exfat_mount(id, (uint32_t)p);
+        if (!v) continue;
+        char path[64];
+        const char *lab = exfat_label(v);
+        int o = 0;
+        const char *pre = "/mnt/";
+        while (pre[o]) { path[o] = pre[o]; o++; }
+        for (int i = 0; lab[i] && o < 40; i++) {
+            char c = lab[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') path[o++] = c;
+        }
+        path[o] = '\0';
+        if (o == 5 || exfat_vfs_register(path, v) != 0) {
+            snprintf(path, sizeof(path), "/mnt/exfat%d", k);
+            if (exfat_vfs_register(path, v) != 0) { exfat_unmount(v); continue; }
+        }
+        k++;
+        printf("exFAT '%s' (device %u, LBA %u) mounted read-only at %s\n", lab, id, (uint32_t)p, path);
+    }
+}
+
 void unmount_filesystem_path(const char *path) {
     if (!path) path = "/";
 
@@ -348,6 +464,7 @@ void unmount_filesystem_path(const char *path) {
     }
 
     vfs_fs_ops_t *ops = fs->ops;
+    void *fs_data = fs->fs_data;
     vfs_unmount(path);
 
     if (ops == vfs_fat32_get_ops()) {
@@ -356,6 +473,12 @@ void unmount_filesystem_path(const char *path) {
     } else if (ops == vfs_ext4_get_ops()) {
         ext4_unmount();
         printf("ext4 unmounted from %s\n", path);
+    } else if (ops == ext4ro_get_ops()) {
+        ext4ro_unmount((e4_vol_t *)fs_data);
+        printf("ext4 unmounted from %s\n", path);
+    } else if (ops == exfat_get_ops()) {
+        exfat_unmount((exfat_vol_t *)fs_data);
+        printf("exFAT unmounted from %s\n", path);
     } else {
         printf("Filesystem unmounted from %s\n", path);
     }

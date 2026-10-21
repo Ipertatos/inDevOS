@@ -1257,11 +1257,14 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_pipe:    return sys_pipe((int *)a1);
     case LX_pipe2: {
         r = sys_pipe((int *)a1);
-        if (r == 0 && (a2 & LX_O_CLOEXEC)) {
+        if (r == 0 && (a2 & (LX_O_CLOEXEC | LX_O_NONBLOCK))) {
             int fds[2];
             if (lx_get(fds, (void *)a1, sizeof(fds)) == 0) {
-                if (lx_fd_ok(p, fds[0])) p->fds[fds[0]].cloexec = true;
-                if (lx_fd_ok(p, fds[1])) p->fds[fds[1]].cloexec = true;
+                for (int k = 0; k < 2; k++) {
+                    if (!lx_fd_ok(p, fds[k])) continue;
+                    if (a2 & LX_O_CLOEXEC)  p->fds[fds[k]].cloexec = true;
+                    if (a2 & LX_O_NONBLOCK) p->fds[fds[k]].flags |= O_NONBLOCK;
+                }
             }
         }
         return r;
@@ -1332,6 +1335,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return sys_poll((pollfd_t *)a1, (unsigned)a2, ms);
     }
     case LX_fsync: case LX_fdatasync: case LX_sync:
+        vfs_sync_all();                         /* exFAT: flush + clear VolumeDirty */
         return 0;
 
     /* ---- metadata / paths ---- */
@@ -1433,8 +1437,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (want_dir && kind != 2) return -ENOTDIR;
         if (!want_dir && kind == 2) return -EISDIR;
         if (want_dir) {
-            extern int fat32_remove_empty_directory(const char *path);
-            r = fat32_remove_empty_directory(path);
+            r = vfs_rmdir(path);
         } else {
             r = vfs_unlink(path);
         }
@@ -1456,16 +1459,16 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (nr == LX_truncate) {
             if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false)))
                 return r;
-            extern int fat32_truncate_file(const char *path);
             if (!lx_path_kind(path, NULL)) return -ENOENT;
-            return fat32_truncate_file(path) == 0 ? 0 : -EIO;
+            r = vfs_truncate(path, (uint64_t)a2);
+            return r < 0 ? (r == -1 ? -EIO : r) : 0;
         }
         if (!lx_fd_ok(p, (long)a1)) return -EBADF;
         if (p->fds[a1].fd_type == FD_TYPE_DEV_NULL) return 0;
         if (p->fds[a1].fd_type != FD_TYPE_VFS) return -EINVAL;
-        /* No reliable VFS ftruncate; accept and ignore length for ash scripts. */
-        (void)a2;
-        return 0;
+        /* Per-fs ftruncate (exFAT); FAT32 still ignores the length. */
+        r = vfs_ftruncate(p->fds[a1].vfs_fd, (uint64_t)a2);
+        return r < 0 ? (r == -1 ? -EIO : r) : 0;
     }
     case LX_umask:   return sys_umask((mode_t)a1);
     case LX_chmod: case LX_fchmod: case LX_fchmodat:
@@ -1738,6 +1741,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
     case LX_pause: {
         extern bool proc_signal_interrupts(process_t *);
+        fork_release_pending(p);
         while (!proc_signal_interrupts(p))
             ktime_yield_until(ktime_deadline_ms(5));
         return -EINTR;
@@ -1754,6 +1758,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             uint32_t sm = (uint32_t)((s << 1) & 0xFFFFFFFEu);
             p->blocked_signals = sm & ~((1u << 9) | (1u << 19));
         }
+        fork_release_pending(p);
         for (int i = 0; i < 500; i++) {
             if (p->pending_signals & ~p->blocked_signals) break;
             ktime_yield_until(ktime_deadline_ms(5));
@@ -1767,8 +1772,41 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (lx_put((void *)a2, ss, sizeof(ss))) return -EFAULT;
         }
         return 0;
-    case LX_alarm: case LX_setitimer: case LX_getitimer:
+    case LX_alarm: {
+        extern void process_alarm_set(process_t *, uint64_t, uint64_t, uint64_t *, uint64_t *);
+        uint64_t old = 0;
+        process_alarm_set(p, (uint64_t)(unsigned)a1 * 1000ULL, 0, &old, NULL);
+        /* Linux: seconds left, rounded to nearest, at least 1 if armed. */
+        return old ? (long)((old + 500) / 1000 ? (old + 500) / 1000 : 1) : 0;
+    }
+    case LX_setitimer: case LX_getitimer: {
+        extern void process_alarm_set(process_t *, uint64_t, uint64_t, uint64_t *, uint64_t *);
+        extern void process_alarm_get(process_t *, uint64_t *, uint64_t *);
+        /* struct itimerval { timeval it_interval; timeval it_value; } */
+        int64_t tv[4];
+        uint64_t ov = 0, oi = 0;
+        if (a1 != 0)                        /* only ITIMER_REAL is backed */
+            return a1 <= 2 ? 0 : -EINVAL;
+        void *outp = (nr == LX_getitimer) ? (void *)a2 : (void *)a3;
+        if (nr == LX_setitimer) {
+            if (!a2) return -EFAULT;
+            if (lx_get(tv, (void *)a2, sizeof(tv))) return -EFAULT;
+            if (tv[1] < 0 || tv[1] >= 1000000 || tv[3] < 0 || tv[3] >= 1000000 ||
+                tv[0] < 0 || tv[2] < 0)
+                return -EINVAL;
+            uint64_t iv = (uint64_t)tv[0] * 1000ULL + ((uint64_t)tv[1] + 999) / 1000;
+            uint64_t vv = (uint64_t)tv[2] * 1000ULL + ((uint64_t)tv[3] + 999) / 1000;
+            process_alarm_set(p, vv, iv, &ov, &oi);
+        } else {
+            process_alarm_get(p, &ov, &oi);
+        }
+        if (outp) {
+            int64_t o[4] = { (int64_t)(oi / 1000), (int64_t)(oi % 1000) * 1000,
+                             (int64_t)(ov / 1000), (int64_t)(ov % 1000) * 1000 };
+            if (lx_put(outp, o, sizeof(o))) return -EFAULT;
+        }
         return 0;
+    }
 
     /* ---- time ---- */
     case LX_clock_gettime: {
@@ -1816,6 +1854,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             extern bool proc_signal_interrupts(process_t *);
             extern bool ktime_expired(uint64_t);
             uint64_t dl = ktime_deadline_ms((want_us + 999) / 1000);
+            fork_release_pending(p);   /* sleeping parent: let held kids run */
             while (!ktime_expired(dl)) {
                 if (proc_signal_interrupts(p)) return -EINTR;
                 __asm__ volatile("sti; hlt" ::: "memory");

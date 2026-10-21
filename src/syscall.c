@@ -1086,6 +1086,7 @@ int sys_exit(int status) {
     if (proc)
         fork_release_pending(proc);
     if (proc) {
+        proc->alarm_deadline_ms = 0;
         proc->exit_status = status;
         proc->is_running  = false;
     }
@@ -1217,6 +1218,11 @@ int sys_read(int fd, void *buf, size_t count) {
             int n = pipe_read(p, kbuf, count);
             if (n == -EAGAIN) {
                 kfree(kbuf);
+                if (proc->fds[fd].flags & O_NONBLOCK)
+                    return -EAGAIN;
+                /* About to block: a held fork newborn (often the writer) must
+                 * run now or this read never completes. */
+                fork_release_pending(proc);
                 if (global_scheduler.scheduler_running) {
                     extern thread_t *scheduler_get_current_thread(void);
                     thread_t *self = scheduler_get_current_thread();
@@ -1277,6 +1283,11 @@ int sys_write(int fd, const void *buf, size_t count) {
         for (;;) {
             int n = pipe_write(pp, kbuf, count);
             if (n == -EAGAIN) {
+                if (proc->fds[fd].flags & O_NONBLOCK) {
+                    kfree(kbuf);
+                    return -EAGAIN;
+                }
+                fork_release_pending(proc);   /* the reader may be a held newborn */
                 if (global_scheduler.scheduler_running) {
                     extern thread_t *scheduler_get_current_thread(void);
                     thread_t *self = scheduler_get_current_thread();
@@ -1995,6 +2006,7 @@ void fork_child_zombie_exit(int status) {
                   proc ? (int)proc->pid : -1, status);
 
     if (proc) {
+        proc->alarm_deadline_ms = 0;
         proc->exit_status = status;
         proc->is_running  = false;
         /* Close FDs BEFORE is_zombie. Otherwise waitpid on another CPU can
@@ -2160,6 +2172,8 @@ static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child
              sizeof(child->linux_exe_path));
     child->mmap_regions = NULL;
     child->pending_signals = 0;
+    child->alarm_deadline_ms = 0;   /* POSIX: pending alarms are not inherited */
+    child->alarm_interval_ms = 0;
     child->pgid = parent->pgid ? parent->pgid : parent->pid;
     child->sid  = parent->sid  ? parent->sid  : parent->pid;
     child->sig_in_handler = false;
@@ -2694,7 +2708,7 @@ int proc_fatal_default_pending(process_t *p) {
         return ks;
     uint32_t pend = p->pending_signals & ~p->blocked_signals;
     if (!pend) return 0;
-    static const int fatal[] = { SIGKILL, SIGINT, SIGQUIT, SIGTERM, SIGHUP };
+    static const int fatal[] = { SIGKILL, SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGALRM };
     for (unsigned i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++) {
         int s = fatal[i];
         if (!(pend & (1u << s))) continue;
@@ -2736,6 +2750,63 @@ void process_post_signal(process_t *t, int signum) {
     if (!t || signum < 1 || signum >= NSIG) return;
     __atomic_or_fetch(&t->pending_signals, 1u << signum, __ATOMIC_SEQ_CST);
     process_kick_thread(process_exec_thread(t));
+}
+
+/* ---- alarm()/setitimer(ITIMER_REAL) ----
+ * Each process keeps an absolute deadline.  The BSP's LAPIC tick scans the
+ * table once any alarm was ever armed and, on expiry, posts SIGALRM through
+ * process_post_signal(): pending bit + wake, exactly like kill(), so a thread
+ * blocked in waitpid/read/poll/nanosleep sees it and returns -EINTR, and a
+ * ring-3 busy loop gets it on the IRQ-return path. */
+static volatile int alarm_ever_armed;
+
+/* Arm (value_ms > 0) or disarm (0).  Returns the previous remaining ms and
+ * reload interval through the optional out pointers. */
+void process_alarm_set(process_t *p, uint64_t value_ms, uint64_t interval_ms,
+                       uint64_t *old_value_ms, uint64_t *old_interval_ms) {
+    extern uint64_t ktime_now_ms(void);
+    if (!p) return;
+    uint64_t now = ktime_now_ms();
+    uint64_t dl = p->alarm_deadline_ms;
+    if (old_value_ms)
+        *old_value_ms = dl ? (dl > now ? dl - now : 1) : 0;
+    if (old_interval_ms)
+        *old_interval_ms = p->alarm_interval_ms;
+    p->alarm_interval_ms = value_ms ? interval_ms : 0;
+    __atomic_store_n(&p->alarm_deadline_ms, value_ms ? now + value_ms : 0,
+                     __ATOMIC_SEQ_CST);
+    if (value_ms)
+        __atomic_store_n(&alarm_ever_armed, 1, __ATOMIC_SEQ_CST);
+}
+
+void process_alarm_get(process_t *p, uint64_t *value_ms, uint64_t *interval_ms) {
+    extern uint64_t ktime_now_ms(void);
+    uint64_t now = ktime_now_ms();
+    uint64_t dl = p ? p->alarm_deadline_ms : 0;
+    if (value_ms) *value_ms = dl ? (dl > now ? dl - now : 1) : 0;
+    if (interval_ms) *interval_ms = p ? p->alarm_interval_ms : 0;
+}
+
+/* Called from tty_timer_hook() on every LAPIC tick (IRQ context). */
+void process_alarm_tick(void) {
+    extern uint64_t ktime_now_ms(void);
+    if (!__atomic_load_n(&alarm_ever_armed, __ATOMIC_ACQUIRE))
+        return;
+    if (smp_cpu_index_fast() != 0)
+        return;                     /* one scanner: the BSP */
+    uint64_t now = ktime_now_ms();
+    for (int i = 1; i < MAX_PROCESSES; i++) {
+        process_t *t = &processes[i];
+        uint64_t dl = __atomic_load_n(&t->alarm_deadline_ms, __ATOMIC_ACQUIRE);
+        if (!dl || now < dl)
+            continue;
+        if (!t->is_running || t->is_zombie) {
+            t->alarm_deadline_ms = 0;
+            continue;
+        }
+        t->alarm_deadline_ms = t->alarm_interval_ms ? now + t->alarm_interval_ms : 0;
+        process_post_signal(t, SIGALRM);
+    }
 }
 
 /* True when @p is executing on the calling context, i.e. this CPU's current
@@ -3334,6 +3405,9 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
             break;
         if (proc_kill_pending(get_current_process()))
             return -EINTR;
+        if (proc && proc->linux_abi && proc_signal_interrupts(proc))
+            return -EINTR;            /* SIGALRM / handled signal: EINTR */
+        fork_release_pending(proc);   /* about to sleep: let held kids run */
         {   /* sync /dev/wm client waiting: kmain is blocked, pump for it */
             extern bool exec_current_is_sync_program(void);
             extern bool wm_dev_pid_connected(uint32_t pid);
@@ -3501,6 +3575,9 @@ int sys_nanosleep(const timespec_ind_t *req, timespec_ind_t *rem) {
         process_t *sp_ = get_current_process();
         uint64_t dl = ktime_deadline_ms(ms);
         (void)ktime_yield_until;
+        /* Sleeping parent: held fork newborns must get to run meanwhile
+         * (they were only released by a blocking wait). */
+        fork_release_pending(sp_);
         while (!ktime_expired(dl)) {
             if (proc_signal_interrupts(sp_))
                 return -EINTR;

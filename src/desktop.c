@@ -2500,11 +2500,12 @@ static const char *dt_basename(const char *p) {
 }
 
 static void dt_dlg_do_delete(void) {
-    extern int fat32_remove_empty_directory(const char *path);
     char msg[96];
     const char *nm = dt_basename(dt_dlg_path);
-    int rc = dt_dlg_isdir ? fat32_remove_empty_directory(dt_dlg_path) : vfs_unlink(dt_dlg_path);
+    /* per-filesystem route: FAT32 keeps fat32_remove_empty_directory, exFAT has its own */
+    int rc = dt_dlg_isdir ? vfs_rmdir(dt_dlg_path) : vfs_unlink(dt_dlg_path);
     fat32_sync();
+    vfs_sync_all();
     serial_printf("[desktop] delete %s%s rc=%d\n", dt_dlg_path, dt_dlg_isdir ? " (dir)" : "", rc);
     snprintf(msg, sizeof(msg), rc == 0 ? "Deleted %s" : "Could not delete %s", nm);
     desktop_toast(msg);

@@ -20,6 +20,7 @@ static uint8_t kernel_stack_area[16384] __attribute__((aligned(16)));
 // These use separate stacks so they can fire even when the main stack is corrupted.
 static uint8_t ist1_stack[16384] __attribute__((aligned(16)));  // IST1: Double Fault (#DF)
 static uint8_t ist2_stack[16384] __attribute__((aligned(16)));  // IST2: NMI
+static uint8_t ist3_stack[16384] __attribute__((aligned(16)));  // IST3: Machine Check (#MC)
 
 void gdt_set_entry(int num, uint64_t base, uint64_t limit, uint8_t access, uint8_t granularity){
     gdt[num].base_low = (base & 0xFFFF);
@@ -57,6 +58,7 @@ void gdt_init(){
     // Set up IST entries for critical exceptions that need known-good stacks
     tss.ist1 = (uint64_t)&ist1_stack[sizeof(ist1_stack)];  // Double Fault
     tss.ist2 = (uint64_t)&ist2_stack[sizeof(ist2_stack)];  // NMI
+    tss.ist3 = (uint64_t)&ist3_stack[sizeof(ist3_stack)];  // Machine Check
 
     //entry 0 null
     gdt_set_entry(0, 0, 0, 0, 0);
@@ -113,6 +115,7 @@ void gdt_init_ap(uint32_t cpu_id) {
     tss_ap[cpu_id].rsp0 = (uint64_t)&ap_kstack[cpu_id][sizeof(ap_kstack[cpu_id])];
     tss_ap[cpu_id].ist1 = tss.ist1;
     tss_ap[cpu_id].ist2 = tss.ist2;
+    tss_ap[cpu_id].ist3 = tss.ist3;
 
     uint64_t tss_base = (uint64_t)&tss_ap[cpu_id];
     gdt_entry_t *ag = gdt_ap[cpu_id];

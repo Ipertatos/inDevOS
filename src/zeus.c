@@ -437,7 +437,7 @@ static const char *const zeus_command_names[] = {
     "sendtest", "set", "setip", "settings", "sh", "shell", "shutdown", "smp",
     "spawn", "srv", "stopdhcp", "stopwatch", "storage", "su",
     "tapconfig", "task", "tcpclean", "tcpinfo", "tdesk", "terminal", "termwin",
-    "terminals", "testkey", "threadtest", "time", "timeraccuracy",
+    "terminals", "testkey", "bootlog", "crashtest", "irqtest", "threadtest", "time", "timeraccuracy",
     "timertest", "touch", "tui", "tuidesktop", "udpverbose",     "unmount", "unset", "udp_test",
     "usb", "usbenum", "usbkeyboard", "usbpoll", "useradd", "userdel",
     "users", "version", "wc", "whoami", "xhci", "lsusb", "usbnet", "lxtrace",
@@ -661,9 +661,55 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
     } else if (kstrcmp(command, "shutdown") == 0 || kstrcmp(command, "poweroff") == 0) {
         extern void acpi_shutdown(void);
         printf("System is going down for poweroff NOW!\n");
+        { extern void bootlog_flush(void); bootlog_flush(); }
         acpi_shutdown();
+    } else if (kstrcmp(command, "bootlog") == 0) {
+        extern void bootlog_status(void);
+        extern void bootlog_flush(void);
+        bootlog_flush();
+        bootlog_status();
+    } else if (kstrcmp(command, "irqtest") == 0) {
+        /* Debug: interrupt/exception diagnostics (see idt.c exc_report). */
+        extern void irq_trace_report(const char *when);
+        extern void irq_trace_poll(void);
+        extern void apic_self_ipi(uint8_t v);
+        extern void bootlog_stage(const char *name);
+        const char *a = argc >= 2 ? argv[1] : "";
+        if (kstrcmp(a, "vec") == 0 && argc >= 3) {
+            int v = atoi(argv[2]);
+            if (v < 32 || v > 252) printf("irqtest vec: vector must be 32..252\n");
+            else {
+                bootlog_stage("irqtest: self-IPI on a vector");
+                apic_self_ipi((uint8_t)v);
+                for (volatile int i = 0; i < 2000000; i++) { }
+                irq_trace_poll();
+                irq_trace_report("irqtest");
+                printf("irqtest: vector %d delivered, kernel still alive\n", v);
+            }
+        } else if (kstrcmp(a, "ud") == 0) {
+            bootlog_stage("irqtest: ud2 in kernel mode");
+            __asm__ volatile("ud2");
+        } else if (kstrcmp(a, "stack") == 0) {
+            /* Like a kernel stack overflow into an unmapped guard page: the
+             * #PF frame cannot be pushed -> #DF on IST1 -> panic + flush. */
+            bootlog_stage("irqtest: kernel stack overflow (RSP -> unmapped)");
+            __asm__ volatile("cli; mov $0x1000, %%rsp; push %%rax" ::: "memory");
+        } else if (kstrcmp(a, "stat") == 0) {
+            irq_trace_report("irqtest stat");
+        } else {
+            printf("Usage: irqtest vec <32-252> | ud | stack | stat\n");
+        }
+    } else if (kstrcmp(command, "crashtest") == 0) {
+        /* Debug: force a triple fault (no IDT + exception) to test that the
+         * boot log on the stick survives a hard reset. */
+        extern void bootlog_stage(const char *name);
+        bootlog_stage("crashtest: forcing a triple fault NOW");
+        struct __attribute__((packed)) { uint16_t limit; uint64_t base; } null_idt = { 0, 0 };
+        __asm__ volatile("cli; lidt %0; int3" : : "m"(null_idt));
+        for (;;) __asm__ volatile("hlt");
     } else if (kstrcmp(command, "reboot") == 0) {
         extern void acpi_reboot(void);
+        { extern void bootlog_flush(void); bootlog_flush(); }
         printf("System is going down for reboot NOW!\n");
         acpi_reboot();
     } else if (kstrcmp(command, "neofetch") == 0) {
@@ -687,10 +733,12 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
         extern void mount_filesystem_device(uint8_t device_id);
         extern void mount_filesystem_ext(uint8_t, uint32_t, const char*, const char*);
         if (argc < 2) {
-            printf("Usage: mount <device_id> [partition_lba] [fat32|ext4] [path]\n");
+            printf("Usage: mount <device_id> [partition_lba] [fat32|ext4|exfat|exfatrw] [path]\n");
             printf("Examples:\n");
             printf("  mount 0              - mount device 0 as FAT32 at /\n");
             printf("  mount 1 2048 ext4 /mnt - mount device 1, LBA 2048, ext4 at /mnt\n");
+            printf("  mount usb0 0 exfat /mnt/usb - first exFAT partition of usb0 (read-only)\n");
+            printf("  mount usb0 0 exfatrw /mnt/usb - same, read-write (experimental)\n");
         } else {
             int mdev = storage_resolve_name(argv[1]);
             if (mdev < 0) { printf("mount: no device '%s'\n", argv[1]); return; }

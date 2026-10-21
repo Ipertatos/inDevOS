@@ -23,6 +23,7 @@
 #include "net_ip.h"
 #include "net_udp.h"
 #include "fat32.h"
+#include "bootlog.h"
 #include "storage.h"
 #include "serial.h"
 #include "cmd.h"
@@ -151,19 +152,23 @@ void kmain(void) {
     mempool_create(64, 1024);    // Small allocations (64 bytes x 1024)
     mempool_create(256, 512);    // Medium allocations (256 bytes x 512)
     mempool_create(1024, 256);   // Large allocations (1KB x 256)
+    bootlog_stage("ACPI");
     klog_info("Initializing ACPI\n");
     init_acpi();
     acpi_power_init();
+    bootlog_stage("PCI");
     klog_info("Initializing PCI\n");
     pci_init();
     
     // Initialize driver manager and adapters
+    bootlog_stage("driver manager");
     klog_info("Initializing driver manager\n");
     driver_manager_init();
     driver_adapters_init();
     driver_adapters_register_all();
     
     // Auto-discover and load drivers
+    bootlog_stage("driver auto-discover (NVMe/AHCI/IDE/GPU/NIC drivers)");
     klog_info("Auto-discovering devices\n");
     driver_auto_discover();
     
@@ -171,12 +176,14 @@ void kmain(void) {
     // in driver_manager yet, so probe it directly; AMD GPU / VMware SVGA /
     // NVMe / IDE / AHCI / NICs are initialized by driver_auto_discover()
     // above via their driver_manager adapters (all inits are idempotent).
+    bootlog_stage("virtio-GPU probe");
     klog_info("Probing virtio-GPU\n");
     if (virtio_gpu_init() < 0) {
         klog_info("Virtio-GPU not available, using driver-manager GPU drivers\n");
     }
 
     // GPU HAL: unify all display backends behind one interface
+    bootlog_stage("GPU HAL / framebuffer / DRM");
     gpu_hal_init();
     { extern void fb_wc_init(void); fb_wc_init(); }
     drm_init();
@@ -190,12 +197,14 @@ void kmain(void) {
     }
     
     // Initialize USB subsystem
+    bootlog_stage("USB subsystem");
     klog_info("Initializing USB subsystem\n");
     usb_init();
     
     // xHCI controllers, then enumerate root ports and hubs; binds HID
     // keyboards/mice and mass storage (usbN disks registered here are seen
     // by storage_init's boot-device detection and the installer).
+    bootlog_stage("xHCI controllers + USB ports");
     klog_info("Initializing xHCI USB controllers\n");
     {
         extern void usb_core_init(void);
@@ -203,6 +212,11 @@ void kmain(void) {
     }
     
     // Initialize AC97 audio driver
+    /* USB disks are enumerated now: a Ventoy stick's exFAT data partition
+     * can take the boot log long before / is mounted. */
+    bootlog_attach_usb();
+    bootlog_stage("USB storage scanned");
+    bootlog_stage("audio (AC97)");
     klog_info("Initializing audio subsystem\n");
     ac97_init();
     
@@ -211,6 +225,7 @@ void kmain(void) {
     mixer_init();
     
     // Initialize clipboard and settings
+    bootlog_stage("clipboard/settings/users/dynlink/pkg");
     extern int clipboard_init(void);
     extern int settings_init(void);
     clipboard_init();
@@ -230,16 +245,19 @@ void kmain(void) {
     
     // Set up the 1ms HPET periodic timer: drives preemptive scheduling,
     // thread sleep wakeups and cursor blink (was done by the old task manager)
+    bootlog_stage("HPET periodic timer");
     klog_info("Configuring 1ms periodic timer\n");
     hpet_set_periodic(1);
 
     // Initialize syscall system
+    bootlog_stage("syscalls");
     klog_info("Initializing syscall system\n");
     syscall_init();
 
     profiler_init();
     
     // Initialize network device abstraction layer and PCI ethernet (E1000 > RTL8139 > PCnet)
+    bootlog_stage("PCI ethernet");
     klog_info("Initializing network device abstraction layer\n");
     net_device_init();
     if (net_device_pci_bringup() != 0) {
@@ -249,6 +267,7 @@ void kmain(void) {
     }
     
     // Initialize network protocols
+    bootlog_stage("network protocols / telnet");
     klog_info("Initializing network protocols\n");
     ip_init();
     udp_init();
@@ -261,10 +280,12 @@ void kmain(void) {
     telnet_server_init();
     
     // Initialize keyboard subsystem
+    bootlog_stage("keyboard");
     klog_info("Initializing keyboard\n");
     keyboard_init();
     
     // Initialize mouse driver (memory allocator is now interrupt-safe)
+    bootlog_stage("mouse");
     klog_info("Initializing mouse\n");
     mouse_init();
     
@@ -277,6 +298,7 @@ void kmain(void) {
      * printf after VFS/kmod was a full virtio present and looked hung. */
     fb_set_defer_flush(true);
 
+    bootlog_stage("storage");
     klog_info("Initializing storage subsystem\n");
     storage_init();
     storage_init_ramdisk();
@@ -284,21 +306,43 @@ void kmain(void) {
     klog_info("Main loop started - ready for input\n");
     klog_info("Keyboard systems: PS/2 (interrupt-driven) + USB (polling) enabled\n");
     //for easy debug 
+    bootlog_stage("mount boot volume");
     mount_filesystem();
+    /* From here on the log is written to /BOOTLOG.TXT on the boot volume. */
+    bootlog_attach();
+    bootlog_stage("boot volume mounted");
+    { extern void mount_exfat_auto(void); mount_exfat_auto(); }
+    bootlog_stage("exFAT volumes mounted");
     fb_flush_pending();
     // CRITICAL FIX: Enable interrupts AFTER all boot printf calls are complete
+    {
+        extern void irq_trace_arm(void);
+        irq_trace_arm();
+    }
+    bootlog_stage("enabling interrupts (first sti)");
     __asm__("sti");
+    bootlog_stage("interrupts enabled");
+    {
+        /* ~50 ms with interrupts on, then log which vectors arrived. */
+        extern void irq_trace_report(const char *when);
+        uint64_t t0 = hpet_get_ticks();
+        for (uint32_t i = 0; i < 20000000u && hpet_get_ticks() - t0 < 50; i++)
+            __asm__ volatile("pause");
+        irq_trace_report("50 ms after first sti");
+    }
     
     //PlayWAV(44100, fsize, file);
     //rtl8169_init();
 
 
     // Initialize kernel module subsystem
+    bootlog_stage("kernel modules");
     klog_info("Initializing kernel module subsystem\n");
     kmod_init();
     fb_flush_pending();
     
     // Initialize SMP subsystem and bring up secondary CPUs
+    bootlog_stage("SMP (application processors)");
     klog_info("Initializing SMP subsystem\n");
     smp_init();
     smp_start_aps();
@@ -308,21 +352,25 @@ void kmain(void) {
     fb_flush_pending();
 
     // Initialize desktop compositor (window manager, not started yet)
+    bootlog_stage("desktop init");
     {
         extern void desktop_init(void);
         desktop_init();
     }
+    bootlog_stage("scheduler start");
 
     // Enable preemptive thread scheduler (required for desktop + spawn)
     scheduler_start();
 
     // Initialize virtual console system (4 switchable consoles via Ctrl+Q)
+    bootlog_stage("virtual consoles / TTY");
     vconsole_init();
 
     // Initialize TTY abstraction layer
     tty_init();
     tty_set_line_callback(tty_zeus_line_handler);
     
+    bootlog_stage("Zeus shell start");
     klog_info("System ready.\n");
     kernel_start_zeus();
 
@@ -350,12 +398,18 @@ void kmain(void) {
     // is not working correctly (common on Proxmox / KVM).
     {
         extern void apic_enable_timer(void);
+        bootlog_stage("LAPIC timer enable");
         apic_enable_timer();
     }
 
     while(1) {
         static uint64_t loop_count = 0;
         loop_count++;
+        if (loop_count == 1) {
+            extern void irq_trace_report(const char *when);
+            bootlog_stage("main loop: first iteration");
+            irq_trace_report("main loop start");
+        }
         
         // Track if we did any work this iteration (for CPU idling)
         bool did_work = false;
@@ -364,6 +418,8 @@ void kmain(void) {
 
         /* Paint console output held back by the coalescing window. */
         fb_flush_pending();
+        bootlog_tick();
+        { extern void irq_trace_poll(void); irq_trace_poll(); }
 
         /* Spawned Ring-3 apps present via SYS_DESKTOP_COMPOSITE. While one is
          * READY, yield instead of burning a CRITICAL quantum on the compositor
