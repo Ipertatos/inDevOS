@@ -1528,7 +1528,7 @@ static int fat32_ensure_clusters(fat32_file_t *file, uint32_t needed_clusters) {
         uint32_t c = fat32_allocate_cluster(fs);
         if (c == FAT32_CLUSTER_END) {
             printf("fat32: Out of space while extending file\n");
-            return -1;
+            return -28;   /* -ENOSPC */
         }
         // Link the new cluster to the chain
         if (fat32_fat_store(fs, last, c) != 0)
@@ -1693,8 +1693,11 @@ static int fat32_write_impl(fat32_file_t *file, const void *buffer, uint32_t siz
     if (needed_clusters == 0) needed_clusters = 1;
 
     // Ensure enough clusters are allocated
-    if (fat32_ensure_clusters(file, needed_clusters) != 0) {
-        FS_UNLOCK(); return -1;
+    int ec = fat32_ensure_clusters(file, needed_clusters);
+    if (ec != 0) {
+        serial_printf("fat32: write '%s' pos=%u size=%u: cluster alloc failed (%d)\n",
+                      file->filename, (unsigned)file->file_position, (unsigned)size, ec);
+        FS_UNLOCK(); return ec == -28 ? -28 /* -ENOSPC */ : -5 /* -EIO */;
     }
 
     // Allocate one cluster buffer for read-modify-write
@@ -2025,6 +2028,24 @@ static uint32_t fat32_allocate_cluster(fat32_fs_t *fs) {
 
     uint32_t bps = fs->boot_sector.bytes_per_sector ? fs->boot_sector.bytes_per_sector : 512;
     uint32_t total_clusters = (uint32_t)(((uint64_t)fs->boot_sector.fat_size_32 * bps) / 4);
+    /* The FAT has room for more entries than the volume has data clusters
+     * (the FAT is rounded up to whole sectors).  Bounding by FAT capacity
+     * handed out clusters past the end of the disk: on the 100 MiB image
+     * clusters 201618..201727 mapped beyond the last sector, so a write that
+     * reached them failed ("IDE: Write beyond drive capacity") and returned
+     * -1 at 2 MiB in ostest fs.large_24mb.  Valid data clusters are
+     * 2 .. data_clusters+1. */
+    {
+        uint32_t tot = fs->boot_sector.total_sectors_32 ? fs->boot_sector.total_sectors_32
+                                                        : fs->boot_sector.total_sectors_16;
+        uint32_t spc = fs->boot_sector.sectors_per_cluster ? fs->boot_sector.sectors_per_cluster : 1;
+        uint64_t meta = (uint64_t)fs->boot_sector.reserved_sector_count +
+                        (uint64_t)fs->boot_sector.num_fats * fs->boot_sector.fat_size_32;
+        if (tot > meta) {
+            uint64_t end = (tot - meta) / spc + 2;
+            if (end < total_clusters) total_clusters = (uint32_t)end;
+        }
+    }
     if (total_clusters <= 2) return FAT32_CLUSTER_END;
     if (fat_alloc_cursor < 2 || fat_alloc_cursor >= total_clusters)
         fat_alloc_cursor = 2;
@@ -3251,4 +3272,81 @@ fat32_fmt_have_range:;
 
     printf("fat32: Format complete. Volume label: %s\n", label ? label : "NO NAME");
     FS_UNLOCK(); return 0;
+}
+
+/*
+ * Set an open file's length (ftruncate/truncate).  Shrinking ends the
+ * cluster chain after the last cluster still needed and frees the rest (or
+ * the whole chain for 0); growing appends zeros through the write path.
+ * The file position is kept (clamped to the new size).
+ */
+int fat32_truncate_handle(fat32_file_t *f, uint32_t len) {
+    if (!f || !f->in_use) return -EBADF;
+    if (f->attributes & FAT32_ATTR_DIRECTORY) return -EISDIR;
+    uint32_t pos = f->file_position;
+    if (len < f->file_size) {
+        FS_LOCK();
+        fat32_fs_t *fs = f->filesystem;
+        uint32_t bpc = fs->bytes_per_cluster;
+        uint32_t keep = (len + bpc - 1) / bpc;
+        if (f->first_cluster >= 2 && f->first_cluster < FAT32_CLUSTER_BAD) {
+            if (keep == 0) {
+                fat32_free_cluster_chain(fs, f->first_cluster);
+                f->first_cluster = 0;
+            } else {
+                uint32_t last = f->first_cluster;
+                for (uint32_t i = 1; i < keep; i++) {
+                    uint32_t nx = fat32_get_next_cluster(fs, last);
+                    if (nx < 2 || nx >= FAT32_CLUSTER_BAD) break;
+                    last = nx;
+                }
+                uint32_t next = fat32_get_next_cluster(fs, last);
+                if (next >= 2 && next < FAT32_CLUSTER_BAD) {
+                    if (fat32_fat_store(fs, last, FAT32_CLUSTER_END) != 0) {
+                        FS_UNLOCK(); return -EIO;
+                    }
+                    fat32_free_cluster_chain(fs, next);
+                }
+            }
+        }
+        f->file_size       = len;
+        f->file_position   = 0;
+        f->current_cluster = f->first_cluster >= 2 ? f->first_cluster : FAT32_CLUSTER_END;
+        uint32_t dir_start = f->parent_dir_cluster ? f->parent_dir_cluster
+                                                   : fat32_filesystem.root_dir_cluster;
+        int rc = fat32_update_dir_entry(f, dir_start);
+        FS_UNLOCK();
+        if (rc != 0) return -EIO;
+    } else if (len > f->file_size) {
+        uint8_t *z = (uint8_t *)kalloc(4096);
+        if (!z) return -ENOMEM;
+        memset(z, 0, 4096);
+        int err = 0;
+        if (fat32_seek(f, f->file_size) < 0) err = -EIO;
+        uint32_t left = len - f->file_size;
+        while (!err && left) {
+            uint32_t n = left > 4096 ? 4096 : left;
+            int w = fat32_write(f, z, n);
+            if (w <= 0) { err = w < 0 && w != -1 ? w : -EIO; break; }
+            left -= (uint32_t)w;
+        }
+        kfree(z);
+        if (err) return err;
+    }
+    fat32_seek(f, pos);
+    return 0;
+}
+
+int fat32_truncate_to(const char *filename, uint32_t len) {
+    if (len == 0) return fat32_truncate_file(filename);
+    if (!fat32_is_mounted()) return -EIO;
+    fat32_file_t *f = fat32_open(filename, "w");
+    if (!f) return -ENOENT;
+    int r = fat32_truncate_handle(f, len);
+    int c = fat32_close(f);
+    return r ? r : (c ? -EIO : 0);
+}
+
+int fat32_truncate_handle_v(void *f, uint32_t len) {
+    return fat32_truncate_handle((fat32_file_t *)f, len);
 }

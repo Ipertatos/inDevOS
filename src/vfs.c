@@ -512,17 +512,23 @@ int vfs_truncate(const char *path, uint64_t len) {
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     if (fs && fs->ops && fs->ops->truncate) { int r = fs->ops->truncate(fs, rel, len); VFS_UNLOCK(); return r; }
     VFS_UNLOCK();
-    extern int fat32_truncate_file(const char *path);
-    return fat32_truncate_file(path) == 0 ? 0 : -EIO;       /* FAT32: unchanged (to 0) */
+    extern int fat32_truncate_to(const char *path, uint32_t len);
+    if (len > 0xFFFFFFFFull) return -EINVAL;                 /* FAT32 4 GiB limit */
+    int fr = fat32_truncate_to(path, (uint32_t)len);
+    return fr == 0 ? 0 : (fr < -1 ? fr : -EIO);
 }
 
 int vfs_ftruncate(int fd, uint64_t len) {
     VFS_LOCK();
     if (fd < 0 || fd >= VFS_MAX_OPEN_FILES || !open_files[fd].in_use) { VFS_UNLOCK(); return -EBADF; }
     vfs_file_t *vf = &open_files[fd];
-    int r = 0;                                               /* FAT32: ignored as before */
+    int r = 0;
+    extern vfs_fs_ops_t *vfs_fat32_get_ops(void);
+    extern int fat32_truncate_handle_v(void *f, uint32_t len);
     if (vf->fs && vf->fs->ops && vf->fs->ops->ftruncate)
         r = vf->fs->ops->ftruncate(vf->fs, vf->fs_handle, len);
+    else if (vf->fs && vf->fs->ops == vfs_fat32_get_ops())  /* FAT32 */
+        r = len > 0xFFFFFFFFull ? -EINVAL : fat32_truncate_handle_v(vf->fs_handle, (uint32_t)len);
     VFS_UNLOCK(); return r;
 }
 

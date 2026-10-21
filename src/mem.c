@@ -1194,6 +1194,19 @@ static uint64_t* vmm_clone_table(uint64_t *src, int level) {
                 dst[i] = pte;
                 continue;
             }
+            if (pte & VMM_SHARED) {
+                /* MAP_SHARED anonymous page: both processes keep the same
+                 * frame, writable, no COW; refcounted like any shared leaf
+                 * so the last unmap/exit frees it. */
+                dst[i] = pte;
+                if (vmm_page_get_ref(phys) == 0) {
+                    vmm_page_ref(phys);
+                    vmm_page_ref(phys);
+                } else {
+                    vmm_page_ref(phys);
+                }
+                continue;
+            }
             if ((pte & VMM_USER) && (pte & VMM_WRITABLE)) {
                 /* Mark both entries read-only + COW */
                 pte = (pte & ~VMM_WRITABLE) | VMM_COW;

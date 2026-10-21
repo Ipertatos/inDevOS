@@ -466,10 +466,13 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
          * (refs>1) even if VMM_COW was cleared — otherwise the child #PFs
          * writing errno/.data (pipe_sigpipe RIP=0x40172f va=0x401030).
          * Sole-owner PROT_READ mmap (refs<=1, not stack/heap) still faults. */
-        bool break_ro = cow_bit || (ro_user && (in_stack || in_heap));
+        /* PROT_READ requested by the program (mmap/mprotect): a write is a
+         * real SIGSEGV, never a COW break -- even when fork shares the frame. */
+        bool user_ro = pte && (*pte & VMM_USER_RO);
+        bool break_ro = !user_ro && (cow_bit || (ro_user && (in_stack || in_heap)));
         extern uint8_t vmm_page_get_ref(uint64_t);
         uint8_t refs_peek = 0;
-        if (!break_ro && ro_user && pte) {
+        if (!break_ro && !user_ro && ro_user && pte) {
             refs_peek = vmm_page_get_ref(*pte & PTE_ADDR_MASK);
             if (refs_peek > 1)
                 break_ro = true;

@@ -73,7 +73,7 @@
  *============================================================================*/
 
 /** Maximum number of processes */
-#define MAX_PROCESSES               64
+#define MAX_PROCESSES               128
 
 /** Maximum number of threads */
 #define MAX_THREADS                 256

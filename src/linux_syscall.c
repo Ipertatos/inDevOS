@@ -1079,9 +1079,11 @@ static long lx_mmap(process_t *p, uint64_t addr, uint64_t len, long prot, long f
                     long fd, int64_t off) {
     if (len == 0) return -EINVAL;
     if (flags & LX_MAP_ANONYMOUS) {
-        /* MAP_SHARED|MAP_ANONYMOUS is only "shared" across fork, which is
-         * vfork-like here anyway: treat it as private. */
+        /* MAP_SHARED|MAP_ANONYMOUS: same frames in parent and fork children
+         * (VMM_SHARED PTEs are never COW-split). */
         int kf = MAP_ANONYMOUS | MAP_PRIVATE | ((flags & LX_MAP_FIXED) ? MAP_FIXED : 0);
+        if (flags & LX_MAP_SHARED)
+            kf |= SYS_MMAP_KSHARED;
         return (long)sys_mmap((void *)addr, (size_t)len, (int)prot, kf);
     }
     if (lx_fd_ok(p, fd) && p->fds[fd].fd_type == FD_TYPE_DEV_FB)
@@ -1127,7 +1129,7 @@ static long lx_wait4(process_t *p, long pid, int *uwstatus, long options, void *
     }
     /* Blocking wait (or WNOHANG with a zombie): wake any held newborns. */
     fork_release_pending(p);
-    long r = sys_wait(uwstatus);
+    long r = sys_wait_pid(pid, uwstatus);
     if (r > 0 && uwstatus) {
         int raw = 0;
         if (lx_get(&raw, uwstatus, sizeof(raw)) == 0) {
@@ -1213,6 +1215,13 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
                    a4 = fr->a4, a5 = fr->a5, a6 = fr->a6;
     char path[256], path2[256];
     long r;
+
+    /* sigsuspend woke on a signal that ran no handler (ignored/default):
+     * put the caller's mask back before anything else. */
+    if (p && p->sigsuspend_restore && !p->sig_in_handler) {
+        p->blocked_signals = p->sigsuspend_saved_mask;
+        p->sigsuspend_restore = false;
+    }
 
     switch (nr) {
     /* ---- file I/O ---- */
@@ -1308,7 +1317,21 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             pf[np].revents = 0;
             np++;
         }
-        int pr = np ? sys_poll(pf, (unsigned)np, timeout_ms) : 0;
+        int pr;
+        if (np) {
+            pr = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
+        } else {                    /* select(0, ..., timeout): plain sleep */
+            if (timeout_ms > 0) {
+                uint64_t dl = ktime_deadline_ms((uint64_t)timeout_ms);
+                fork_release_pending(p);
+                while (ktime_now_ms() < dl) {
+                    extern bool proc_signal_interrupts(process_t *);
+                    if (proc_signal_interrupts(p)) return -EINTR;
+                    __asm__ volatile("sti; hlt" ::: "memory");
+                }
+            }
+            pr = 0;
+        }
         if (pr < 0) return pr;
         uint64_t rout = 0, wout = 0, eout = 0;
         int ready = 0;
@@ -1589,7 +1612,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return sys_clone(a1, a2, a3, a4, a5);
     }
     case LX_execve: {
-        r = sys_exec((const char *)a1, (char *const *)a2);
+        r = sys_exec_env((const char *)a1, (char *const *)a2, (char *const *)a3);
         if (r < 0) return r;
                 /* In-place replace: SYSRET into the new entry (same pid). */
         if (p && p->exec_replaced) {
@@ -1713,6 +1736,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_rt_sigreturn: {
         if (!p->sig_in_handler) return 0;
         p->sig_in_handler = false;
+        if (p->sigsuspend_restore) {
+            p->blocked_signals = p->sigsuspend_saved_mask;
+            p->sigsuspend_restore = false;
+        }
         if (p->sig_from_irq) {
             p->sig_from_irq = false;
             p->sig_iret_pending = true; /* handled right after lx_dispatch */
@@ -1763,7 +1790,15 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (p->pending_signals & ~p->blocked_signals) break;
             ktime_yield_until(ktime_deadline_ms(5));
         }
-        p->blocked_signals = old;
+        if (p->pending_signals & ~p->blocked_signals) {
+            /* Linux: the handler runs under the temporary mask; the old mask
+             * comes back at rt_sigreturn.  Restoring it here re-blocked the
+             * signal before the return path could deliver it. */
+            p->sigsuspend_saved_mask = old;
+            p->sigsuspend_restore = true;
+        } else {
+            p->blocked_signals = old;
+        }
         return -EINTR;
     }
     case LX_sigaltstack:

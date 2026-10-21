@@ -86,6 +86,9 @@ static exec_auxinfo_t exec_cur_aux;
 static const char *const *exec_abi_extra_env;
 static char exec_spawn_cwd[256];
 static const char *const *exec_spawn_envp;
+/* execve envp (kernel copy) for the image exec_replace_env() is building;
+ * NULL = no caller environment (built-in defaults). */
+static const char *const *exec_user_envp;
 static const char *const exec_default_envp[] = {
     "PATH=/bin:/",
     "HOME=/",
@@ -210,7 +213,9 @@ static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
     /* exec_spawn_ex() extras (PWD, caller envp) first, then the defaults
      * whose keys the extras did not set. */
     for (int pass = 0; pass < 2; pass++) {
-        const char *const *list = pass == 0 ? exec_abi_extra_env : exec_default_envp;
+        const char *const *list = pass == 0
+            ? (exec_user_envp ? exec_user_envp : exec_abi_extra_env)
+            : (exec_user_envp ? NULL : exec_default_envp);
         for (int i = 0; list && list[i] && envc < 16; i++) {
             bool dup = false;
             if (pass == 1 && exec_abi_extra_env) {
@@ -1422,14 +1427,20 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
  */
 static int exec_replace_impl(process_t *proc, const char *filename, char *const argv[]);
 static volatile int exec_replace_busy = 0;
-int exec_replace(process_t *proc, const char *filename, char *const argv[]) {
+int exec_replace_env(process_t *proc, const char *filename, char *const argv[],
+                     const char *const envp[]) {
     while (__atomic_exchange_n(&exec_replace_busy, 1, __ATOMIC_ACQUIRE)) {
         if (global_scheduler.scheduler_running) thread_sleep(1);
         else __asm__ volatile("pause");
     }
+    exec_user_envp = envp;
     int r = exec_replace_impl(proc, filename, argv);
+    exec_user_envp = NULL;
     __atomic_store_n(&exec_replace_busy, 0, __ATOMIC_RELEASE);
     return r;
+}
+int exec_replace(process_t *proc, const char *filename, char *const argv[]) {
+    return exec_replace_env(proc, filename, argv, NULL);
 }
 static int exec_replace_impl(process_t *proc, const char *filename, char *const argv[]) {
     if (!proc || !filename)

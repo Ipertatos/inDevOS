@@ -325,6 +325,7 @@ uint32_t *fd_refcount_create(void) {
 
 static void process_signal_terminate(process_t *proc, int signum);
 static void handle_pending_signals(process_t *proc);
+static void process_orphan_children(process_t *proc);
 bool proc_signal_interrupts(process_t *p);
 void process_post_signal(process_t *t, int signum);
 int sys_getchar_intr(process_t *p);
@@ -1085,15 +1086,24 @@ int sys_exit(int status) {
     process_t *proc = get_current_process();
     if (proc)
         fork_release_pending(proc);
+    if (proc && !proc->fork_parent)
+        process_orphan_children(proc);   /* legacy vfork child: parent borrows;
+                                          * clone-vfork: done in zombie exit */
     if (proc) {
         proc->alarm_deadline_ms = 0;
         proc->exit_status = status;
         proc->is_running  = false;
     }
 
-    /* If this is a vfork child, return to the parent's fork() call
-     * instead of longjmping to exec_run_elf. */
-    if (proc && proc->fork_parent) {
+    /* If this is a LEGACY vfork child (running on the parent's thread after
+     * the parent's setjmp), return to the parent's fork() call instead of
+     * longjmping to exec_run_elf.  A clone(CLONE_VFORK) child owns its own
+     * thread and never had fork_jmpbuf set: it exits as a zombie below
+     * (fork_child_zombie_exit wakes the parent waiting in sys_clone). */
+    bool own_thread_vfork = proc && proc->fork_parent && proc->sched_thread &&
+        (thread_t *)proc->sched_thread == scheduler_get_current_thread() &&
+        proc->sched_thread != proc->fork_parent->sched_thread;
+    if (proc && proc->fork_parent && !own_thread_vfork) {
         proc->is_zombie = true;
         process_t *parent = proc->fork_parent;
         int child_pid = (int)proc->pid;
@@ -1329,7 +1339,13 @@ int sys_write(int fd, const void *buf, size_t count) {
             kfree(kbuf);
             return -EFAULT;
         }
+        if (proc->fds[fd].flags & O_APPEND) {
+            int endpos = vfs_seek(proc->fds[fd].vfs_fd, 0, VFS_SEEK_END);
+            if (endpos >= 0) proc->fds[fd].position = (uint32_t)endpos;
+        }
         int bytes_written = vfs_write(proc->fds[fd].vfs_fd, kbuf, count);
+        if (bytes_written == -1)
+            bytes_written = -EIO;   /* fs drivers return bare -1; that is -EPERM to user */
         if (bytes_written >= 0) {
             proc->fds[fd].position += bytes_written;
         }
@@ -1616,6 +1632,10 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
     proc = mm_syscall_owner(proc);
     if (length == 0 || length > (256ull << 20))
         return MMAP_ERR(EINVAL);
+    /* Internal: Linux MAP_SHARED|MAP_ANONYMOUS (lx_mmap) -- pages stay
+     * shared across fork (VMM_SHARED) instead of COW. */
+    bool kshared = (flags & SYS_MMAP_KSHARED) != 0;
+    flags &= ~SYS_MMAP_KSHARED;
     if (!(flags & MAP_ANONYMOUS))
         return MMAP_ERR(EOPNOTSUPP);
     if ((flags & MAP_SHARED))
@@ -1651,6 +1671,10 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
         pte_flags |= VMM_WRITABLE;
     if (!(prot & PROT_EXEC))
         pte_flags |= VMM_NX;
+    if (kshared)
+        pte_flags |= VMM_SHARED;
+    if (!(prot & PROT_WRITE))
+        pte_flags |= VMM_USER_RO;
 
     for (size_t p = 0; p < pages; p++) {
         uint64_t va = v0 + p * PAGE_SIZE;
@@ -1743,6 +1767,9 @@ int sys_mprotect(void *addr, size_t length, int prot) {
         /* Preserve COW bit if set so fork semantics stay intact. */
         if (*pte & VMM_COW)
             flags = (flags & ~VMM_WRITABLE) | VMM_COW;
+        flags |= *pte & VMM_SHARED;          /* MAP_SHARED stays shared */
+        if (!(prot & PROT_WRITE))
+            flags |= VMM_USER_RO;            /* a write must SIGSEGV */
         *pte = phys | flags;
         __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
     }
@@ -1991,6 +2018,50 @@ void process_fault_kill_current(int signum) {
         proc->parent->pending_signals |= (1u << SIGCHLD);
 }
 
+/* Exit-time child cleanup.  Zombie children of an exiting process were never
+ * reaped (nobody would ever wait for them), so every fork child that exited
+ * without waiting leaked process slots (+ page tables) until fork returned
+ * -ENOMEM (ostest proc.many_children -> zombies/vfork/sigint_pgrp cascade).
+ * Reap zombie children now; hand still-running ones to our parent (Linux
+ * reparents to init) so their zombie is collected by its wait(). */
+static void process_orphan_children(process_t *proc) {
+    extern process_t *get_kernel_process(void);
+    if (!proc || !proc->child) return;
+    process_t *np = proc->parent;
+    bool np_ok = np && np != get_kernel_process() && np != proc &&
+                 np->is_running && !np->is_zombie;
+    uint64_t f = 0;
+    scheduler_irq_lock(&f);
+    process_t *list = proc->child;
+    proc->child = NULL;
+    scheduler_irq_unlock(f);
+    int reaped = 0, moved = 0;
+    while (list) {
+        process_t *c = list;
+        list = c->sibling;
+        c->sibling = NULL;
+        if (c->is_zombie) {
+            process_release(c);
+            memset(c, 0, sizeof(process_t));
+            reaped++;
+            continue;
+        }
+        scheduler_irq_lock(&f);
+        if (np_ok) {
+            c->parent = np;
+            c->sibling = np->child;
+            np->child = c;
+        } else {
+            c->parent = NULL;
+        }
+        scheduler_irq_unlock(f);
+        moved++;
+    }
+    if (reaped || moved)
+        serial_printf("exit: PID %u reaped %d zombie children, reparented %d to %u\n",
+                      proc->pid, reaped, moved, np_ok ? np->pid : 0);
+}
+
 void fork_child_zombie_exit(int status) {
     /* SMP: never use global current_process — APs overwrite it mid-exit
      * and we would close the sibling's fds (PIPEOK: PID4 exit zombied PID5). */
@@ -2004,6 +2075,7 @@ void fork_child_zombie_exit(int status) {
 
     serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
                   proc ? (int)proc->pid : -1, status);
+    process_orphan_children(proc);
 
     if (proc) {
         proc->alarm_deadline_ms = 0;
@@ -2408,8 +2480,8 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
     if (do_vfork) {
         /* Child was queued BLOCKED with defer; must run while we wait
          * in-kernel -- release now or this loops forever. */
-        fork_release_pending(parent);
         child->fork_parent = parent;
+        fork_release_pending(parent);
         while (child->fork_parent == parent) {
             if (child->is_zombie) {
                 child->fork_parent = NULL;
@@ -2435,7 +2507,24 @@ int sys_clone(uint64_t flags, uint64_t newsp, uint64_t parent_tidptr,
 
 
 
-int sys_wait(int *status) {
+/* waitpid() pid selector: >0 that child, -1 any, 0 caller's pgrp, <-1 pgrp. */
+static bool wait_match(process_t *parent, process_t *c, long wpid) {
+    if (wpid > 0)  return c->pid == (uint32_t)wpid;
+    if (wpid == 0) return c->pgid == parent->pgid;
+    if (wpid < -1) return c->pgid == (uint32_t)(-wpid);
+    return true;
+}
+static bool wait_has_match(process_t *parent, long wpid) {
+    for (process_t *c = parent->child; c; c = c->sibling)
+        if (wait_match(parent, c, wpid)) return true;
+    return false;
+}
+
+int sys_wait(int *status) { return sys_wait_pid(-1, status); }
+
+/* Blocking wait for a child selected by @wpid (sys_wait used to reap the
+ * first zombie whatever pid waitpid() asked for). */
+int sys_wait_pid(long wpid, int *status) {
     /* SMP: never use the global current_process — APs overwrite it. */
     process_t *parent = get_current_process();
     /* Wake held newborns before blocking. */
@@ -2443,7 +2532,7 @@ int sys_wait(int *status) {
         fork_release_pending(parent);
 
     for (;;) {
-        if (!parent->child)
+        if (!wait_has_match(parent, wpid))
             return -ECHILD;
 
         /* Lost-wakeup protocol: under scheduler_lock, set BLOCKED THEN scan
@@ -2455,12 +2544,12 @@ int sys_wait(int *status) {
         scheduler_irq_lock(&wf);
         thread_block_current_unlocked();
         for (process_t *c = parent->child; c; c = c->sibling) {
-            if (c->is_zombie) {
+            if (c->is_zombie && wait_match(parent, c, wpid)) {
                 zombie = c;
                 break;
             }
         }
-        if (zombie || !parent->child) {
+        if (zombie || !wait_has_match(parent, wpid)) {
             thread_unblock_current_running_unlocked();
             scheduler_irq_unlock(wf);
             if (!zombie)
@@ -3051,6 +3140,14 @@ static int exec_resolve_path(process_t *proc, const char *name, char *out, size_
 }
 
 int sys_exec(const char *pathname, char *const argv[]) {
+    return sys_exec_env(pathname, argv, NULL);
+}
+
+/* execve with an environment: envp (user pointer, may be NULL) becomes the
+ * new image's environment instead of the built-in defaults. */
+#define EXEC_ENV_MAX 15
+#define EXEC_ENV_LEN 256
+int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]) {
     process_t *p = get_current_process();
 
     /* Copy the path out of user memory before dereferencing it: pathname is
@@ -3088,6 +3185,30 @@ int sys_exec(const char *pathname, char *const argv[]) {
         }
     }
     kargv[argc] = NULL;
+    /* Copy envp into one kernel block: pointer table + strings. */
+    char *envblk = NULL;
+    const char **kenvp = NULL;
+    if (envp && is_user_address((uint64_t)envp)) {
+        envblk = (char *)kalloc((EXEC_ENV_MAX + 1) * sizeof(char *) + EXEC_ENV_MAX * EXEC_ENV_LEN);
+        if (envblk) {
+            kenvp = (const char **)envblk;
+            char *strs = envblk + (EXEC_ENV_MAX + 1) * sizeof(char *);
+            int ne = 0;
+            for (int i = 0; ne < EXEC_ENV_MAX && i < 256; i++) {
+                char *uptr = NULL;
+                if (copy_from_user(&uptr, &envp[i], sizeof(uptr)) != 0 || !uptr)
+                    break;
+                if (!is_user_address((uint64_t)uptr))
+                    break;
+                char *dst = strs + ne * EXEC_ENV_LEN;
+                if (!strncpy_from_user(dst, uptr, EXEC_ENV_LEN))
+                    break;
+                dst[EXEC_ENV_LEN - 1] = '\0';
+                kenvp[ne++] = dst;
+            }
+            kenvp[ne] = NULL;
+        }
+    }
     char resolved[256];
     exec_resolve_path(p, kpath, resolved, sizeof(resolved));
 
@@ -3097,13 +3218,19 @@ int sys_exec(const char *pathname, char *const argv[]) {
      * the new entry via proc->exec_replaced (see LX_execve).
      */
     if (p->is_usermode && p->pml4) {
-        int ir = exec_replace(p, resolved, argc ? kargv : NULL);
+        extern int exec_replace_env(process_t *proc, const char *filename, char *const argv[],
+                                    const char *const envp[]);
+        int ir = exec_replace_env(p, resolved, argc ? kargv : NULL, kenvp);
+        if (envblk)
+            kfree(envblk);
         if (ir < 0)
             return ir;
         /* Success: do not nest. Caller rewrites the SYSCALL frame. */
         return 0;
     }
 
+    if (envblk)
+        kfree(envblk);
     /* Kernel/shell first launch: nested blocking exec_file (unchanged). */
     bool nested_exec = get_program_running();
     if (nested_exec)
@@ -3283,10 +3410,21 @@ int sys_select(int nfds, fd_set_t *readfds, fd_set_t *writefds, fd_set_t *except
     return 0;
 }
 
+static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool kbuf);
 int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
+    return sys_poll_impl(fds, nfds, timeout_ms, false);
+}
+int sys_poll_kernel(pollfd_t *kfds_in, unsigned int nfds, int timeout_ms) {
+    return sys_poll_impl(kfds_in, nfds, timeout_ms, true);
+}
+static int poll_copy_out(pollfd_t *dst, const pollfd_t *src, unsigned int nfds, bool kbuf) {
+    if (kbuf) { memcpy(dst, src, nfds * sizeof(pollfd_t)); return 0; }
+    return copy_to_user(dst, src, nfds * sizeof(pollfd_t));
+}
+static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool kbuf) {
     syscall_uaccess_ensure_user_cr3();
     if (!fds || nfds == 0 || nfds > 64 ||
-        !access_ok_user_range((uint64_t)fds, nfds * sizeof(pollfd_t)))
+        (!kbuf && !access_ok_user_range((uint64_t)fds, nfds * sizeof(pollfd_t))))
         return -EFAULT;
 
     extern uint64_t ktime_deadline_ms(uint64_t);
@@ -3298,7 +3436,9 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
         deadline = ktime_deadline_ms(60000);
 
     pollfd_t kfds[64];
-    if (copy_from_user(kfds, fds, nfds * sizeof(pollfd_t)) != 0)
+    if (kbuf)
+        memcpy(kfds, fds, nfds * sizeof(pollfd_t));
+    else if (copy_from_user(kfds, fds, nfds * sizeof(pollfd_t)) != 0)
         return -EFAULT;
 
     process_t *proc = get_current_process();
@@ -3315,10 +3455,14 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
             if ((kfds[i].events & POLLIN) && fd == STDIN_FILENO &&
                 keyboard_get_buffer_length() > 0) {
                 kfds[i].revents |= POLLIN;
-            } else if ((kfds[i].events & POLLIN) && fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
+            } else if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
                        proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_PIPE_READ) {
-                if (pipe_available((pipe_t *)proc->fds[fd].file_handle) > 0)
+                pipe_t *rp = (pipe_t *)proc->fds[fd].file_handle;
+                if ((kfds[i].events & POLLIN) && rp && pipe_available(rp) > 0)
                     kfds[i].revents |= POLLIN;
+                /* Linux: all writers gone -> POLLHUP (reported even if not requested) */
+                if (rp && rp->writers == 0)
+                    kfds[i].revents |= POLLHUP;
             } else if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
                        proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_SOCKET) {
                 kernel_socket_t *ks = (kernel_socket_t *)proc->fds[fd].file_handle;
@@ -3380,6 +3524,14 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
                     kfds[i].revents |= POLLIN;
                 kfds[i].revents |= kfds[i].events & POLLOUT;
             }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == FD_TYPE_PIPE_WRITE) {
+                pipe_t *wp = (pipe_t *)proc->fds[fd].file_handle;
+                if (wp && wp->readers == 0)
+                    kfds[i].revents |= POLLERR;
+                else if (!wp || wp->count < wp->buf_size)
+                    kfds[i].revents |= kfds[i].events & POLLOUT;
+            }
             if ((kfds[i].events & POLLOUT) && fd >= 1 && fd <= 2)
                 kfds[i].revents |= POLLOUT;
             /* POSIX: return value is the number of fds with nonzero revents */
@@ -3395,7 +3547,7 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
                               kfds[j].events, kfds[j].revents, cnt);
         }
         if (cnt > 0) {
-            if (copy_to_user(fds, kfds, nfds * sizeof(pollfd_t)) != 0)
+            if (poll_copy_out(fds, kfds, nfds, kbuf) != 0)
                 return -EFAULT;
             return cnt;
         }
@@ -3422,7 +3574,7 @@ int sys_poll(pollfd_t *fds, unsigned int nfds, int timeout_ms) {
         if (timeout_ms > 0 && ktime_expired(deadline))
             break;
     }
-    if (copy_to_user(fds, kfds, nfds * sizeof(pollfd_t)) != 0)
+    if (poll_copy_out(fds, kfds, nfds, kbuf) != 0)
         return -EFAULT;
     return 0;
 }
@@ -4061,6 +4213,7 @@ int sys_dup(int oldfd) {
 
     // Copy the file descriptor entry
     memcpy(&proc->fds[newfd], &proc->fds[oldfd], sizeof(file_descriptor_t));
+    proc->fds[newfd].cloexec = false;   /* dup/dup2 never copy FD_CLOEXEC */
     if (proc->fds[newfd].ref_count) {
         (*proc->fds[newfd].ref_count)++;
     } else {
@@ -4109,6 +4262,7 @@ int sys_dup2(int oldfd, int newfd) {
 
     // Copy the file descriptor entry
     memcpy(&proc->fds[newfd], &proc->fds[oldfd], sizeof(file_descriptor_t));
+    proc->fds[newfd].cloexec = false;   /* dup/dup2 never copy FD_CLOEXEC */
     proc->fds[newfd].in_use = true;
     if (proc->fds[newfd].ref_count) {
         (*proc->fds[newfd].ref_count)++;
@@ -4310,6 +4464,9 @@ int sys_ioctl(int fd, unsigned long request, void *arg) {
             // Get number of bytes available to read
             if (arg) {
                 int value = 0;
+                if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                    proc->fds[fd].fd_type == FD_TYPE_PIPE_READ && proc->fds[fd].file_handle)
+                    value = (int)pipe_available((pipe_t *)proc->fds[fd].file_handle);
                 if (copy_to_user(arg, &value, sizeof(value)) != 0) {
                     return -EFAULT;
                 }

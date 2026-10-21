@@ -31,6 +31,8 @@
 #define VMM_HUGE        (1ULL << 7)    /**< Huge page (2MB at PD level, 1GB at PDPT) */
 #define VMM_GLOBAL      (1ULL << 8)    /**< Global page (not flushed on CR3 change) */
 #define VMM_COW         (1ULL << 9)    /**< Copy-on-write (OS-defined, avail bit 9) */
+#define VMM_SHARED      (1ULL << 11)   /**< MAP_SHARED anon: fork shares the frame, never COW (avail bit 11) */
+#define VMM_USER_RO     (1ULL << 52)   /**< user asked for read-only (mmap/mprotect): never COW-break (avail bit 52) */
 #define VMM_DEVICE      (1ULL << 10)   /**< Device memory (fb mmap): never freed, never COW (avail bit 10) */
 /** No-execute bit, or 0 when the CPU lacks NX (bit 63 would be reserved) */
 extern uint64_t vmm_nx_bit;

@@ -212,7 +212,7 @@ typedef struct kernel_socket {
 
 // Maximum number of open files per process (avoid conflict with fat32.h)
 #ifndef MAX_OPEN_FILES_SYSCALL
-#define MAX_OPEN_FILES_SYSCALL  16
+#define MAX_OPEN_FILES_SYSCALL  64
 #endif
 
 // File descriptor type
@@ -371,6 +371,11 @@ typedef struct process {
      * process_alarm_tick(), which posts SIGALRM like kill() does. */
     volatile uint64_t alarm_deadline_ms;
     uint64_t alarm_interval_ms;
+
+    /* rt_sigsuspend: mask to restore once the handler that woke it has run
+     * (rt_sigreturn), or at the next syscall if no handler was invoked. */
+    uint32_t sigsuspend_saved_mask;
+    bool     sigsuspend_restore;
 } process_t;
 
 /** @brief Virtual memory layout for processes */
@@ -421,7 +426,10 @@ int sys_munmap(void *addr, size_t length);
 int sys_getpid(void);
 int sys_fork(void);
 int sys_exec(const char *pathname, char *const argv[]);
+int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]);
 int sys_wait(int *status);
+int sys_poll_kernel(pollfd_t *kfds, unsigned int nfds, int timeout_ms);
+int sys_wait_pid(long wpid, int *status);
 sighandler_t sys_signal(int signum, sighandler_t handler);
 int sys_kill(pid_t pid, int signum);
 int sys_sleep(unsigned int seconds);
@@ -517,6 +525,8 @@ int sys_setpgid(pid_t pid, pid_t pgid);
 int sys_setsid(void);
 
 void fork_release_pending(process_t *p);
+/* sys_mmap() internal flag: MAP_SHARED anonymous (shared across fork). */
+#define SYS_MMAP_KSHARED 0x40000000
 void fork_release_after_syscall(process_t *p);
 void fork_child_zombie_exit(int status);
 int process_deliver_signals(process_t *proc, void *linux_frame);
