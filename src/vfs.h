@@ -52,6 +52,12 @@ typedef struct vfs_dirent {
 } vfs_dirent_t;
 
 // Filesystem operations – each filesystem implementation fills these in
+typedef struct vfs_stat {
+    uint32_t mode, uid, gid, nlink, blksize;
+    uint64_t size, ino, blocks;
+    int64_t  atime, mtime, ctime;        /* seconds since the epoch */
+} vfs_stat_t;
+
 typedef struct vfs_fs_ops {
     // Open a file relative to the mountpoint.  'rel_path' has the mount
     // prefix stripped.  Returns a filesystem-private handle (cookie).
@@ -98,6 +104,8 @@ typedef struct vfs_fs_ops {
     int   (*truncate)(struct vfs_filesystem *fs, const char *rel_path, uint64_t len);
     int   (*ftruncate)(struct vfs_filesystem *fs, void *handle, uint64_t len);
     int   (*sync)(struct vfs_filesystem *fs);
+    /* Optional: real inode metadata (follows symlinks).  0 or -errno. */
+    int   (*stat)(struct vfs_filesystem *fs, const char *rel_path, struct vfs_stat *st);
 } vfs_fs_ops_t;
 
 // A mounted filesystem instance
@@ -153,6 +161,8 @@ int  vfs_unlink(const char *path);
 int  vfs_rename(const char *oldpath, const char *newpath);
 int  vfs_rmdir(const char *path);
 int  vfs_truncate(const char *path, uint64_t len);
+/* Filesystem-provided metadata; -ENOSYS when the fs has no stat op. */
+int vfs_stat(const char *path, vfs_stat_t *st);
 int  vfs_ftruncate(int fd, uint64_t len);
 int  vfs_sync_all(void);
 int  vfs_exists(const char *path);

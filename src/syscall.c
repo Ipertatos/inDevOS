@@ -3871,6 +3871,23 @@ static void stat_fill_common(stat_t *st, uint32_t mode, uint64_t size,
 static int stat_vfs_path(const char *abspath, stat_t *st) {
     uint32_t uid = 0, gid = 0;
     uint16_t pm = 0644;
+    {
+        vfs_stat_t vs;
+        int vr = vfs_stat(abspath, &vs);
+        if (vr == 0) {                      /* filesystem with real inodes (ext2/3/4) */
+            stat_fill_common(st, vs.mode, vs.size, abspath, vs.uid, vs.gid);
+            st->st_ino = vs.ino;
+            st->st_nlink = vs.nlink ? vs.nlink : 1;
+            st->st_blksize = vs.blksize ? vs.blksize : 4096;
+            st->st_blocks = vs.blocks;
+            st->st_atime = vs.atime;
+            st->st_mtime = vs.mtime;
+            st->st_ctime = vs.ctime;
+            return 0;
+        }
+        if (vr != -ENOSYS)
+            return vr == -5 ? -EIO : -ENOENT;
+    }
     perm_get(abspath, &uid, &gid, &pm);
 
     int vfd = vfs_open(abspath, VFS_O_READ);

@@ -310,7 +310,9 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap){
          * printed a literal "%-22s" and then let the following conversions read
          * the wrong varargs (the profiler's syscall table printed pointers as
          * integers and lost every syscall name). */
-        if(*fmt == '-'){
+        int alt = 0;              /* '#': 0x prefix for nonzero %x/%X */
+        while(*fmt == '-' || *fmt == '#' || *fmt == '+' || *fmt == ' '){
+            if(*fmt == '#') alt = 1;
             fmt++;
         }
         if(*fmt == '0'){
@@ -396,6 +398,7 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap){
                     val = va_arg(ap, unsigned long long);
                 else
                     val = va_arg(ap, unsigned int);
+                if(alt && val){ append_str(&buf, &remaining, "0x", &written); if(width >= 2) width -= 2; }
                 append_uint(&buf, &remaining, val, 16, 0, width, zero_pad, &written);
                 break;
             }
@@ -405,6 +408,7 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap){
                     val = va_arg(ap, unsigned long long);
                 else
                     val = va_arg(ap, unsigned int);
+                if(alt && val){ append_str(&buf, &remaining, "0X", &written); if(width >= 2) width -= 2; }
                 append_uint(&buf, &remaining, val, 16, 1, width, zero_pad, &written);
                 break;
             }

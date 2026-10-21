@@ -280,6 +280,11 @@ void serial_printf(const char *format, ...) {
             // Handle padding
             int pad_width = 0;
             bool zero_pad = false;
+            bool alt = false;           /* '#': 0x prefix for nonzero %x/%X */
+            while (*p == '#' || *p == '-' || *p == '+' || *p == ' ') {
+                if (*p == '#') alt = true;
+                p++;
+            }
             
             // Check for zero padding
             if (*p == '0') {
@@ -310,6 +315,12 @@ void serial_printf(const char *format, ...) {
                 if (*p == 'h') p += 1;
             }
             
+            if (alt && (*p == 'x' || *p == 'X')) {
+                va_list cp; va_copy(cp, args);
+                unsigned long long av = is_long_long ? va_arg(cp, unsigned long long) : va_arg(cp, unsigned int);
+                va_end(cp);
+                if (av) { serial_putc_unlocked('0'); serial_putc_unlocked(*p); }
+            }
             switch (*p) {
                 case 'd': {
                     if (is_long_long) {

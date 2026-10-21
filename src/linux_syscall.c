@@ -486,7 +486,15 @@ static void lx_fill_stat(lx_stat_t *ls, const stat_t *st) {
     ls->st_blocks = (int64_t)st->st_blocks;
     /* The VFS has no timestamps yet; report "now" rather than boot-relative
      * seconds so tools that compare times see something plausible. */
-    ls->st_atime_sec = ls->st_mtime_sec = ls->st_ctime_sec = now;
+    /* Filesystems with real inode times (ext2/3/4) report epoch seconds;
+     * the rest fill boot-relative values, for which "now" is reported. */
+    if (st->st_mtime > 100000000) {
+        ls->st_atime_sec = st->st_atime;
+        ls->st_mtime_sec = st->st_mtime;
+        ls->st_ctime_sec = st->st_ctime;
+    } else {
+        ls->st_atime_sec = ls->st_mtime_sec = ls->st_ctime_sec = now;
+    }
 }
 
 /* Synthetic character devices: stat/access by path (fbdev apps, isatty

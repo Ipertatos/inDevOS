@@ -505,6 +505,17 @@ int vfs_rmdir(const char *path) {
     return fat32_remove_empty_directory(path);               /* FAT32: unchanged */
 }
 
+int vfs_stat(const char *path, vfs_stat_t *st) {
+    if (!path || !st) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    if (!fs || !fs->ops || !fs->ops->stat) { VFS_UNLOCK(); return -ENOSYS; }
+    int r = fs->ops->stat(fs, rel ? rel : "", st);
+    VFS_UNLOCK();
+    return r;
+}
+
 int vfs_truncate(const char *path, uint64_t len) {
     if (!path) return -EINVAL;
     VFS_LOCK();

@@ -38,6 +38,9 @@ struct e4_vol {
     char     label[17];
     char     mpath[64];
     uint8_t *gdt;                   /* all group descriptors */
+    bool     csum;                  /* metadata_csum: verify crc32c */
+    uint32_t seed;                  /* crc32c(~0, uuid) or s_checksum_seed */
+    uint32_t csum_errs;
 };
 
 typedef struct {
@@ -45,10 +48,43 @@ typedef struct {
     uint32_t uid, gid, flags, links;
     uint64_t size;
     uint32_t mtime;
+    uint32_t ino, cseed;            /* inode number, per-inode crc32c seed */
     uint8_t  iblock[60];
     uint8_t  raw[1024];             /* whole on-disk inode (inline data xattr) */
     uint32_t rawlen;
 } e4_inode_t;
+
+#define RO_HUGE_FILE     0x0008
+#define RO_METADATA_CSUM 0x0400
+#define FL_INDEX     0x00001000u
+#define FL_HUGE_FILE 0x00040000u
+#define E4_BMAP_ERR  ((uint64_t)-1)
+
+/* crc32c (Castagnoli, reflected 0x82F63B78) without the final inversion -
+ * the form ext4 stores (Linux ext4_chksum). */
+static uint32_t e4_crc_tab[256];
+static volatile bool e4_crc_ready;
+static uint32_t e4_crc32c(uint32_t crc, const void *data, uint32_t len) {
+    if (!e4_crc_ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0x82F63B78u & (0u - (c & 1u)));
+            e4_crc_tab[i] = c;
+        }
+        e4_crc_ready = true;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    while (len--) crc = e4_crc_tab[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+static const uint8_t e4_zero4[4];
+static void e4_csum_bad(e4_vol_t *v, const char *what, uint64_t id, uint32_t want, uint32_t got) {
+    v->csum_errs++;
+    serial_printf("[ext4ro] %s %llu checksum mismatch (stored 0x%x computed 0x%x) - EIO\n",
+                  what, (unsigned long long)id, want, got);
+    if (v->csum_errs <= 4)
+        printf("ext4: %s %llu: metadata checksum mismatch\n", what, (unsigned long long)id);
+}
 
 #define E4_MAX_VOLS 8
 static e4_vol_t *e4_vols[E4_MAX_VOLS];
@@ -92,6 +128,27 @@ static int e4_iget(e4_vol_t *v, uint32_t ino, e4_inode_t *out) {
     out->links = *(uint16_t *)(r + 26);
     out->flags = *(uint32_t *)(r + 32);
     memcpy(out->iblock, r + 40, 60);
+    out->ino = ino;
+    if (v->csum) {
+        uint32_t le = ino, gen = *(uint32_t *)(r + 0x64);
+        uint32_t s = e4_crc32c(v->seed, &le, 4);
+        s = e4_crc32c(s, &gen, 4);
+        out->cseed = s;
+        uint32_t isz = out->rawlen;
+        bool has_hi = isz > 128 && 128u + *(uint16_t *)(r + 0x80) >= 0x84;
+        uint32_t c = e4_crc32c(s, r, 0x7C);
+        c = e4_crc32c(c, e4_zero4, 2);
+        if (isz > 128) {
+            c = e4_crc32c(c, r + 0x7E, 0x82 - 0x7E);
+            if (has_hi) { c = e4_crc32c(c, e4_zero4, 2); c = e4_crc32c(c, r + 0x84, isz - 0x84); }
+            else c = e4_crc32c(c, r + 0x82, isz - 0x82);
+        } else {
+            c = e4_crc32c(c, r + 0x7E, isz - 0x7E);
+        }
+        uint32_t stored = *(uint16_t *)(r + 0x7C) | (has_hi ? (uint32_t)*(uint16_t *)(r + 0x82) << 16 : 0);
+        uint32_t calc = has_hi ? c : (c & 0xFFFF);
+        if (stored != calc) { e4_csum_bad(v, "inode", ino, stored, calc); return -1; }
+    }
     return 0;
 }
 
@@ -125,7 +182,14 @@ static uint64_t e4_bmap(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk) {
             const uint8_t *ix = e + 12 * pick;
             uint64_t leaf = *(uint32_t *)(ix + 4) | ((uint64_t)*(uint16_t *)(ix + 8) << 32);
             if (!buf && !(buf = (uint8_t *)kalloc(v->bs))) break;
-            if (e4_read(v, leaf, buf) != 0) break;
+            if (e4_read(v, leaf, buf) != 0) { res = E4_BMAP_ERR; break; }
+            if (*(uint16_t *)buf != 0xF30A) { res = E4_BMAP_ERR; break; }
+            if (v->csum) {
+                uint32_t to = 12 + 12u * *(uint16_t *)(buf + 4);
+                if (to + 4 > v->bs) { res = E4_BMAP_ERR; break; }
+                uint32_t c = e4_crc32c(in->cseed, buf, to), st = *(uint32_t *)(buf + to);
+                if (c != st) { e4_csum_bad(v, "extent block", leaf, st, c); res = E4_BMAP_ERR; break; }
+            }
             node = buf;
         }
         if (buf) kfree(buf);
@@ -197,6 +261,7 @@ static int e4_pread(e4_vol_t *v, const e4_inode_t *in, uint64_t off, uint8_t *ds
         uint32_t lb = (uint32_t)(p / v->bs), in_off = (uint32_t)(p % v->bs);
         uint32_t n = v->bs - in_off; if (n > len - done) n = len - done;
         uint64_t pb = e4_bmap(v, in, lb);
+        if (pb == E4_BMAP_ERR) { kfree(b); return done ? (int)done : -5 /* -EIO */; }
         if (!pb) memset(dst + done, 0, n);
         else if (in_off == 0 && n == v->bs) {
             if (e4_read(v, pb, dst + done) != 0) { kfree(b); return done ? (int)done : -1; }
@@ -208,6 +273,32 @@ static int e4_pread(e4_vol_t *v, const e4_inode_t *in, uint64_t off, uint8_t *ds
     }
     kfree(b);
     return (int)done;
+}
+
+/* metadata_csum directory blocks: leaves end in a 12-byte fake dirent
+ * (inode 0, rec_len 12, file_type 0xDE) holding crc32c(inode seed, block);
+ * htree index blocks (dx root / dx node) end in a dx_tail after the
+ * dx_entry array. */
+static bool e4_dirblk_ok(e4_vol_t *v, const e4_inode_t *d, uint32_t lb, uint64_t pb, const uint8_t *b) {
+    uint32_t bs = v->bs;
+    const uint8_t *t = b + bs - 12;
+    if (*(uint32_t *)t == 0 && *(uint16_t *)(t + 4) == 12 && t[6] == 0 && t[7] == 0xDE) {
+        uint32_t c = e4_crc32c(d->cseed, b, bs - 12), st = *(uint32_t *)(t + 8);
+        if (c != st) { e4_csum_bad(v, "dir block", pb, st, c); return false; }
+        return true;
+    }
+    uint32_t co = 0;
+    if ((d->flags & FL_INDEX) && lb == 0) co = 24 + b[24 + 5];        /* dx_root: . .. info */
+    else if (*(uint32_t *)b == 0 && *(uint16_t *)(b + 4) == bs) co = 8;  /* dx_node */
+    if (!co) { e4_csum_bad(v, "dir block (no csum tail)", pb, 0, 0); return false; }
+    uint32_t limit = *(uint16_t *)(b + co), count = *(uint16_t *)(b + co + 2);
+    uint32_t to = co + limit * 8;
+    if (count > limit || to + 8 > bs) { e4_csum_bad(v, "dx block (bad limit)", pb, limit, count); return false; }
+    uint32_t c = e4_crc32c(d->cseed, b, co + count * 8);
+    c = e4_crc32c(c, b + to, 4);
+    uint32_t st = *(uint32_t *)(b + to + 4);
+    if (c != st) { e4_csum_bad(v, "dx block", pb, st, c); return false; }
+    return true;
 }
 
 /* Directory iteration: cb(name, nlen, ino, ftype, arg) != 0 stops. */
@@ -237,8 +328,10 @@ static int e4_dir_iter(e4_vol_t *v, const e4_inode_t *d, e4_dcb cb, void *arg) {
     uint32_t nblk = (uint32_t)((d->size + v->bs - 1) / v->bs);
     for (uint32_t lb = 0; lb < nblk && !rc; lb++) {
         uint64_t pb = e4_bmap(v, d, lb);
+        if (pb == E4_BMAP_ERR) { rc = -1; break; }
         if (!pb) continue;
         if (e4_read(v, pb, b) != 0) { rc = -1; break; }
+        if (v->csum && !e4_dirblk_ok(v, d, lb, pb, b)) { rc = -1; break; }
         for (uint32_t o = 0; o + 8 <= v->bs; ) {
             uint32_t ino = *(uint32_t *)(b + o); uint16_t rl = *(uint16_t *)(b + o + 4);
             uint8_t nl = b[o + 6], ft = b[o + 7];
@@ -334,6 +427,16 @@ e4_vol_t *ext4ro_mount(uint8_t dev, uint32_t lba) {
         kfree(sb); return NULL;
     }
     if (inc & I_META_BG) { printf("ext4: meta_bg not supported - not mounting\n"); kfree(sb); return NULL; }
+    bool csum = (roc & RO_METADATA_CSUM) != 0;
+    uint32_t seed = 0;
+    if (csum) {
+        uint32_t c = e4_crc32c(~0u, sb, 0x3FC), st = *(uint32_t *)(sb + 0x3FC);
+        if (sb[0x175] != 1 || c != st) {
+            printf("ext4: superblock checksum mismatch (stored %#x computed %#x) - not mounting\n", st, c);
+            kfree(sb); return NULL;
+        }
+        seed = (inc & I_CSUM_SEED) ? *(uint32_t *)(sb + 0x270) : e4_crc32c(~0u, sb + 0x68, 16);
+    }
     e4_vol_t *v = (e4_vol_t *)kalloc(sizeof(e4_vol_t));
     if (!v) { kfree(sb); return NULL; }
     memset(v, 0, sizeof(*v));
@@ -348,6 +451,7 @@ e4_vol_t *ext4ro_mount(uint8_t dev, uint32_t lba) {
     if (v->dsz < 32) v->dsz = 32;
     v->blocks = *(uint32_t *)(sb + 0x04) | ((inc & I_64BIT) ? (uint64_t)*(uint32_t *)(sb + 0x150) << 32 : 0);
     v->incompat = inc; v->ro_compat = roc;
+    v->csum = csum; v->seed = seed;
     memcpy(v->label, sb + 0x78, 16); v->label[16] = 0;
     kfree(sb);
     if (v->bs > 65536 || v->bpg == 0 || v->ipg == 0 || v->isz < 128) { printf("ext4: bad geometry\n"); kfree(v); return NULL; }
@@ -357,9 +461,24 @@ e4_vol_t *ext4ro_mount(uint8_t dev, uint32_t lba) {
     if (!v->gdt) { kfree(v); return NULL; }
     for (uint32_t i = 0; i < gblocks; i++)
         if (e4_read(v, v->first_data + 1 + i, v->gdt + i * v->bs) != 0) { kfree(v->gdt); kfree(v); return NULL; }
+    if (v->csum) {
+        for (uint32_t g = 0; g < v->groups; g++) {
+            const uint8_t *gd = v->gdt + (uint64_t)g * v->dsz;
+            uint32_t c = e4_crc32c(v->seed, &g, 4);
+            c = e4_crc32c(c, gd, 0x1E);
+            c = e4_crc32c(c, e4_zero4, 2);
+            if (v->dsz > 0x20) c = e4_crc32c(c, gd + 0x20, v->dsz - 0x20);
+            uint16_t st = *(uint16_t *)(gd + 0x1E);
+            if ((c & 0xFFFF) != st) {
+                printf("ext4: group %u descriptor checksum mismatch (stored %#x computed %#x) - not mounting\n",
+                       g, st, c & 0xFFFF);
+                kfree(v->gdt); kfree(v); return NULL;
+            }
+        }
+    }
     if (inc & I_RECOVER) printf("ext4: journal needs recovery - reading as-is (read-only)\n");
-    serial_printf("[ext4ro] mounted dev %u LBA %u label '%s': %u-byte blocks, %u groups, incompat %#x ro_compat %#x\n",
-                  dev, lba, v->label, v->bs, v->groups, inc, roc);
+    serial_printf("[ext4ro] mounted dev %u LBA %u label '%s': %u-byte blocks, %u groups, incompat %#x ro_compat %#x%s\n",
+                  dev, lba, v->label, v->bs, v->groups, inc, roc, v->csum ? ", metadata_csum verified" : "");
     return v;
 }
 
@@ -458,6 +577,31 @@ static int e4_exists(vfs_filesystem_t *fs, const char *rel) {
     int ok = e4_namei((e4_vol_t *)fs->fs_data, rel ? rel : "", d, 0, true) != 0;
     kfree(d); return ok;
 }
+/* Real inode metadata for stat(): follows symlinks like stat(2). */
+static int e4_stat(vfs_filesystem_t *fs, const char *rel, vfs_stat_t *st) {
+    e4_vol_t *v = (e4_vol_t *)fs->fs_data;
+    e4_inode_t *in = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    if (!in) return -12;
+    uint32_t ino = e4_namei(v, rel ? rel : "", in, 0, true);
+    if (!ino) { kfree(in); return -2; /* ENOENT */ }
+    const uint8_t *r = in->raw;
+    memset(st, 0, sizeof(*st));
+    st->mode = in->mode; st->uid = in->uid; st->gid = in->gid;
+    st->nlink = in->links; st->size = in->size; st->ino = ino; st->blksize = v->bs;
+    uint64_t blk = *(uint32_t *)(r + 0x1C);
+    if (v->ro_compat & RO_HUGE_FILE) blk |= (uint64_t)*(uint16_t *)(r + 0x74) << 32;
+    if (in->flags & FL_HUGE_FILE) blk *= v->bs / 512;
+    st->blocks = blk;
+    uint16_t extra = in->rawlen > 128 ? *(uint16_t *)(r + 0x80) : 0;
+    int64_t at = (int32_t)*(uint32_t *)(r + 0x08), ct = (int32_t)*(uint32_t *)(r + 0x0C), mt = (int32_t)*(uint32_t *)(r + 0x10);
+    /* extra timestamp words: low 2 bits extend the epoch past 2038 */
+    if (128u + extra >= 0x88) ct += (int64_t)(*(uint32_t *)(r + 0x84) & 3) << 32;
+    if (128u + extra >= 0x8C) mt += (int64_t)(*(uint32_t *)(r + 0x88) & 3) << 32;
+    if (128u + extra >= 0x90) at += (int64_t)(*(uint32_t *)(r + 0x8C) & 3) << 32;
+    st->atime = at; st->mtime = mt; st->ctime = ct;
+    kfree(in);
+    return 0;
+}
 static int e4_ro(vfs_filesystem_t *fs, const char *rel) { return -30; /* EROFS */ }
 static int e4_ro2(vfs_filesystem_t *fs, const char *a, const char *b) { return -30; }
 static int e4_ro3(vfs_filesystem_t *fs, const char *a, uint64_t l) { return -30; }
@@ -466,7 +610,7 @@ static vfs_fs_ops_t e4_ops = {
     .open = e4_open, .close = e4_close, .read = e4_readop, .write = e4_write,
     .seek = e4_seek, .get_size = e4_size, .readdir = e4_readdir,
     .create = e4_ro, .mkdir = e4_ro, .unlink = e4_ro, .exists = e4_exists,
-    .rename = e4_ro2, .rmdir = e4_ro, .truncate = e4_ro3,
+    .rename = e4_ro2, .rmdir = e4_ro, .truncate = e4_ro3, .stat = e4_stat,
 };
 vfs_fs_ops_t *ext4ro_get_ops(void) { return &e4_ops; }
 

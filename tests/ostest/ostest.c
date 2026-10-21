@@ -671,6 +671,63 @@ static int t_vol_rw(char *d, size_t n) {
     R(PASS, "%s", res);
 }
 
+/* ext2/3/4 read-only: real stat() metadata and content vs the host manifest
+ * (/home/user/ext_manifest.txt, written by the test-disk fixture).
+ *   F path mode(octal) uid gid size mtime crc32   D path mode uid gid nentries
+ *   C path size crc32 (content only)              X path (must fail: bad checksum) */
+static uint32_t crc32_tab[256];
+static uint32_t crc32_upd(const uint8_t *p, size_t n, uint32_t c) {
+    if (!crc32_tab[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t x = i; for (int k = 0; k < 8; k++) x = (x >> 1) ^ (0xEDB88320u & (0u - (x & 1))); crc32_tab[i] = x; }
+    c = ~c; while (n--) c = crc32_tab[(c ^ *p++) & 0xFF] ^ (c >> 8); return ~c;
+}
+static int file_crc(const char *p, uint32_t *crc, long long *len) {
+    int fd = open(p, O_RDONLY); if (fd < 0) return -1;
+    static uint8_t b[65536]; ssize_t r; uint32_t c = 0; long long t = 0;
+    while ((r = read(fd, b, sizeof(b))) > 0) { c = crc32_upd(b, r, c); t += r; }
+    close(fd); *crc = c; *len = t; return r < 0 ? -1 : 0;
+}
+static int t_vol_extmeta(char *d, size_t n) {
+    FILE *f = fopen("/home/user/ext_manifest.txt", "r");
+    if (!f) R(SKIP, "no /home/user/ext_manifest.txt");
+    char line[700], err[300] = ""; int nf = 0, nd = 0, nc = 0, nx = 0, bad = 0;
+#define EXTBAD(...) do { if (!bad++) snprintf(err, sizeof(err), __VA_ARGS__); } while (0)
+    while (fgets(line, sizeof(line), f)) {
+        char t, rel[500], p[600]; unsigned long mode = 0; unsigned long uid = 0, gid = 0; long long size = 0, mt = 0, cnt = 0; unsigned long crc = 0;
+        if (sscanf(line, "%c %499s", &t, rel) != 2) continue;
+        snprintf(p, sizeof(p), "/mnt/%s", rel);
+        struct stat st; uint32_t c; long long len;
+        if (t == 'F' && sscanf(line, "%*c %*s %lo %lu %lu %lld %lld %lx", &mode, &uid, &gid, &size, &mt, &crc) == 6) {
+            nf++;
+            if (stat(p, &st) != 0) { EXTBAD("stat %s: %s", p, strerror(errno)); continue; }
+            if (st.st_mode != mode || st.st_uid != uid || st.st_gid != gid || st.st_size != size || (long long)st.st_mtime != mt)
+                { EXTBAD("%s: mode %o uid %u gid %u size %lld mtime %lld, want %lo %lu %lu %lld %lld", p, st.st_mode, st.st_uid, st.st_gid, (long long)st.st_size, (long long)st.st_mtime, mode, uid, gid, size, mt); continue; }
+            if (file_crc(p, &c, &len) || c != crc || len != size) EXTBAD("%s: content crc %08x len %lld, want %08lx %lld", p, c, len, crc, size);
+        } else if (t == 'D' && sscanf(line, "%*c %*s %lo %lu %lu %lld", &mode, &uid, &gid, &cnt) == 4) {
+            nd++;
+            if (stat(p, &st) != 0) { EXTBAD("stat %s: %s", p, strerror(errno)); continue; }
+            if (st.st_mode != mode || st.st_uid != uid || st.st_gid != gid) { EXTBAD("%s: dir mode %o uid %u gid %u, want %lo %lu %lu", p, st.st_mode, st.st_uid, st.st_gid, mode, uid, gid); continue; }
+            DIR *D = opendir(p); long long k = 0; struct dirent *e;
+            if (!D) { EXTBAD("opendir %s: %s", p, strerror(errno)); continue; }
+            while ((e = readdir(D))) if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) k++;
+            closedir(D);
+            if (k != cnt) EXTBAD("%s: %lld entries, want %lld", p, k, cnt);
+        } else if (t == 'C' && sscanf(line, "%*c %*s %lld %lx", &size, &crc) == 2) {
+            nc++;
+            if (file_crc(p, &c, &len) || c != crc || len != size) EXTBAD("%s: content crc %08x len %lld, want %08lx %lld", p, c, len, crc, size);
+        } else if (t == 'X') {
+            nx++;
+            int fd = open(p, O_RDONLY); int e1 = errno;
+            if (fd >= 0) { char b[16]; ssize_t r = read(fd, b, sizeof(b)); close(fd); if (r >= 0) EXTBAD("%s: corrupted inode readable (%zd bytes)", p, r); }
+            else if (e1 != EIO && e1 != ENOENT) EXTBAD("%s: open errno %d", p, e1);
+            if (stat(p, &st) == 0) EXTBAD("%s: stat of corrupted inode succeeded", p);
+        }
+    }
+    fclose(f);
+    if (!nf && !nd) R(SKIP, "manifest empty");
+    CHECK(!bad, "%d mismatches; first: %s", bad, err);
+    R(PASS, "%d files, %d dirs, %d content, %d bad-csum rejected", nf, nd, nc, nx);
+}
+
 /* ===================== dev ===================== */
 static int t_dev_null_zero(char *d, size_t n) {
     int fd = open("/dev/null", O_RDWR); CHECKE(fd >= 0, "open /dev/null");
@@ -907,6 +964,7 @@ static const struct test tests[] = {
     { "fs", "many_files", t_fs_many, 120, 0 }, { "fs", "large_24mb", t_fs_large, 180, 0 },
     { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 },
     { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 },
+    { "vol", "ext_meta", t_vol_extmeta, 180, 0 },
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
     { "dev", "fb0", t_dev_fb, 10, 0 }, { "dev", "evdev", t_dev_evdev, 10, 0 }, { "dev", "uinput", t_dev_uinput, 10, 0 },
     { "dev", "wm", t_dev_wm, 10, 0 },
