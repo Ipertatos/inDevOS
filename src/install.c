@@ -37,7 +37,7 @@
 #define INSTALL_PATH_MAX         192
 #define INSTALL_FILE_MAX         (16u * 1024u * 1024u)
 #define INSTALL_PROGRESS_EVERY   50
-#define INSTALL_DIR_ENTS         VFS_READDIR_MAX
+#define INSTALL_DIR_ENTS         VFS_READDIR_LIMIT   /* listing grows as needed (vfs_readdir_alloc) */
 
 extern void mount_filesystem_device(uint8_t device_id);
 
@@ -254,14 +254,12 @@ static int install_walk(install_node_t *nodes, int *count, const char *dir, int 
         printf("install: %s is nested too deeply\n", dir);
         return -1;
     }
-    ents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * INSTALL_DIR_ENTS);
-    if (!ents) {
+    nent = vfs_readdir_alloc(dir, &ents, 0);
+    if (nent == -12 /* -ENOMEM */) {
         printf("install: out of memory listing %s\n", dir);
         return -1;
     }
-    nent = vfs_readdir(dir, ents, INSTALL_DIR_ENTS);
     if (nent < 0) {
-        kfree(ents);
         printf("install: cannot list %s\n", dir);
         return -1;
     }

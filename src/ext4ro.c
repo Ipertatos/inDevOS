@@ -49,7 +49,14 @@ struct e4_vol {
     uint32_t csum_errs;
     uint32_t hseed[4];              /* s_hash_seed (dir_index) */
     uint8_t  hunsigned;             /* 3 if EXT2_FLAGS_UNSIGNED_HASH (version += 3) */
+    struct e4_ovl *ovl;             /* read-only mount of a volume needing recovery: */
+    uint32_t novl;                  /*   committed journal blocks, sorted by home block */
+    struct e4_jw *jw;               /* journaled writes (JBD2 transaction layer) */
+    bool     jtest;                 /* test-only: allow rw on a journaled volume */
+    uint32_t jres, jtxmax;          /* test-only journal knobs (0 = defaults) */
+    bool     closing;               /* unmount in progress: final clean superblock */
 };
+struct e4_ovl { uint64_t home, phys; uint32_t esc; };
 
 typedef struct {
     uint16_t mode;
@@ -96,13 +103,167 @@ static void e4_csum_bad(e4_vol_t *v, const char *what, uint64_t id, uint32_t wan
 
 #define E4_MAX_VOLS 8
 static e4_vol_t *e4_vols[E4_MAX_VOLS];
+/* ---- journaled writes (JBD2, ordered mode) ----
+ * One transaction per VFS operation.  Every metadata write (anything that goes
+ * through e4_wblk / e4_swrite: bitmaps, group descriptors, inode tables,
+ * directory, extent and indirect blocks) lands in an in-memory block cache
+ * instead of its home location; file data (e4_wdata) is written in place
+ * immediately, i.e. before the commit (ordered mode).  At the end of the
+ * operation the cached blocks are logged (revoke blocks, descriptor + copies,
+ * commit block last).  Home locations are written only by a checkpoint, which
+ * runs at the start of a transaction when the log or the cache is getting full
+ * (forced checkpoint), and at sync/unmount; a checkpoint never runs while a
+ * transaction is open.  Freed blocks that have a copy in the live log are
+ * revoked in the freeing transaction (and the revoke cancelled if the same
+ * transaction journals the block again). */
+#define E4_CB_RUN  1
+#define E4_CB_DONE 2
+#define E4_JW_MAXCB 512
+struct e4_cb { uint64_t blk; uint8_t *buf, *cbuf; uint8_t st, fr; };   /* cbuf: committed version of a RUN block not yet home; fr: freed by the running transaction */
+struct e4_jw {
+    e4_inode_t jin;
+    uint64_t *jmap;
+    uint32_t first, last, seq, tseq, head, start, seed, tagsz, reserve;
+    bool c2, c3, b64;
+    uint8_t uuid[16];
+    struct e4_cb *cb; uint32_t ncb, cbcap, ndone;
+    uint64_t *rv; uint32_t nrv, rvcap;
+    uint64_t *lg; uint32_t nlg, lgcap;
+    int depth;
+    bool broken;
+    uint32_t ncommit, nckpt, nforced, nrevoke, nlogged, nwrap, naborted, txmax;
+    int32_t  snap_a, snap_i;
+    uint64_t *pfs, *pfc; uint32_t npf, pfcap, pfcap2;   /* frees deferred to the end of the transaction */
+    bool     applying;
+    uint32_t ndeferred, norphan;
+    bool     aborted;
+};
+static int e4_cb_find(struct e4_jw *w, uint64_t blk) {
+    for (uint32_t i = 0; i < w->ncb; i++) if (w->cb[i].blk == blk) return (int)i;
+    return -1;
+}
+static void e4_cb_drop(struct e4_jw *w, uint32_t i) {
+    if (w->cb[i].st == E4_CB_DONE) w->ndone--;
+    if (w->cb[i].cbuf) kfree(w->cb[i].cbuf);
+    kfree(w->cb[i].buf); w->cb[i] = w->cb[--w->ncb];
+}
+static bool e4_u64_has(const uint64_t *a, uint32_t n, uint64_t x) { for (uint32_t i = 0; i < n; i++) if (a[i] == x) return true; return false; }
+static void e4_u64_del(uint64_t *a, uint32_t *n, uint64_t x) { for (uint32_t i = 0; i < *n; i++) if (a[i] == x) { a[i] = a[--*n]; return; } }
+static int e4_u64_add(uint64_t **a, uint32_t *n, uint32_t *cap, uint64_t x) {
+    if (*n == *cap) {
+        uint32_t nc = *cap ? *cap * 2 : 128;
+        uint64_t *b = (uint64_t *)kalloc(sizeof(uint64_t) * nc);
+        if (!b) return -1;
+        if (*a) { memcpy(b, *a, sizeof(uint64_t) * *n); kfree(*a); }
+        *a = b; *cap = nc;
+    }
+    (*a)[(*n)++] = x;
+    return 0;
+}
+static int e4_sread(e4_vol_t *v, uint64_t lba, uint32_t n, void *buf) {
+    struct e4_jw *w = v->jw;
+    if (!w || !w->ncb || lba < v->part) return storage_read_sectors(v->dev, lba, n, buf);
+    uint8_t *p = (uint8_t *)buf;
+    while (n) {
+        uint64_t rel = lba - v->part, blk = rel / v->spb; uint32_t off = (uint32_t)(rel % v->spb), k = v->spb - off;
+        if (k > n) k = n;
+        int i = e4_cb_find(w, blk);
+        if (i >= 0) memcpy(p, w->cb[i].buf + off * 512, k * 512);
+        else if (storage_read_sectors(v->dev, lba, k, p) != 0) return -1;
+        lba += k; p += k * 512; n -= k;
+    }
+    return 0;
+}
+static void e4_tx_begin(e4_vol_t *v);
+static int e4_tx_end(e4_vol_t *v);
+static int e4_swrite(e4_vol_t *v, uint64_t lba, uint32_t n, const void *buf) {
+    struct e4_jw *w = v->jw;
+    if (!w || lba < v->part) return storage_write_sectors(v->dev, lba, n, buf);
+    bool implicit = w->depth == 0;
+    if (implicit) e4_tx_begin(v);
+    const uint8_t *p = (const uint8_t *)buf; int rc = 0;
+    while (n) {
+        uint64_t rel = lba - v->part, blk = rel / v->spb; uint32_t off = (uint32_t)(rel % v->spb), k = v->spb - off;
+        if (k > n) k = n;
+        int i = e4_cb_find(w, blk);
+        if (i < 0) {
+            if (w->ncb == w->cbcap) {
+                uint32_t nc = w->cbcap ? w->cbcap * 2 : 64;
+                struct e4_cb *c = (struct e4_cb *)kalloc(sizeof(struct e4_cb) * nc);
+                if (!c) { rc = -1; break; }
+                if (w->cb) { memcpy(c, w->cb, sizeof(struct e4_cb) * w->ncb); kfree(w->cb); }
+                w->cb = c; w->cbcap = nc;
+            }
+            uint8_t *b = (uint8_t *)kalloc(v->bs);
+            if (!b) { rc = -1; break; }
+            if (k < v->spb && storage_read_sectors(v->dev, v->part + blk * v->spb, v->spb, b) != 0) { kfree(b); rc = -1; break; }
+            i = (int)w->ncb++; w->cb[i].blk = blk; w->cb[i].buf = b; w->cb[i].cbuf = NULL; w->cb[i].st = 0; w->cb[i].fr = 0;
+        }
+        if (w->cb[i].st == E4_CB_DONE) {                 /* keep the committed version until commit/abort */
+            uint8_t *c = (uint8_t *)kalloc(v->bs);
+            if (!c) { rc = -1; w->broken = true; break; }
+            memcpy(c, w->cb[i].buf, v->bs); w->cb[i].cbuf = c; w->ndone--;
+        }
+        w->cb[i].fr = 0;
+        memcpy(w->cb[i].buf + off * 512, p, k * 512);
+        w->cb[i].st = E4_CB_RUN;
+        e4_u64_del(w->rv, &w->nrv, blk);                 /* journaled again: cancel its revoke */
+        lba += k; p += k * 512; n -= k;
+    }
+    if (implicit && e4_tx_end(v) != 0) rc = -1;
+    return rc;
+}
+/* blocks freed by the running transaction */
+static void e4_jw_freed(e4_vol_t *v, uint64_t start, uint64_t cnt) {
+    struct e4_jw *w = v->jw;
+    if (!w) return;
+    /* a committed version not yet home must survive until the free commits (or is aborted) */
+    for (uint32_t i = 0; i < w->ncb; ) {
+        if (w->cb[i].blk >= start && w->cb[i].blk - start < cnt) {
+            if (w->cb[i].st == E4_CB_DONE || w->cb[i].cbuf) { w->cb[i].fr = 1; i++; } else e4_cb_drop(w, i);
+        } else i++;
+    }
+    for (uint32_t i = 0; i < w->nlg; i++)
+        if (w->lg[i] >= start && w->lg[i] - start < cnt && !e4_u64_has(w->rv, w->nrv, w->lg[i])) {
+            if (e4_u64_add(&w->rv, &w->nrv, &w->rvcap, w->lg[i]) != 0) w->broken = true;
+            else w->nrevoke++;
+        }
+}
+/* A block freed by the running transaction must not be reused before that free commits
+ * (jbd2 semantics): the bitmap update itself is deferred to the end of the transaction,
+ * so the allocator cannot see the block as free while the transaction runs. */
+static bool e4_jw_defer(e4_vol_t *v, uint64_t start, uint64_t cnt) {
+    struct e4_jw *w = v->jw;
+    if (!w || !w->depth || w->applying) return false;
+    e4_jw_freed(v, start, cnt);
+    if (e4_u64_add(&w->pfs, &w->npf, &w->pfcap, start) != 0) { w->broken = true; return true; }
+    w->npf--;
+    if (e4_u64_add(&w->pfc, &w->npf, &w->pfcap2, cnt) != 0) { w->broken = true; return true; }
+    w->ndeferred++;
+    return true;
+}
+/* file data: in place, now (ordered mode) */
+static int e4_wdata(e4_vol_t *v, uint64_t blk, const void *buf) {
+    if (!v->rw || blk < v->first_data + 1 || blk >= v->blocks) return -1;
+    if (v->jw) { int i = e4_cb_find(v->jw, blk); if (i >= 0) e4_cb_drop(v->jw, (uint32_t)i); }
+    return storage_write_sectors(v->dev, v->part + blk * v->spb, v->spb, buf);
+}
 
 static int e4_read(e4_vol_t *v, uint64_t blk, void *buf) {
-    return storage_read_sectors(v->dev, v->part + blk * v->spb, v->spb, buf);
+    if (v->novl) {
+        uint32_t lo = 0, hi = v->novl;
+        while (lo < hi) { uint32_t m = (lo + hi) / 2; if (v->ovl[m].home < blk) lo = m + 1; else hi = m; }
+        if (lo < v->novl && v->ovl[lo].home == blk) {
+            int r = storage_read_sectors(v->dev, v->part + v->ovl[lo].phys * v->spb, v->spb, buf);
+            if (r == 0 && v->ovl[lo].esc) { uint8_t *b = (uint8_t *)buf; b[0] = 0xC0; b[1] = 0x3B; b[2] = 0x39; b[3] = 0x98; }
+            return r;
+        }
+    }
+    return e4_sread(v, v->part + blk * v->spb, v->spb, buf);
 }
 static int e4_wblk(e4_vol_t *v, uint64_t blk, const void *buf) {
     if (!v->rw || blk < v->first_data + 1 || blk >= v->blocks) return -1;   /* never the superblock area */
-    return storage_write_sectors(v->dev, v->part + blk * v->spb, v->spb, buf);
+    return e4_swrite(v, v->part + blk * v->spb, v->spb, buf);
 }
 
 bool ext4ro_probe(uint8_t dev, uint32_t lba) {
@@ -172,7 +333,11 @@ static int e4_iget(e4_vol_t *v, uint32_t ino, e4_inode_t *out) {
 }
 
 /* logical -> physical block (0 = hole / unwritten). */
-static uint64_t e4_bmap(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk) {
+static uint64_t e4_bmap_x(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk, bool *unw_out);
+static uint64_t e4_bmap(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk) { return e4_bmap_x(v, in, lblk, NULL); }
+/* @unw_out != NULL: also return the physical block of an unwritten extent (*unw_out = true) */
+static uint64_t e4_bmap_x(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk, bool *unw_out) {
+    if (unw_out) *unw_out = false;
     if (in->flags & FL_EXTENTS) {
         const uint8_t *node = in->iblock;
         uint8_t *buf = NULL;
@@ -186,9 +351,10 @@ static uint64_t e4_bmap(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk) {
                     uint32_t lb = *(uint32_t *)e; uint16_t len = *(uint16_t *)(e + 4);
                     bool unwritten = len > 32768; if (unwritten) len -= 32768;
                     if (lblk >= lb && lblk < lb + len) {
-                        if (!unwritten) {
+                        if (!unwritten || unw_out) {
                             uint64_t start = *(uint32_t *)(e + 8) | ((uint64_t)*(uint16_t *)(e + 6) << 32);
                             res = start + (lblk - lb);
+                            if (unwritten) *unw_out = true;
                         }
                         break;
                     }
@@ -222,7 +388,7 @@ static uint64_t e4_bmap(e4_vol_t *v, const e4_inode_t *in, uint32_t lblk) {
     uint32_t lvl, root;
     if (lblk < per) { lvl = 1; root = ib[12]; }
     else if ((lblk -= per) < per * per) { lvl = 2; root = ib[13]; }
-    else { lblk -= per * per; lvl = 3; root = ib[14]; }
+    else { lblk -= per * per; lvl = 3; root = ib[14]; if ((uint64_t)lblk >= (uint64_t)per * per * per) return 0; }
     uint32_t *buf = (uint32_t *)kalloc(v->bs);
     if (!buf) return 0;
     uint32_t cur = root;
@@ -582,6 +748,260 @@ static uint32_t e4_namei(e4_vol_t *v, const char *path, e4_inode_t *out, int dep
     return cur;
 }
 
+
+/* ---- JBD2 journal recovery (internal journal inode only) ----
+ * Same passes as jbd2/e2fsprogs recovery.c: SCAN finds the end of the last
+ * committed transaction (a bad commit/descriptor/revoke checksum or a
+ * sequence break ends the log), REVOKE collects revoke records, VERIFY checks
+ * every tag checksum and target before anything is written, REPLAY copies the
+ * journalled blocks home in log order (or OVERLAY records them in memory). */
+#define JBD2_MAGIC 0xC03B3998u
+enum { J_SCAN, J_REVOKE, J_VERIFY, J_REPLAY, J_OVERLAY };
+static uint32_t j_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static uint16_t j_be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static void j_put32(uint8_t *p, uint32_t x) { p[0] = (uint8_t)(x >> 24); p[1] = (uint8_t)(x >> 16); p[2] = (uint8_t)(x >> 8); p[3] = (uint8_t)x; }
+typedef struct { uint64_t blk; uint32_t seq; } e4_jrv_t;
+typedef struct {
+    e4_vol_t *v; e4_inode_t jin;
+    uint32_t first, last, start, seq, end, inc, seed, tagsz, jsb_errno;
+    bool c2, c3, b64;
+    e4_jrv_t *rv; uint32_t nrv, rvcap;
+    uint32_t ntags, nrevoked, nwritten;
+    const char *why;
+} e4_j_t;
+static int e4_j_read(e4_j_t *j, uint32_t jb, uint8_t *buf, uint64_t *phys) {
+    uint64_t pb = e4_bmap(j->v, &j->jin, jb);
+    if (!pb || pb == E4_BMAP_ERR || pb >= j->v->blocks) return -1;
+    if (phys) *phys = pb;
+    return storage_read_sectors(j->v->dev, j->v->part + pb * j->v->spb, j->v->spb, buf);
+}
+static uint32_t e4_j_next(e4_j_t *j, uint32_t b) { return ++b >= j->last ? j->first : b; }
+static bool e4_j_tail_ok(e4_j_t *j, uint8_t *buf) {        /* descriptor / revoke block tail */
+    uint32_t bs = j->v->bs, st = j_be32(buf + bs - 4);
+    uint8_t save[4]; memcpy(save, buf + bs - 4, 4); memset(buf + bs - 4, 0, 4);
+    uint32_t c = e4_crc32c(j->seed, buf, bs);
+    memcpy(buf + bs - 4, save, 4);
+    return c == st;
+}
+static bool e4_j_revoked(e4_j_t *j, uint64_t blk, uint32_t seq) {
+    for (uint32_t i = 0; i < j->nrv; i++) if (j->rv[i].blk == blk) return (int32_t)(j->rv[i].seq - seq) >= 0;
+    return false;
+}
+static int e4_j_addrv(e4_j_t *j, uint64_t blk, uint32_t seq) {
+    for (uint32_t i = 0; i < j->nrv; i++) if (j->rv[i].blk == blk) { if ((int32_t)(seq - j->rv[i].seq) > 0) j->rv[i].seq = seq; return 0; }
+    if (j->nrv == j->rvcap) {
+        uint32_t nc = j->rvcap ? j->rvcap * 2 : 256;
+        e4_jrv_t *n = (e4_jrv_t *)kalloc(sizeof(e4_jrv_t) * nc);
+        if (!n) return -1;
+        if (j->rv) { memcpy(n, j->rv, sizeof(e4_jrv_t) * j->nrv); kfree(j->rv); }
+        j->rv = n; j->rvcap = nc;
+    }
+    j->rv[j->nrv].blk = blk; j->rv[j->nrv].seq = seq; j->nrv++;
+    return 0;
+}
+static int e4_ovl_add(e4_vol_t *v, uint32_t cap, uint64_t home, uint64_t phys, bool esc) {
+    uint32_t lo = 0, hi = v->novl;
+    while (lo < hi) { uint32_t m = (lo + hi) / 2; if (v->ovl[m].home < home) lo = m + 1; else hi = m; }
+    if (lo < v->novl && v->ovl[lo].home == home) { v->ovl[lo].phys = phys; v->ovl[lo].esc = esc; return 0; }
+    if (v->novl >= cap) return -1;
+    memmove(v->ovl + lo + 1, v->ovl + lo, sizeof(struct e4_ovl) * (v->novl - lo));
+    v->ovl[lo].home = home; v->ovl[lo].phys = phys; v->ovl[lo].esc = esc; v->novl++;
+    return 0;
+}
+/* one pass over the log; 0 ok, <0 error (j->why says what) */
+static int e4_j_pass(e4_j_t *j, int pass, uint8_t *buf, uint8_t *db, uint32_t ovcap) {
+    e4_vol_t *v = j->v;
+    uint32_t bs = v->bs, seq = j->seq, blk = j->start;
+    bool cs = j->c2 || j->c3;
+    for (uint32_t guard = 0; ; guard++) {
+        if (pass != J_SCAN && seq == j->end) break;
+        if (guard > j->last) { j->why = "journal loops"; return -1; }
+        if (e4_j_read(j, blk, buf, NULL) != 0) { j->why = "journal block unreadable"; return -1; }
+        if (j_be32(buf) != JBD2_MAGIC || j_be32(buf + 8) != seq) {
+            if (pass == J_SCAN) break;
+            j->why = "log changed between passes"; return -1;
+        }
+        uint32_t type = j_be32(buf + 4);
+        if (type == 1) {                                      /* descriptor */
+            if (cs && !e4_j_tail_ok(j, buf)) { if (pass == J_SCAN) break; j->why = "descriptor block checksum"; return -1; }
+            uint8_t *p = buf + 12, *end = buf + bs - (cs ? 4 : 0);
+            while (p + j->tagsz <= end) {
+                uint32_t fl = j->c3 ? j_be32(p + 4) : j_be16(p + 6);
+                uint64_t home = j_be32(p) | (j->b64 ? (uint64_t)j_be32(p + 8) << 32 : 0);
+                blk = e4_j_next(j, blk);
+                if (pass >= J_VERIFY) {
+                    j->ntags++;
+                    if (!e4_j_revoked(j, home, seq)) {
+                        uint64_t phys = 0;
+                        if (e4_j_read(j, blk, db, &phys) != 0) { j->why = "journal data block unreadable"; return -1; }
+                        if (pass == J_VERIFY) {
+                            if (home >= v->blocks) { j->why = "tag points outside the volume"; return -1; }
+                            if (cs) {
+                                uint8_t sq[4]; j_put32(sq, seq);
+                                uint32_t c = e4_crc32c(e4_crc32c(j->seed, sq, 4), db, bs);
+                                uint32_t want = j->c3 ? j_be32(p + 12) : j_be16(p + 4);
+                                if ((j->c3 ? c : (c & 0xFFFF)) != want) { j->why = "data block checksum"; return -1; }
+                            }
+                        } else if (pass == J_REPLAY) {
+                            if (fl & 1) j_put32(db, JBD2_MAGIC);
+                            if (storage_write_sectors(v->dev, v->part + home * v->spb, v->spb, db) != 0) { j->why = "write failed"; return -1; }
+                            j->nwritten++;
+                        } else if (pass == J_OVERLAY) {
+                            if (e4_ovl_add(v, ovcap, home, phys, (fl & 1) != 0) != 0) { j->why = "overlay full"; return -1; }
+                        }
+                    } else if (pass == J_VERIFY) j->nrevoked++;
+                }
+                p += j->tagsz;
+                if (!(fl & 2)) p += 16;                       /* no SAME_UUID: uuid follows */
+                if (fl & 8) break;                            /* LAST_TAG */
+            }
+            blk = e4_j_next(j, blk);
+        } else if (type == 2) {                               /* commit */
+            if (pass == J_SCAN && cs) {
+                memcpy(db, buf, bs); memset(db + 0x10, 0, 4);
+                if (e4_crc32c(j->seed, db, bs) != j_be32(buf + 0x10)) break;   /* torn commit: log ends */
+            }
+            seq++; blk = e4_j_next(j, blk);
+        } else if (type == 5) {                               /* revoke */
+            if (cs && !e4_j_tail_ok(j, buf)) { if (pass == J_SCAN) break; j->why = "revoke block checksum"; return -1; }
+            if (pass == J_REVOKE) {
+                uint32_t cnt = j_be32(buf + 12), rs = j->b64 ? 8 : 4;
+                if (cnt > bs - (cs ? 4 : 0)) { j->why = "bad revoke count"; return -1; }
+                for (uint32_t o = 16; o + rs <= cnt; o += rs) {
+                    uint64_t rb = j->b64 ? ((uint64_t)j_be32(buf + o) << 32 | j_be32(buf + o + 4)) : j_be32(buf + o);
+                    if (e4_j_addrv(j, rb, seq) != 0) { j->why = "out of memory"; return -1; }
+                }
+            }
+            blk = e4_j_next(j, blk);
+        } else {
+            if (pass == J_SCAN) break;
+            j->why = "unknown journal block"; return -1;
+        }
+    }
+    if (pass == J_SCAN) j->end = seq;
+    return 0;
+}
+/* open the journal: 1 = clean (nothing to do), 0 = needs replay, <0 = refuse */
+static int e4_j_open(e4_vol_t *v, e4_j_t *j, uint8_t *buf) {
+    memset(j, 0, sizeof(*j)); j->v = v;
+    uint8_t *sb = (uint8_t *)kalloc(1024);
+    if (!sb) { j->why = "out of memory"; return -1; }
+    int r = storage_read_sectors(v->dev, v->part + 2, 2, sb);
+    uint32_t inum = *(uint32_t *)(sb + 0xE0), jdev = *(uint32_t *)(sb + 0xE4);
+    kfree(sb);
+    if (r != 0) { j->why = "superblock unreadable"; return -1; }
+    if (jdev || !inum) { j->why = "external journal"; return -1; }
+    if (e4_iget(v, inum, &j->jin) != 0) { j->why = "journal inode unreadable"; return -1; }
+    if (e4_j_read(j, 0, buf, NULL) != 0) { j->why = "journal superblock unreadable"; return -1; }
+    uint32_t bt = j_be32(buf + 4);
+    if (j_be32(buf) != JBD2_MAGIC || (bt != 3 && bt != 4)) { j->why = "bad journal superblock"; return -1; }
+    if (j_be32(buf + 0x0C) != v->bs) { j->why = "journal block size differs"; return -1; }
+    j->last = j_be32(buf + 0x10); j->first = j_be32(buf + 0x14); j->seq = j_be32(buf + 0x18); j->start = j_be32(buf + 0x1C);
+    j->jsb_errno = j_be32(buf + 0x20);
+    if (j->last < 2 || (uint64_t)j->last * v->bs > j->jin.size || j->first < 1 || j->first >= j->last) { j->why = "bad journal geometry"; return -1; }
+    if (bt == 4) {
+        j->inc = j_be32(buf + 0x28);
+        if (j->inc & ~0x1Fu) { j->why = (j->inc & 0x20) ? "fast_commit journal" : "unknown journal features"; return -1; }
+        j->c3 = (j->inc & 0x10) != 0; j->c2 = !j->c3 && (j->inc & 0x08); j->b64 = (j->inc & 0x02) != 0;
+    }
+    if (j->c2 || j->c3) {
+        if (buf[0x50] != 4) { j->why = "journal checksum type"; return -1; }
+        uint32_t st = j_be32(buf + 0xFC);
+        memset(buf + 0xFC, 0, 4);
+        if (e4_crc32c(~0u, buf, 1024) != st) { j->why = "journal superblock checksum"; return -1; }
+        j_put32(buf + 0xFC, st);
+        j->seed = e4_crc32c(~0u, buf + 0x30, 16);
+    }
+    j->tagsz = j->c3 ? 16 : 8 + (j->b64 ? 4 : 0) + (j->c2 ? 2 : 0);
+    if (j->start == 0) return 1;
+    if (j->start < j->first || j->start >= j->last) { j->why = "bad log start"; return -1; }
+    return 0;
+}
+/* scan + revoke + verify; 0 ok */
+static int e4_j_prepare(e4_j_t *j, uint8_t *buf, uint8_t *db) {
+    if (e4_j_pass(j, J_SCAN, buf, db, 0) || e4_j_pass(j, J_REVOKE, buf, db, 0) || e4_j_pass(j, J_VERIFY, buf, db, 0)) return -1;
+    return 0;
+}
+/* rw enable: replay into place, empty the log, clear needs_recovery.  0 ok */
+static int e4_j_recover(e4_vol_t *v) {
+    e4_j_t *j = (e4_j_t *)kalloc(sizeof(e4_j_t));
+    uint8_t *buf = (uint8_t *)kalloc(v->bs), *db = (uint8_t *)kalloc(v->bs);
+    int rc = -1;
+    if (!j || !buf || !db) goto out;
+    int o = e4_j_open(v, j, buf);
+    if (o < 0) goto bad;
+    if (o == 0) {
+        if (e4_j_prepare(j, buf, db) || e4_j_pass(j, J_REPLAY, buf, db, 0)) goto bad;
+    }
+    /* empty log: journal sb s_start = 0, s_sequence = end + 1 (as e2fsck) */
+    if (e4_j_read(j, 0, buf, NULL) != 0) { j->why = "journal superblock unreadable"; goto bad; }
+    {
+        uint64_t jpb = e4_bmap(v, &j->jin, 0);
+        j_put32(buf + 0x1C, 0);
+        if (o == 0) j_put32(buf + 0x18, j->end + 1);
+        if (j->jsb_errno) j_put32(buf + 0x20, 0);
+        if (j->c2 || j->c3) { memset(buf + 0xFC, 0, 4); j_put32(buf + 0xFC, e4_crc32c(~0u, buf, 1024)); }
+        if (storage_write_sectors(v->dev, v->part + jpb * v->spb, v->spb, buf) != 0) { j->why = "journal superblock write"; goto bad; }
+    }
+    {
+        uint8_t *sb = (uint8_t *)kalloc(1024);
+        if (!sb) goto out;
+        if (storage_read_sectors(v->dev, v->part + 2, 2, sb) != 0 || *(uint16_t *)(sb + 56) != 0xEF53) { kfree(sb); j->why = "superblock unreadable after replay"; goto bad; }
+        *(uint32_t *)(sb + 0x60) &= ~(uint32_t)I_RECOVER;
+        if ((int32_t)j->jsb_errno) *(uint16_t *)(sb + 0x3A) |= 2;            /* journal recorded an error */
+        if (*(uint32_t *)(sb + 0x64) & RO_METADATA_CSUM) *(uint32_t *)(sb + 0x3FC) = e4_crc32c(~0u, sb, 0x3FC);
+        int w = storage_write_sectors(v->dev, v->part + 2, 2, sb);
+        kfree(sb);
+        if (w != 0) { j->why = "superblock write"; goto bad; }
+    }
+    /* group descriptors may have been replayed */
+    {
+        uint32_t gblocks = (v->groups * v->dsz + v->bs - 1) / v->bs;
+        for (uint32_t i = 0; i < gblocks; i++) if (e4_read(v, v->first_data + 1 + i, v->gdt + i * v->bs) != 0) { j->why = "group descriptors unreadable"; goto bad; }
+    }
+    v->incompat &= ~(uint32_t)I_RECOVER;
+    printf("ext4 '%s': journal replayed: %u transaction(s), %u block(s) written, %u revoked\n", v->label, o == 0 ? j->end - j->seq : 0, j->nwritten, j->nrevoked);
+    serial_printf("[ext4ro] '%s': journal replayed (seq %u..%u, %u tags, %u written, %u revoked, csum %s%s)\n", v->label, j->seq, j->end, j->ntags, j->nwritten, j->nrevoked,
+                  j->c3 ? "v3" : j->c2 ? "v2" : "none", j->b64 ? ", 64bit" : "");
+    rc = 0; goto out;
+bad:
+    printf("ext4 '%s': journal recovery refused: %s\n", v->label, j->why ? j->why : "?");
+    serial_printf("[ext4ro] '%s': journal recovery refused: %s\n", v->label, j->why ? j->why : "?");
+out:
+    if (j && j->rv) kfree(j->rv);
+    if (j) kfree(j);
+    if (buf) kfree(buf);
+    if (db) kfree(db);
+    return rc;
+}
+/* read-only mount of a volume needing recovery: committed blocks become an
+ * in-memory overlay (nothing written).  0 ok */
+static int e4_j_overlay(e4_vol_t *v) {
+    e4_j_t *j = (e4_j_t *)kalloc(sizeof(e4_j_t));
+    uint8_t *buf = (uint8_t *)kalloc(v->bs), *db = (uint8_t *)kalloc(v->bs);
+    int rc = -1;
+    if (!j || !buf || !db) goto out;
+    int o = e4_j_open(v, j, buf);
+    if (o != 0) { if (o > 0) rc = 0; goto out; }
+    if (e4_j_prepare(j, buf, db)) goto out;
+    if (j->ntags) {
+        v->ovl = (struct e4_ovl *)kalloc(sizeof(struct e4_ovl) * j->ntags);
+        if (!v->ovl) { j->why = "out of memory"; goto out; }
+        if (e4_j_pass(j, J_OVERLAY, buf, db, j->ntags)) { kfree(v->ovl); v->ovl = NULL; v->novl = 0; goto out; }
+        uint32_t gblocks = (v->groups * v->dsz + v->bs - 1) / v->bs;
+        for (uint32_t i = 0; i < gblocks; i++) e4_read(v, v->first_data + 1 + i, v->gdt + i * v->bs);
+    }
+    serial_printf("[ext4ro] '%s': journal needs recovery - %u committed block(s) from %u transaction(s) applied in memory (read-only)\n", v->label, v->novl, j->end - j->seq);
+    rc = 0;
+out:
+    if (rc && j) serial_printf("[ext4ro] '%s': journal not usable (%s) - reading as-is\n", v->label, j->why ? j->why : "?");
+    if (j && j->rv) kfree(j->rv);
+    if (j) kfree(j);
+    if (buf) kfree(buf);
+    if (db) kfree(db);
+    return rc;
+}
+
 e4_vol_t *ext4ro_mount(uint8_t dev, uint32_t lba) {
     uint8_t *sb = (uint8_t *)kalloc(1024);
     if (!sb) return NULL;
@@ -647,17 +1067,257 @@ e4_vol_t *ext4ro_mount(uint8_t dev, uint32_t lba) {
             }
         }
     }
-    if (inc & I_RECOVER) printf("ext4: journal needs recovery - reading as-is (read-only)\n");
+    if ((inc & I_RECOVER) && (v->compat & 0x0004)) {
+        if (e4_j_overlay(v) == 0) printf("ext4: journal needs recovery - committed transactions applied in memory (read-only; replayed when made read-write)\n");
+        else printf("ext4: journal needs recovery and cannot be read - reading as-is (read-only)\n");
+    } else if (inc & I_RECOVER) printf("ext4: journal needs recovery - reading as-is (read-only)\n");
     serial_printf("[ext4ro] mounted dev %u LBA %u label '%s': %u-byte blocks, %u groups, incompat %#x ro_compat %#x%s\n",
                   dev, lba, v->label, v->bs, v->groups, inc, roc, v->csum ? ", metadata_csum verified" : "");
     return v;
 }
 
+extern uint64_t rtc_unix_epoch(void);
+/* ---- journal writer: log, commit, checkpoint ---- */
+static int e4_free_range(e4_vol_t *v, uint64_t start, uint32_t cnt);
+static void e4_orphans_process(e4_vol_t *v);
+static uint32_t e4_jw_next(struct e4_jw *w, uint32_t b) { if (++b >= w->last) { w->nwrap++; return w->first; } return b; }
+static int e4_sb_update(e4_vol_t *v, bool clean);
+static uint32_t e4_jw_space(struct e4_jw *w) {
+    uint32_t cap = w->last - w->first;
+    if (!w->start) return cap - 1;
+    uint32_t used = w->head >= w->start ? w->head - w->start : (w->last - w->start) + (w->head - w->first);
+    return used + 1 >= cap ? 0 : cap - used - 1;
+}
+static int e4_jw_lwrite(e4_vol_t *v, uint32_t jb, const void *buf) {
+    return storage_write_sectors(v->dev, v->part + v->jw->jmap[jb] * v->spb, v->spb, buf);
+}
+static int e4_jw_sb(e4_vol_t *v, uint8_t *buf) {           /* journal superblock: s_sequence, s_start */
+    struct e4_jw *w = v->jw;
+    if (storage_read_sectors(v->dev, v->part + w->jmap[0] * v->spb, v->spb, buf) != 0 || j_be32(buf) != JBD2_MAGIC) return -1;
+    j_put32(buf + 0x18, w->start ? w->tseq : w->seq);
+    j_put32(buf + 0x1C, w->start);
+    if (w->c2 || w->c3) { memset(buf + 0xFC, 0, 4); j_put32(buf + 0xFC, e4_crc32c(~0u, buf, 1024)); }
+    return e4_jw_lwrite(v, 0, buf);
+}
+static void e4_jw_tail(struct e4_jw *w, uint8_t *b, uint32_t bs) {
+    if (!(w->c2 || w->c3)) return;
+    memset(b + bs - 4, 0, 4); j_put32(b + bs - 4, e4_crc32c(w->seed, b, bs));
+}
+/* write every committed block home, then mark the log empty */
+static int e4_jw_checkpoint(e4_vol_t *v) {
+    struct e4_jw *w = v->jw;
+    if (!w || w->depth) return 0;
+    int rc = 0;
+    for (uint32_t i = 0; i < w->ncb; ) {
+        if (w->cb[i].st == E4_CB_DONE) {
+            if (storage_write_sectors(v->dev, v->part + w->cb[i].blk * v->spb, v->spb, w->cb[i].buf) != 0) { rc = -1; i++; continue; }
+            e4_cb_drop(w, i);
+        } else i++;
+    }
+    if (rc) return rc;
+    if (w->start) {
+        uint8_t *b = (uint8_t *)kalloc(v->bs);
+        if (!b) return -1;
+        w->start = 0;
+        rc = e4_jw_sb(v, b);
+        kfree(b);
+        if (rc) return rc;
+        w->nckpt++;
+    }
+    w->nlg = 0;                                      /* the log continues at head (and wraps) */
+    return 0;
+}
+static void e4_tx_begin(e4_vol_t *v) {
+    struct e4_jw *w = v->jw;
+    if (!w || w->depth++) return;
+    w->snap_a = v->alloc_since_sync; w->snap_i = v->ialloc_since_sync;
+    if (e4_jw_space(w) < w->reserve || w->ndone >= E4_JW_MAXCB) {
+        w->depth = 0;
+        if (e4_jw_checkpoint(v) != 0) w->broken = true;
+        w->depth = 1; w->nforced++;
+    }
+}
+static int e4_jw_commit(e4_vol_t *v) {
+    struct e4_jw *w = v->jw;
+    uint32_t nrun = 0, bs = v->bs;
+    for (uint32_t i = 0; i < w->ncb; i++) if (w->cb[i].st == E4_CB_RUN) nrun++;
+    if (!nrun && !w->nrv) return 0;
+    uint32_t cs = (w->c2 || w->c3) ? 4 : 0, rs = w->b64 ? 8 : 4;
+    uint32_t per_rv = (bs - 16 - cs) / rs, nrvb = (w->nrv + per_rv - 1) / per_rv;
+    uint32_t room = bs - 12 - cs, ndesc = 0, used = room + 1;
+    for (uint32_t i = 0; i < nrun; i++) { if (used + w->tagsz > room) { ndesc++; used = w->tagsz + 16; } else used += w->tagsz; }
+    uint32_t need = nrvb + ndesc + nrun + 1;
+    uint8_t *b = (uint8_t *)kalloc(bs), *d = (uint8_t *)kalloc(bs);
+    if (!b || !d) { if (b) kfree(b); if (d) kfree(d); return -1; }
+    int rc = 0;
+    if (need > e4_jw_space(w) || need > w->txmax || w->broken) {
+        /* cannot be logged atomically: abort - drop the running changes (home blocks were never
+         * touched), restore the in-memory allocation state; the caller makes the volume read-only */
+        serial_printf("[ext4ro] '%s': transaction of %u blocks cannot be journaled (%u free, max %u%s) - aborted\n", v->label, need, e4_jw_space(w), w->txmax, w->broken ? ", journal error" : "");
+        for (uint32_t i = 0; i < w->ncb; ) {
+            if (w->cb[i].st != E4_CB_RUN) { i++; continue; }
+            if (w->cb[i].cbuf) { kfree(w->cb[i].buf); w->cb[i].buf = w->cb[i].cbuf; w->cb[i].cbuf = NULL; w->cb[i].st = E4_CB_DONE; w->ndone++; i++; }
+            else e4_cb_drop(w, i);
+        }
+        for (uint32_t i = 0; i < w->ncb; i++) w->cb[i].fr = 0;
+        w->nrv = 0; w->naborted++; w->aborted = true;
+        v->alloc_since_sync = w->snap_a; v->ialloc_since_sync = w->snap_i;
+        uint32_t gblocks = (v->groups * v->dsz + v->bs - 1) / v->bs;
+        for (uint32_t g = 0; g < gblocks; g++) e4_read(v, v->first_data + 1 + g, v->gdt + g * v->bs);
+        kfree(b); kfree(d);
+        return -1;
+    }
+    uint32_t pos = w->head, first = pos, seq = w->seq;
+    /* revoke blocks */
+    for (uint32_t r = 0; r < w->nrv && !rc; ) {
+        memset(b, 0, bs); j_put32(b, JBD2_MAGIC); j_put32(b + 4, 5); j_put32(b + 8, seq);
+        uint32_t o = 16;
+        while (r < w->nrv && o + rs <= bs - cs) {
+            if (w->b64) { j_put32(b + o, (uint32_t)(w->rv[r] >> 32)); j_put32(b + o + 4, (uint32_t)w->rv[r]); }
+            else j_put32(b + o, (uint32_t)w->rv[r]);
+            o += rs; r++;
+        }
+        j_put32(b + 12, o);
+        e4_jw_tail(w, b, bs);
+        if (e4_jw_lwrite(v, pos, b) != 0) rc = -1;
+        pos = e4_jw_next(w, pos);
+    }
+    /* descriptor blocks, each followed by its block copies */
+    uint32_t i = 0;
+    while (i < w->ncb && !rc) {
+        memset(b, 0, bs); j_put32(b, JBD2_MAGIC); j_put32(b + 4, 1); j_put32(b + 8, seq);
+        uint32_t dpos = pos; pos = e4_jw_next(w, pos);
+        uint8_t *p = b + 12, *lastp = NULL; bool firsttag = true;
+        while (i < w->ncb && !rc) {
+            if (w->cb[i].st != E4_CB_RUN) { i++; continue; }
+            uint32_t tl = w->tagsz + (firsttag ? 16 : 0);
+            if (p + tl > b + bs - cs) break;
+            const uint8_t *src = w->cb[i].buf; uint32_t fl = firsttag ? 0 : 2;
+            if (j_be32(src) == JBD2_MAGIC) { memcpy(d, src, bs); memset(d, 0, 4); src = d; fl |= 1; }
+            uint8_t sq[4]; j_put32(sq, seq);
+            uint32_t c = (w->c2 || w->c3) ? e4_crc32c(e4_crc32c(w->seed, sq, 4), src, bs) : 0;
+            j_put32(p, (uint32_t)w->cb[i].blk);
+            if (w->c3) { j_put32(p + 4, fl); if (w->b64) j_put32(p + 8, (uint32_t)(w->cb[i].blk >> 32)); j_put32(p + 12, c); }
+            else { p[4] = (uint8_t)(c >> 8); p[5] = (uint8_t)c; p[6] = (uint8_t)(fl >> 8); p[7] = (uint8_t)fl; if (w->b64) j_put32(p + 8, (uint32_t)(w->cb[i].blk >> 32)); }
+            lastp = p;
+            p += w->tagsz;
+            if (firsttag) { memcpy(p, w->uuid, 16); p += 16; firsttag = false; }
+            if (e4_jw_lwrite(v, pos, src) != 0) rc = -1;
+            pos = e4_jw_next(w, pos);
+            if (!e4_u64_has(w->lg, w->nlg, w->cb[i].blk) && e4_u64_add(&w->lg, &w->nlg, &w->lgcap, w->cb[i].blk) != 0) rc = -1;
+            w->nlogged++;
+            i++;
+        }
+        if (!lastp) { pos = dpos; break; }                 /* nothing left for this descriptor */
+        if (w->c3) j_put32(lastp + 4, j_be32(lastp + 4) | 8); else lastp[7] |= 8;
+        e4_jw_tail(w, b, bs);
+        if (e4_jw_lwrite(v, dpos, b) != 0) rc = -1;
+    }
+    /* first transaction in an empty log: point the journal superblock at it */
+    if (!rc && !w->start) { w->start = first; w->tseq = seq; if (e4_jw_sb(v, b) != 0) rc = -1; }
+    if (!rc) {
+        memset(b, 0, bs); j_put32(b, JBD2_MAGIC); j_put32(b + 4, 2); j_put32(b + 8, seq);
+        uint64_t now = rtc_unix_epoch();
+        j_put32(b + 0x30, (uint32_t)(now >> 32)); j_put32(b + 0x34, (uint32_t)now);
+        if (w->c2 || w->c3) j_put32(b + 0x10, e4_crc32c(w->seed, b, bs));
+        if (e4_jw_lwrite(v, pos, b) != 0) rc = -1;          /* the commit point */
+        pos = e4_jw_next(w, pos);
+    }
+    kfree(b); kfree(d);
+    if (rc) { w->broken = true; serial_printf("[ext4ro] '%s': journal commit failed (seq %u)\n", v->label, seq); return rc; }
+    for (uint32_t k = 0; k < w->ncb; k++) if (w->cb[k].st == E4_CB_RUN) {
+        w->cb[k].st = E4_CB_DONE; w->ndone++;
+        if (w->cb[k].cbuf) { kfree(w->cb[k].cbuf); w->cb[k].cbuf = NULL; }
+    }
+    for (uint32_t k = 0; k < w->ncb; ) { if (w->cb[k].fr) e4_cb_drop(w, k); else k++; }   /* free is committed */
+    w->nrv = 0; w->head = pos; w->seq = seq + 1; w->ncommit++;
+    return 0;
+}
+static int e4_tx_end(e4_vol_t *v) {
+    struct e4_jw *w = v->jw;
+    if (!w || !w->depth) return 0;
+    if (w->depth == 1) {
+        /* end of the operation: apply the deferred frees, journal the superblock free counts */
+        w->applying = true;
+        for (uint32_t i = 0; i < w->npf; i++) if (e4_free_range(v, w->pfs[i], (uint32_t)w->pfc[i]) != 0) w->broken = true;
+        w->applying = false; w->npf = 0;
+        if ((v->alloc_since_sync || v->ialloc_since_sync) && e4_sb_update(v, false) != 0) w->broken = true;
+    }
+    if (--w->depth) return 0;
+    int r = e4_jw_commit(v);
+    if (r && w->aborted) {
+        /* nothing of this operation is in the log or at home (file data excepted, ordered mode):
+         * the committed log stays as it is (needs_recovery remains set, replayed at the next
+         * read-write mount or by e2fsck); go read-only */
+        v->rw = false;
+        printf("ext4 '%s': journal transaction aborted - volume is now read-only\n", v->label);
+    }
+    return r;
+}
+/* rw enable on a journaled volume (test-only option): log must be empty */
+static int e4_jw_open(e4_vol_t *v, const char **why) {
+    e4_j_t *j = (e4_j_t *)kalloc(sizeof(e4_j_t));
+    uint8_t *buf = (uint8_t *)kalloc(v->bs);
+    struct e4_jw *w = (struct e4_jw *)kalloc(sizeof(struct e4_jw));
+    int rc = -1;
+    if (!j || !buf || !w) { *why = "out of memory"; goto out; }
+    memset(w, 0, sizeof(*w));
+    int o = e4_j_open(v, j, buf);
+    if (o < 0) { *why = j->why; goto out; }
+    if (o != 1) { *why = "journal not empty"; goto out; }
+    if ((j_be32(buf + 0x24) & 1) && !(j->c2 || j->c3)) { *why = "journal checksum v1"; goto out; }
+    if (j->inc & 0x04) { *why = "async_commit journal"; goto out; }
+    w->jin = j->jin; w->first = j->first; w->last = j->last; w->seq = j->seq; w->seed = j->seed; w->tagsz = j->tagsz;
+    w->c2 = j->c2; w->c3 = j->c3; w->b64 = j->b64; memcpy(w->uuid, buf + 0x30, 16);
+    w->head = w->first;
+    w->reserve = (w->last - w->first) / 2;
+    if (w->reserve > 1024) w->reserve = 1024;
+    w->txmax = w->last - w->first - 2;
+    if (v->jres && v->jres < w->reserve) w->reserve = v->jres;
+    if (v->jtxmax && v->jtxmax < w->txmax) w->txmax = v->jtxmax;
+    w->jmap = (uint64_t *)kalloc(sizeof(uint64_t) * w->last);
+    if (!w->jmap) { *why = "out of memory"; goto out; }
+    for (uint32_t i = 0; i < w->last; i++) {
+        uint64_t pb = e4_bmap(v, &w->jin, i);
+        if (!pb || pb == E4_BMAP_ERR || pb >= v->blocks) { *why = "journal inode mapping"; kfree(w->jmap); goto out; }
+        w->jmap[i] = pb;
+    }
+    v->jw = w; w = NULL; rc = 0;
+    serial_printf("[ext4ro] '%s': journaled writes ON: log %u blocks, seq %u, csum %s%s\n", v->label, j->last - j->first, j->seq,
+                  j->c3 ? "v3" : j->c2 ? "v2" : "none", j->b64 ? ", 64bit" : "");
+out:
+    if (w) kfree(w);
+    if (j) kfree(j);
+    if (buf) kfree(buf);
+    return rc;
+}
+static void e4_jw_close(e4_vol_t *v) {
+    struct e4_jw *w = v->jw;
+    if (!w) return;
+    while (w->ncb) e4_cb_drop(w, 0);
+    if (w->cb) kfree(w->cb);
+    if (w->rv) kfree(w->rv);
+    if (w->lg) kfree(w->lg);
+    if (w->pfs) kfree(w->pfs);
+    if (w->pfc) kfree(w->pfc);
+    if (w->jmap) kfree(w->jmap);
+    serial_printf("[ext4ro] '%s': journal: %u commits, %u blocks logged, %u revoked, %u checkpoints (%u forced), %u wraps, %u aborted, %u deferred frees, %u orphans%s\n", v->label,
+                  w->ncommit, w->nlogged, w->nrevoke, w->nckpt, w->nforced, w->nwrap, w->naborted, w->ndeferred, w->norphan, w->broken ? ", BROKEN" : "");
+    kfree(w); v->jw = NULL;
+}
+void ext4ro_set_journal_test(e4_vol_t *v, bool on);
+void ext4ro_set_journal_test(e4_vol_t *v, bool on) { if (v) v->jtest = on; }
+/* TEST ONLY: forced-checkpoint reserve and max transaction size, in journal blocks (0 = default) */
+void ext4ro_set_journal_limits(e4_vol_t *v, uint32_t reserve, uint32_t txmax);
+void ext4ro_set_journal_limits(e4_vol_t *v, uint32_t reserve, uint32_t txmax) { if (v) { v->jres = reserve; v->jtxmax = txmax; } }
 static int e4_sync_vol(e4_vol_t *v);
 void ext4ro_unmount(e4_vol_t *v) {
     if (!v) return;
+    v->closing = true;
     if (v->rw && e4_sync_vol(v) != 0) printf("ext4 '%s': could not mark the volume clean\n", v->label);
+    e4_jw_close(v);
     for (int i = 0; i < E4_MAX_VOLS; i++) if (e4_vols[i] == v) e4_vols[i] = NULL;
+    if (v->ovl) kfree(v->ovl);
     kfree(v->gdt); kfree(v);
 }
 const char *ext4ro_label(const e4_vol_t *v) { return v ? v->label : ""; }
@@ -694,10 +1354,12 @@ static int e4_sb_update(e4_vol_t *v, bool clean) {
     uint8_t *sb = (uint8_t *)kalloc(1024);
     if (!sb) return -1;
     int rc = -1;
-    if (storage_read_sectors(v->dev, v->part + 2, 2, sb) != 0 || *(uint16_t *)(sb + 56) != 0xEF53) goto out;
+    bool jt = v->jw && v->jw->depth;
+    if (e4_sread(v, v->part + 2, 2, sb) != 0 || *(uint16_t *)(sb + 56) != 0xEF53) goto out;
     if (v->csum && e4_crc32c(~0u, sb, 0x3FC) != *(uint32_t *)(sb + 0x3FC)) { e4_csum_bad(v, "superblock", 0, *(uint32_t *)(sb + 0x3FC), 0); goto out; }
     uint16_t *st = (uint16_t *)(sb + 0x3A);
     if (clean) *st |= 1; else *st &= (uint16_t)~1u;
+    if (v->jw) { if (clean) *(uint32_t *)(sb + 0x60) &= ~(uint32_t)I_RECOVER; else *(uint32_t *)(sb + 0x60) |= I_RECOVER; }
     if (v->alloc_since_sync) {
         uint64_t f = *(uint32_t *)(sb + 0x0C) | ((v->incompat & I_64BIT) ? (uint64_t)*(uint32_t *)(sb + 0x158) << 32 : 0);
         int64_t nf = (int64_t)f - v->alloc_since_sync;
@@ -711,7 +1373,7 @@ static int e4_sb_update(e4_vol_t *v, bool clean) {
     }
     *(uint32_t *)(sb + 0x30) = (uint32_t)rtc_unix_epoch();          /* s_wtime */
     if (v->csum) *(uint32_t *)(sb + 0x3FC) = e4_crc32c(~0u, sb, 0x3FC);
-    if (storage_write_sectors(v->dev, v->part + 2, 2, sb) != 0) goto out;
+    if ((jt ? e4_swrite(v, v->part + 2, 2, sb) : storage_write_sectors(v->dev, v->part + 2, 2, sb)) != 0) goto out;
     v->alloc_since_sync = 0; v->ialloc_since_sync = 0; v->sb_clean = clean; rc = 0;
 out:
     kfree(sb);
@@ -721,6 +1383,11 @@ static int e4_mark_dirty(e4_vol_t *v) { return v->sb_clean ? e4_sb_update(v, fal
 /* sync / unmount: free count + clean flag. */
 static int e4_sync_vol(e4_vol_t *v) {
     if (!v || !v->rw) return 0;
+    if (v->jw) {
+        if (v->jw->depth) return 0;
+        if (e4_jw_commit(v) != 0 || e4_jw_checkpoint(v) != 0) return -1;
+        if (!v->closing) return 0;                       /* journaled: clean only at unmount */
+    }
     if (v->sb_clean && !v->alloc_since_sync && !v->ialloc_since_sync) return 0;
     return e4_sb_update(v, true);
 }
@@ -731,15 +1398,19 @@ int ext4ro_enable_rw(e4_vol_t *v) {
     uint8_t *sb = (uint8_t *)kalloc(1024);
     if (!sb) return -1;
     const char *why = NULL;
+    if (storage_read_sectors(v->dev, v->part + 2, 2, sb) == 0 && (*(uint32_t *)(sb + 0x60) & I_RECOVER) && (*(uint32_t *)(sb + 0x5C) & C_HAS_JOURNAL)) {
+        if (v->ovl) { kfree(v->ovl); v->ovl = NULL; v->novl = 0; }
+        if (e4_j_recover(v) != 0) why = "journal needs recovery (replay refused)";
+    }
     uint32_t bad = 0;
-    if (storage_read_sectors(v->dev, v->part + 2, 2, sb) != 0 || *(uint16_t *)(sb + 56) != 0xEF53) why = "superblock unreadable";
+    if (why) ;
+    else if (storage_read_sectors(v->dev, v->part + 2, 2, sb) != 0 || *(uint16_t *)(sb + 56) != 0xEF53) why = "superblock unreadable";
     else {
         uint32_t c = *(uint32_t *)(sb + 0x5C), inc = *(uint32_t *)(sb + 0x60), roc = *(uint32_t *)(sb + 0x64);
         uint16_t state = *(uint16_t *)(sb + 0x3A);
         uint32_t rev = *(uint32_t *)(sb + 0x4C);
-        if (c & C_HAS_JOURNAL) why = "has a journal (has_journal)";
-        else if (inc & I_RECOVER) why = "journal needs recovery";
-        else if (!(state & 1) || (state & 2)) { why = "not cleanly unmounted or has errors - run e2fsck"; bad = state; }
+        if (inc & I_RECOVER) why = "journal needs recovery";
+        else if ((!(state & 1) && !(c & C_HAS_JOURNAL)) || (state & 2)) {   /* journaled: unclean is normal after replay */ why = "not cleanly unmounted or has errors - run e2fsck"; bad = state; }
         else if (*(uint32_t *)(sb + 0x194)) why = "error records present (s_error_count) - run e2fsck";
         else if (inc & I_INLINE) why = "inline_data";
         else if (inc & I_META_BG) why = "meta_bg";
@@ -749,7 +1420,8 @@ int ext4ro_enable_rw(e4_vol_t *v) {
         else if (inc & I_MMP) why = "mmp";
         else if (inc & ~I_RW_OK) { why = "unknown/unsupported INCOMPAT features"; bad = inc & ~I_RW_OK; }
         else if (roc & ~RO_RW_OK) { why = "unknown/unsupported RO_COMPAT features"; bad = roc & ~RO_RW_OK; }
-        else if (c & ~C_RW_OK) { why = "unknown/unsupported COMPAT features"; bad = c & ~C_RW_OK; }
+        else if (c & ~(C_RW_OK | C_HAS_JOURNAL)) { why = "unknown/unsupported COMPAT features"; bad = c & ~C_RW_OK; }
+        else if ((c & C_HAS_JOURNAL) && e4_jw_open(v, &why) != 0) ;
         else if (rev < 1 && v->isz != 128) why = "bad inode size";
         else if (v->csum_errs) why = "metadata checksum errors seen";
     }
@@ -762,8 +1434,9 @@ int ext4ro_enable_rw(e4_vol_t *v) {
         return -30;
     }
     v->rw = true; v->sb_clean = true;
-    if (e4_sb_update(v, false) != 0) { v->rw = false; printf("ext4 '%s': cannot write superblock - read-only\n", v->label); return -5; }
-    serial_printf("[ext4ro] '%s' read-write enabled (state not-clean until sync/unmount)\n", v->label);
+    if (e4_sb_update(v, false) != 0) { v->rw = false; e4_jw_close(v); printf("ext4 '%s': cannot write superblock - read-only\n", v->label); return -5; }
+    serial_printf("[ext4ro] '%s' read-write enabled (state not-clean until %s)\n", v->label, v->jw ? "unmount" : "sync/unmount");
+    if (v->jw) e4_orphans_process(v);
     return 0;
 }
 bool ext4ro_is_rw(const e4_vol_t *v) { return v && v->rw; }
@@ -780,7 +1453,7 @@ static int e4_touch(e4_vol_t *v, e4_inode_t *in) {
     if (!b) return -1;
     uint64_t lba = v->part + blk * v->spb + sec0;
     int rc = -1;
-    if (storage_read_sectors(v->dev, lba, nsec, b) != 0) goto out;
+    if (e4_sread(v, lba, nsec, b) != 0) goto out;
     uint8_t *r = b + (off % 512);
     if (*(uint16_t *)r != in->mode) goto out;                       /* inode changed under us */
     if (v->csum) {
@@ -806,7 +1479,7 @@ static int e4_touch(e4_vol_t *v, e4_inode_t *in) {
         if (v->isz > 128 && 128u + extra >= 0x84) *(uint16_t *)(r + 0x82) = (uint16_t)(c >> 16);
     }
     if (blk < v->first_data + 1 || blk >= v->blocks) goto out;
-    if (storage_write_sectors(v->dev, lba, nsec, b) != 0) goto out;
+    if (e4_swrite(v, lba, nsec, b) != 0) goto out;
     in->mtime = (uint32_t)now;
     memcpy(in->raw, r, in->rawlen);
     rc = 0;
@@ -847,14 +1520,53 @@ static int e4_bitmap_commit(e4_vol_t *v, uint32_t g, uint8_t *bm, int delta) {
     *(uint16_t *)(d + 0x0C) = (uint16_t)f;
     if (v->dsz >= 64) *(uint16_t *)(d + 0x2C) = (uint16_t)(f >> 16);
     if (v->csum) *(uint16_t *)(d + 0x1E) = e4_gd_csum(v, g);
-    if (storage_write_sectors(v->dev, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) != 0) return -1;
+    if (e4_swrite(v, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) != 0) return -1;
     uint64_t gblk = v->first_data + 1 + ((uint64_t)g * v->dsz) / v->bs;
     uint32_t goff = (uint32_t)(((uint64_t)g * v->dsz) / v->bs) * v->bs;
-    if (storage_write_sectors(v->dev, v->part + gblk * v->spb, v->spb, v->gdt + goff) != 0) return -1;
+    if (e4_swrite(v, v->part + gblk * v->spb, v->spb, v->gdt + goff) != 0) return -1;
     v->alloc_since_sync += delta;
     return 0;
 }
 /* Allocate one block, first free at/after @goal (wrapping).  0 = none. */
+static bool e4_has_super(e4_vol_t *v, uint32_t g) {
+    if (g <= 1 || !(v->ro_compat & 0x0001)) return true;
+    for (uint32_t b = 3; b <= 7; b += 2) { uint64_t p = b; while (p < g) p *= b; if (p == g) return true; }
+    return false;
+}
+static void e4_bm_mark(uint8_t *bm, uint64_t gstart, uint32_t nbits, uint64_t a, uint64_t n) {
+    for (uint64_t x = a; x < a + n; x++) if (x >= gstart && x < gstart + nbits) bm[(x - gstart) >> 3] |= (uint8_t)(1u << ((x - gstart) & 7));
+}
+/* 0 = @bm now holds the bitmap of BLOCK_UNINIT group @g (matches its free count) */
+static int e4_bm_uninit(e4_vol_t *v, uint32_t g, uint8_t *bm) {
+    if (v->compat & 0x0200) return -1;                               /* sparse_super2: not handled */
+    uint64_t gstart = v->first_data + (uint64_t)g * v->bpg;
+    uint32_t nbits = v->bpg;
+    if (gstart + nbits > v->blocks) nbits = (uint32_t)(v->blocks - gstart);
+    memset(bm, 0, v->bs);
+    if (e4_has_super(v, g)) {
+        uint8_t *sb = (uint8_t *)kalloc(1024);
+        if (!sb) return -1;
+        int r = storage_read_sectors(v->dev, v->part + 2, 2, sb);
+        uint32_t rsv = *(uint16_t *)(sb + 0xCE);
+        kfree(sb);
+        if (r != 0) return -1;
+        uint32_t gdtb = (uint32_t)(((uint64_t)v->groups * v->dsz + v->bs - 1) / v->bs);
+        e4_bm_mark(bm, gstart, nbits, gstart, 1 + gdtb + rsv);
+    }
+    const uint8_t *d = v->gdt + (uint64_t)g * v->dsz;
+    uint64_t it = *(uint32_t *)(d + 8) | (v->dsz >= 64 ? (uint64_t)*(uint32_t *)(d + 0x28) << 32 : 0);
+    e4_bm_mark(bm, gstart, nbits, e4_gd_bitmap(v, g), 1);
+    e4_bm_mark(bm, gstart, nbits, *(uint32_t *)(d + 4) | (v->dsz >= 64 ? (uint64_t)*(uint32_t *)(d + 0x24) << 32 : 0), 1);
+    e4_bm_mark(bm, gstart, nbits, it, ((uint64_t)v->ipg * v->isz + v->bs - 1) / v->bs);
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < nbits; i++) if (bm[i >> 3] & (1u << (i & 7))) used++;
+    for (uint32_t i = nbits; i < v->bpg; i++) bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+    if (used + e4_gd_free(v, g) != nbits) {
+        serial_printf("[ext4ro] group %u: BLOCK_UNINIT bitmap would not match the free count (%u used, %u free) - skipped\n", g, used, e4_gd_free(v, g));
+        return -1;
+    }
+    return 0;
+}
 static uint64_t e4_alloc_block(e4_vol_t *v, uint64_t goal) {
     if ((v->ro_compat & 0x0010) && !v->csum) return 0;          /* gdt_csum (crc16) not implemented */
     if (goal < v->first_data || goal >= v->blocks) goal = v->first_data;
@@ -865,9 +1577,13 @@ static uint64_t e4_alloc_block(e4_vol_t *v, uint64_t goal) {
     for (uint32_t k = 0; k <= v->groups && !res; k++) {
         uint32_t g = (g0 + k) % v->groups;
         const uint8_t *d = v->gdt + (uint64_t)g * v->dsz;
-        if (!e4_gd_free(v, g) || (*(uint16_t *)(d + 0x12) & BG_BLOCK_UNINIT)) continue;
-        if (storage_read_sectors(v->dev, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) != 0) break;
-        if (v->csum) {
+        if (!e4_gd_free(v, g)) continue;
+        bool uninit = (*(uint16_t *)(d + 0x12) & BG_BLOCK_UNINIT) != 0;
+        if (uninit) {
+            if (e4_bm_uninit(v, g, bm) != 0) continue;
+            *(uint16_t *)((uint8_t *)d + 0x12) &= (uint16_t)~BG_BLOCK_UNINIT;  /* committed with the first allocation */
+        } else if (e4_sread(v, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) != 0) break;
+        if (v->csum && !uninit) {
             uint32_t c = e4_crc32c(v->seed, bm, v->bpg / 8);
             uint32_t st = *(uint16_t *)(d + 0x18) | (v->dsz >= 0x3C ? (uint32_t)*(uint16_t *)(d + 0x38) << 16 : 0);
             if ((v->dsz >= 0x3C ? c : (c & 0xFFFF)) != st) { e4_csum_bad(v, "block bitmap", g, st, c); break; }
@@ -892,10 +1608,11 @@ done:
     return res;
 }
 static void e4_free_block(e4_vol_t *v, uint64_t pb) {
+    if (e4_jw_defer(v, pb, 1)) return;
     uint32_t g = (uint32_t)((pb - v->first_data) / v->bpg), i = (uint32_t)((pb - v->first_data) % v->bpg);
     uint8_t *bm = (uint8_t *)kalloc(v->bs);
     if (!bm) return;
-    if (storage_read_sectors(v->dev, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) == 0 &&
+    if (e4_sread(v, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) == 0 &&
         (bm[i >> 3] & (1u << (i & 7)))) {
         bm[i >> 3] &= (uint8_t)~(1u << (i & 7));
         e4_bitmap_commit(v, g, bm, -1);
@@ -922,10 +1639,11 @@ static void e4_leaf_csum(e4_vol_t *v, const e4_inode_t *in, uint8_t *blk) {
 static uint32_t e4_map_end(e4_vol_t *v, const e4_inode_t *in, uint64_t *goal) {
     *goal = 0;
     if (!(in->flags & FL_EXTENTS)) {
-        const uint32_t *ib = (const uint32_t *)in->iblock;
-        if (ib[12] || ib[13] || ib[14]) return E4_NO_APPEND;    /* indirect blocks: not yet */
-        uint32_t e = 0;
-        for (uint32_t i = 0; i < 12; i++) if (ib[i]) { e = i + 1; *goal = ib[i] + 1; }
+        uint32_t e = (uint32_t)((in->size + v->bs - 1) / v->bs);
+        for (uint32_t k = e; k > 0 && k + 64 > e; k--) {
+            uint64_t pb = e4_bmap(v, in, k - 1);
+            if (pb && pb != E4_BMAP_ERR) { *goal = pb + 1 + (e - k); break; }
+        }
         return e;
     }
     const uint8_t *node = in->iblock;
@@ -953,6 +1671,51 @@ static uint32_t e4_map_end(e4_vol_t *v, const e4_inode_t *in, uint64_t *goal) {
     if (buf) kfree(buf);
     return res;
 }
+
+/* ---- block maps (ext2/3, no extents): set lblk -> pb, allocating indirect blocks ---- */
+static int e4_ind_set(e4_vol_t *v, e4_inode_t *in, uint32_t lblk, uint64_t pb) {
+    uint32_t *ib = (uint32_t *)in->iblock, per = v->bs / 4;
+    if (pb >> 32) return -27;
+    if (lblk < 12) { ib[lblk] = (uint32_t)pb; return 0; }
+    uint64_t rel = lblk - 12; uint32_t lvl;
+    if (rel < per) lvl = 1;
+    else if ((rel -= per) < (uint64_t)per * per) lvl = 2;
+    else { rel -= (uint64_t)per * per; lvl = 3; if (rel >= (uint64_t)per * per * per) return -27; }
+    uint32_t *buf = (uint32_t *)kalloc(v->bs);
+    if (!buf) return -12;
+    int rc = 0;
+    uint32_t *slot = &ib[11 + lvl];
+    if (!*slot) {
+        uint64_t nb = e4_alloc_block(v, pb);
+        if (!nb) { kfree(buf); return -28; }
+        memset(buf, 0, v->bs);
+        if (e4_wblk(v, nb, buf) != 0) { e4_free_block(v, nb); kfree(buf); return -5; }
+        *slot = (uint32_t)nb; e4_iblocks_add(v, in, 1);
+    }
+    uint32_t cur = *slot;
+    for (uint32_t l = lvl; l > 0; l--) {
+        uint64_t div = 1;
+        for (uint32_t k = 1; k < l; k++) div *= per;
+        uint32_t idx = (uint32_t)((rel / div) % per);
+        if (e4_read(v, cur, buf) != 0) { rc = -5; break; }
+        if (l == 1) { buf[idx] = (uint32_t)pb; rc = e4_wblk(v, cur, buf) ? -5 : 0; break; }
+        if (!buf[idx]) {
+            uint64_t nb = e4_alloc_block(v, pb);
+            if (!nb) { rc = -28; break; }
+            uint32_t *z = (uint32_t *)kalloc(v->bs);
+            if (!z) { e4_free_block(v, nb); rc = -12; break; }
+            memset(z, 0, v->bs);
+            int w = e4_wblk(v, nb, z); kfree(z);
+            if (w) { e4_free_block(v, nb); rc = -5; break; }
+            buf[idx] = (uint32_t)nb;
+            if (e4_wblk(v, cur, buf) != 0) { rc = -5; break; }
+            e4_iblocks_add(v, in, 1);
+        }
+        cur = buf[idx];
+    }
+    kfree(buf);
+    return rc;
+}
 /* Add lblk->pb (lblk >= map end): merge into the last extent, add an entry,
  * or (root leaf full) move the root's entries into a new leaf block. */
 static int e4_leaf_add(uint8_t *node, uint32_t lblk, uint64_t pb) {
@@ -970,80 +1733,217 @@ static int e4_leaf_add(uint8_t *node, uint32_t lblk, uint64_t pb) {
     *(uint16_t *)(node + 2) = n + 1;
     return 0;
 }
+static int e4_ext_set(e4_vol_t *v, e4_inode_t *in, uint32_t lblk, uint64_t pb);
 static int e4_map_append(e4_vol_t *v, e4_inode_t *in, uint32_t lblk, uint64_t pb) {
-    if (!(in->flags & FL_EXTENTS)) {
-        if (lblk >= 12) return -95;
-        ((uint32_t *)in->iblock)[lblk] = (uint32_t)pb;
-        return 0;
-    }
-    uint8_t *root = in->iblock;
-    if (*(uint16_t *)root != 0xF30A) return -5;
-    uint16_t depth = *(uint16_t *)(root + 6);
-    if (depth == 0) {
-        int r = e4_leaf_add(root, lblk, pb);
-        if (r == 0) return 0;
-        /* split: root entries -> new leaf block, root becomes a 1-entry index */
-        uint64_t nb = e4_alloc_block(v, pb + 1);
-        if (!nb) return -28;
-        uint8_t *blk = (uint8_t *)kalloc(v->bs);
-        if (!blk) { e4_free_block(v, nb); return -12; }
-        memset(blk, 0, v->bs);
-        uint16_t n = *(uint16_t *)(root + 2);
-        *(uint16_t *)blk = 0xF30A; *(uint16_t *)(blk + 2) = n;
-        *(uint16_t *)(blk + 4) = (uint16_t)((v->bs - 12) / 12);
-        *(uint16_t *)(blk + 6) = 0; *(uint32_t *)(blk + 8) = 0;
-        memcpy(blk + 12, root + 12, 12u * n);
-        e4_leaf_add(blk, lblk, pb);
-        e4_leaf_csum(v, in, blk);
-        if (e4_wblk(v, nb, blk) != 0) { kfree(blk); e4_free_block(v, nb); return -5; }
-        kfree(blk);
-        uint32_t first = n ? *(uint32_t *)(root + 12) : lblk;
-        memset(root + 12, 0, 48);
-        *(uint16_t *)(root + 2) = 1; *(uint16_t *)(root + 6) = 1;
-        uint8_t *ix = root + 12;
-        *(uint32_t *)ix = first; *(uint32_t *)(ix + 4) = (uint32_t)nb; *(uint16_t *)(ix + 8) = (uint16_t)(nb >> 32);
-        e4_iblocks_add(v, in, 1);
-        serial_printf("[ext4ro] ino %u: extent root full - split into leaf block %llu\n", in->ino, (unsigned long long)nb);
-        return 0;
-    }
-    if (depth != 1) return -95;                                     /* deeper trees: not yet */
-    uint16_t n = *(uint16_t *)(root + 2);
-    if (!n) return -5;
-    uint8_t *ix = root + 12 + 12 * (n - 1);
-    uint64_t leaf = *(uint32_t *)(ix + 4) | ((uint64_t)*(uint16_t *)(ix + 8) << 32);
-    uint8_t *blk = (uint8_t *)kalloc(v->bs);
-    if (!blk) return -12;
-    int rc = -5;
-    if (e4_read(v, leaf, blk) == 0 && *(uint16_t *)blk == 0xF30A && *(uint16_t *)(blk + 6) == 0) {
-        if (v->csum) {
-            uint32_t to = 12 + 12u * *(uint16_t *)(blk + 4);
-            if (to + 4 > v->bs || e4_crc32c(in->cseed, blk, to) != *(uint32_t *)(blk + to)) { e4_csum_bad(v, "extent block", leaf, 0, 0); goto out; }
-        }
-        if (e4_leaf_add(blk, lblk, pb) != 0) {                     /* leaf full: start the next leaf */
-            if (n >= *(uint16_t *)(root + 4)) { serial_printf("[ext4ro] ino %u: extent index full (depth 2 not supported)\n", in->ino); rc = -95; goto out; }
-            uint64_t nb = e4_alloc_block(v, pb + 1);
-            if (!nb) { rc = -28; goto out; }
-            memset(blk, 0, v->bs);
-            *(uint16_t *)blk = 0xF30A; *(uint16_t *)(blk + 4) = (uint16_t)((v->bs - 12) / 12);
-            e4_leaf_add(blk, lblk, pb);
-            e4_leaf_csum(v, in, blk);
-            if (e4_wblk(v, nb, blk) != 0) { e4_free_block(v, nb); rc = -5; goto out; }
-            uint8_t *nx = root + 12 + 12 * n;
-            memset(nx, 0, 12);
-            *(uint32_t *)nx = lblk; *(uint32_t *)(nx + 4) = (uint32_t)nb; *(uint16_t *)(nx + 8) = (uint16_t)(nb >> 32);
-            *(uint16_t *)(root + 2) = n + 1;
-            e4_iblocks_add(v, in, 1);
-            serial_printf("[ext4ro] ino %u: extent leaf %u full - new leaf block %llu\n", in->ino, (unsigned)n, (unsigned long long)nb);
-            rc = 0; goto out;
-        }
-        e4_leaf_csum(v, in, blk);
-        rc = e4_wblk(v, leaf, blk) == 0 ? 0 : -5;
-    }
-out:
-    kfree(blk);
-    return rc;
+    if (!(in->flags & FL_EXTENTS)) return e4_ind_set(v, in, lblk, pb);
+    return e4_ext_set(v, in, lblk, pb);
 }
 
+
+/* ---- extents: map lblk -> pb inside the mapping (fill a hole, or mark one
+ * block of an unwritten extent written), with splits/merges, root -> leaf and
+ * leaf splits under a depth-1 root (deeper trees: not yet) ---- */
+typedef struct { uint32_t lb, len; uint64_t pb; bool unw; } e4_x_t;
+static int e4_x_load(const uint8_t *node, e4_x_t *x) {
+    uint16_t n = *(uint16_t *)(node + 2);
+    for (int i = 0; i < n; i++) {
+        const uint8_t *e = node + 12 + 12 * i;
+        uint16_t raw = *(uint16_t *)(e + 4);
+        x[i].lb = *(uint32_t *)e; x[i].unw = raw > 32768; x[i].len = x[i].unw ? raw - 32768u : raw;
+        x[i].pb = *(uint32_t *)(e + 8) | ((uint64_t)*(uint16_t *)(e + 6) << 32);
+    }
+    return n;
+}
+static void e4_x_store(uint8_t *node, const e4_x_t *x, int n) {
+    uint16_t max = *(uint16_t *)(node + 4);
+    memset(node + 12, 0, 12u * max);
+    for (int i = 0; i < n; i++) {
+        uint8_t *e = node + 12 + 12 * i;
+        *(uint32_t *)e = x[i].lb; *(uint16_t *)(e + 4) = (uint16_t)(x[i].unw ? x[i].len + 32768u : x[i].len);
+        *(uint16_t *)(e + 6) = (uint16_t)(x[i].pb >> 32); *(uint32_t *)(e + 8) = (uint32_t)x[i].pb;
+    }
+    *(uint16_t *)(node + 2) = (uint16_t)n;
+}
+/* apply lblk -> pb to the sorted list (room for n + 2); returns the new count */
+static int e4_x_apply(e4_x_t *x, int n, uint32_t lblk, uint64_t pb) {
+    int i = 0;
+    while (i < n && x[i].lb + x[i].len <= lblk) i++;
+    if (i < n && x[i].lb <= lblk) {                                  /* inside an (unwritten) extent */
+        e4_x_t o = x[i], p[3]; int k = 0;
+        if (lblk > o.lb) { p[k].lb = o.lb; p[k].len = lblk - o.lb; p[k].pb = o.pb; p[k].unw = o.unw; k++; }
+        p[k].lb = lblk; p[k].len = 1; p[k].pb = pb; p[k].unw = false; k++;
+        if (lblk + 1 < o.lb + o.len) { p[k].lb = lblk + 1; p[k].len = o.lb + o.len - lblk - 1; p[k].pb = o.pb + (lblk + 1 - o.lb); p[k].unw = o.unw; k++; }
+        memmove(x + i + k, x + i + 1, sizeof(e4_x_t) * (n - i - 1));
+        memcpy(x + i, p, sizeof(e4_x_t) * k);
+        n += k - 1;
+    } else {                                                          /* hole: new entry */
+        memmove(x + i + 1, x + i, sizeof(e4_x_t) * (n - i));
+        x[i].lb = lblk; x[i].len = 1; x[i].pb = pb; x[i].unw = false;
+        n++;
+    }
+    /* merge written neighbours that are contiguous logically and physically */
+    for (int k = 1; k < n; ) {
+        e4_x_t *a = &x[k - 1], *b = &x[k];
+        if (!a->unw && !b->unw && a->lb + a->len == b->lb && a->pb + a->len == b->pb && a->len + b->len <= 32768) {
+            a->len += b->len; memmove(x + k, x + k + 1, sizeof(e4_x_t) * (n - k - 1)); n--;
+        } else k++;
+    }
+    return n;
+}
+static bool e4_leaf_csum_ok(e4_vol_t *v, const e4_inode_t *in, const uint8_t *blk, uint64_t at) {
+    if (*(uint16_t *)blk != 0xF30A) return false;
+    if (!v->csum) return true;
+    uint32_t to = 12 + 12u * *(uint16_t *)(blk + 4);
+    if (to + 4 > v->bs || e4_crc32c(in->cseed, blk, to) != *(uint32_t *)(blk + to)) { e4_csum_bad(v, "extent block", at, 0, 0); return false; }
+    return true;
+}
+#define E4_MAXD 5                                   /* ext4 limit */
+typedef struct { uint8_t *buf; uint64_t blk; int idx; } e4_pl_t;   /* path level; 0 = root in the inode */
+typedef struct { uint64_t b[E4_MAXD + 2]; int n, used; } e4_pool_t;
+static uint64_t e4_pool_take(e4_pool_t *p) { return p->used < p->n ? p->b[p->used++] : 0; }
+static void e4_pool_release(e4_vol_t *v, e4_pool_t *p) { while (p->n > p->used) e4_free_block(v, p->b[--p->n]); }
+static bool e4_node_ok(e4_vol_t *v, const e4_inode_t *in, const uint8_t *b, uint64_t at, int depth) {
+    if (*(uint16_t *)b != 0xF30A || *(uint16_t *)(b + 6) != depth) return false;
+    uint16_t max = *(uint16_t *)(b + 4);
+    if (!max || max > (v->bs - 12) / 12 || *(uint16_t *)(b + 2) > max) return false;
+    return e4_leaf_csum_ok(v, in, b, at);
+}
+static int e4_pl_write(e4_vol_t *v, e4_inode_t *in, e4_pl_t *pl, int L) {
+    if (L == 0) return 0;                          /* root: written with the inode (e4_touch) */
+    e4_leaf_csum(v, in, pl[L].buf);
+    return e4_wblk(v, pl[L].blk, pl[L].buf) ? -5 : 0;
+}
+static void e4_ix_put(uint8_t *e, uint32_t key, uint64_t child) {
+    memset(e, 0, 12); *(uint32_t *)e = key; *(uint32_t *)(e + 4) = (uint32_t)child; *(uint16_t *)(e + 8) = (uint16_t)(child >> 32);
+}
+/* insert index entry {key, child} at @pos of index node @L; splits full nodes
+ * upward and grows the root depth when the root is full */
+static int e4_ix_insert(e4_vol_t *v, e4_inode_t *in, e4_pl_t *pl, int L, int pos, uint32_t key, uint64_t child, e4_pool_t *pool) {
+    uint8_t *nd = pl[L].buf;
+    uint16_t n = *(uint16_t *)(nd + 2), max = *(uint16_t *)(nd + 4), d = *(uint16_t *)(nd + 6);
+    uint16_t lmax = (uint16_t)((v->bs - 12) / 12);
+    if (n < max) {
+        memmove(nd + 12 + 12 * (pos + 1), nd + 12 + 12 * pos, 12u * (n - pos));
+        e4_ix_put(nd + 12 + 12 * pos, key, child); *(uint16_t *)(nd + 2) = n + 1;
+        return e4_pl_write(v, in, pl, L);
+    }
+    uint64_t nb = e4_pool_take(pool);
+    if (!nb) return -28;
+    uint8_t *b = (uint8_t *)kalloc(v->bs), *t = (uint8_t *)kalloc(12u * (n + 1));
+    if (!b || !t) { if (b) kfree(b); if (t) kfree(t); return -12; }
+    memcpy(t, nd + 12, 12u * pos); e4_ix_put(t + 12 * pos, key, child); memcpy(t + 12 * (pos + 1), nd + 12 + 12 * pos, 12u * (n - pos));
+    int rc;
+    memset(b, 0, v->bs); *(uint16_t *)b = 0xF30A; *(uint16_t *)(b + 6) = d;
+    if (L == 0) {                                  /* root full: entries move down, depth + 1 */
+        *(uint16_t *)(b + 2) = n + 1; *(uint16_t *)(b + 4) = lmax; memcpy(b + 12, t, 12u * (n + 1));
+        e4_leaf_csum(v, in, b);
+        rc = e4_wblk(v, nb, b) ? -5 : 0;
+        if (!rc) {
+            memset(nd + 12, 0, 48); *(uint16_t *)(nd + 2) = 1; *(uint16_t *)(nd + 6) = d + 1;
+            e4_ix_put(nd + 12, *(uint32_t *)t, nb);
+            e4_iblocks_add(v, in, 1);
+            serial_printf("[ext4ro] ino %u: extent tree depth %u -> %u (index block %llu)\n", in->ino, d, d + 1, (unsigned long long)nb);
+        }
+    } else {                                       /* split this index node */
+        int left = pos == n ? n : (n + 1) / 2;
+        memset(nd + 12, 0, 12u * max); memcpy(nd + 12, t, 12u * left); *(uint16_t *)(nd + 2) = (uint16_t)left;
+        *(uint16_t *)(b + 2) = (uint16_t)(n + 1 - left); *(uint16_t *)(b + 4) = max; memcpy(b + 12, t + 12 * left, 12u * (n + 1 - left));
+        uint32_t rkey = *(uint32_t *)(b + 12);
+        e4_leaf_csum(v, in, b);
+        rc = e4_wblk(v, nb, b) ? -5 : e4_pl_write(v, in, pl, L);
+        if (!rc) {
+            e4_iblocks_add(v, in, 1);
+            serial_printf("[ext4ro] ino %u: extent index split at depth %u -> block %llu\n", in->ino, d, (unsigned long long)nb);
+            rc = e4_ix_insert(v, in, pl, L - 1, pl[L - 1].idx + 1, rkey, nb, pool);
+        }
+    }
+    kfree(b); kfree(t);
+    return rc;
+}
+/* map lblk -> pb anywhere: fill a hole, append, or mark one block of an
+ * unwritten extent written; splits/merges extents, splits leaves and index
+ * nodes, grows the tree depth (up to 5) */
+static int e4_ext_set(e4_vol_t *v, e4_inode_t *in, uint32_t lblk, uint64_t pb) {
+    uint8_t *root = in->iblock;
+    if (*(uint16_t *)root != 0xF30A) {                                /* empty file without a header */
+        memset(root, 0, 60); *(uint16_t *)root = 0xF30A; *(uint16_t *)(root + 4) = 4;
+    }
+    int D = *(uint16_t *)(root + 6);
+    if (D > E4_MAXD || *(uint16_t *)(root + 2) > 4) return -5;
+    uint32_t lmax = (v->bs - 12) / 12;
+    e4_pl_t pl[E4_MAXD + 1]; memset(pl, 0, sizeof(pl));
+    e4_pool_t pool; memset(&pool, 0, sizeof(pool));
+    pl[0].buf = root;
+    e4_x_t *x = (e4_x_t *)kalloc(sizeof(e4_x_t) * (lmax + 4));
+    uint8_t *nb2 = (uint8_t *)kalloc(v->bs);
+    int rc = -12;
+    if (!x || !nb2) goto out;
+    for (int L = 0; L < D; L++) {
+        uint8_t *nd = pl[L].buf; uint16_t n = *(uint16_t *)(nd + 2);
+        if (!n) { rc = -5; goto out; }
+        int pick = 0;
+        for (int i = 0; i < n; i++) if (*(uint32_t *)(nd + 12 + 12 * i) <= lblk) pick = i;
+        pl[L].idx = pick;
+        uint8_t *ix = nd + 12 + 12 * pick;
+        pl[L + 1].blk = *(uint32_t *)(ix + 4) | ((uint64_t)*(uint16_t *)(ix + 8) << 32);
+        if (!(pl[L + 1].buf = (uint8_t *)kalloc(v->bs))) goto out;
+        if (pl[L + 1].blk < v->first_data + 1 || pl[L + 1].blk >= v->blocks || e4_read(v, pl[L + 1].blk, pl[L + 1].buf) != 0 ||
+            !e4_node_ok(v, in, pl[L + 1].buf, pl[L + 1].blk, D - L - 1)) { rc = -5; goto out; }
+    }
+    uint8_t *leaf = pl[D].buf;
+    uint16_t max = *(uint16_t *)(leaf + 4);
+    if (max > lmax) { rc = -5; goto out; }
+    int n0 = e4_x_load(leaf, x);
+    bool tail = n0 == 0 || lblk >= x[n0 - 1].lb;
+    int n = e4_x_apply(x, n0, lblk, pb);
+    if (n > max) {                                 /* reserve every block a split chain can need */
+        int need = 1;
+        for (int L = D - 1; L >= 0; L--) { if (*(uint16_t *)(pl[L].buf + 2) >= *(uint16_t *)(pl[L].buf + 4)) need++; else break; }
+        uint64_t goal = D ? pl[D].blk + 1 : pb + 1;
+        for (int i = 0; i < need; i++) {
+            uint64_t b = e4_alloc_block(v, goal);
+            if (!b) { e4_pool_release(v, &pool); rc = -28; goto out; }
+            pool.b[pool.n++] = b; goal = b + 1;
+        }
+    }
+    /* keys on the path must not exceed the first block below them */
+    for (int L = D - 1; L >= 0; L--) {
+        uint8_t *e = pl[L].buf + 12 + 12 * pl[L].idx;
+        if (*(uint32_t *)e <= x[0].lb) break;
+        *(uint32_t *)e = x[0].lb;
+        if ((rc = e4_pl_write(v, in, pl, L)) != 0) goto rel;
+    }
+    if (n <= max) { e4_x_store(leaf, x, n); rc = e4_pl_write(v, in, pl, D); goto rel; }
+    uint64_t nb = e4_pool_take(&pool);
+    memset(nb2, 0, v->bs);
+    *(uint16_t *)nb2 = 0xF30A;
+    if (D == 0) {                                  /* root leaf full: entries -> new leaf, depth 1 */
+        *(uint16_t *)(nb2 + 4) = (uint16_t)lmax;
+        e4_x_store(nb2, x, n); e4_leaf_csum(v, in, nb2);
+        if (e4_wblk(v, nb, nb2) != 0) { rc = -5; goto rel; }
+        memset(root + 12, 0, 48);
+        *(uint16_t *)(root + 2) = 1; *(uint16_t *)(root + 6) = 1;
+        e4_ix_put(root + 12, x[0].lb, nb);
+        e4_iblocks_add(v, in, 1);
+        serial_printf("[ext4ro] ino %u: extent root full - split into leaf block %llu\n", in->ino, (unsigned long long)nb);
+        rc = 0; goto rel;
+    }
+    int left = tail ? (n - 1 < max ? n - 1 : max) : n / 2;  /* appends keep the left leaf full */
+    *(uint16_t *)(nb2 + 4) = max;
+    e4_x_store(nb2, x + left, n - left); e4_leaf_csum(v, in, nb2);
+    e4_x_store(leaf, x, left);
+    if (e4_wblk(v, nb, nb2) != 0 || (rc = e4_pl_write(v, in, pl, D)) != 0) { rc = -5; goto rel; }
+    e4_iblocks_add(v, in, 1);
+    serial_printf("[ext4ro] ino %u: extent leaf split -> block %llu\n", in->ino, (unsigned long long)nb);
+    rc = e4_ix_insert(v, in, pl, D - 1, pl[D - 1].idx + 1, x[left].lb, nb, &pool);
+rel:
+    e4_pool_release(v, &pool);
+out:
+    for (int L = 1; L <= E4_MAXD; L++) if (pl[L].buf) kfree(pl[L].buf);
+    if (x) kfree(x);
+    if (nb2) kfree(nb2);
+    return rc;
+}
 /* Write file bytes [off, off+len).  Allocated blocks are rewritten in place;
  * blocks past the end of the mapping are allocated (extents: merged into the
  * last extent / new entries / root split; block maps: direct blocks only).
@@ -1065,28 +1965,49 @@ static int e4_pwrite(e4_vol_t *v, e4_inode_t *in, uint64_t off, const uint8_t *s
         uint64_t pb = e4_bmap(v, in, (uint32_t)(in->size / v->bs));
         if (pb && pb != E4_BMAP_ERR && e4_read(v, pb, b) == 0) {
             memset(b + in->size % v->bs, 0, v->bs - in->size % v->bs);
-            if (e4_wblk(v, pb, b) != 0) { kfree(b); return -5; }
+            if (e4_wdata(v, pb, b) != 0) { kfree(b); return -5; }
         }
     }
     while (done < len) {
         uint64_t p = off + done;
         uint32_t lb = (uint32_t)(p / v->bs), in_off = (uint32_t)(p % v->bs);
         uint32_t n = v->bs - in_off; if (n > len - done) n = len - done;
-        uint64_t pb = e4_bmap(v, in, lb);
+        bool unw = false;
+        uint64_t pb = e4_bmap_x(v, in, lb, &unw);
         if (pb == E4_BMAP_ERR) { err = -5; break; }
-        if (!pb) {
+        if (unw) {                                                    /* unwritten: rest of the block reads as zeros */
+            if (pb < v->first_data + 1 || pb >= v->blocks) { err = -5; break; }
+            memset(b, 0, v->bs);
+            memcpy(b + in_off, src + done, n);
+            if (e4_wdata(v, pb, b) != 0) { err = -5; break; }
+            int r = e4_ext_set(v, in, lb, pb);
+            if (r) { serial_printf("[ext4ro] ino %u lblk %u: unwritten -> written failed (%d)\n", in->ino, lb, r); err = r; break; }
+            meta = true;
+        } else if (!pb) {
             uint64_t goal;
             uint32_t end = e4_map_end(v, in, &goal);
-            if (end == E4_NO_APPEND || lb < end) {
-                serial_printf("[ext4ro] write into hole/unwritten block (ino %u lblk %u, map end %u): not supported yet\n", in->ino, lb, end);
-                err = -95; break;
+            if (end == E4_NO_APPEND || lb < end) {                    /* hole inside the mapping */
+                uint64_t prev = lb ? e4_bmap(v, in, lb - 1) : 0;
+                if (prev == E4_BMAP_ERR) prev = 0;
+                pb = e4_alloc_block(v, prev ? prev + 1 : goal);
+                if (!pb) { err = -28; break; }
+                memset(b, 0, v->bs);
+                memcpy(b + in_off, src + done, n);
+                if (e4_wdata(v, pb, b) != 0) { e4_free_block(v, pb); err = -5; break; }
+                int r = (in->flags & FL_EXTENTS) ? e4_ext_set(v, in, lb, pb) : e4_ind_set(v, in, lb, pb);
+                if (r) { e4_free_block(v, pb); serial_printf("[ext4ro] ino %u lblk %u: hole fill failed (%d)\n", in->ino, lb, r); err = r; break; }
+                e4_iblocks_add(v, in, 1);
+                meta = true;
+                done += n;
+                if (off + done > in->size) { in->size = off + done; }
+                continue;
             }
             if (lb > end) goal += lb - end;
             pb = e4_alloc_block(v, goal);
             if (!pb) { err = -28; break; }
             memset(b, 0, v->bs);
             memcpy(b + in_off, src + done, n);
-            if (e4_wblk(v, pb, b) != 0) { e4_free_block(v, pb); err = -5; break; }
+            if (e4_wdata(v, pb, b) != 0) { e4_free_block(v, pb); err = -5; break; }
             int r = e4_map_append(v, in, lb, pb);
             if (r != 0) {
                 e4_free_block(v, pb);
@@ -1097,11 +2018,11 @@ static int e4_pwrite(e4_vol_t *v, e4_inode_t *in, uint64_t off, const uint8_t *s
             meta = true;
         } else if (pb < v->first_data + 1 || pb >= v->blocks) { err = -5; break; }
         else if (in_off == 0 && n == v->bs) {
-            if (e4_wblk(v, pb, src + done) != 0) { err = -5; break; }
+            if (e4_wdata(v, pb, src + done) != 0) { err = -5; break; }
         } else {
             if (e4_read(v, pb, b) != 0) { err = -5; break; }
             memcpy(b + in_off, src + done, n);
-            if (e4_wblk(v, pb, b) != 0) { err = -5; break; }
+            if (e4_wdata(v, pb, b) != 0) { err = -5; break; }
         }
         done += n;
         if (off + done > in->size) { in->size = off + done; meta = true; }
@@ -1118,10 +2039,11 @@ static int e4_pwrite(e4_vol_t *v, e4_inode_t *in, uint64_t off, const uint8_t *s
 static int e4_gdt_write(e4_vol_t *v, uint32_t g) {
     uint64_t gblk = v->first_data + 1 + ((uint64_t)g * v->dsz) / v->bs;
     uint32_t goff = (uint32_t)(((uint64_t)g * v->dsz) / v->bs) * v->bs;
-    return storage_write_sectors(v->dev, v->part + gblk * v->spb, v->spb, v->gdt + goff);
+    return e4_swrite(v, v->part + gblk * v->spb, v->spb, v->gdt + goff);
 }
 /* Free [start, start+cnt) in the block bitmaps (only bits that are set). */
 static int e4_free_range(e4_vol_t *v, uint64_t start, uint32_t cnt) {
+    if (e4_jw_defer(v, start, cnt)) return 0;
     uint8_t *bm = (uint8_t *)kalloc(v->bs);
     if (!bm) return -12;
     int rc = 0;
@@ -1129,7 +2051,7 @@ static int e4_free_range(e4_vol_t *v, uint64_t start, uint32_t cnt) {
         if (start < v->first_data + 1 || start >= v->blocks) { rc = -5; break; }
         uint32_t g = (uint32_t)((start - v->first_data) / v->bpg), i = (uint32_t)((start - v->first_data) % v->bpg);
         uint32_t n = v->bpg - i; if (n > cnt) n = cnt;
-        if (storage_read_sectors(v->dev, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) != 0) { rc = -5; break; }
+        if (e4_sread(v, v->part + e4_gd_bitmap(v, g) * v->spb, v->spb, bm) != 0) { rc = -5; break; }
         int k = 0;
         for (uint32_t j = i; j < i + n; j++) if (bm[j >> 3] & (1u << (j & 7))) { bm[j >> 3] &= (uint8_t)~(1u << (j & 7)); k++; }
         if (k && e4_bitmap_commit(v, g, bm, -k) != 0) { rc = -5; break; }
@@ -1176,6 +2098,90 @@ static int e4_free_ind(e4_vol_t *v, uint32_t blk, int lvl, uint32_t *freed) {
     return 0;
 }
 /* Free every block mapped at logical >= keep (data + emptied tree blocks). */
+
+/* free mapped blocks >= @keep below indirect block @blk (level @lvl, first
+ * logical block @base).  1 = @blk is now empty (caller frees it), 0, <0 error */
+static int e4_ind_trim(e4_vol_t *v, uint32_t blk, int lvl, uint64_t base, uint32_t keep, uint32_t *freed) {
+    uint32_t per = v->bs / 4;
+    uint64_t span = 1;
+    for (int k = 1; k < lvl; k++) span *= per;
+    uint32_t *b = (uint32_t *)kalloc(v->bs);
+    if (!b) return -12;
+    if (e4_read(v, blk, b) != 0) { kfree(b); return -5; }
+    bool any = false, changed = false;
+    for (uint32_t i = 0; i < per; i++) {
+        if (!b[i]) continue;
+        uint64_t lo = base + i * span;
+        if (lo + span <= keep) { any = true; continue; }
+        if (lvl == 1) { if (e4_free_range(v, b[i], 1)) { kfree(b); return -5; } (*freed)++; b[i] = 0; changed = true; continue; }
+        if (lo >= keep) { if (e4_free_ind(v, b[i], lvl - 1, freed)) { kfree(b); return -5; } b[i] = 0; changed = true; continue; }
+        int r = e4_ind_trim(v, b[i], lvl - 1, lo, keep, freed);
+        if (r < 0) { kfree(b); return r; }
+        if (r == 1) { if (e4_free_range(v, b[i], 1)) { kfree(b); return -5; } (*freed)++; b[i] = 0; changed = true; }
+        else any = true;
+    }
+    int rc = 0;
+    if (!any) rc = 1;
+    else if (changed && e4_wblk(v, blk, b) != 0) rc = -5;
+    kfree(b);
+    return rc;
+}
+
+/* free everything mapped at >= keep below node @nd; empty children (leaf or
+ * index blocks) are freed and their index entries dropped */
+static int e4_ext_trim(e4_vol_t *v, e4_inode_t *in, uint8_t *nd, uint32_t keep, uint32_t *freed, int lvl) {
+    uint16_t d = *(uint16_t *)(nd + 6);
+    if (d == 0) return e4_leaf_trim(v, nd, keep, freed);
+    if (lvl >= E4_MAXD) return -5;
+    uint16_t n = *(uint16_t *)(nd + 2), w = 0;
+    uint8_t *b = (uint8_t *)kalloc(v->bs);
+    if (!b) return -12;
+    int rc = 0;
+    for (uint16_t i = 0; i < n && !rc; i++) {
+        uint8_t *e = nd + 12 + 12 * i;
+        uint64_t next = i + 1 < n ? *(uint32_t *)(e + 12) : 0x100000000ull;
+        if (next <= keep) { if (w != i) memmove(nd + 12 + 12 * w, e, 12); w++; continue; }
+        uint64_t c = *(uint32_t *)(e + 4) | ((uint64_t)*(uint16_t *)(e + 8) << 32);
+        if (c < v->first_data + 1 || c >= v->blocks || e4_read(v, c, b) != 0 || !e4_node_ok(v, in, b, c, d - 1)) { rc = -5; break; }
+        if ((rc = e4_ext_trim(v, in, b, keep, freed, lvl + 1)) != 0) break;
+        if (*(uint16_t *)(b + 2) == 0) {
+            if (e4_free_range(v, c, 1)) { rc = -5; break; }
+            (*freed)++; continue;                      /* drop the entry */
+        }
+        e4_leaf_csum(v, in, b);
+        if (e4_wblk(v, c, b) != 0) { rc = -5; break; }
+        if (w != i) memmove(nd + 12 + 12 * w, e, 12);
+        w++;
+    }
+    kfree(b);
+    if (rc) return rc;
+    for (uint16_t i = w; i < n; i++) memset(nd + 12 + 12 * i, 0, 12);
+    *(uint16_t *)(nd + 2) = w;
+    return 0;
+}
+/* after a truncate: empty root -> depth 0; a single child that fits in the
+ * root (<= 4 entries) is pulled up into it */
+static int e4_ext_collapse(e4_vol_t *v, e4_inode_t *in, uint32_t *freed) {
+    uint8_t *root = in->iblock;
+    uint8_t *b = (uint8_t *)kalloc(v->bs);
+    if (!b) return -12;
+    int rc = 0;
+    for (int g = 0; g < E4_MAXD && *(uint16_t *)(root + 6) > 0; g++) {
+        uint16_t n = *(uint16_t *)(root + 2), d = *(uint16_t *)(root + 6);
+        if (n == 0) { *(uint16_t *)(root + 6) = 0; *(uint16_t *)(root + 4) = 4; break; }
+        if (n != 1) break;
+        uint64_t c = *(uint32_t *)(root + 16) | ((uint64_t)*(uint16_t *)(root + 20) << 32);
+        if (c < v->first_data + 1 || c >= v->blocks || e4_read(v, c, b) != 0 || !e4_node_ok(v, in, b, c, d - 1)) { rc = -5; break; }
+        uint16_t cn = *(uint16_t *)(b + 2);
+        if (cn > 4) break;
+        memset(root + 12, 0, 48); memcpy(root + 12, b + 12, 12u * cn);
+        *(uint16_t *)(root + 2) = cn; *(uint16_t *)(root + 6) = d - 1;
+        if (e4_free_range(v, c, 1)) { rc = -5; break; }
+        (*freed)++;
+    }
+    kfree(b);
+    return rc;
+}
 static int e4_trunc_blocks(e4_vol_t *v, e4_inode_t *in, uint32_t keep) {
     uint32_t freed = 0;
     int rc = 0;
@@ -1183,43 +2189,20 @@ static int e4_trunc_blocks(e4_vol_t *v, e4_inode_t *in, uint32_t keep) {
         uint8_t *root = in->iblock;
         if (*(uint16_t *)root != 0xF30A)                    /* empty file without an extent header */
             return (*(uint32_t *)(in->raw + 0x1C) == 0 && in->size == 0) ? 0 : -5;
-        uint16_t depth = *(uint16_t *)(root + 6);
-        if (depth == 0) rc = e4_leaf_trim(v, root, keep, &freed);
-        else if (depth == 1) {
-            uint16_t n = *(uint16_t *)(root + 2), w = 0;
-            uint8_t *blk = (uint8_t *)kalloc(v->bs);
-            if (!blk) return -12;
-            for (uint16_t i = 0; i < n && !rc; i++) {
-                uint8_t *ix = root + 12 + 12 * i;
-                uint64_t leaf = *(uint32_t *)(ix + 4) | ((uint64_t)*(uint16_t *)(ix + 8) << 32);
-                if (e4_read(v, leaf, blk) != 0 || *(uint16_t *)blk != 0xF30A) { rc = -5; break; }
-                if (v->csum) {
-                    uint32_t to = 12 + 12u * *(uint16_t *)(blk + 4);
-                    if (to + 4 > v->bs || e4_crc32c(in->cseed, blk, to) != *(uint32_t *)(blk + to)) { e4_csum_bad(v, "extent block", leaf, 0, 0); rc = -5; break; }
-                }
-                if ((rc = e4_leaf_trim(v, blk, keep, &freed)) != 0) break;
-                if (*(uint16_t *)(blk + 2) == 0 && !(i == 0 && keep > 0)) {
-                    if (e4_free_range(v, leaf, 1)) { rc = -5; break; }
-                    freed++;
-                    continue;                                      /* drop the index entry */
-                }
-                e4_leaf_csum(v, in, blk);
-                if (e4_wblk(v, leaf, blk) != 0) { rc = -5; break; }
-                if (w != i) memmove(root + 12 + 12 * w, ix, 12);
-                w++;
-            }
-            kfree(blk);
-            if (!rc) {
-                for (uint16_t i = w; i < n; i++) memset(root + 12 + 12 * i, 0, 12);
-                *(uint16_t *)(root + 2) = w;
-                if (w == 0) { *(uint16_t *)(root + 6) = 0; *(uint16_t *)(root + 4) = 4; }
-            }
-        } else return -95;
+        rc = e4_ext_trim(v, in, root, keep, &freed, 0);
+        if (!rc) rc = e4_ext_collapse(v, in, &freed);
     } else {
-        uint32_t *ib = (uint32_t *)in->iblock;
-        if ((ib[12] || ib[13] || ib[14]) && keep > 12) return -95;   /* partial indirect trim: not yet */
+        uint32_t *ib = (uint32_t *)in->iblock, per = v->bs / 4;
         for (uint32_t i = keep; i < 12; i++) if (ib[i]) { if (e4_free_range(v, ib[i], 1)) return -5; ib[i] = 0; freed++; }
-        for (int l = 0; l < 3 && !rc; l++) if (ib[12 + l]) { rc = e4_free_ind(v, ib[12 + l], l + 1, &freed); if (!rc) ib[12 + l] = 0; }
+        uint64_t base = 12, span = per;
+        for (int l = 0; l < 3 && !rc; l++, base += span, span *= per) {
+            if (!ib[12 + l]) continue;
+            if (keep <= base) { rc = e4_free_ind(v, ib[12 + l], l + 1, &freed); if (!rc) ib[12 + l] = 0; }
+            else if (keep < base + span) {
+                rc = e4_ind_trim(v, ib[12 + l], l + 1, base, keep, &freed);
+                if (rc == 1) { rc = e4_free_range(v, ib[12 + l], 1) ? -5 : 0; freed++; ib[12 + l] = 0; }
+            }
+        }
     }
     if (freed) e4_iblocks_add(v, in, -(int)freed);
     return rc;
@@ -1242,7 +2225,7 @@ static int e4_trunc(e4_vol_t *v, e4_inode_t *in, uint64_t len) {
         uint8_t *b = (uint8_t *)kalloc(v->bs);
         if (b && pb && pb != E4_BMAP_ERR && e4_read(v, pb, b) == 0) {
             memset(b + z % v->bs, 0, v->bs - z % v->bs);
-            e4_wblk(v, pb, b);
+            e4_wdata(v, pb, b);
         }
         if (b) kfree(b);
     }
@@ -1278,7 +2261,7 @@ static int e4_ibitmap_commit(e4_vol_t *v, uint32_t g, uint8_t *bm, int delta, ui
         }
     }
     if (v->csum) *(uint16_t *)(d + 0x1E) = e4_gd_csum(v, g);
-    if (storage_write_sectors(v->dev, v->part + e4_gd_ibitmap(v, g) * v->spb, v->spb, bm) != 0) return -1;
+    if (e4_swrite(v, v->part + e4_gd_ibitmap(v, g) * v->spb, v->spb, bm) != 0) return -1;
     if (e4_gdt_write(v, g) != 0) return -1;
     v->ialloc_since_sync += delta;
     return 0;
@@ -1298,7 +2281,7 @@ static uint32_t e4_ialloc(e4_vol_t *v, uint32_t g0) {
             for (uint32_t i = v->ipg; i < v->bs * 8; i++) bm[i >> 3] |= (uint8_t)(1u << (i & 7));
             *(uint16_t *)(v->gdt + (uint64_t)g * v->dsz + 0x12) &= (uint16_t)~0x0001u;   /* commit recomputes the gd csum */
             serial_printf("[ext4ro] group %u: initialising inode bitmap (INODE_UNINIT)\n", g);
-        } else if (storage_read_sectors(v->dev, v->part + e4_gd_ibitmap(v, g) * v->spb, v->spb, bm) != 0) break;
+        } else if (e4_sread(v, v->part + e4_gd_ibitmap(v, g) * v->spb, v->spb, bm) != 0) break;
         else if (v->csum) {
             uint32_t c = e4_crc32c(v->seed, bm, v->ipg / 8);
             uint32_t st = *(uint16_t *)(d + 0x1A) | (v->dsz >= 0x3C ? (uint32_t)*(uint16_t *)(d + 0x3A) << 16 : 0);
@@ -1320,7 +2303,7 @@ static void e4_ifree(e4_vol_t *v, uint32_t ino) {
     uint32_t g = (ino - 1) / v->ipg, i = (ino - 1) % v->ipg;
     uint8_t *bm = (uint8_t *)kalloc(v->bs);
     if (!bm) return;
-    if (storage_read_sectors(v->dev, v->part + e4_gd_ibitmap(v, g) * v->spb, v->spb, bm) == 0 && (bm[i >> 3] & (1u << (i & 7)))) {
+    if (e4_sread(v, v->part + e4_gd_ibitmap(v, g) * v->spb, v->spb, bm) == 0 && (bm[i >> 3] & (1u << (i & 7)))) {
         bm[i >> 3] &= (uint8_t)~(1u << (i & 7));
         e4_ibitmap_commit(v, g, bm, -1, i);
     }
@@ -1343,9 +2326,9 @@ static int e4_iwrite(e4_vol_t *v, uint32_t ino, uint8_t *raw) {
     if (!b) return -1;
     uint64_t lba = v->part + blk * v->spb + sec0;
     int rc = -1;
-    if (storage_read_sectors(v->dev, lba, nsec, b) == 0) {
+    if (e4_sread(v, lba, nsec, b) == 0) {
         memcpy(b + off % 512, raw, v->isz);
-        rc = storage_write_sectors(v->dev, lba, nsec, b) == 0 ? 0 : -1;
+        rc = e4_swrite(v, lba, nsec, b) == 0 ? 0 : -1;
     }
     kfree(b);
     return rc;
@@ -1699,6 +2682,74 @@ static int e4_release(e4_vol_t *v, e4_inode_t *t, bool isdir) {
     if (isdir) e4_gd_dirs(v, t->ino, -1);
     return 0;
 }
+/* ---- orphan list (s_last_orphan, next in i_dtime): unlinked inodes still open ---- */
+static uint32_t e4_sb_get32(e4_vol_t *v, uint32_t off) {
+    uint8_t *sb = (uint8_t *)kalloc(1024); uint32_t x = 0;
+    if (sb && e4_sread(v, v->part + 2, 2, sb) == 0) x = *(uint32_t *)(sb + off);
+    if (sb) kfree(sb);
+    return x;
+}
+static int e4_sb_set32(e4_vol_t *v, uint32_t off, uint32_t x) {
+    uint8_t *sb = (uint8_t *)kalloc(1024); int rc = -1;
+    if (sb && e4_sread(v, v->part + 2, 2, sb) == 0 && *(uint16_t *)(sb + 56) == 0xEF53) {
+        *(uint32_t *)(sb + off) = x;
+        if (v->csum) *(uint32_t *)(sb + 0x3FC) = e4_crc32c(~0u, sb, 0x3FC);
+        rc = (v->jw && v->jw->depth) ? e4_swrite(v, v->part + 2, 2, sb) : storage_write_sectors(v->dev, v->part + 2, 2, sb);
+    }
+    if (sb) kfree(sb);
+    return rc ? -5 : 0;
+}
+static int e4_orphan_add(e4_vol_t *v, e4_inode_t *t) {
+    uint32_t now = (uint32_t)rtc_unix_epoch();
+    *(uint16_t *)(t->raw + 0x1A) = 0; t->links = 0;
+    *(uint32_t *)(t->raw + 0x14) = e4_sb_get32(v, 0xE8);           /* dtime = next orphan */
+    *(uint32_t *)(t->raw + 0x0C) = now;
+    if (e4_iwrite(v, t->ino, t->raw) != 0) return -5;
+    if (v->jw) v->jw->norphan++;
+    return e4_sb_set32(v, 0xE8, t->ino);
+}
+static int e4_orphan_del(e4_vol_t *v, uint32_t ino, uint32_t next) {
+    uint32_t cur = e4_sb_get32(v, 0xE8);
+    if (cur == ino) return e4_sb_set32(v, 0xE8, next);
+    e4_inode_t *c = (e4_inode_t *)kalloc(sizeof(e4_inode_t)); int rc = -5;
+    for (uint32_t guard = 0; c && cur && guard < 65536; guard++) {
+        if (e4_iget(v, cur, c) != 0) break;
+        uint32_t n = *(uint32_t *)(c->raw + 0x14);
+        if (n == ino) { *(uint32_t *)(c->raw + 0x14) = next; rc = e4_iwrite(v, cur, c->raw) ? -5 : 0; break; }
+        cur = n;
+    }
+    if (c) kfree(c);
+    return rc;
+}
+/* last close of an unlinked inode (or orphan found at mount): free it */
+static int e4_release(e4_vol_t *v, e4_inode_t *t, bool isdir);
+static int e4_orphan_release(e4_vol_t *v, e4_inode_t *t) {
+    if (t->links) return 0;
+    if (e4_orphan_del(v, t->ino, *(uint32_t *)(t->raw + 0x14)) != 0) return -5;
+    return e4_release(v, t, false);
+}
+static void e4_orphans_process(e4_vol_t *v) {
+    uint32_t ino = e4_sb_get32(v, 0xE8), n = 0;
+    if (!ino) return;
+    e4_inode_t *t = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    if (!t) return;
+    e4_tx_begin(v);
+    for (uint32_t guard = 0; ino && guard < 65536; guard++) {
+        if (ino < v->first_ino || ino > v->ipg * v->groups || e4_iget(v, ino, t) != 0) { e4_sb_set32(v, 0xE8, 0); break; }
+        uint32_t next = *(uint32_t *)(t->raw + 0x14);
+        if (e4_sb_set32(v, 0xE8, next) != 0) break;
+        if (t->links == 0) e4_release(v, t, false);
+        else {                                                   /* truncate orphan: drop blocks past i_size */
+            if ((t->mode & S_IFMT_) == S_IFREG_ && !(t->flags & FL_INLINE)) e4_trunc_blocks(v, t, (uint32_t)((t->size + v->bs - 1) / v->bs));
+            *(uint32_t *)(t->raw + 0x14) = 0; e4_touch(v, t);
+        }
+        n++; ino = next;
+    }
+    int r = e4_tx_end(v);
+    kfree(t);
+    printf("ext4 '%s': %u orphan inode(s) processed%s\n", v->label, n, r ? " (commit failed)" : "");
+    serial_printf("[ext4ro] '%s': %u orphan inode(s) processed\n", v->label, n);
+}
 static void e4_link_adj(e4_vol_t *v, e4_inode_t *d, int delta) {
     if (delta > 0) {
         if (d->links >= 64999 || d->links == 1) d->links = (v->ro_compat & 0x0020) ? 1 : d->links + 1;   /* dir_nlink */
@@ -1729,11 +2780,12 @@ static int e4_unlink_in(e4_vol_t *v, const char *rel, bool busy, bool want_dir) 
         if (e < 0) { rc = -5; goto out; }
         if (e == 1) { rc = -39; goto out; }                        /* ENOTEMPTY */
     }
-    if (busy) { rc = -16; goto out; }
+    if (busy && (isdir || !v->jw)) { rc = -16; goto out; }   /* journaled: an open file becomes an orphan */
     if (e4_mark_dirty(v) != 0) { rc = -5; goto out; }
     if ((rc = e4_dir_del(v, d, nm, nl)) != 0) goto out;
     if (isdir) { e4_iget(v, d->ino, d); e4_link_adj(v, d, -1); e4_touch(v, d); }
-    rc = e4_release(v, t, isdir);
+    if (busy && t->links <= 1) rc = e4_orphan_add(v, t);
+    else rc = e4_release(v, t, isdir);
 out:
     if (t) kfree(t);
     if (d) kfree(d);
@@ -2072,11 +3124,55 @@ static int e4_ftruncop(vfs_filesystem_t *fs, void *hd, uint64_t len) {
 static int e4_ro2(vfs_filesystem_t *fs, const char *a, const char *b) { return -30; }
 static int e4_ro3(vfs_filesystem_t *fs, const char *a, uint64_t l) { return -30; }
 
+#define E4_TXOP(name, call, args, ...) \
+    static int e4tx_##name(vfs_filesystem_t *fs, __VA_ARGS__) { e4_vol_t *v = (e4_vol_t *)fs->fs_data; e4_tx_begin(v); int r = call args; \
+        if (e4_tx_end(v) != 0 && r >= 0) { r = -5; } return r; }
+/* writes: one transaction per 1 MiB chunk (a crash can leave a prefix of a large write) */
+#define E4_TX_CHUNK (1u << 20)
+static int e4tx_write(vfs_filesystem_t *fs, void *hd, const void *b, uint32_t n) {
+    e4_vol_t *v = (e4_vol_t *)fs->fs_data;
+    if (!v->jw) return e4_write(fs, hd, b, n);
+    uint32_t done = 0;
+    do {
+        uint32_t c = n - done > E4_TX_CHUNK ? E4_TX_CHUNK : n - done;
+        e4_tx_begin(v);
+        int r = e4_write(fs, hd, (const uint8_t *)b + done, c);
+        if (e4_tx_end(v) != 0 && r >= 0) r = -5;
+        if (r < 0) return done ? (int)done : r;
+        done += (uint32_t)r;
+        if ((uint32_t)r < c) break;
+    } while (done < n);
+    return (int)done;
+}
+E4_TXOP(create, e4_createop, (fs, rel), const char *rel)
+E4_TXOP(mkdir, e4_mkdirop, (fs, rel), const char *rel)
+E4_TXOP(unlink, e4_unlinkop, (fs, rel), const char *rel)
+E4_TXOP(rename, e4_renameop, (fs, a, b), const char *a, const char *b)
+E4_TXOP(rmdir, e4_rmdirop, (fs, rel), const char *rel)
+/* close: the last close of an unlinked (orphan) inode frees it, in its own transaction */
+static int e4tx_close(vfs_filesystem_t *fs, void *hd) {
+    e4_h_t *h = e4_hh(hd); if (!h) return -1;
+    e4_vol_t *v = h->v; uint32_t ino = h->in.ino;
+    h->in_use = false;
+    if (!v || !v->jw || !v->rw) return 0;
+    for (int i = 0; i < E4_MAX_H; i++) if (e4_h[i].in_use && e4_h[i].v == v && e4_h[i].in.ino == ino) return 0;
+    e4_inode_t *t = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    if (!t) return 0;
+    if (e4_iget(v, ino, t) == 0 && t->links == 0 && t->mode) {
+        e4_tx_begin(v);
+        int r = e4_orphan_release(v, t);
+        if (e4_tx_end(v) != 0 || r) serial_printf("[ext4ro] '%s': ino %u: orphan release failed (%d)\n", v->label, ino, r);
+    }
+    kfree(t);
+    return 0;
+}
+E4_TXOP(trunc, e4_truncop, (fs, rel, len), const char *rel, uint64_t len)
+E4_TXOP(ftrunc, e4_ftruncop, (fs, hd, len), void *hd, uint64_t len)
 static vfs_fs_ops_t e4_ops = {
-    .open = e4_open, .close = e4_close, .read = e4_readop, .write = e4_write,
+    .open = e4_open, .close = e4tx_close, .read = e4_readop, .write = e4tx_write,
     .seek = e4_seek, .get_size = e4_size, .readdir = e4_readdir,
-    .create = e4_createop, .mkdir = e4_mkdirop, .unlink = e4_unlinkop, .exists = e4_exists,
-    .rename = e4_renameop, .rmdir = e4_rmdirop, .truncate = e4_truncop, .ftruncate = e4_ftruncop,
+    .create = e4tx_create, .mkdir = e4tx_mkdir, .unlink = e4tx_unlink, .exists = e4_exists,
+    .rename = e4tx_rename, .rmdir = e4tx_rmdir, .truncate = e4tx_trunc, .ftruncate = e4tx_ftrunc,
     .stat = e4_stat, .sync = e4_syncop,
 };
 vfs_fs_ops_t *ext4ro_get_ops(void) { return &e4_ops; }

@@ -494,6 +494,7 @@ static int fd_close_entry(process_t *proc, int fd) {
             }
         } else if (ty == FD_TYPE_VFS_DIR) {
             if (fde->file_handle) {
+                vfs_dircache_drop(fde->file_handle);
                 kfree(fde->file_handle);
             }
         }
@@ -4119,29 +4120,27 @@ int sys_readdir(int fd, void *dirp, size_t count) {
 
     if (!vfs_has_root_mount())
         return -EIO;
-    kents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * VFS_READDIR_MAX);
+    uint32_t pos = proc->fds[fd].position;
+    size_t want = count > 256 ? 256 : count;
+    kents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * want);
     if (!kents)
         return -ENOMEM;
-    total = vfs_readdir(path, kents, VFS_READDIR_MAX);
+    total = vfs_dircache_read(proc->fds[fd].file_handle, path, pos, kents, (uint32_t)want, NULL, 0);
     if (total < 0) {
         kfree(kents);
-        return -EIO;
+        return total == -ENOMEM ? -ENOMEM : -EIO;
     }
-
-    uint32_t pos = proc->fds[fd].position;
-    if (pos >= (uint32_t)total) {
+    if (total == 0) {
         kfree(kents);
         return 0;
     }
 
-    size_t room = count;
-    if (room > (size_t)(total - (int)pos))
-        room = (size_t)(total - (int)pos);
+    size_t room = (size_t)total;
 
     for (size_t i = 0; i < room; i++) {
         indevos_dirent_t out;
         memset(&out, 0, sizeof(out));
-        vfs_dirent_t *src = &kents[pos + i];
+        vfs_dirent_t *src = &kents[i];
         size_t nl = strlen(src->name);
         if (nl >= INDEVOS_NAME_MAX)
             nl = INDEVOS_NAME_MAX - 1;

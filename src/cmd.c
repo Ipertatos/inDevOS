@@ -308,9 +308,11 @@ void mount_filesystem_ext(uint8_t device_id, uint32_t partition_lba,
     if (!fstype) fstype = "fat32";
     if (!mount_path) mount_path = "/";
 
-    if (kstrcmp(fstype, "ext4") == 0 || kstrcmp(fstype, "ext4w") == 0) {
-        /* multi-instance driver (ext4ro.c); "ext4w" = read-write where safe */
-        bool want_rw = kstrcmp(fstype, "ext4w") == 0;
+    if (kstrcmp(fstype, "ext4") == 0 || kstrcmp(fstype, "ext4w") == 0 || kstrcmp(fstype, "ext4wj-test") == 0) {
+        /* multi-instance driver (ext4ro.c); "ext4w" = read-write where safe;
+         * "ext4wj-test" = TEST ONLY: also read-write on a journaled volume (journaled writes) */
+        bool jtest = kstrcmp(fstype, "ext4wj-test") == 0;
+        bool want_rw = jtest || kstrcmp(fstype, "ext4w") == 0;
         uint32_t plba = partition_lba;
         if (plba == 0 && !ext4ro_probe(device_id, 0)) {
             uint32_t st[17]; int ns = partscan_starts(device_id, st, 17);
@@ -320,6 +322,7 @@ void mount_filesystem_ext(uint8_t device_id, uint32_t partition_lba,
         e4_vol_t *mv = ext4ro_find_mounted(device_id, plba, &have);
         if (mv) {
             if (want_rw) {
+                if (jtest) ext4ro_set_journal_test(mv, true);
                 if (ext4ro_enable_rw(mv) == 0) printf("ext4 volume already mounted at %s - switched it to read-write\n", have);
                 else printf("ext4 volume at %s stays read-only\n", have);
             } else printf("ext4 volume already mounted at %s\n", have);
@@ -328,6 +331,7 @@ void mount_filesystem_ext(uint8_t device_id, uint32_t partition_lba,
         printf("Mounting ext4 (read-only) from device %d LBA %u at %s...\n", device_id, plba, mount_path);
         e4_vol_t *ev = ext4ro_mount(device_id, plba);
         if (!ev) { printf("Failed to mount ext4 from device %d\n", device_id); return; }
+        if (jtest) { ext4ro_set_journal_test(ev, true); printf("ext4: TEST-ONLY journaled read-write requested\n"); }
         if (want_rw && ext4ro_enable_rw(ev) != 0) printf("ext4: mounting read-only instead\n");
         if (ext4ro_vfs_register(mount_path, ev) == 0) ext4ro_info(ev);
         else { ext4ro_unmount(ev); printf("ext4: could not register at %s\n", mount_path); }

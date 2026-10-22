@@ -874,46 +874,51 @@ static long lx_openat(process_t *p, long dirfd, const char *upath, long lflags, 
     return fd;
 }
 
+/* /dev, /dev/input: append synthetic device nodes not on disk */
+static int lx_dev_augment(const char *path, vfs_dirent_t *ents, int total, int cap) {
+    enum { NSYN = 24 };
+    char sn[NSYN][16]; uint8_t sd[NSYN];
+    int ns = input_dev_dir_list(path, sn, sd, NSYN);
+    if (ns < 0) return total;
+    if (total < 0) total = 0;
+    for (int i = 0; i < ns && total < cap; i++) {
+        bool dup = false;
+        for (int j = 0; j < total && !dup; j++) dup = strcmp(ents[j].name, sn[i]) == 0;
+        if (dup) continue;
+        memset(&ents[total], 0, sizeof(ents[total]));
+        memcpy(ents[total].name, sn[i], strlen(sn[i]) + 1);
+        ents[total].type = sd[i] ? VFS_DIRECTORY : 0;
+        ents[total].inode = 0xD100 + (uint32_t)total;
+        total++;
+    }
+    return total;
+}
+
 static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     file_descriptor_t *f = &p->fds[fd];
     if (f->fd_type != FD_TYPE_VFS_DIR || !f->file_handle) return -ENOTDIR;
     if (count > 65536) count = 65536;
 
-    enum { MAXENT = VFS_READDIR_MAX };
-    vfs_dirent_t *ents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * MAXENT);
+    /* the smallest record is 24 bytes: never fetch more entries than fit */
+    uint32_t want = (uint32_t)(count / 24) + 1;
+    if (want > 256) want = 256;
+    vfs_dirent_t *ents = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * want);
     uint8_t *kbuf = (uint8_t *)kalloc(count ? count : 1);
     if (!ents || !kbuf) {
         if (ents) kfree(ents);
         if (kbuf) kfree(kbuf);
         return -ENOMEM;
     }
-    int total = vfs_readdir((const char *)f->file_handle, ents, MAXENT);
-    {
-        /* /dev, /dev/input: append synthetic device nodes not on disk */
-        enum { NSYN = 24 };
-        char sn[NSYN][16]; uint8_t sd[NSYN];
-        int ns = input_dev_dir_list((const char *)f->file_handle, sn, sd, NSYN);
-        if (ns >= 0) {
-            if (total < 0) total = 0;
-            for (int i = 0; i < ns && total < MAXENT; i++) {
-                bool dup = false;
-                for (int j = 0; j < total && !dup; j++) dup = strcmp(ents[j].name, sn[i]) == 0;
-                if (dup) continue;
-                memset(&ents[total], 0, sizeof(ents[total]));
-                memcpy(ents[total].name, sn[i], strlen(sn[i]) + 1);
-                ents[total].type = sd[i] ? VFS_DIRECTORY : 0;
-                ents[total].inode = 0xD100 + (uint32_t)total;
-                total++;
-            }
-        }
-    }
-    if (total < 0) { kfree(ents); kfree(kbuf); return -EIO; }
+    uint32_t pos0 = f->position;
+    int got = vfs_dircache_read(f->file_handle, (const char *)f->file_handle, pos0, ents, want, lx_dev_augment, 24);
+    if (got < 0) { kfree(ents); kfree(kbuf); return got == -ENOMEM ? -ENOMEM : -EIO; }
+    uint32_t total = pos0 + (uint32_t)got;
 
-    uint32_t pos = f->position;
+    uint32_t pos = pos0;
     size_t off = 0;
-    while (pos < (uint32_t)total) {
-        vfs_dirent_t *e = &ents[pos];
+    while (pos < total) {
+        vfs_dirent_t *e = &ents[pos - pos0];
         size_t nl = strlen(e->name);
         size_t reclen = (19 + nl + 1 + 7) & ~(size_t)7;
         if (off + reclen > count) break;
@@ -933,7 +938,7 @@ static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
         pos++;
     }
     long r;
-    if (off == 0 && pos < (uint32_t)total) {
+    if (off == 0 && pos < total) {
         r = -EINVAL;                            /* buffer too small */
     } else if (off && copy_to_user(udirp, kbuf, off) != 0) {
         r = -EFAULT;

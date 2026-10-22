@@ -78,12 +78,14 @@ int vfs_mount(const char *path, vfs_fs_ops_t *ops, void *fs_data) {
             mount_table[i].fs_data = fs_data;
             mount_table[i].mounted = true;
 
-            printf("vfs: Mounted filesystem at '%s'\n", mount_table[i].mount_path);
+            int used = 0;
+            for (int k = 0; k < VFS_MAX_MOUNTPOINTS; k++) if (mount_table[k].mounted) used++;
+            printf("vfs: Mounted filesystem at '%s' (%d of %d mount slots used)\n", mount_table[i].mount_path, used, VFS_MAX_MOUNTPOINTS);
             VFS_UNLOCK(); return 0;
         }
     }
 
-    printf("vfs: No free mount slots\n");
+    printf("vfs: No free mount slots (%d in use)\n", VFS_MAX_MOUNTPOINTS);
     VFS_UNLOCK(); return -ENOMEM;
 }
 
@@ -281,6 +283,101 @@ int vfs_ioctl(int fd, unsigned long cmd, void *arg) {
 }
 
 // ---- Directory operations ---------------------------------------------------
+
+int vfs_readdir_alloc(const char *path, vfs_dirent_t **out, uint32_t extra) {
+    *out = NULL;
+    for (uint32_t cap = VFS_READDIR_MAX; ; cap *= 2) {
+        vfs_dirent_t *e = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * (cap + extra));
+        if (!e) return -ENOMEM;
+        int n = vfs_readdir(path, e, cap);
+        if (n < 0) { kfree(e); return n; }
+        if ((uint32_t)n < cap || cap >= VFS_READDIR_LIMIT) { *out = e; return n; }
+        kfree(e);                                   /* may be truncated: retry bigger */
+    }
+}
+
+/* Per-open-directory listing cache.  Slots are keyed by the directory fd's
+ * path handle (shared by dup/fork) and checked against the path, so a stale
+ * slot can never serve another directory; every read at position 0 rebuilds. */
+#define VFS_DIRCACHE_SLOTS 32
+typedef struct {
+    const void   *key;
+    char         *path;
+    vfs_dirent_t *ents;
+    int           total;
+    uint64_t      stamp;
+} vfs_dircache_t;
+static vfs_dircache_t dircache[VFS_DIRCACHE_SLOTS];
+static spinlock_t dircache_lock = {0};
+static uint64_t dircache_clock;
+
+static int dircache_copy(vfs_dircache_t *c, uint32_t pos, vfs_dirent_t *out, uint32_t max) {
+    if (pos >= (uint32_t)c->total) return 0;
+    uint32_t n = (uint32_t)c->total - pos;
+    if (n > max) n = max;
+    memcpy(out, c->ents + pos, sizeof(vfs_dirent_t) * n);
+    c->stamp = ++dircache_clock;
+    return (int)n;
+}
+
+int vfs_dircache_read(const void *key, const char *path, uint32_t pos, vfs_dirent_t *out, uint32_t max,
+                      vfs_dir_augment_fn augment, uint32_t extra) {
+    if (pos > 0) {
+        spinlock_lock(&dircache_lock);
+        for (int i = 0; i < VFS_DIRCACHE_SLOTS; i++) {
+            vfs_dircache_t *c = &dircache[i];
+            if (c->key == key && c->path && strEql(c->path, path)) {
+                int r = dircache_copy(c, pos, out, max);
+                spinlock_unlock(&dircache_lock);
+                return r;
+            }
+        }
+        spinlock_unlock(&dircache_lock);
+    }
+    /* (re)build outside the lock */
+    vfs_dirent_t *e = NULL;
+    int n = vfs_readdir_alloc(path, &e, augment ? extra : 0);
+    if (augment) {
+        if (!e && !(e = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * (extra ? extra : 1)))) return -ENOMEM;
+        n = augment(path, e, n, (n > 0 ? n : 0) + (int)extra);
+    }
+    if (n < 0) { if (e) kfree(e); return n; }
+    size_t pl = strlen(path);
+    char *pc = (char *)kalloc(pl + 1);
+    if (!pc) { kfree(e); return -ENOMEM; }
+    memcpy(pc, path, pl + 1);
+    vfs_dirent_t *old_e = NULL; char *old_p = NULL;
+    spinlock_lock(&dircache_lock);
+    int slot = -1;
+    for (int i = 0; i < VFS_DIRCACHE_SLOTS && slot < 0; i++) if (dircache[i].key == key) slot = i;
+    for (int i = 0; i < VFS_DIRCACHE_SLOTS && slot < 0; i++) if (!dircache[i].key) slot = i;
+    if (slot < 0) {                                 /* evict the least recently used */
+        slot = 0;
+        for (int i = 1; i < VFS_DIRCACHE_SLOTS; i++) if (dircache[i].stamp < dircache[slot].stamp) slot = i;
+    }
+    vfs_dircache_t *c = &dircache[slot];
+    old_e = c->ents; old_p = c->path;
+    c->key = key; c->path = pc; c->ents = e; c->total = n;
+    int r = dircache_copy(c, pos, out, max);
+    spinlock_unlock(&dircache_lock);
+    if (old_e) kfree(old_e);
+    if (old_p) kfree(old_p);
+    return r;
+}
+
+void vfs_dircache_drop(const void *key) {
+    for (int i = 0; i < VFS_DIRCACHE_SLOTS; i++) {
+        vfs_dirent_t *e = NULL; char *p = NULL;
+        spinlock_lock(&dircache_lock);
+        if (dircache[i].key == key) {
+            e = dircache[i].ents; p = dircache[i].path;
+            dircache[i].key = NULL; dircache[i].ents = NULL; dircache[i].path = NULL; dircache[i].total = 0;
+        }
+        spinlock_unlock(&dircache_lock);
+        if (e) kfree(e);
+        if (p) kfree(p);
+    }
+}
 
 int vfs_readdir(const char *path, vfs_dirent_t *entries, uint32_t max) {
     VFS_LOCK();

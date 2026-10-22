@@ -21,5 +21,7 @@ vfs_fs_ops_t *ext4ro_get_ops(void);
  * known features only; see ext4ro.c).  0 or -EROFS. */
 int       ext4ro_enable_rw(e4_vol_t *v);
 bool      ext4ro_is_rw(const e4_vol_t *v);
+/* TEST ONLY: allow ext4ro_enable_rw on a journaled volume (journaled writes) */
+void      ext4ro_set_journal_test(e4_vol_t *v, bool on);
 e4_vol_t *ext4ro_find_mounted(uint8_t dev, uint32_t lba, const char **path);
 #endif

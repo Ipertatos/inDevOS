@@ -10,13 +10,16 @@
 //
 // File handles returned by vfs_open() are valid until vfs_close() is called.
 
-#define VFS_MAX_MOUNTPOINTS 8
+#define VFS_MAX_MOUNTPOINTS 32   /* was 8: ext4 test fixture + scratch copies need more */
 #define VFS_MAX_OPEN_FILES  64
 #define VFS_MAX_PATH        1024
 #define VFS_MAX_NAME        256
 /* Upper bound on the entries one directory listing returns (sys_readdir,
  * getdents64, the installer). Callers allocate it on the heap. */
 #define VFS_READDIR_MAX     2048
+/* Listings start at VFS_READDIR_MAX entries and double until the directory
+ * fits (vfs_readdir_alloc), up to this bound. */
+#define VFS_READDIR_LIMIT   262144
 
 // Node types
 #define VFS_FILE        0x01
@@ -149,6 +152,18 @@ int  vfs_ioctl(int fd, unsigned long cmd, void *arg);
 
 // Directory operations
 int  vfs_readdir(const char *path, vfs_dirent_t *entries, uint32_t max);
+/* Whole listing of @path in a kalloc'd array (*out, caller kfree()s; @extra
+ * spare slots at the end).  Returns the entry count or <0 (then *out is NULL). */
+int  vfs_readdir_alloc(const char *path, vfs_dirent_t **out, uint32_t extra);
+/* Listing of an open directory, cached per open handle @key: copies entries
+ * [pos, pos+max) into @out and returns how many (0 at the end, <0 on error).
+ * pos == 0 (opendir / rewinddir) rebuilds the listing; @augment may append up
+ * to @extra synthetic entries (returns the new count). */
+typedef int (*vfs_dir_augment_fn)(const char *path, vfs_dirent_t *ents, int total, int cap);
+int  vfs_dircache_read(const void *key, const char *path, uint32_t pos, vfs_dirent_t *out, uint32_t max,
+                       vfs_dir_augment_fn augment, uint32_t extra);
+/* Forget the cached listing of handle @key (directory fd closed). */
+void vfs_dircache_drop(const void *key);
 int  vfs_create(const char *path);
 int  vfs_mkdir(const char *path);
 /** Create every missing component of 'path' (mkdir -p). Returns 0 or -errno. */
