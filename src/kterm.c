@@ -575,3 +575,20 @@ void kterm_open_in(const char *dir) {
     }
     kterm_open();
 }
+
+/* Open the terminal in @dir and type @cmdline into its shell (desktop
+ * shortcuts with Exec=terminal-run ...).  The shell is BusyBox ash on pipes,
+ * so full-screen programs should use non-interactive modes for now. */
+void kterm_run_in(const char *dir, const char *cmdline) {
+    kterm_open_in(dir);
+    if (!cmdline || !cmdline[0]) return;
+    int n = 0;
+    while (cmdline[n]) n++;
+    if (kt_sh_in) {
+        kt_shell_send(cmdline, n);
+        kt_shell_send("\n", 1);
+        serial_printf("[kterm] run: %s\n", cmdline);
+    } else {
+        kt_add_line("No disk shell: cannot run the shortcut command.");
+    }
+}

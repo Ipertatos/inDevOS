@@ -635,6 +635,53 @@ static int t_fs_fd_offsets(char *d, size_t n) {
     R(PASS, "dup/fork share offsets, separate opens don't");
 }
 
+/* Links -dump of a page served on the host (python3 -m http.server 8080 in the
+ * slirp host, 10.0.2.2).  SKIP when /bin/links or the host server is absent. */
+static int links_dump(const char *url, char *out, size_t cap) {
+    static int seq; char f[160]; snprintf(f, sizeof(f), "%s/lk.%d.%d", tmpdir, getpid(), seq++);
+    pid_t c = fork();
+    if (c < 0) return -1;
+    if (c == 0) {
+        int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        char home[160]; snprintf(home, sizeof(home), "HOME=%s", tmpdir);
+        char *av[] = { "/bin/links", "-no-connect", "-dump", (char *)url, NULL };
+        char *ev[] = { home, "TERM=vt100", "PATH=/bin", NULL };
+        execve(av[0], av, ev); _exit(127);
+    }
+    int st = 0; long long t0 = mono_ms(); pid_t w = 0;
+    while ((w = waitpid(c, &st, WNOHANG)) == 0 && mono_ms() - t0 < 20000) msleep(50);
+    if (w == 0) { kill(c, SIGKILL); waitpid(c, &st, 0); }
+    ssize_t r = get_file(f, out, cap - 1); out[r > 0 ? r : 0] = 0; unlink(f);
+    if (w == 0) return -2;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+}
+static void oneline(char *s) { for (; *s; s++) if (*s == '\n' || *s == '\r') *s = '|'; }
+static int t_net_links_http(char *d, size_t n) {
+    if (access("/bin/links", X_OK) && access("/bin/links", F_OK)) R(SKIP, "/bin/links missing");
+    static char out[4096];
+    int r = links_dump("http://10.0.2.2:8080/", out, sizeof(out));
+    CHECK(r != -2, "links -dump timed out (20 s)");
+    if (!strstr(out, "LINKS_OK")) {
+        if (strstr(out, "efused") || strstr(out, "rror")) { oneline(out); R(SKIP, "no host server on 10.0.2.2:8080 (rc %d: %.80s)", r, out); }
+        oneline(out); R(FAIL, "rc %d, no LINKS_OK marker: '%.160s'", r, out);
+    }
+    char *p = strstr(out, "LINKS_OK"); char snip[64]; snprintf(snip, sizeof(snip), "%.40s", p); oneline(snip);
+    /* by name through /etc/hosts (musl reads it in the resolver child) */
+    static char hosts[8192]; ssize_t hl = get_file("/etc/hosts", hosts, sizeof(hosts) - 64);
+    const char *byname = "not tried";
+    if (hl >= 0) {
+        hosts[hl] = 0; static char nh[8256];
+        snprintf(nh, sizeof(nh), "%s%s10.0.2.2 testhost\n", hosts, (hl && hosts[hl - 1] != '\n') ? "\n" : "");
+        if (put_file("/etc/hosts", nh, strlen(nh)) == 0) {
+            int r2 = links_dump("http://testhost:8080/", out, sizeof(out));
+            put_file("/etc/hosts", hosts, (size_t)hl);
+            byname = (r2 == 0 && strstr(out, "LINKS_OK")) ? "testhost ok" : "testhost FAILED";
+            if (strcmp(byname, "testhost ok")) { oneline(out); R(FAIL, "by IP ok, by /etc/hosts name rc %d: '%.120s'", r2, out); }
+        }
+    }
+    R(PASS, "rc %d '%s'; %s", r, snip, byname);
+}
+
 /* ===================== vol (/mnt/<x>: exFAT / ext4 / FAT) ===================== */
 struct walk { int files, dirs, errors, symlinks; long long bytes; char err[200]; };
 static void walk_dir(const char *dir, int depth, struct walk *w, int limit) {
@@ -1313,7 +1360,7 @@ static const struct test tests[] = {
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
     { "dev", "fb0", t_dev_fb, 10, 0 }, { "dev", "evdev", t_dev_evdev, 10, 0 }, { "dev", "uinput", t_dev_uinput, 10, 0 },
     { "dev", "wm", t_dev_wm, 10, 0 },
-    { "net", "sockets", t_net_socket, 5, 0 }, { "net", "udp_loopback", t_net_udp_lo, 5, 0 }, { "net", "tcp_loopback", t_net_tcp_lo, 10, 0 },
+    { "net", "sockets", t_net_socket, 5, 0 }, { "net", "udp_loopback", t_net_udp_lo, 5, 0 }, { "net", "tcp_loopback", t_net_tcp_lo, 10, 0 }, { "net", "links_http", t_net_links_http, 60, 0 },
     { "net", "dns_connect", t_net_dns, 20, TF_EXPLICIT },
     { "misc", "cwd", t_cwd, 5, 0 }, { "misc", "dup", t_dup, 5, 0 }, { "misc", "fcntl", t_fcntl, 5, 0 },
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },

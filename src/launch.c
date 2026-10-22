@@ -215,7 +215,8 @@ static void launch_fail(const char *what, const char *name) {
  *     Icon=folder
  * Exec is a program path (or bare name looked up in /bin) with arguments, a
  * file or folder to open through the associations, or one of the built-in
- * words: files [dir], notepad <file>, terminal [dir]. */
+ * words: files [dir], notepad <file>, terminal [dir],
+ * terminal-run <command line> (typed into a terminal window's shell). */
 typedef struct {
     char name[64];
     char exec[192];
@@ -341,10 +342,21 @@ static int launch_shortcut_run(const char *path) {
     int l = 0;
     while (s.exec[l] && l < (int)sizeof(cmd) - 1) { cmd[l] = s.exec[l]; l++; }
     cmd[l] = '\0';
-    char *argv[12];
-    int argc = launch_split(cmd, argv, 12);
     serial_printf("[launch] shortcut %s: Name='%s' Exec='%s' Icon='%s'\n",
                   path, s.name, s.exec, s.icon);
+    /* Exec=terminal-run <shell command line>: a terminal window runs it. */
+    {
+        static const char tr[] = "terminal-run ";
+        int k = 0;
+        while (tr[k] && cmd[k] == tr[k]) k++;
+        if (!tr[k]) {
+            while (cmd[k] == ' ') k++;
+            kterm_run_in("/home/user", cmd + k);
+            return 0;
+        }
+    }
+    char *argv[12];
+    int argc = launch_split(cmd, argv, 12);
     if (argc == 0) { launch_fail("Bad shortcut", name); return -1; }
     if (streq_ci(argv[0], "files")) {
         files_open_path(argc > 1 ? argv[1] : dir);

@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=Links
+Exec=terminal-run HOME=/home/user /bin/links -dump /etc/links/start.html
+Icon=terminal

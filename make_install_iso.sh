@@ -118,6 +118,20 @@ if [[ -f tests/curl/curl ]]; then
     mcopy -o -i "$ROOTFS" tests/curl/curl ::/bin/curl.exe
     echo "    /bin/curl.exe (static musl curl, HTTPS)"
 fi
+# OpenSSL-based programs (Links) look for the CA bundle at /etc/ssl/cert.pem.
+if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
+    mcopy -o -i "$ROOTFS" /etc/ssl/certs/ca-certificates.crt ::/etc/ssl/cert.pem
+    echo "    /etc/ssl/cert.pem (CA bundle for OpenSSL/Links)"
+fi
+# Links 2.29 text browser (static musl + OpenSSL 3) at tests/links/links,
+# plus a start page and a desktop shortcut.  $HOME/.links is pre-created.
+if [[ -f tests/links/links ]]; then
+    mcopy -o -i "$ROOTFS" tests/links/links ::/bin/links
+    echo "    /bin/links (static musl Links 2.29, HTTP/HTTPS)"
+    mmd -D s -i "$ROOTFS" ::/home ::/home/user ::/home/user/.links ::/home/user/Desktop ::/etc/links 2>/dev/null || true
+    [[ -f tests/links/start.html ]] && mcopy -o -i "$ROOTFS" tests/links/start.html ::/etc/links/start.html
+    [[ -f tests/links/Links.desktop ]] && mcopy -o -i "$ROOTFS" tests/links/Links.desktop ::/home/user/Desktop/Links.desktop
+fi
 rm -rf "$NETTMP"
 
 # Static TinyCC + musl sysroot (headers, crt, libc.a) for on-OS C compile.
@@ -148,8 +162,8 @@ if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
     mmd -i "$ROOTFS" ::/usr/lib/tcc 2>/dev/null || true
     mmd -i "$ROOTFS" ::/usr/include 2>/dev/null || true
     mmd -i "$ROOTFS" ::/tmp 2>/dev/null || true
-    mmd -i "$ROOTFS" ::/home 2>/dev/null || true
-    mmd -i "$ROOTFS" ::/home/user 2>/dev/null || true
+    mmd -D s -i "$ROOTFS" ::/home 2>/dev/null </dev/null || true
+    mmd -D s -i "$ROOTFS" ::/home/user 2>/dev/null </dev/null || true
     mcopy -o -i "$ROOTFS" "$TCC_STAGE/bin/tcc.exe" ::/bin/tcc.exe
     mcopy -o -s -i "$ROOTFS" "$TCC_STAGE/usr" ::/
     if ls "$TCC_STAGE"/home/user/*.c >/dev/null 2>&1; then

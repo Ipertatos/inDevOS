@@ -8,6 +8,8 @@
 void kterm_open(void);
 /** Open the terminal with the shell working in @dir. */
 void kterm_open_in(const char *dir);
+/** Open the terminal in @dir and run @cmdline in its shell. */
+void kterm_run_in(const char *dir, const char *cmdline);
 bool kterm_is_open(void);
 bool kterm_is_window(const desktop_window_t *win);
 void kterm_on_key(int32_t keycode, bool pressed);
