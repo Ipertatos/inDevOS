@@ -642,6 +642,7 @@ static int t_vol_read(char *d, size_t n) {
     if (!k) R(SKIP, "nothing mounted under /mnt");
     char res[600]; int o = 0, bad = 0; char err[200] = "";
     for (int i = 0; i < k; i++) {
+        if (!strcmp(names[i], "badcs")) { o += snprintf(res + o, sizeof(res) - o, "badcs: skipped (bad-checksum fixture); "); continue; }
         char p[128]; snprintf(p, sizeof(p), "/mnt/%s", names[i]);
         struct walk w; memset(&w, 0, sizeof(w)); walk_dir(p, 0, &w, 400);
         o += snprintf(res + o, sizeof(res) - o, "%s: %d files %d dirs %d links %lldKB%s; ", names[i], w.files, w.dirs, w.symlinks, w.bytes >> 10, w.errors ? " ERR" : "");
@@ -685,6 +686,181 @@ static int file_crc(const char *p, uint32_t *crc, long long *len) {
     static uint8_t b[65536]; ssize_t r; uint32_t c = 0; long long t = 0;
     while ((r = read(fd, b, sizeof(b))) > 0) { c = crc32_upd(b, r, c); t += r; }
     close(fd); *crc = c; *len = t; return r < 0 ? -1 : 0;
+}
+
+/* ext4 write step 1 on the scratch volume /mnt/e4rw (switched read-write by
+ * the harness): in-place overwrites only; the host diffs the image against
+ * the same script (e4w_check.py) and runs e2fsck -fn. */
+/* Shared ext4 write script (host_e4w.c and ostest vol.ext_write).
+ * mode 0: at off, 1: at EOF (O_APPEND), 2: at EOF+off (leaves a hole). */
+static const char *E4F[3] = { "w1.bin", "holes.bin", "keep.txt" };
+static const struct { int file, mode, off, len, want; } E4OPS[] = {
+    {0,0,5,100,100}, {0,0,4096,4096,4096}, {0,0,10000,3000,3000}, {0,0,19990,50,50}, {0,0,20000,5,5},
+    {0,1,0,3000,3000}, {0,1,0,70000,70000},
+    {0,2,9000,2000,2000}, {0,2,9000,2000,2000}, {0,2,9000,2000,2000}, {0,2,9000,2000,2000}, {0,2,9000,2000,2000}, {0,2,9000,2000,2000},
+    {1,0,8192,100,100}, {1,0,4000,200,96}, {2,1,0,10,10},
+};
+#define E4NOPS ((int)(sizeof(E4OPS) / sizeof(E4OPS[0])))
+static void e4w_pat(unsigned char *b, int n, int j) { for (int k = 0; k < n; k++) b[k] = (unsigned char)(k * 31 + j * 17 + 1); }
+static int t_vol_extwrite(char *d, size_t n) {
+    struct stat st;
+    if (stat("/mnt/e4rw/w1.bin", &st) != 0) R(SKIP, "no /mnt/e4rw scratch volume");
+    time_t t0 = time(NULL);
+    static unsigned char ref[3][200000], b[80000], got[200000];
+    long sz[3]; int res[64]; char rs[300]; int o = 0;
+    for (int f = 0; f < 3; f++) {
+        char p[64]; snprintf(p, sizeof(p), "/mnt/e4rw/%s", E4F[f]);
+        CHECK(stat(p, &st) == 0, "stat %s", p); sz[f] = st.st_size;
+        CHECK(get_file(p, ref[f], sizeof(ref[f])) == sz[f], "read %s", p);
+    }
+    int ro = open("/mnt/e4rw/w1.bin", O_RDONLY);          /* opened before the writes */
+    for (int j = 0; j < E4NOPS; j++) {
+        int f = E4OPS[j].file; char p[64]; snprintf(p, sizeof(p), "/mnt/e4rw/%s", E4F[f]);
+        int fd = open(p, O_RDWR | (E4OPS[j].mode == 1 ? O_APPEND : 0));
+        CHECK(fd >= 0, "open %s O_RDWR: %s (volume not read-write?)", p, strerror(errno));
+        long off = E4OPS[j].mode == 0 ? E4OPS[j].off : E4OPS[j].mode == 1 ? sz[f] : sz[f] + E4OPS[j].off;
+        if (E4OPS[j].mode == 2) CHECK(lseek(fd, E4OPS[j].off, SEEK_END) == off, "lseek END+%d", E4OPS[j].off);
+        else if (E4OPS[j].mode == 0) CHECK(lseek(fd, off, SEEK_SET) == off, "lseek %ld", off);
+        e4w_pat(b, E4OPS[j].len, j);
+        errno = 0; ssize_t k = write(fd, b, E4OPS[j].len); res[j] = k < 0 ? -errno : (int)k;
+        close(fd);
+        o += snprintf(rs + o, sizeof(rs) - o, "%s%d", j ? "," : "", res[j]);
+        CHECK(res[j] == E4OPS[j].want, "op%d %s off %ld len %d -> %d (%s), want %d", j, p, off, E4OPS[j].len, res[j], strerror(errno), E4OPS[j].want);
+        if (k > 0) { if (off > sz[f]) memset(ref[f] + sz[f], 0, off - sz[f]); e4w_pat(ref[f] + off, (int)k, j); if (off + k > sz[f]) sz[f] = off + k; }
+    }
+    for (int f = 0; f < 3; f++) {
+        char p[64]; snprintf(p, sizeof(p), "/mnt/e4rw/%s", E4F[f]);
+        CHECK(stat(p, &st) == 0 && st.st_size == sz[f], "%s size %lld want %ld", p, (long long)st.st_size, sz[f]);
+        CHECK(get_file(p, got, sizeof(got)) == sz[f] && !memcmp(got, ref[f], sz[f]), "%s readback differs", p);
+    }
+    CHECK(ro >= 0 && pread(ro, got, sizeof(got), 0) == sz[0] && !memcmp(got, ref[0], sz[0]), "reader opened earlier does not see the new size/data");
+    close(ro);
+    CHECK(stat("/mnt/e4rw/w1.bin", &st) == 0 && st.st_mtime >= t0 - 2 && st.st_mtime <= t0 + 60, "mtime %lld not updated (t0 %lld)", (long long)st.st_mtime, (long long)t0);
+    int fd = open("/mnt/ext4d/tiny.txt", O_WRONLY);
+    CHECK(fd < 0, "journaled ext4d opened for write");
+    fd = open("/mnt/old2/sub/old.txt", O_WRONLY);
+    CHECK(fd < 0, "read-only ext2 fixture opened for write");
+    sync();
+    R(PASS, "E4W_RES %s w1.bin %ld bytes", rs, sz[0]);
+}
+
+/* ext4 write step 3 on /mnt/e4rw (after vol.ext_write): truncate/ftruncate/
+ * O_TRUNC, create (inode + dirent alloc, dir growth), unlink; htree create
+ * refused.  The host replays this (e4w_check.py ... ns) and runs e2fsck. */
+static int t_vol_extns(char *d, size_t n) {
+    struct stat st; char nm[96]; static unsigned char b[80000], got[80000];
+    if (stat("/mnt/e4rw/w1.bin", &st) != 0) R(SKIP, "no /mnt/e4rw scratch volume");
+    CHECK(truncate("/mnt/e4rw/w1.bin", 50000) == 0, "truncate grow: %s", strerror(errno));
+    int fd = open("/mnt/e4rw/holes.bin", O_RDWR); CHECK(fd >= 0, "open holes");
+    CHECK(ftruncate(fd, 30000) == 0, "ftruncate: %s", strerror(errno));
+    CHECK(fstat(fd, &st) == 0 && st.st_size == 30000, "fstat after ftruncate %lld", (long long)st.st_size);
+    CHECK(pread(fd, got, 30000 - 12288, 12288) == 30000 - 12288, "pread tail");
+    for (int i = 0; i < 30000 - 12288; i++) CHECK(got[i] == 0, "grown tail not zero at %d", 12288 + i);
+    close(fd);
+    fd = open("/mnt/e4rw/keep.txt", O_WRONLY | O_TRUNC); CHECK(fd >= 0, "O_TRUNC open: %s", strerror(errno));
+    CHECK(fstat(fd, &st) == 0 && st.st_size == 0, "size after O_TRUNC %lld", (long long)st.st_size);
+    CHECK(write(fd, "kept\n", 5) == 5, "write kept"); close(fd);
+    CHECK(truncate("/mnt/e4rw/w1.bin", 12000) == 0, "truncate shrink: %s", strerror(errno));
+    CHECK(stat("/mnt/e4rw/w1.bin", &st) == 0 && st.st_size == 12000, "w1 size %lld", (long long)st.st_size);
+    static const struct { const char *n; int len, j; } NF[] = { {"new1.txt", 5000, 50}, {"new2.txt", 100, 51}, {"new3.bin", 80000, 52} };
+    for (int i = 0; i < 3; i++) {
+        snprintf(nm, sizeof(nm), "/mnt/e4rw/%s", NF[i].n);
+        fd = open(nm, O_WRONLY | O_CREAT, 0644); CHECK(fd >= 0, "create %s: %s", nm, strerror(errno));
+        e4w_pat(b, NF[i].len, NF[i].j); CHECK(write(fd, b, NF[i].len) == NF[i].len, "write %s", nm); close(fd);
+    }
+    CHECK(get_file("/mnt/e4rw/new1.txt", got, sizeof(got)) == 5000, "read new1");
+    e4w_pat(b, 5000, 50); CHECK(!memcmp(got, b, 5000), "new1 content");
+    for (int i = 0; i < 300; i++) { snprintf(nm, sizeof(nm), "/mnt/e4rw/cfile_%03d", i); fd = open(nm, O_WRONLY | O_CREAT, 0644); CHECK(fd >= 0, "create %s: %s", nm, strerror(errno)); close(fd); }
+    CHECK(unlink("/mnt/e4rw/new2.txt") == 0, "unlink new2: %s", strerror(errno));
+    CHECK(unlink("/mnt/e4rw/new3.bin") == 0, "unlink new3: %s", strerror(errno));
+    for (int i = 0; i < 300; i += 2) { snprintf(nm, sizeof(nm), "/mnt/e4rw/cfile_%03d", i); CHECK(unlink(nm) == 0, "unlink %s: %s", nm, strerror(errno)); }
+    fd = open("/mnt/e4rw/hdir/x.txt", O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0, "create in htree directory: %s", strerror(errno)); if (fd >= 0) close(fd);
+    CHECK(unlink("/mnt/e4rw/hdir/f_7") == 0, "unlink from htree dir: %s", strerror(errno));
+    errno = 0; CHECK(unlink("/mnt/e4rw/nosuch") != 0 && errno == ENOENT, "unlink missing: %s", strerror(errno));
+    CHECK(access("/mnt/e4rw/new2.txt", F_OK) != 0 && access("/mnt/e4rw/cfile_000", F_OK) != 0 && access("/mnt/e4rw/cfile_001", F_OK) == 0, "listing after unlink");
+    DIR *D = opendir("/mnt/e4rw"); int nc = 0; struct dirent *e;
+    CHECK(D, "opendir"); while ((e = readdir(D))) if (!strncmp(e->d_name, "cfile_", 6)) nc++; closedir(D);
+    CHECK(nc == 150, "%d cfile entries, want 150", nc);
+    D = opendir("/mnt/e4rw/hdir"); int nh = 0; CHECK(D, "opendir hdir"); while ((e = readdir(D))) if (e->d_name[0] != '.') nh++; closedir(D);
+    CHECK(nh == 2000, "hdir %d entries, want 2000", nh);
+    sync();
+    R(PASS, "truncate/ftruncate/O_TRUNC, 303 creates (dir grew), 153 unlinks, htree create ok, htree unlink ok");
+}
+
+/* ext4 write step 4 on /mnt/e4rw (after vol.ext_ns): mkdir/rmdir/rename,
+ * same script as host_e4w.c; host replays (e4w_check.py ... dir) + e2fsck. */
+static int e4d_wf(const char *p, const char *str) { int fd = open(p, O_WRONLY | O_CREAT, 0644); if (fd < 0) return -1; int k = write(fd, str, strlen(str)); close(fd); return k == (int)strlen(str) ? 0 : -1; }
+#define E4D(call, werr) do { errno = 0; int _r = (call); int _e = _r < 0 ? errno : 0; CHECK(_e == (werr), "%s -> %d errno %d (%s), want errno %d", #call, _r, _e, strerror(_e), werr); } while (0)
+static int t_vol_extdir(char *d, size_t n) {
+    struct stat st; char b[64];
+    if (stat("/mnt/e4rw/w1.bin", &st) != 0) R(SKIP, "no /mnt/e4rw scratch volume");
+#define M(x) "/mnt/e4rw/" x
+    E4D(mkdir(M("d1"), 0755), 0); E4D(mkdir(M("d1/d2"), 0755), 0); E4D(mkdir(M("d1/d2/d3"), 0755), 0); E4D(mkdir(M("d1"), 0755), EEXIST);
+    CHECK(stat(M("d1"), &st) == 0 && S_ISDIR(st.st_mode) && st.st_nlink == 3, "d1 nlink %d", (int)st.st_nlink);
+    CHECK(e4d_wf(M("d1/f1"), "f1data") == 0 && e4d_wf(M("d1/d2/f2"), "f2data") == 0, "write files in new dirs");
+    E4D(rename(M("keep.txt"), M("d1/keep2.txt")), 0);
+    E4D(rename(M("new1.txt"), M("new1b.txt")), 0);
+    CHECK(e4d_wf(M("d1/tgt.txt"), "old") == 0, "tgt");
+    E4D(rename(M("d1/f1"), M("d1/tgt.txt")), 0);
+    E4D(rename(M("d1/d2"), M("d2moved")), 0);
+    E4D(rename(M("d2moved"), M("d2moved/d3/x")), EINVAL);
+    E4D(mkdir(M("e1"), 0755), 0);
+    E4D(rename(M("d1"), M("e1")), 0);
+    E4D(rmdir(M("e1")), ENOTEMPTY); E4D(rmdir(M("d2moved/d3")), 0);
+    E4D(mkdir(M("rmd"), 0755), 0); E4D(rmdir(M("rmd")), 0);
+    E4D(rename(M("cfile_001"), M("hdir/x")), 0);
+    E4D(rename(M("hdir/f_9"), M("f9out")), 0);
+    E4D(unlink(M("e1")), EISDIR); E4D(rmdir(M("new1b.txt")), ENOTDIR);
+    E4D(rename(M("cfile_003"), M("hdir/f_11")), 0);
+    memset(b, 0, sizeof(b));
+    CHECK(get_file(M("e1/tgt.txt"), b, sizeof(b)) == 6 && !strcmp(b, "f1data"), "e1/tgt.txt '%s'", b);
+    memset(b, 0, sizeof(b));
+    CHECK(get_file(M("e1/keep2.txt"), b, sizeof(b)) == 5 && !strcmp(b, "kept\n"), "e1/keep2.txt '%s'", b);
+    CHECK(access(M("d1"), F_OK) != 0 && access(M("e1/f1"), F_OK) != 0 && access(M("d2moved/f2"), F_OK) == 0, "listing after renames");
+    CHECK(stat(M("d2moved/.."), &st) == 0 && st.st_ino == 2, "d2moved/.. ino %lu", (unsigned long)st.st_ino);
+    CHECK(stat(M("e1"), &st) == 0 && st.st_nlink == 2, "e1 nlink %d", (int)st.st_nlink);
+    sync();
+    R(PASS, "mkdir x6, rmdir x2 (+ENOTEMPTY/ENOTDIR), rename file/dir same+cross dir, replace file/dir/htree entry, subtree move refused");
+#undef M
+}
+
+/* ext4 write step 5 on /mnt/e4rw (after vol.ext_dir): hashed inserts into the
+ * htree directory hdir (leaf splits), lookups through the index (namei uses
+ * it), mkdir/rename inside it; host replays (e4w_check.py ... dir) + e2fsck. */
+static int t_vol_exthtree(char *d, size_t n) {
+    struct stat st; char nm[96]; int bad = 0, miss = 0, extra = 0;
+    if (stat("/mnt/e4rw/hdir", &st) != 0) R(SKIP, "no /mnt/e4rw scratch volume");
+    for (int i = 0; i < 1000; i++) {
+        snprintf(nm, sizeof(nm), "/mnt/e4rw/hdir/h_%d", i);
+        int fd = open(nm, O_WRONLY | O_CREAT, 0644);
+        if (fd < 0) { if (!bad++) CHECK(0, "create %s: %s", nm, strerror(errno)); } else close(fd);
+    }
+    CHECK(bad == 0, "%d hashed creates failed", bad);
+    for (int i = 0; i < 1000; i += 7) { snprintf(nm, sizeof(nm), "/mnt/e4rw/hdir/h_%d", i); CHECK(unlink(nm) == 0, "unlink %s: %s", nm, strerror(errno)); }
+    CHECK(mkdir("/mnt/e4rw/hdir/hsub", 0755) == 0, "mkdir in htree: %s", strerror(errno));
+    CHECK(rename("/mnt/e4rw/hdir/h_1", "/mnt/e4rw/hdir/h_1r") == 0, "rename in htree: %s", strerror(errno));
+    int found = 0;
+    for (int i = 0; i < 1000; i++) {
+        snprintf(nm, sizeof(nm), "/mnt/e4rw/hdir/h_%d", i);
+        int want = i % 7 != 0 && i != 1, got = stat(nm, &st) == 0;
+        if (want && !got) miss++; else if (!want && got) extra++; else if (got) found++;
+    }
+    for (int i = 1; i <= 2000; i++) {
+        snprintf(nm, sizeof(nm), "/mnt/e4rw/hdir/f_%d", i);
+        int want = i != 7 && i != 9, got = stat(nm, &st) == 0;
+        if (want && !got) miss++; else if (!want && got) extra++; else if (got) found++;
+    }
+    CHECK(stat("/mnt/e4rw/hdir/h_1r", &st) == 0 && stat("/mnt/e4rw/hdir/x", &st) == 0 && stat("/mnt/e4rw/hdir/x.txt", &st) == 0, "renamed/created names");
+    CHECK(miss == 0 && extra == 0, "index lookups: %d missing, %d unexpected", miss, extra);
+    DIR *D = opendir("/mnt/e4rw/hdir"); int nh = 0; struct dirent *e;
+    CHECK(D, "opendir hdir"); while ((e = readdir(D))) if (e->d_name[0] != '.') nh++; closedir(D);
+    /* getdents returns at most VFS_READDIR_MAX (2048) entries per directory - an OS
+     * limit, not ext4: the host checker verifies the full 2860-name listing */
+    CHECK(nh == 2858 || nh == 2048, "hdir %d entries, want 2858 (or 2048 = VFS readdir cap)", nh);
+    sync();
+    snprintf(d, n, "1000 hashed inserts (leaf splits), 143 unlinks, mkdir+rename in htree, %d names found via index, %d listed%s", found, nh, nh == 2048 ? " (readdir cap)" : "");
+    return PASS;
 }
 static int t_vol_extmeta(char *d, size_t n) {
     FILE *f = fopen("/home/user/ext_manifest.txt", "r");
@@ -963,7 +1139,7 @@ static const struct test tests[] = {
     { "fs", "rename", t_fs_rename, 10, 0 }, { "fs", "dirs", t_fs_dirs, 15, 0 }, { "fs", "readdir_stat", t_fs_readdir_stat, 10, 0 },
     { "fs", "many_files", t_fs_many, 120, 0 }, { "fs", "large_24mb", t_fs_large, 180, 0 },
     { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 },
-    { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 },
+    { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 }, { "vol", "ext_write", t_vol_extwrite, 60, 0 }, { "vol", "ext_ns", t_vol_extns, 120, 0 }, { "vol", "ext_dir", t_vol_extdir, 60, 0 }, { "vol", "ext_htree", t_vol_exthtree, 120, 0 },
     { "vol", "ext_meta", t_vol_extmeta, 180, 0 },
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
     { "dev", "fb0", t_dev_fb, 10, 0 }, { "dev", "evdev", t_dev_evdev, 10, 0 }, { "dev", "uinput", t_dev_uinput, 10, 0 },
