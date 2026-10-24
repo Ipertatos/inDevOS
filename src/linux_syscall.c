@@ -2322,6 +2322,28 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return lx_enosys(p, nr);
     }
 
+    case 1000: {    /* inDevOS private: network helper for /bin/dhcp.
+                     * a1: 1 = run Zeus "dhcp", 2 = "ddhcp" (QEMU user-net
+                     * defaults) on the kernel main loop; 3 = status:
+                     * bits 0-31 IPv4 (network order bytes), bit 32 lease,
+                     * bits 40-63 completed-request counter. */
+        extern volatile int lx_net_req;
+        extern volatile uint32_t lx_net_gen;
+        extern void net_get_ip_address(uint8_t *ip);
+        extern int dhcp_has_lease(void);
+        if (a1 == 1 || a1 == 2) { lx_net_req = (int)a1; return 0; }
+        if (a1 == 3) {
+            uint8_t ip[4];
+            net_get_ip_address(ip);
+            uint64_t v = (uint64_t)ip[0] | ((uint64_t)ip[1] << 8) |
+                         ((uint64_t)ip[2] << 16) | ((uint64_t)ip[3] << 24);
+            if (dhcp_has_lease()) v |= 1ULL << 32;
+            v |= ((uint64_t)(lx_net_gen & 0xffffff)) << 40;
+            return (long)v;
+        }
+        return -EINVAL;
+    }
+
     default:
         return lx_enosys(p, nr);
     }

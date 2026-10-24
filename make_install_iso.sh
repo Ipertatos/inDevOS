@@ -188,6 +188,32 @@ else
 fi
 
 
+# NetSurf 3.11 graphical browser (static musl, framebuffer frontend drawing
+# through /dev/wm) at tests/netsurf/: /bin/netsurf, resources in
+# /usr/share/netsurf, Choices + start page in /etc/netsurf (the binary also
+# searches /cdrom/... for the live CD), desktop shortcut NetSurf.desktop.
+if [[ -f tests/netsurf/netsurf ]]; then
+    mcopy -o -i "$ROOTFS" tests/netsurf/netsurf ::/bin/netsurf
+    mmd -D s -i "$ROOTFS" ::/usr ::/usr/share ::/usr/share/netsurf ::/etc/netsurf ::/home ::/home/user ::/home/user/Desktop 2>/dev/null </dev/null || true
+    for f in tests/netsurf/res/*; do mcopy -o -s -i "$ROOTFS" "$f" ::/usr/share/netsurf/; done
+    mcopy -o -i "$ROOTFS" tests/netsurf/Choices ::/etc/netsurf/Choices
+    mcopy -o -i "$ROOTFS" tests/netsurf/start.html ::/etc/netsurf/start.html
+    mcopy -o -i "$ROOTFS" tests/netsurf/NetSurf.desktop ::/home/user/Desktop/NetSurf.desktop
+    for f in usr/share/netsurf/en/Messages usr/share/netsurf/default.css usr/share/netsurf/pointers etc/netsurf/Choices; do
+        mdir -i "$ROOTFS" "::/$f" >/dev/null 2>&1 || die "rootfs is missing /$f after copying NetSurf"
+    done
+    echo "    /bin/netsurf (static musl NetSurf 3.11, /dev/wm) + /usr/share/netsurf + /etc/netsurf"
+else
+    echo "    (tests/netsurf/netsurf not built, skipping NetSurf; see tests/netsurf/build/README.md)"
+fi
+# /bin/dhcp: brings networking up from ash (kernel syscall 1000 -> Zeus dhcp/ddhcp)
+if [[ -f tests/netsurf/dhcp ]]; then
+    mcopy -o -i "$ROOTFS" tests/netsurf/dhcp ::/bin/dhcp
+    echo "    /bin/dhcp"
+else
+    echo "    (tests/netsurf/dhcp not built, skipping /bin/dhcp; see tests/netsurf/build/README.md)"
+fi
+
 echo ">>> installing Doom (one binary, one WAD)"
 mcopy -o -i "$ROOTFS" doom/doom.exe ::/bin/doom.exe
 mcopy -o -i "$ROOTFS" doom1.wad ::/doom1.wad

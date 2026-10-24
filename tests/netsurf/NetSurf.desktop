@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=NetSurf
+Exec=terminal-run dhcp -a; HOME=/tmp /bin/netsurf file:///etc/netsurf/start.html
+Icon=terminal

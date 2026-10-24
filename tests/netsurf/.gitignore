@@ -1,0 +1,4 @@
+# Built by build/build_netsurf.sh; not tracked (see build/README.md)
+/netsurf
+/dhcp
+/res.new/

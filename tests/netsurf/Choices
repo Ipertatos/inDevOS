@@ -1,0 +1,7 @@
+window_width:960
+window_height:640
+ca_bundle:/etc/ssl/cert.pem
+homepage_url:file:///etc/netsurf/start.html
+enable_javascript:1
+cookie_file:/tmp/.netsurf_cookies
+cookie_jar:/tmp/.netsurf_cookies

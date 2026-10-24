@@ -493,6 +493,23 @@ bool wm_dev_key(uint32_t desk_id, int32_t keycode, bool pressed) {
     memset(&ev, 0, sizeof(ev));
     ev.type = pressed ? WM_EV_KEY_DOWN : WM_EV_KEY_UP;
     ev.key = keycode;
+    {
+        /* Modifier state tracked from the key events themselves, in queue
+         * order (the PS/2 ISR flags run ahead of the deferred SDL queue, so
+         * reading them here gave stale mods on fast typing). SDL keycodes:
+         * 0x200/0x201 shift, 0x202/0x203 ctrl, 0x204/0x205 alt, 0x206 gui. */
+        static uint32_t held;      /* bit per modifier key 0x200..0x206 */
+        if (keycode >= 0x200 && keycode <= 0x206) {
+            uint32_t bit = 1u << (keycode - 0x200);
+            if (pressed) held |= bit; else held &= ~bit;
+        }
+        uint32_t m = 0;
+        if (held & 0x03) m |= WM_MOD_SHIFT;
+        if (held & 0x0c) m |= WM_MOD_CTRL;
+        if (held & 0x30) m |= WM_MOD_ALT;
+        if (held & 0x40) m |= WM_MOD_SUPER;
+        ev.mods = m;
+    }
     post(desk_id, &ev);
     return true;
 }

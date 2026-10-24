@@ -205,6 +205,12 @@ SDL_Keycode SDL_Ps2ScancodeToKeycode(uint8_t scancode) {
         case 0x33: return SDLK_COMMA;
         case 0x34: return SDLK_PERIOD;
         case 0x35: return SDLK_SLASH;
+        case 0x27: return ';';          /* SDLK_SEMICOLON (Shift -> ':') */
+        case 0x28: return '\'';         /* SDLK_QUOTE */
+        case 0x29: return '`';          /* SDLK_BACKQUOTE */
+        case 0x1A: return '[';          /* SDLK_LEFTBRACKET */
+        case 0x1B: return ']';          /* SDLK_RIGHTBRACKET */
+        case 0x2B: return '\\';         /* SDLK_BACKSLASH */
         case 0x2A: return SDLK_LSHIFT;
         case 0x36: return SDLK_RSHIFT;
         case 0x1D: return SDLK_LCTRL;

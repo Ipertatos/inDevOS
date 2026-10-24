@@ -73,6 +73,9 @@ static void tty_zeus_line_handler(int tty_id, const char *line, uint32_t len) {
     zeus_process_command(line);
 }
 
+volatile int lx_net_req;
+volatile uint32_t lx_net_gen;
+
 void kmain(void) {
     // CRITICAL: Clear BSS section first to ensure all static variables are zeroed
     // The linker places BSS after .data in the data segment
@@ -497,6 +500,16 @@ void kmain(void) {
         if (desktop_is_running()) {
             extern bool kterm_pump(void);
             if (kterm_pump()) did_work = true;
+        }
+
+        /* /bin/dhcp (syscall 1000) asks for DHCP / QEMU defaults; run the
+         * Zeus command here, in main-loop context, like typing it in Zeus. */
+        if (lx_net_req) {
+            int req = lx_net_req;
+            lx_net_req = 0;
+            zeus_process_command(req == 2 ? "ddhcp" : "dhcp");
+            lx_net_gen++;
+            did_work = true;
         }
 
         { extern void fbdev_tick(void); fbdev_tick(); }   /* /dev/fb0 scanout */
