@@ -13,6 +13,15 @@ static ahci_controller_t ahci_ctrl = {0};
 static uint8_t ahci_storage_device_id = 0xFF;
 /* storage device_id -> AHCI port. 0xFF means "not an AHCI disk". */
 static uint8_t ahci_dev_port[MAX_STORAGE_DEVICES];
+/* Non-zero when that AHCI port is an ATAPI CD/DVD (SIG 0xEB140101). */
+static uint8_t ahci_port_atapi[32];
+static int ahci_atapi_cache_valid;
+static uint32_t ahci_atapi_cache_blk;
+static int ahci_atapi_cache_port = -1;
+/* Dedicated 2048-byte ATAPI block cache. Must NOT alias dma_bounce: ATA
+ * DMA reuses dma_bounce and would otherwise serve stale/corrupt CD data
+ * while cache_valid stays set (live Links segfault reading /bin/links). */
+static uint8_t *ahci_atapi_cache_data;
 
 static uint8_t ahci_port_of(storage_device_t *dev) {
     if (dev && dev->device_id < MAX_STORAGE_DEVICES &&
@@ -20,6 +29,10 @@ static uint8_t ahci_port_of(storage_device_t *dev) {
         return ahci_dev_port[dev->device_id];
     return ahci_ctrl.active_port;
 }
+
+static int ahci_wait_completion(uint8_t port, int timeout_ms);
+static int ahci_atapi_capacity(uint8_t port);
+static int ahci_atapi_read_512(uint8_t port, uint64_t lba, uint32_t count, void *buffer);
 
 // Global AHCI buffers - guaranteed to be in mapped kernel memory
 #define AHCI_DMA_BOUNCE_BYTES (128 * 512)
@@ -201,7 +214,11 @@ static int ahci_init_port(uint8_t port) {
     ahci_write_port_reg32(port, AHCI_PORT_SERR, 0xFFFFFFFF);
 
     uint32_t sig = ahci_read_port_reg32(port, AHCI_PORT_SIG);
-    if (sig == 0xEB140101u || sig == 0xC33C0101u || sig == 0x96690101u) {
+    ahci_port_atapi[port] = 0;
+    if (sig == 0xEB140101u) {
+        ahci_port_atapi[port] = 1;
+        printf("AHCI: Port %d is ATAPI CD/DVD (SIG=0x%x)\n", port, sig);
+    } else if (sig == 0xC33C0101u || sig == 0x96690101u) {
         printf("AHCI: Port %d is not an ATA disk (SIG=0x%x) - skipping\n", port, sig);
         return -1;
     }
@@ -363,6 +380,8 @@ static int ahci_identify_once(uint8_t port) {
     return 0;
 }
 
+static int ahci_atapi_capacity(uint8_t port); /* defined below */
+
 static int ahci_identify_drive(uint8_t port) {
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt) {
@@ -373,7 +392,11 @@ static int ahci_identify_drive(uint8_t port) {
             ahci_port_wait_ready_ms(port, 10000);  /* disk spin-up */
             ahci_port_start(port);
         }
-        if (ahci_identify_once(port) == 0) return 0;
+        if (ahci_port_atapi[port]) {
+            if (ahci_atapi_capacity(port) == 0) return 0;
+        } else {
+            if (ahci_identify_once(port) == 0) return 0;
+        }
     }
     return -1;
 }
@@ -414,25 +437,19 @@ void ahci_handle_interrupt(void) {
 }
 
 /**
- * Wait for command completion using interrupt-driven notification.
- * Falls back to polling if the interrupt doesn't fire within timeout.
- * Returns 0 on success, -1 on timeout/error.
+ * Wait for AHCI command completion.
+ *
+ * Only treat the command as done when PxCI bit0 is clear. Returning on the
+ * completion IRQ alone races under SMP: a late IRQ from the previous command
+ * can set ahci_port_complete after we zero it and before CI is issued, so the
+ * wait returns while DMA is still in flight. That produced non-deterministic
+ * ATAPI CD reads (varying /bin/links md5) and live Links segfaults on q35.
+ *
+ * Polling CI (with pause) stays fast; the IRQ flag is only drained after CI
+ * clears. mfence makes device DMA stores visible before the caller copies
+ * the bounce/ATAPI cache buffer.
  */
 static int ahci_wait_completion(uint8_t port, int timeout_ms) {
-    /* Fast path: the completion interrupt already fired. */
-    if (ahci_port_complete[port]) {
-        ahci_port_complete[port] = 0;
-        return ahci_port_error[port] ? -1 : 0;
-    }
-
-    /* Poll PxCI rather than halting until the next interrupt.
-     *
-     * The old loop did "sti; hlt; cli" and only re-checked completion after
-     * each halt, so it could not observe completion more than once per timer
-     * tick.  Profiling showed 13 x 128-sector reads costing 946 ms (~60 ms per
-     * command = one tick each even though the transfer itself is far quicker).
-     * Polling returns as soon as the controller clears CI; the interrupt fast
-     * path above is still used when the IRQ does fire. */
     uint64_t deadline = ktime_deadline_ms((uint64_t)timeout_ms);
 
     for (;;) {
@@ -441,16 +458,13 @@ static int ahci_wait_completion(uint8_t port, int timeout_ms) {
          * a clear bit here means completion, not "not started yet". */
         uint32_t ci = ahci_read_port_reg32(port, AHCI_PORT_CI);
         if ((ci & 1) == 0) {
-            uint32_t tfd = ahci_read_port_reg32(port, AHCI_PORT_TFD);
-            return (tfd & 0x1) ? -1 : 0;
-        }
-
-        if (ahci_port_complete[port]) {
             ahci_port_complete[port] = 0;
-            if (ahci_port_error[port]) {
-                ahci_port_error[port] = 0;
+            uint32_t tfd = ahci_read_port_reg32(port, AHCI_PORT_TFD);
+            int err = ahci_port_error[port];
+            ahci_port_error[port] = 0;
+            if (err || (tfd & 0x1))
                 return -1;
-            }
+            __asm__ volatile("mfence" ::: "memory");
             return 0;
         }
 
@@ -540,6 +554,28 @@ void ahci_init(void) {
     
     DEBUG_SERIAL("AHCI: Beginning per-port initialization\n");
 
+    /* kalloc once — static BSS was not DMA-reachable. Allocate before
+     * IDENTIFY/ATAPI so capacity and early reads can DMA into it. */
+    if (!ahci_ctrl.dma_bounce) {
+        ahci_ctrl.dma_bounce = kalloc(AHCI_DMA_BOUNCE_BYTES);
+        if (!ahci_ctrl.dma_bounce) {
+            printf("AHCI: Failed to allocate DMA bounce buffer\n");
+            return;
+        }
+    }
+    /* ATAPI READ(10) needs its own DMA page. A lazy kalloc(2048) comes from
+     * the slab (max class 2048); keep a full page allocated with the bounce
+     * so PRDT phys translation stays on a dedicated, page-backed buffer and
+     * never aliases dma_bounce (ATA DMA). */
+    if (!ahci_atapi_cache_data) {
+        ahci_atapi_cache_data = kalloc(4096);
+        if (!ahci_atapi_cache_data) {
+            printf("AHCI: Failed to allocate ATAPI DMA cache\n");
+            return;
+        }
+        ahci_atapi_cache_valid = 0;
+    }
+
     bool port_found = false;
     for (uint8_t port = 0; port < 32; port++) {
         if (!(pi & (1 << port))) {
@@ -565,15 +601,6 @@ void ahci_init(void) {
     if (!port_found) {
         printf("AHCI: No usable ports found – aborting init\n");
         return;
-    }
-
-    /* kalloc once — static BSS was not DMA-reachable; per-read kalloc was slow. */
-    if (!ahci_ctrl.dma_bounce) {
-        ahci_ctrl.dma_bounce = kalloc(AHCI_DMA_BOUNCE_BYTES);
-        if (!ahci_ctrl.dma_bounce) {
-            printf("AHCI: Failed to allocate DMA bounce buffer\n");
-            return;
-        }
     }
 
     ahci_ctrl.initialized = true;
@@ -648,17 +675,23 @@ int ahci_register_storage() {
         ahci_device->sector_count = ahci_ctrl.port_sectors[port];
         ahci_device->sector_size = 512;
         ahci_device->is_initialized = true;
+        ahci_device->optical = ahci_port_atapi[port] != 0;
         ahci_device->pci_dev = ahci_ctrl.pci_dev;
         ahci_device->base_address = ahci_ctrl.bar5_base;
-        ahci_device->name[0] = 'S';
-        ahci_device->name[1] = 'A';
-        ahci_device->name[2] = 'T';
-        ahci_device->name[3] = 'A';
-        if (port >= 10) {
-            ahci_device->name[4] = (char)('0' + port / 10);
-            ahci_device->name[5] = (char)('0' + port % 10);
+        if (ahci_device->optical) {
+            const char *n = "AHCI CD-ROM";
+            for (int i = 0; n[i] && i < 31; i++) ahci_device->name[i] = n[i];
         } else {
-            ahci_device->name[4] = (char)('0' + port);
+            ahci_device->name[0] = 'S';
+            ahci_device->name[1] = 'A';
+            ahci_device->name[2] = 'T';
+            ahci_device->name[3] = 'A';
+            if (port >= 10) {
+                ahci_device->name[4] = (char)('0' + port / 10);
+                ahci_device->name[5] = (char)('0' + port % 10);
+            } else {
+                ahci_device->name[4] = (char)('0' + port);
+            }
         }
         ahci_dev_port[id] = port;
         if (ahci_storage_device_id == 0xFF)
@@ -677,6 +710,158 @@ int ahci_register_storage() {
 }
 
 // AHCI DMA read implementation
+
+/* ---- AHCI ATAPI (PACKET) --------------------------------------------------
+ * QEMU q35 puts the -cdrom drive on an AHCI port with SIG 0xEB140101.  We
+ * speak READ CAPACITY / READ(10) and present the disc as 512-byte logical
+ * sectors (4 per 2048-byte CD block), matching ide_atapi.c so FAT32 hybrid
+ * ISOs (MBR + type 0x0C) mount unchanged. */
+static int ahci_atapi_packet(uint8_t port, const uint8_t cdb[12],
+                             void *buf, uint32_t buflen) {
+    extern uint64_t vmm_higher_half_offset;
+    if (ahci_port_wait_ready(port) != 0)
+        return -1;
+    int slot_timeout = 100000;
+    while (slot_timeout-- && (ahci_read_port_reg32(port, AHCI_PORT_CI) & 1))
+        ;
+    if (slot_timeout <= 0)
+        return -1;
+
+    ahci_cmd_table_t *cmd_table = (ahci_cmd_table_t *)ahci_ctrl.cmd_table[port];
+    memset(cmd_table, 0, sizeof(*cmd_table));
+    memcpy(cmd_table->acmd, cdb, 12);
+
+    uint64_t buf_virt = (uint64_t)buf;
+    uint64_t buf_phys = buf_virt - vmm_higher_half_offset;
+    cmd_table->prdt_entry[0].dba = (uint32_t)buf_phys;
+    cmd_table->prdt_entry[0].dbau = (uint32_t)(buf_phys >> 32);
+    cmd_table->prdt_entry[0].dbc = buflen ? (buflen - 1) : 0;
+    cmd_table->prdt_entry[0].i = 1;
+
+    fis_reg_h2d_t *fis = (fis_reg_h2d_t *)cmd_table->cfis;
+    memset(fis, 0, sizeof(*fis));
+    fis->fis_type = FIS_TYPE_REG_H2D;
+    fis->c = 1;
+    fis->command = ATA_CMD_PACKET;
+    fis->featurel = 1; /* DMA */
+    fis->lba1 = (uint8_t)(buflen & 0xFF);
+    fis->lba2 = (uint8_t)((buflen >> 8) & 0xFF);
+
+    ahci_cmd_header_t *hdr = (ahci_cmd_header_t *)ahci_ctrl.cmd_list[port];
+    uint64_t ct_phys = ((uint64_t)ahci_ctrl.cmd_table[port]) - vmm_higher_half_offset;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->cfl = sizeof(fis_reg_h2d_t) / 4;
+    hdr->a = 1; /* ATAPI */
+    hdr->w = 0;
+    hdr->prdtl = 1;
+    hdr->ctba = (uint32_t)ct_phys;
+    hdr->ctbau = (uint32_t)(ct_phys >> 32);
+
+    ahci_port_complete[port] = 0;
+    ahci_port_error[port] = 0;
+    ahci_write_port_reg32(port, AHCI_PORT_IS, 0xFFFFFFFF);
+    ahci_write_port_reg32(port, AHCI_PORT_CI, 1);
+    if (ahci_wait_completion(port, 5000) != 0)
+        return -1;
+    return 0;
+}
+
+static int ahci_atapi_capacity(uint8_t port) {
+    uint8_t cdb[12];
+    uint8_t *raw;
+    uint32_t last, blen;
+    uint64_t sec512;
+    raw = kalloc(512);
+    if (!raw) return -1;
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x25; /* READ CAPACITY(10) */
+    memset(raw, 0, 512);
+    if (ahci_atapi_packet(port, cdb, raw, 8) != 0) {
+        kfree(raw);
+        printf("AHCI: ATAPI READ CAPACITY failed on port %d\n", port);
+        return -1;
+    }
+    last = ((uint32_t)raw[0] << 24) | ((uint32_t)raw[1] << 16) |
+           ((uint32_t)raw[2] << 8) | raw[3];
+    blen = ((uint32_t)raw[4] << 24) | ((uint32_t)raw[5] << 16) |
+           ((uint32_t)raw[6] << 8) | raw[7];
+    if (blen != 2048 && blen != 512) {
+        printf("AHCI: ATAPI block size %u unsupported on port %d\n", blen, port);
+        kfree(raw);
+        return -1;
+    }
+    /* Store 512-byte logical sector count (shift 2 when blen==2048). */
+    if (blen == 2048)
+        sec512 = ((uint64_t)last + 1ull) << 2;
+    else
+        sec512 = (uint64_t)last + 1ull;
+    if (sec512 == 0 || sec512 > 0xFFFFFFFFull) {
+        kfree(raw);
+        return -1;
+    }
+    ahci_ctrl.port_sectors[port] = (uint32_t)sec512;
+    printf("AHCI: Port %d ATAPI CD capacity: %u x 512-byte sectors (%u MB, %u-byte blocks)\n",
+           port, (uint32_t)sec512,
+           (uint32_t)((sec512 * 512ull) / (1024ull * 1024ull)), blen);
+    ahci_atapi_cache_valid = 0;
+    ahci_atapi_cache_port = -1;
+    kfree(raw);
+    return 0;
+}
+
+static int ahci_atapi_fill(uint8_t port, uint32_t blk, void *dma_buf) {
+    uint8_t cdb[12];
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x28; /* READ(10) */
+    cdb[2] = (uint8_t)((blk >> 24) & 0xFF);
+    cdb[3] = (uint8_t)((blk >> 16) & 0xFF);
+    cdb[4] = (uint8_t)((blk >> 8) & 0xFF);
+    cdb[5] = (uint8_t)(blk & 0xFF);
+    cdb[8] = 1;
+    if (ahci_atapi_packet(port, cdb, dma_buf, 2048) != 0) {
+        ahci_atapi_cache_valid = 0;
+        return -1;
+    }
+    ahci_atapi_cache_blk = blk;
+    ahci_atapi_cache_port = (int)port;
+    ahci_atapi_cache_valid = 1;
+    return 0;
+}
+
+static int ahci_atapi_ensure_cache(void) {
+    if (ahci_atapi_cache_data)
+        return 0;
+    /* Late path (should be rare): still demand a full page, not slab 2048. */
+    ahci_atapi_cache_data = kalloc(4096);
+    if (!ahci_atapi_cache_data)
+        return -1;
+    return 0;
+}
+
+static int ahci_atapi_read_512(uint8_t port, uint64_t lba, uint32_t count, void *buffer) {
+    uint8_t *dst = (uint8_t *)buffer;
+    if (ahci_atapi_ensure_cache() != 0)
+        return -1;
+    void *dma_buf = ahci_atapi_cache_data;
+    if (lba + count > ahci_ctrl.port_sectors[port])
+        return -1;
+    while (count) {
+        uint32_t blk = (uint32_t)(lba >> 2);
+        uint32_t off = (uint32_t)(lba & 3u) * 512u;
+        if (!ahci_atapi_cache_valid || ahci_atapi_cache_port != (int)port ||
+            ahci_atapi_cache_blk != blk) {
+            if (ahci_atapi_fill(port, blk, dma_buf) != 0)
+                return -1;
+        }
+        memcpy(dst, (uint8_t *)dma_buf + off, 512);
+        dst += 512;
+        lba++;
+        count--;
+    }
+    return 0;
+}
+
+
 int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
     spinlock_lock(&ahci_lock);
     if (!ahci_ctrl.initialized || !dev || !buffer) {
@@ -687,6 +872,14 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
     //printf("AHCI: Reading %d sectors starting at LBA %llu\n", sector_count, lba);
 
     uint8_t port = ahci_port_of(dev);
+    if (ahci_port_atapi[port] || (dev && dev->optical)) {
+        int rc = ahci_atapi_read_512(port, lba, sector_count, buffer);
+        spinlock_unlock(&ahci_lock);
+        return rc;
+    }
+
+    /* ATA DMA clobbers dma_bounce; never let ATAPI think its cache is warm. */
+    ahci_atapi_cache_valid = 0;
 
     uint32_t sectors_remaining = sector_count;
     uint8_t *buf_ptr = (uint8_t*)buffer;
@@ -791,6 +984,8 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
 }
 
 int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer) {
+    if (dev && dev->optical) return -1;
+
     spinlock_lock(&ahci_lock);
     if (!ahci_ctrl.initialized || !dev || !buffer) {
         printf("AHCI: Invalid parameters for write\n");
@@ -801,6 +996,8 @@ int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_coun
     SERIAL_DEBUG_PRINT(AHCI, "AHCI: Writing %d sectors starting at LBA %llu\n", sector_count, lba);
 
     uint8_t port = ahci_port_of(dev);
+
+    ahci_atapi_cache_valid = 0;
 
     uint32_t sectors_remaining = sector_count;
     const uint8_t *buf_ptr = (const uint8_t*)buffer;

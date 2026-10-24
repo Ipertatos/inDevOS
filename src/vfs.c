@@ -514,6 +514,11 @@ void vfs_seed_standard_layout(void) {
     for (int i = 0; dirs[i]; i++)
         vfs_mkdir_p(dirs[i]);
 
+    {
+        extern int tmpfs_mount_tmp(void);
+        tmpfs_mount_tmp();
+    }
+
     if (!vfs_exists("/home/user/Documents/readme.txt")) {
         static const char msg[] =
             "Welcome to inDevOS.\n"

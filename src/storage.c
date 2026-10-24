@@ -501,6 +501,14 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
         return -1;
     }
 
+    /* Optical CD: bcache made large-file reads non-deterministic (md5 of
+     * /bin/links differed between consecutive runs). Bypass cache+readahead. */
+    if (dev->optical) {
+        int r = storage_read_sectors_hw(dev, device_id, lba, sector_count, buffer);
+        spinlock_unlock(&storage_lock);
+        return r;
+    }
+
     uint8_t *dst = (uint8_t *)buffer;
     int result = 0;
     int kp_hw = 0;
@@ -710,22 +718,30 @@ uint32_t find_first_fat32_partition_lba(uint8_t device_id) {
         kfree(mbr);
         return 0;
     }
-    // Partition table starts at offset 446
+    // Partition table starts at offset 446.  Hybrid install ISOs have both a
+    // protective 0xEE GPT entry and a type 0x0C FAT32 partition — prefer the
+    // explicit FAT32 MBR entry so we mount the INDEVOS rootfs, not the ESP.
+    uint32_t gpt_fallback = 0;
     for (int i = 0; i < 4; ++i) {
         uint8_t *entry = mbr + 446 + i * 16;
         uint8_t part_type = entry[4];
         uint32_t lba = entry[8] | (entry[9] << 8) | (entry[10] << 16) | (entry[11] << 24);
         printf("storage: Partition %d type=0x%02x lba=%u\n", i, part_type, lba);
-        if (part_type == 0x0B || part_type == 0x0C) {
+        if ((part_type == 0x0B || part_type == 0x0C) && lba) {
             printf("storage: Found FAT32 partition at LBA %u\n", lba);
             kfree(mbr);
             return lba;
         }
-        if (part_type == 0xEE) {
-            uint32_t g = storage_gpt_find_fat32(device_id, mbr);
-            kfree(mbr);
-            return g;
+        if (part_type == 0xEE && gpt_fallback == 0) {
+            uint8_t tmp[512];
+            memcpy(tmp, mbr, 512);
+            gpt_fallback = storage_gpt_find_fat32(device_id, tmp);
         }
+    }
+    if (gpt_fallback) {
+        printf("storage: Using GPT FAT32 partition at LBA %u\n", gpt_fallback);
+        kfree(mbr);
+        return gpt_fallback;
     }
     printf("storage: No FAT32 partition found in MBR\n");
     kfree(mbr);

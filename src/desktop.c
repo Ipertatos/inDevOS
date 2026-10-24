@@ -738,32 +738,53 @@ static void dt_refresh_desktop_icons(void) {
     if (!tmp) tmp = (vfs_dirent_t *)kalloc(sizeof(vfs_dirent_t) * DT_ICON_MAX);
     if (!tmp) return;
     static const char *paths[] = {
-        "/home/user/Desktop", "/Desktop", "/os/Desktop"
+        "/home/user/Desktop", "/Desktop", "/os/Desktop",
+        "/cdrom/home/user/Desktop"
     };
+    /* Primary folder fills the icon table; /cdrom Desktop entries are merged
+     * in (by name) so a live CD shortcut appears next to the disk's icons
+     * without writing the user's disk. */
+    int wn = 0;
+    const char *primary = NULL;
     for (unsigned p = 0; p < sizeof(paths) / sizeof(paths[0]); p++) {
         int n = vfs_readdir(paths[p], tmp, DT_ICON_MAX);
-        if (n > 0) {
+        if (n <= 0) continue;
+        if (!primary) {
             int w = 0;
             while (paths[p][w] && w < (int)sizeof(dt_icon_base_path) - 1) {
                 dt_icon_base_path[w] = paths[p][w];
                 w++;
             }
             dt_icon_base_path[w] = '\0';
-            int wn = 0;
-            for (int i = 0; i < n && wn < DT_ICON_MAX; i++) {
-                if (tmp[i].name[0] == '.' && tmp[i].name[1] == '\0') continue;
-                if (tmp[i].name[0] == '.' && tmp[i].name[1] == '.' && tmp[i].name[2] == '\0') continue;
-                dt_icon_entries[wn++] = tmp[i];
-            }
-            dt_icon_count = wn;
-            dt_icon_drag = -1;
-            dt_icon_dragging = false;
-            dt_icon_labels();
-            dt_icon_assign_slots();
-            if (dt_icon_sel >= wn) dt_icon_sel = -1;
-            serial_printf("[desktop] desktop icons from %s (%d entries)\n", paths[p], dt_icon_count);
-            return;
+            primary = paths[p];
         }
+        for (int i = 0; i < n && wn < DT_ICON_MAX; i++) {
+            if (tmp[i].name[0] == '.' && tmp[i].name[1] == '\0') continue;
+            if (tmp[i].name[0] == '.' && tmp[i].name[1] == '.' && tmp[i].name[2] == '\0') continue;
+            int dup = 0;
+            for (int j = 0; j < wn; j++) {
+                if (strcmp(dt_icon_entries[j].name, tmp[i].name) == 0) { dup = 1; break; }
+            }
+            if (dup) continue;
+            /* For merged /cdrom entries, remember a full path via a side table
+             * is not available; launch uses dt_icon_base_path + name.  Put
+             * cdrom-only shortcuts into the table with a path rewrite at click
+             * time when the primary base lacks the file (see launch). */
+            if (primary != paths[p] && paths[p][1] == 'c') {
+                /* Keep base as primary; launch_open_path falls back to /cdrom. */
+            }
+            dt_icon_entries[wn++] = tmp[i];
+        }
+    }
+    if (wn > 0) {
+        dt_icon_count = wn;
+        dt_icon_drag = -1;
+        dt_icon_dragging = false;
+        dt_icon_labels();
+        dt_icon_assign_slots();
+        if (dt_icon_sel >= wn) dt_icon_sel = -1;
+        serial_printf("[desktop] desktop icons from %s (+cdrom merge, %d entries)\n",
+                      primary ? primary : "?", dt_icon_count);
     }
 }
 

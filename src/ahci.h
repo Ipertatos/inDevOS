@@ -53,6 +53,8 @@
 #define ATA_CMD_READ_DMA_EXT    0x25
 #define ATA_CMD_WRITE_DMA_EXT   0x35
 #define ATA_CMD_IDENTIFY        0xEC
+#define ATA_CMD_PACKET          0xA0
+#define ATA_CMD_IDENTIFY_PACKET 0xA1
 #define ATA_CMD_FLUSH_CACHE_EXT 0xEA
 
 // FIS Types

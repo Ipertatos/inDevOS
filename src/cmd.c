@@ -274,6 +274,57 @@ void gpu_test(void) {
 
 void unmount_filesystem_path(const char *path);
 
+
+void mount_cdrom_alias(void) {
+    extern storage_device_t storage_devices[];
+    extern uint8_t storage_device_count;
+    extern fat32_fs_t fat32_filesystem;
+    extern vfs_fs_ops_t *vfs_fat32_get_ops(void);
+    extern uint32_t find_first_fat32_partition_lba(uint8_t device_id);
+
+    if (vfs_find_mount("/cdrom", NULL))
+        return;
+
+    int optical = -1;
+    for (uint8_t i = 0; i < storage_device_count; i++) {
+        if (storage_devices[i].is_initialized && storage_devices[i].optical) {
+            optical = (int)i;
+            break;
+        }
+    }
+    if (optical < 0) {
+        printf("cdrom: no optical storage device\n");
+        return;
+    }
+
+    /* Case A: / is already the optical FAT32 — alias /cdrom to it. */
+    if (fat32_is_mounted() && fat32_filesystem.storage_dev &&
+        fat32_filesystem.storage_dev->device_id == (uint8_t)optical) {
+        if (vfs_mount("/cdrom", vfs_fat32_get_ops(), &fat32_filesystem) == 0)
+            printf("cdrom: /cdrom -> optical FAT32 (device %d)\n", optical);
+        return;
+    }
+
+    /* Case B: / is a hard disk. Prefer the live install image so Links and the
+     * CA bundle are visible. Single FAT32 instance: remount / from the CD. */
+    if (!vfs_exists("/home/user/Desktop/Links.desktop") &&
+        !vfs_exists("/bin/links")) {
+        printf("cdrom: remounting / from optical device %d for live Links\n", optical);
+        if (vfs_find_mount("/", NULL))
+            unmount_filesystem_path("/");
+        if (fat32_mount((uint8_t)optical) == 0 && vfs_fat32_register("/") == 0) {
+            vfs_seed_standard_layout();
+            zeus_use_home_if_present();
+            if (vfs_mount("/cdrom", vfs_fat32_get_ops(), &fat32_filesystem) == 0)
+                printf("cdrom: / and /cdrom are the install CD (device %d)\n", optical);
+            return;
+        }
+        printf("cdrom: failed to mount optical device %d\n", optical);
+        return;
+    }
+    printf("cdrom: optical device %d present; / already has Links — left unchanged\n", optical);
+}
+
 void mount_filesystem(void) {
     int id = storage_find_boot_device();
     if (id < 0) {

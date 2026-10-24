@@ -351,7 +351,24 @@ static int launch_shortcut_run(const char *path) {
         while (tr[k] && cmd[k] == tr[k]) k++;
         if (!tr[k]) {
             while (cmd[k] == ' ') k++;
-            kterm_run_in("/home/user", cmd + k);
+            {
+                /* Live CD: /bin/links lives on /cdrom when / is the HDD. */
+                static char rewritten[192];
+                const char *src = cmd + k;
+                if (!vfs_exists("/bin/links") && vfs_exists("/cdrom/bin/links") &&
+                    (src[0] == 'H' || src[0] == '/' || (src[0] == 'S' && src[1] == 'S'))) {
+                    /* Prefer a known-good live command line. */
+                    snprintf(rewritten, sizeof(rewritten),
+                        "HOME=/tmp SSL_CERT_FILE=/cdrom/etc/ssl/cert.pem "
+                        "/cdrom/bin/links -dump /cdrom/etc/links/start.html");
+                    src = rewritten;
+                } else if (!vfs_exists("/bin/links") && vfs_exists("/cdrom/bin/links")) {
+                    snprintf(rewritten, sizeof(rewritten), "%s", src);
+                    /* best-effort already in Exec= */
+                    src = rewritten;
+                }
+                kterm_run_in("/tmp", src);
+            }
             return 0;
         }
     }
@@ -377,7 +394,19 @@ static int launch_shortcut_run(const char *path) {
         snprintf(prog, sizeof(prog), "/bin/%s.exe", argv[0]);
         if (!vfs_exists(prog)) snprintf(prog, sizeof(prog), "/bin/%s", argv[0]);
     }
-    if (!vfs_exists(prog)) { launch_fail("Shortcut target missing:", argv[0]); return -1; }
+    if (!vfs_exists(prog)) {
+        char alt[160];
+        if (argv[0][0] == '/')
+            snprintf(alt, sizeof(alt), "/cdrom%s", argv[0]);
+        else
+            snprintf(alt, sizeof(alt), "/cdrom/bin/%s", argv[0]);
+        if (vfs_exists(alt)) {
+            snprintf(prog, sizeof(prog), "%s", alt);
+        } else {
+            launch_fail("Shortcut target missing:", argv[0]);
+            return -1;
+        }
+    }
     if (argc == 1 && !launch_is_elf(prog)) {
         if (launch_is_shortcut(prog)) { launch_fail("Shortcut points to a shortcut", name); return -1; }
         return launch_open_path(prog, launch_is_dir(prog));
@@ -391,6 +420,16 @@ static int launch_shortcut_run(const char *path) {
 
 int launch_open_path(const char *path, bool is_dir) {
     if (!path || !path[0]) return -1;
+    static char cdrom_path[256];
+    if (!vfs_exists(path)) {
+        const char *base = launch_basename(path);
+        snprintf(cdrom_path, sizeof(cdrom_path), "/cdrom/home/user/Desktop/%s", base);
+        if (vfs_exists(cdrom_path)) path = cdrom_path;
+        else {
+            snprintf(cdrom_path, sizeof(cdrom_path), "/cdrom%s", path);
+            if (vfs_exists(cdrom_path)) path = cdrom_path;
+        }
+    }
     const char *name = launch_basename(path);
     if (!is_dir && launch_is_shortcut(path)) return launch_shortcut_run(path);
     const char *act = launch_find(path, is_dir);

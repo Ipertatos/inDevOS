@@ -308,6 +308,16 @@ void kmain(void) {
     //for easy debug 
     bootlog_stage("mount boot volume");
     mount_filesystem();
+    /* Live install CD on AHCI (q35 -cdrom): expose the same FAT32 at /cdrom
+     * so desktop shortcuts and /cdrom/bin/links work whether or not / is the CD. */
+    {
+        extern void mount_cdrom_alias(void);
+        mount_cdrom_alias();
+    }
+    {
+        extern int tmpfs_mount_tmp(void);
+        tmpfs_mount_tmp();
+    }
     /* From here on the log is written to /BOOTLOG.TXT on the boot volume. */
     bootlog_attach();
     bootlog_stage("boot volume mounted");
