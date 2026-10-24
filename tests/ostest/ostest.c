@@ -1334,6 +1334,37 @@ static int t_eventfd(char *d, size_t n) {
 }
 
 /* ===================== registry ===================== */
+/* tty.pty_basic: stdin of the desktop terminal is a pty-like device:
+ * isatty, raw-mode termios round-trip, TIOCGWINSZ/TIOCSWINSZ round-trip. */
+static int t_pty_basic(char *d, size_t n) {
+    int fd = 0;
+    if (!isatty(0)) { if (isatty(1)) fd = 1; else R(SKIP, "stdin/stdout not a tty"); }
+    struct termios o, r, c, b;
+    CHECKE(tcgetattr(fd, &o) == 0, "tcgetattr");
+    r = o;
+    r.c_lflag &= ~(ICANON | ECHO);
+    r.c_cc[VMIN] = 0; r.c_cc[VTIME] = 1;
+    CHECKE(tcsetattr(fd, TCSANOW, &r) == 0, "tcsetattr raw");
+    int g = tcgetattr(fd, &c);
+    tcsetattr(fd, TCSANOW, &o);
+    CHECKE(g == 0, "tcgetattr raw");
+    CHECK(!(c.c_lflag & (ICANON | ECHO)), "raw lflag 0x%x kept ICANON/ECHO", (unsigned)c.c_lflag);
+    CHECK(c.c_cc[VMIN] == 0 && c.c_cc[VTIME] == 1, "VMIN %d VTIME %d", c.c_cc[VMIN], c.c_cc[VTIME]);
+    CHECKE(tcgetattr(fd, &b) == 0, "tcgetattr restored");
+    CHECK((b.c_lflag & (ICANON | ECHO)) == (o.c_lflag & (ICANON | ECHO)), "restore lflag 0x%x vs 0x%x", (unsigned)b.c_lflag, (unsigned)o.c_lflag);
+    struct winsize w0, w1, ws;
+    CHECKE(ioctl(fd, TIOCGWINSZ, &w0) == 0, "TIOCGWINSZ");
+    CHECK(w0.ws_row > 0 && w0.ws_col > 0, "winsize %dx%d", w0.ws_col, w0.ws_row);
+    ws = w0; ws.ws_row = 33; ws.ws_col = 77;
+    CHECKE(ioctl(fd, TIOCSWINSZ, &ws) == 0, "TIOCSWINSZ");
+    int g2 = ioctl(fd, TIOCGWINSZ, &w1);
+    ioctl(fd, TIOCSWINSZ, &w0);
+    CHECK(g2 == 0 && w1.ws_row == 33 && w1.ws_col == 77, "winsize round-trip got %dx%d", w1.ws_col, w1.ws_row);
+    const char *te = getenv("TERM"), *li = getenv("LINES"), *co = getenv("COLUMNS");
+    R(PASS, "fd %d %dx%d TERM=%s LINES=%s COLUMNS=%s", fd, w0.ws_col, w0.ws_row,
+      te ? te : "-", li ? li : "-", co ? co : "-");
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -1362,6 +1393,7 @@ static const struct test tests[] = {
     { "dev", "wm", t_dev_wm, 10, 0 },
     { "net", "sockets", t_net_socket, 5, 0 }, { "net", "udp_loopback", t_net_udp_lo, 5, 0 }, { "net", "tcp_loopback", t_net_tcp_lo, 10, 0 }, { "net", "links_http", t_net_links_http, 60, 0 },
     { "net", "dns_connect", t_net_dns, 20, TF_EXPLICIT },
+    { "tty", "pty_basic", t_pty_basic, 10, 0 },
     { "misc", "cwd", t_cwd, 5, 0 }, { "misc", "dup", t_dup, 5, 0 }, { "misc", "fcntl", t_fcntl, 5, 0 },
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },
 };

@@ -349,7 +349,8 @@ int process_deliver_signals(process_t *proc, void *linux_frame) {
         }
         if (handler == SIG_DFL) {
             /* POSIX defaults: SIGCHLD/CONT ignored — never fatal via deliver. */
-            if (signum == SIGCHLD || signum == SIGCONT) {
+            if (signum == SIGCHLD || signum == SIGCONT || signum == 28 /*WINCH*/ ||
+                signum == 23 /*URG*/) {
                 proc->pending_signals &= ~bit;
                 continue;
             }
@@ -2643,6 +2644,8 @@ static void handle_pending_signals(process_t *proc) {
                         process_signal_terminate(proc, signum);
                         return; /* proc may be reaped — stop iterating */
                     case SIGCHLD:
+                    case 28: /* SIGWINCH */
+                    case 23: /* SIGURG */
                         // Ignore by default
                         break;
                     default:

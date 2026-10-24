@@ -43,6 +43,7 @@ typedef struct pipe {
     bool active;                /**< Whether this pipe slot is in use */
     void *waiting_reader;       /**< thread_t* blocked in read */
     void *waiting_writer;       /**< thread_t* blocked in write */
+    void *pty;                  /**< kpty_t* when this pipe is a terminal (kterm) */
 } pipe_t;
 
 /**

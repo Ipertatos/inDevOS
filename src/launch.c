@@ -360,7 +360,7 @@ static int launch_shortcut_run(const char *path) {
                     /* Prefer a known-good live command line. */
                     snprintf(rewritten, sizeof(rewritten),
                         "HOME=/tmp SSL_CERT_FILE=/cdrom/etc/ssl/cert.pem "
-                        "/cdrom/bin/links -dump /cdrom/etc/links/start.html");
+                        "/cdrom/bin/links /cdrom/etc/links/start.html");
                     src = rewritten;
                 } else if (!vfs_exists("/bin/links") && vfs_exists("/cdrom/bin/links")) {
                     snprintf(rewritten, sizeof(rewritten), "%s", src);

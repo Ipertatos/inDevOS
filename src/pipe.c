@@ -62,6 +62,7 @@ pipe_t* pipe_create(void) {
     pipe->active    = true;
     pipe->waiting_reader = NULL;
     pipe->waiting_writer = NULL;
+    pipe->pty = NULL;
 
     spinlock_unlock(&pipe_table_lock);
 

@@ -207,6 +207,17 @@ static bool lx_fd_ok(process_t *p, long fd) {
 }
 
 /* fds 0..2 that were never redirected are the console. */
+#include "pty.h"
+#include "pipe.h"
+/* kterm pty: fds on the desktop terminal's shell pipes are terminals. */
+static kpty_t *lx_fd_pty(process_t *p, long fd) {
+    if (!lx_fd_ok(p, fd)) return NULL;
+    uint8_t ty = p->fds[fd].fd_type;
+    if (ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) return NULL;
+    pipe_t *pp = (pipe_t *)p->fds[fd].file_handle;
+    return pp ? (kpty_t *)pp->pty : NULL;
+}
+
 static bool lx_fd_is_tty(process_t *p, long fd) {
     if (!lx_fd_ok(p, fd)) return false;
     if (p->fds[fd].fd_type == FD_TYPE_DEV_TTY) return true;
@@ -336,6 +347,23 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
         return uinput_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
     if (ty == FD_TYPE_DEV_WM)
         return wm_dev_read(p->fds[fd].file_handle, ubuf, count, (p->fds[fd].flags & O_NONBLOCK) != 0);
+    if (ty == FD_TYPE_PIPE_READ && lx_fd_pty(p, fd)) {
+        /* pty read: the window does the line discipline; honour
+         * non-canonical VMIN=0 (poll with VTIME*100ms timeout). */
+        kpty_t *pt = lx_fd_pty(p, fd);
+        pipe_t *pp = (pipe_t *)p->fds[fd].file_handle;
+        if (!(pt->lflag & KPTY_ICANON) && pt->cc[KPTY_VMIN] == 0) {
+            extern uint64_t ktime_now_ms(void);
+            extern void thread_yield(void);
+            uint64_t end = ktime_now_ms() + (uint64_t)pt->cc[KPTY_VTIME] * 100u;
+            while (pp->count == 0 && pp->writers > 0) {
+                if (ktime_now_ms() >= end) return 0;
+                thread_yield();
+            }
+            if (pp->count == 0 && pp->writers > 0) return 0;
+        }
+        return (long)sys_read((int)fd, ubuf, count);
+    }
     if (ty == FD_TYPE_DEV_TTY || lx_fd_is_tty(p, fd))
         return lx_read_tty(p, fd, ubuf, count);
     if (ty == FD_TYPE_SOCKET)
@@ -618,6 +646,11 @@ static long lx_fstat(process_t *p, long fd, void *ubuf) {
         if (syscall_stat_abspath((const char *)f->file_handle, &st) != 0) {
             st.st_mode = S_IFDIR | 0755;
         }
+    } else if (lx_fd_pty(p, fd)) {
+        st.st_mode = S_IFCHR | 0620;            /* /dev/pts/0 */
+        st.st_rdev = (136u << 8) | 0;
+        st.st_blksize = 1024;
+        st.st_ino = 2000;
     } else if (f->fd_type == FD_TYPE_PIPE_READ || f->fd_type == FD_TYPE_PIPE_WRITE) {
         st.st_mode = LX_S_IFIFO | 0600;
         st.st_blksize = 4096;
@@ -966,8 +999,68 @@ static long lx_lseek(process_t *p, long fd, int64_t off, long whence) {
     return sys_seek((int)fd, (off_t)off, (int)whence);
 }
 
+static uint16_t lx_con_ws_rows, lx_con_ws_cols;   /* console TIOCSWINSZ override */
+
+static long lx_pty_ioctl(process_t *p, long fd, kpty_t *pt, unsigned long req, void *arg) {
+    switch (req) {
+        case LX_TCGETS: {
+            lx_termios_t ti;
+            memset(&ti, 0, sizeof(ti));
+            ti.c_iflag = pt->iflag; ti.c_oflag = pt->oflag;
+            ti.c_cflag = pt->cflag; ti.c_lflag = pt->lflag;
+            memcpy(ti.c_cc, pt->cc, sizeof(ti.c_cc) < KPTY_NCC ? sizeof(ti.c_cc) : KPTY_NCC);
+            return lx_put(arg, &ti, sizeof(ti));
+        }
+        case LX_TCSETS: case LX_TCSETSW: case LX_TCSETSF: {
+            lx_termios_t ti;
+            if (lx_get(&ti, arg, sizeof(ti))) return -EFAULT;
+            pt->iflag = ti.c_iflag; pt->oflag = ti.c_oflag;
+            pt->cflag = ti.c_cflag; pt->lflag = ti.c_lflag;
+            memcpy(pt->cc, ti.c_cc, sizeof(ti.c_cc) < KPTY_NCC ? sizeof(ti.c_cc) : KPTY_NCC);
+            return 0;
+        }
+        case LX_TIOCGWINSZ: {
+            lx_winsize_t ws = { pt->rows ? pt->rows : 24, pt->cols ? pt->cols : 80, 0, 0 };
+            return lx_put(arg, &ws, sizeof(ws));
+        }
+        case LX_TIOCSWINSZ: {
+            lx_winsize_t ws;
+            if (lx_get(&ws, arg, sizeof(ws))) return -EFAULT;
+            pt->rows = ws.ws_row; pt->cols = ws.ws_col;
+            return 0;
+        }
+        case LX_TIOCGPGRP: {
+            int pg = pt->pgid ? pt->pgid : (int)p->pgid;
+            return lx_put(arg, &pg, sizeof(pg));
+        }
+        case LX_TIOCSPGRP: {
+            int pg = 0;
+            if (lx_get(&pg, arg, sizeof(pg))) return -EFAULT;
+            if (pg < 0) return -EINVAL;
+            pt->pgid = pg;     /* per-terminal; Ctrl-C stays tree-based in kterm */
+            return 0;
+        }
+        case 0x540E: /* TIOCSCTTY */
+        case 0x5422: /* TIOCNOTTY */
+            return 0;
+        case 0x5429: { /* TIOCGSID */
+            int sid = (int)p->sid;
+            return lx_put(arg, &sid, sizeof(sid));
+        }
+        case LX_FIONREAD:
+        case LX_FIONBIO:
+            return sys_ioctl((int)fd, req, arg);
+        default:
+            return -ENOTTY;
+    }
+}
+
 static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
+    {
+        kpty_t *pt = lx_fd_pty(p, fd);
+        if (pt) return lx_pty_ioctl(p, fd, pt, req, arg);
+    }
     if (p->fds[fd].fd_type == FD_TYPE_DEV_FB)
         return fbdev_ioctl(p, req, arg);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_INPUT)
@@ -1015,11 +1108,20 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
             if (!tty) return -ENOTTY;
             uint32_t cols = 80, rows = 25;
             fb_console_get_size(&cols, &rows);
+            if (lx_con_ws_rows && lx_con_ws_cols) { rows = lx_con_ws_rows; cols = lx_con_ws_cols; }
             lx_winsize_t ws = { (uint16_t)rows, (uint16_t)cols, 0, 0 };
             return lx_put(arg, &ws, sizeof(ws));
         }
-        case LX_TIOCSWINSZ:
-            return tty ? 0 : -ENOTTY;
+        case LX_TIOCSWINSZ: {
+            if (!tty) return -ENOTTY;
+            lx_winsize_t ws;
+            if (lx_get(&ws, arg, sizeof(ws))) return -EFAULT;
+            uint32_t cols = 80, rows = 25;
+            fb_console_get_size(&cols, &rows);
+            if (ws.ws_row == rows && ws.ws_col == cols) lx_con_ws_rows = lx_con_ws_cols = 0;
+            else { lx_con_ws_rows = ws.ws_row; lx_con_ws_cols = ws.ws_col; }
+            return 0;
+        }
         case LX_TIOCGPGRP: {
             if (!tty) return -ENOTTY;
             int pg = (int)process_get_fg_pgid();
