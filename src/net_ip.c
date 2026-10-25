@@ -31,6 +31,97 @@
 static uint16_t ip_id_counter = 0;
 static spinlock_t ip_lock;
 
+/* ── Loopback (127.0.0.0/8 and our own address) ─────────────────────────────
+ * Datagrams for a local destination never touch the NIC: ip_send_packet()
+ * builds the full frame and parks it here; ip_loopback_drain() (called from
+ * poll_network_once() and the main-loop RX service) feeds it back through
+ * ip_handle_packet().  Delivery is deferred on purpose: TCP sends while
+ * holding tcp_lock, so handling the segment synchronously would deadlock. */
+#define IP_LO_MAX 512
+static uint8_t  *ip_lo_frame[IP_LO_MAX];
+static uint32_t  ip_lo_flen[IP_LO_MAX];
+static uint32_t  ip_lo_head, ip_lo_tail, ip_lo_count;
+static spinlock_t ip_lo_lock;
+static volatile int ip_lo_draining;
+
+int ip_is_local_dst(const uint8_t *dst) {
+    if (!dst) return 0;
+    if (dst[0] == 127) return 1;
+    uint8_t our[4];
+    net_get_ip_address(our);
+    if ((our[0] | our[1] | our[2] | our[3]) == 0) return 0;
+    return memcmp(dst, our, 4) == 0;
+}
+
+void ip_select_src(const uint8_t *dst, uint8_t *src) {
+    if (dst && dst[0] == 127) { memcpy(src, dst, 4); return; }
+    net_get_ip_address(src);
+}
+
+static uint16_t ip_header_checksum_bytes(const uint8_t *header_bytes, uint16_t header_len);
+
+static int ip_lo_enqueue(const uint8_t *dst_ip, uint8_t protocol,
+                         const uint8_t *payload, uint16_t payload_len) {
+    uint32_t total = 20u + payload_len;
+    if (total > 0xFFFF) return -1;
+    uint8_t *f = kalloc(14 + total);
+    if (!f) return -1;
+    memset(f, 0, 34);
+    uint8_t mac[6];
+    net_get_mac_address(mac);
+    memcpy(f, mac, 6); memcpy(f + 6, mac, 6);
+    f[12] = 0x08; f[13] = 0x00;
+    uint8_t *h = f + 14;
+    h[0] = 0x45;
+    h[2] = (uint8_t)(total >> 8); h[3] = (uint8_t)total;
+    uint16_t id = __atomic_fetch_add(&ip_id_counter, 1, __ATOMIC_RELAXED);
+    h[4] = (uint8_t)(id >> 8); h[5] = (uint8_t)id;
+    h[6] = 0x40;                       /* DF */
+    h[8] = 64; h[9] = protocol;
+    ip_select_src(dst_ip, h + 12);
+    memcpy(h + 16, dst_ip, 4);
+    uint16_t cs = ip_header_checksum_bytes(h, 20);
+    h[10] = (uint8_t)(cs >> 8); h[11] = (uint8_t)cs;
+    if (payload && payload_len) memcpy(f + 34, payload, payload_len);
+    klock(&ip_lo_lock);
+    if (ip_lo_count >= IP_LO_MAX) {
+        kunlock(&ip_lo_lock);
+        kfree(f);
+        return 0;                      /* dropped like a full NIC queue; TCP retransmits */
+    }
+    ip_lo_frame[ip_lo_tail] = f;
+    ip_lo_flen[ip_lo_tail] = 14 + total;
+    ip_lo_tail = (ip_lo_tail + 1) % IP_LO_MAX;
+    ip_lo_count++;
+    kunlock(&ip_lo_lock);
+    return 0;
+}
+
+int ip_loopback_pending(void) { return ip_lo_count != 0; }
+
+/* Deliver queued local datagrams; replies they trigger are delivered in the
+ * same call (bounded so a ping-pong cannot spin forever). */
+int ip_loopback_drain(void) {
+    if (__atomic_exchange_n(&ip_lo_draining, 1, __ATOMIC_ACQUIRE))
+        return 0;
+    int n = 0;
+    while (n < 1024) {
+        klock(&ip_lo_lock);
+        if (ip_lo_count == 0) { kunlock(&ip_lo_lock); break; }
+        uint8_t *f = ip_lo_frame[ip_lo_head];
+        uint32_t len = ip_lo_flen[ip_lo_head];
+        ip_lo_frame[ip_lo_head] = NULL;
+        ip_lo_head = (ip_lo_head + 1) % IP_LO_MAX;
+        ip_lo_count--;
+        kunlock(&ip_lo_lock);
+        ip_handle_packet(f, len);
+        kfree(f);
+        n++;
+    }
+    __atomic_store_n(&ip_lo_draining, 0, __ATOMIC_RELEASE);
+    return n;
+}
+
 // ---- ARP-pending transmit queue ---------------------------------------------
 //
 // Datagrams whose next hop has no ARP entry yet wait here.  arp_insert()
@@ -368,7 +459,8 @@ void ip_handle_packet(const uint8_t *frame, uint32_t len) {
     // Also accept packets if our IP is 0.0.0.0 (e.g. during DHCP configuration)
     int is_unconfigured = (our_ip[0] == 0 && our_ip[1] == 0 && our_ip[2] == 0 && our_ip[3] == 0);
     
-    if (!is_broadcast && !is_unconfigured && memcmp(ip_header->dst_ip, our_ip, 4) != 0) {
+    int is_loop = (ip_header->dst_ip[0] == 127);
+    if (!is_broadcast && !is_unconfigured && !is_loop && memcmp(ip_header->dst_ip, our_ip, 4) != 0) {
         DEBUG_PRINT(NET_IP, "IP: Packet not for us (dst: %d.%d.%d.%d)\n",
                ip_header->dst_ip[0], ip_header->dst_ip[1], 
                ip_header->dst_ip[2], ip_header->dst_ip[3]);
@@ -418,7 +510,8 @@ void ip_handle_packet(const uint8_t *frame, uint32_t len) {
     // Extract sender MAC from Ethernet header
     uint8_t sender_mac[6];
     memcpy(sender_mac, frame + 6, 6); // Source MAC is at offset 6 in Ethernet header
-    arp_insert(ip_header->src_ip, sender_mac);
+    if (!is_loop && ip_header->src_ip[0] != 127 && memcmp(ip_header->src_ip, our_ip, 4) != 0)
+        arp_insert(ip_header->src_ip, sender_mac);
 
     // Check for fragmentation
     uint16_t flags_frag_raw = ((uint16_t)raw_header[6] << 8) | raw_header[7];
@@ -602,6 +695,9 @@ int ip_send_packet(const uint8_t *dst_ip, uint8_t protocol, const uint8_t *paylo
     DEBUG_PRINT(NET_IP, "IP: send_packet called for %d.%d.%d.%d, protocol=%d, payload_len=%d\n",
            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], protocol, payload_len);
     
+    if (ip_is_local_dst(dst_ip))
+        return ip_lo_enqueue(dst_ip, protocol, payload, payload_len);
+
     // Determine if destination is on-link; if not, route via gateway
     uint8_t our_ip[4], mask[4], gw[4];
     net_get_ip_address(our_ip);

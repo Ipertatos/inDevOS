@@ -36,10 +36,15 @@
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <stddef.h>
 #include <sys/sysinfo.h>
 #include <sys/statfs.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/file.h>
+#include <sys/uio.h>
+#include <sched.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/fb.h>
@@ -202,6 +207,131 @@ static int t_mmap_shared_file(char *d, size_t n) {
     char r[8192]; get_file(p, r, sizeof(r)); unlink(p);
     CHECK(memcmp(r + 100, "SHARED", 6) == 0, "store through MAP_SHARED file mapping not in file after msync+munmap");
     R(PASS, "write-back ok");
+}
+static int t_mmap_shared_coh(char *d, size_t n) {
+    char p[160]; tpath(p, sizeof(p), "mshcoh.bin");
+    char z[8192]; memset(z, 'b', sizeof(z)); CHECKE(put_file(p, z, sizeof(z)) == 0, "write");
+    int fd = open(p, O_RDWR); CHECKE(fd >= 0, "open");
+    char *m = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); CHECKE(m != MAP_FAILED, "mmap");
+    memcpy(m + 5000, "MAPW", 4);
+    char r[8]; memset(r, 0, sizeof(r));
+    CHECKE(pread(fd, r, 4, 5000) == 4, "pread");
+    CHECK(memcmp(r, "MAPW", 4) == 0, "read() does not see store through mapping");
+    CHECKE(pwrite(fd, "FILW", 4, 300) == 4, "pwrite");
+    CHECK(memcmp(m + 300, "FILW", 4) == 0, "mapping does not see write()");
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) { memcpy(m + 7000, "KID!", 4); _exit(0); }
+    int st; waitpid(c, &st, 0);
+    CHECK(memcmp(m + 7000, "KID!", 4) == 0, "child store not visible to parent");
+    munmap(m, 8192); close(fd);
+    char f[8192]; get_file(p, f, sizeof(f)); unlink(p);
+    CHECK(memcmp(f + 7000, "KID!", 4) == 0 && memcmp(f + 5000, "MAPW", 4) == 0, "file content after munmap");
+    R(PASS, "map<->read/write coherent, fork child store written back");
+}
+
+/* ---- batch 2 item 4: small calls ---- */
+static int t_sc_links(char *d, size_t n) {
+    char f[160], s2[160], h[160]; tpath(f, sizeof f, "sc_lnk"); tpath(s2, sizeof s2, "sc_sym"); tpath(h, sizeof h, "sc_hard");
+    CHECKE(put_file(f, "x", 1) == 0, "create"); unlink(s2); unlink(h);
+    int rs = symlink(f, s2); int es = errno;
+    CHECK(rs == 0 || es == EPERM, "symlink: want 0 or EPERM, got %d errno %d", rs, es);
+    CHECK(symlink(f, f) == -1 && errno == EEXIST, "symlink onto existing: errno %d (want EEXIST)", errno);
+    int rl = link(f, h); int el = errno;
+    CHECK(rl == 0 || el == EPERM, "link: want 0 or EPERM, got %d errno %d", rl, el);
+    CHECK(link(s2[0] ? "/nonexistent_sc" : f, h) == -1 && (errno == ENOENT || errno == EEXIST), "link missing src: errno %d", errno);
+    unlink(s2); unlink(h); unlink(f);
+    R(PASS, "symlink %s, link %s, EEXIST/ENOENT ok", rs == 0 ? "ok" : "EPERM", rl == 0 ? "ok" : "EPERM");
+}
+static int t_sc_fifo(char *d, size_t n) {
+    char q[160]; tpath(q, sizeof q, "sc_fifo"); unlink(q);
+    CHECKE(mkfifo(q, 0644) == 0, "mkfifo");
+    struct stat st; CHECKE(stat(q, &st) == 0, "stat");
+    CHECK(S_ISFIFO(st.st_mode), "not S_ISFIFO (mode %o)", st.st_mode);
+    CHECK(open(q, O_WRONLY | O_NONBLOCK) == -1 && errno == ENXIO, "O_WRONLY|O_NONBLOCK w/o reader: errno %d (want ENXIO)", errno);
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) { int w = open(q, O_WRONLY); if (w < 0) _exit(2); write(w, "fifo!", 5); close(w); _exit(0); }
+    int r = open(q, O_RDONLY); CHECKE(r >= 0, "open reader");
+    char b[16]; int got = 0, k;
+    while ((k = read(r, b + got, sizeof b - got)) > 0) got += k;
+    close(r); int st2; waitpid(c, &st2, 0); unlink(q);
+    CHECK(got == 5 && !memcmp(b, "fifo!", 5), "fifo read %d bytes", got);
+    CHECK(WIFEXITED(st2) && WEXITSTATUS(st2) == 0, "writer child status %x", st2);
+    R(PASS, "mkfifo + blocking open pairing + EOF");
+}
+static int t_sc_flock(char *d, size_t n) {
+    char f[160]; tpath(f, sizeof f, "sc_flock"); CHECKE(put_file(f, "x", 1) == 0, "create");
+    int a = open(f, O_RDWR), b = open(f, O_RDWR); CHECKE(a >= 0 && b >= 0, "open");
+    CHECKE(flock(a, LOCK_EX) == 0, "LOCK_EX");
+    CHECK(flock(b, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK, "2nd EX|NB: errno %d", errno);
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) _exit(flock(b, LOCK_EX) == 0 ? 0 : 1);      /* blocks until parent unlocks */
+    usleep(100000);
+    CHECKE(flock(a, LOCK_UN) == 0, "LOCK_UN");
+    int st; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "blocked child did not get the lock");
+    close(b);                                                  /* last ref: releases */
+    CHECK(flock(a, LOCK_EX | LOCK_NB) == 0, "lock not released on close: errno %d", errno);
+    close(a); unlink(f);
+    R(PASS, "EX conflict, blocking wait, release on close");
+}
+static int t_sc_fallocate(char *d, size_t n) {
+    char f[160]; tpath(f, sizeof f, "sc_falloc"); CHECKE(put_file(f, "abc", 3) == 0, "create");
+    int a = open(f, O_RDWR); CHECKE(a >= 0, "open");
+    CHECKE(fallocate(a, 0, 0, 20000) == 0, "fallocate");
+    struct stat st; fstat(a, &st);
+    CHECK(st.st_size == 20000, "size %ld (want 20000)", (long)st.st_size);
+    CHECK(fallocate(a, 1, 0, 90000) == 0 && fstat(a, &st) == 0 && st.st_size == 20000, "KEEP_SIZE changed size");
+    struct iovec w[2] = { { "12", 2 }, { "345", 3 } };
+    CHECK(pwritev(a, w, 2, 9000) == 5, "pwritev: errno %d", errno);
+    char x[2], y[3]; struct iovec r[2] = { { x, 2 }, { y, 3 } };
+    CHECK(preadv(a, r, 2, 9000) == 5 && !memcmp(x, "12", 2) && !memcmp(y, "345", 3), "preadv mismatch");
+    CHECK(lseek(a, 0, SEEK_CUR) == 0, "offset moved");
+    CHECK(posix_fadvise(a, 0, 0, POSIX_FADV_WILLNEED) == 0, "fadvise");
+    char h[3]; CHECK(pread(a, h, 3, 0) == 3 && !memcmp(h, "abc", 3), "head lost");
+    close(a); unlink(f);
+    R(PASS, "fallocate grow/KEEP_SIZE, preadv/pwritev, fadvise");
+}
+static int t_sc_times(char *d, size_t n) {
+    char f[160]; tpath(f, sizeof f, "sc_times"); CHECKE(put_file(f, "x", 1) == 0, "create");
+    struct timeval tv[2] = { { 1000, 0 }, { 2000, 0 } };
+    CHECKE(utimes(f, tv) == 0, "utimes");
+    CHECKE(utimensat(AT_FDCWD, f, NULL, 0) == 0, "utimensat");
+    unlink(f);
+    CHECK(utimes(f, tv) == -1 && errno == ENOENT, "utimes on missing: errno %d", errno);
+    R(PASS, "utimes/utimensat accepted, ENOENT on missing");
+}
+static int t_sc_waitid(char *d, size_t n) {
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) _exit(5);
+    siginfo_t si; memset(&si, 0, sizeof si);
+    CHECKE(waitid(P_PID, c, &si, WEXITED | WNOWAIT) == 0, "waitid WNOWAIT");
+    CHECK(si.si_pid == c && si.si_code == CLD_EXITED && si.si_status == 5, "WNOWAIT info pid %d code %d st %d", si.si_pid, si.si_code, si.si_status);
+    memset(&si, 0, sizeof si);
+    CHECKE(waitid(P_PID, c, &si, WEXITED) == 0, "waitid");
+    CHECK(si.si_pid == c && si.si_status == 5 && si.si_signo == SIGCHLD, "info pid %d st %d", si.si_pid, si.si_status);
+    c = fork(); CHECKE(c >= 0, "fork2");
+    if (c == 0) { pause(); _exit(0); }
+    memset(&si, 0, sizeof si);
+    CHECK(waitid(P_PID, c, &si, WEXITED | WNOHANG) == 0 && si.si_pid == 0, "WNOHANG on running child");
+    kill(c, SIGKILL);
+    CHECKE(waitid(P_PID, c, &si, WEXITED) == 0, "waitid killed");
+    CHECK(si.si_code == CLD_KILLED && si.si_status == SIGKILL, "killed: code %d st %d", si.si_code, si.si_status);
+    R(PASS, "waitid exited/killed/WNOWAIT/WNOHANG");
+}
+static int t_sc_sched(char *d, size_t n) {
+    CHECKE(setpriority(PRIO_PROCESS, 0, 7) == 0, "setpriority");
+    errno = 0; int v = getpriority(PRIO_PROCESS, 0);
+    CHECK(v == 7 && errno == 0, "getpriority %d", v);
+    setpriority(PRIO_PROCESS, 0, 0);
+    CHECK(getpriority(PRIO_PROCESS, 999999) == -1 && errno == ESRCH, "bad pid: errno %d", errno);
+    cpu_set_t cs; CPU_ZERO(&cs);
+    CHECKE(sched_getaffinity(0, sizeof cs, &cs) == 0, "getaffinity");
+    CHECK(CPU_ISSET(0, &cs), "cpu0 not in mask");
+    CPU_ZERO(&cs); CPU_SET(0, &cs);
+    CHECKE(sched_setaffinity(0, sizeof cs, &cs) == 0, "setaffinity");
+    CPU_ZERO(&cs);
+    CHECK(sched_setaffinity(0, sizeof cs, &cs) == -1 && errno == EINVAL, "empty mask: errno %d", errno);
+    R(PASS, "get/setpriority, get/setaffinity");
 }
 static volatile sig_atomic_t got_sig;
 static void on_sig(int s) { got_sig = s; }
@@ -1446,13 +1576,96 @@ static int t_cx_tmp_big(char *d, size_t n) {
     R(PASS, "4 MB file in /tmp written, renamed, read back");
 }
 
+/* ===================== AF_UNIX ===================== */
+static int t_unix_pair_stream(char *d, size_t n) {
+    int sv[2]; CHECKE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) {
+        close(sv[1]); static uint8_t b[200000]; fill(b, sizeof(b), 7);
+        _exit(writeall(sv[0], b, sizeof(b)) == (ssize_t)sizeof(b) ? 0 : 1);
+    }
+    close(sv[0]);
+    static uint8_t got[200000], want[200000]; fill(want, sizeof(want), 7);
+    ssize_t r = readall(sv[1], got, sizeof(got)); char x; ssize_t e = read(sv[1], &x, 1);
+    int st = 0; waitpid(c, &st, 0); close(sv[1]);
+    CHECK(r == (ssize_t)sizeof(got) && !memcmp(got, want, sizeof(got)), "200 KB mismatch (r=%zd)", r);
+    CHECK(e == 0, "no EOF after writer exit (%zd)", e);
+    CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "writer status %x", st);
+    R(PASS, "200 KB through socketpair + EOF");
+}
+static int t_unix_pair_dgram(char *d, size_t n) {
+    int sv[2]; CHECKE(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0, "socketpair dgram");
+    send(sv[0], "one", 3, 0); send(sv[0], "second", 6, 0);
+    char b[16]; ssize_t a1 = recv(sv[1], b, sizeof(b), 0), a2 = recv(sv[1], b, 3, 0);
+    errno = 0; ssize_t a3 = recv(sv[1], b, sizeof(b), MSG_DONTWAIT); int e3 = errno;
+    close(sv[0]); close(sv[1]);
+    CHECK(a1 == 3 && a2 == 3 && !memcmp(b, "sec", 3), "boundaries %zd %zd", a1, a2);
+    CHECK(a3 == -1 && e3 == EAGAIN, "empty recv %zd errno %d", a3, e3);
+    R(PASS, "datagram boundaries, truncation, EAGAIN");
+}
+static int unix_srv(char *d, size_t n, struct sockaddr_un *a, socklen_t al, const char *what) {
+    int l = socket(AF_UNIX, SOCK_STREAM, 0); CHECKE(l >= 0, "socket");
+    CHECKE(bind(l, (void *)a, al) == 0, "bind");
+    int l2 = socket(AF_UNIX, SOCK_STREAM, 0); errno = 0;
+    int b2 = bind(l2, (void *)a, al); int e2 = errno; close(l2);
+    CHECK(b2 == -1 && e2 == EADDRINUSE, "second bind %d errno %d", b2, e2);
+    CHECKE(listen(l, 4) == 0, "listen");
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) {
+        int s = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (connect(s, (void *)a, al)) _exit(3);
+        write(s, "ping", 4); char b[8]; int k = read(s, b, sizeof(b));
+        _exit(k == 4 && !memcmp(b, "pong", 4) ? 0 : 4);
+    }
+    struct pollfd p = { l, POLLIN, 0 }; int pr = poll(&p, 1, 3000);
+    int s = pr == 1 ? accept(l, NULL, NULL) : -1;
+    char b[8] = ""; ssize_t k = s >= 0 ? read(s, b, sizeof(b)) : -1;
+    if (s >= 0) write(s, "pong", 4);
+    int st = 0; waitpid(c, &st, 0); if (s >= 0) close(s); close(l);
+    CHECK(pr == 1 && s >= 0, "poll/accept %d %d", pr, s);
+    CHECK(k == 4 && !memcmp(b, "ping", 4), "server read %zd", k);
+    CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "client status %x", st);
+    int x = socket(AF_UNIX, SOCK_STREAM, 0); errno = 0;
+    int cr = connect(x, (void *)a, al); int ce = errno; close(x);
+    CHECK(cr == -1 && (ce == ECONNREFUSED || ce == ENOENT), "connect after close %d errno %d", cr, ce);
+    R(PASS, "%s: bind/listen/accept/connect, EADDRINUSE, refused after close", what);
+}
+static int t_unix_path(char *d, size_t n) {
+    struct sockaddr_un a; memset(&a, 0, sizeof(a)); a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s/ux.sock", tmpdir); unlink(a.sun_path);
+    int r = unix_srv(d, n, &a, sizeof(a), "path"); unlink(a.sun_path); return r;
+}
+static int t_unix_abstract(char *d, size_t n) {
+    struct sockaddr_un a; memset(&a, 0, sizeof(a)); a.sun_family = AF_UNIX;
+    memcpy(a.sun_path + 1, "ostest_abs", 10);
+    return unix_srv(d, n, &a, offsetof(struct sockaddr_un, sun_path) + 11, "abstract");
+}
+static int t_unix_scm_rights(char *d, size_t n) {
+    int sv[2], pp[2]; CHECKE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair"); CHECKE(pipe(pp) == 0, "pipe");
+    char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof(cb));
+    struct iovec iov = { "F", 1 }; struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof(cb) };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m); cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &pp[1], sizeof(int));
+    CHECKE(sendmsg(sv[0], &m, 0) == 1, "sendmsg"); close(pp[1]);
+    char rb[4], rc[CMSG_SPACE(sizeof(int))]; struct iovec ri = { rb, sizeof(rb) };
+    struct msghdr r = { .msg_iov = &ri, .msg_iovlen = 1, .msg_control = rc, .msg_controllen = sizeof(rc) };
+    ssize_t k = recvmsg(sv[1], &r, 0); struct cmsghdr *rcm = CMSG_FIRSTHDR(&r); int nfd = -1;
+    if (k == 1 && rcm && rcm->cmsg_level == SOL_SOCKET && rcm->cmsg_type == SCM_RIGHTS) memcpy(&nfd, CMSG_DATA(rcm), sizeof(int));
+    CHECK(nfd >= 0, "no fd received (k=%zd)", k);
+    write(nfd, "via", 3); close(nfd);
+    char pb[8] = ""; ssize_t a = read(pp[0], pb, sizeof(pb)), b = read(pp[0], pb + 3, 1);
+    close(pp[0]); close(sv[0]); close(sv[1]);
+    CHECK(a == 3 && !memcmp(pb, "via", 3) && b == 0, "pipe via passed fd: %zd %zd", a, b);
+    R(PASS, "pipe write end passed with SCM_RIGHTS");
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
     { "sys", "sysinfo", t_sysinfo, 5, 0 }, { "sys", "getrandom", t_getrandom, 5, 0 },
     { "time", "rtc", t_time, 5, 0 },
     { "mem", "malloc_big", t_malloc_big, 20, 0 }, { "mem", "mmap_anon", t_mmap_anon, 15, 0 }, { "mem", "mmap_file", t_mmap_file, 10, 0 },
-    { "mem", "mmap_shared_anon", t_mmap_shared, 10, 0 }, { "mem", "mmap_shared_file", t_mmap_shared_file, 10, 0 },
+    { "mem", "mmap_shared_anon", t_mmap_shared, 10, 0 }, { "mem", "mmap_shared_file", t_mmap_shared_file, 10, 0 }, { "mem", "mmap_shared_coherent", t_mmap_shared_coh, 10, 0 },
     { "mem", "munmap", t_munmap, 10, 0 }, { "mem", "mprotect", t_mprotect, 10, 0 }, { "mem", "brk", t_brk, 10, 0 },
     { "mem", "cow_fork", t_cow, 10, 0 }, { "mem", "exhaust", t_mem_exhaust, 60, TF_DESTRUCT },
     { "proc", "exit_codes", t_exit_codes, 10, 0 }, { "proc", "exec_busybox", t_exec_busybox, 20, 0 },
@@ -1474,6 +1687,12 @@ static const struct test tests[] = {
     { "dev", "wm", t_dev_wm, 10, 0 },
     { "net", "sockets", t_net_socket, 5, 0 }, { "net", "udp_loopback", t_net_udp_lo, 5, 0 }, { "net", "tcp_loopback", t_net_tcp_lo, 10, 0 }, { "net", "links_http", t_net_links_http, 60, 0 },
     { "net", "dns_connect", t_net_dns, 20, TF_EXPLICIT },
+    { "unix", "pair_stream", t_unix_pair_stream, 15, 0 }, { "unix", "pair_dgram", t_unix_pair_dgram, 5, 0 },
+    { "unix", "path_listen", t_unix_path, 15, 0 }, { "unix", "abstract_listen", t_unix_abstract, 15, 0 },
+    { "unix", "scm_rights", t_unix_scm_rights, 10, 0 },
+    { "sc", "links", t_sc_links, 10, 0 }, { "sc", "fifo", t_sc_fifo, 15, 0 }, { "sc", "flock", t_sc_flock, 15, 0 },
+    { "sc", "fallocate_pv", t_sc_fallocate, 15, 0 }, { "sc", "utimes", t_sc_times, 10, 0 },
+    { "sc", "waitid", t_sc_waitid, 15, 0 }, { "sc", "prio_affinity", t_sc_sched, 10, 0 },
     { "tty", "pty_basic", t_pty_basic, 10, 0 },
     { "misc", "cwd", t_cwd, 5, 0 }, { "misc", "dup", t_dup, 5, 0 }, { "misc", "fcntl", t_fcntl, 5, 0 },
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },

@@ -121,6 +121,13 @@ typedef struct tcp_connection {
 
     // Next connection in list
     struct tcp_connection *next;
+
+    // Socket-layer ownership (appended: keeps earlier offsets stable)
+    bool owned;        // a tcp_socket_t points here: never reap/free under it
+    bool half_close;   // socket semantics: peer FIN -> CLOSE_WAIT, no auto-FIN
+    bool accepted;     // already handed out by accept()
+    bool user_child;   // created by a SYN to a socket-layer listener
+    bool disowned;     // socket closed it: free as soon as the close handshake ends
 } tcp_connection_t;
 
 // TCP Socket Structure (for user applications)
@@ -147,6 +154,8 @@ int tcp_socket_connect(tcp_socket_t *sock, const uint8_t *remote_ip, uint16_t re
 int tcp_socket_send(tcp_socket_t *sock, const uint8_t *data, uint32_t len);
 int tcp_socket_recv(tcp_socket_t *sock, uint8_t *buffer, uint32_t max_len);
 int tcp_socket_close(tcp_socket_t *sock);
+int tcp_socket_accept_ready(tcp_socket_t *sock);
+int tcp_socket_shutdown_wr(tcp_socket_t *sock);
 
 // Utility functions
 uint16_t tcp_checksum(const uint8_t *src_ip, const uint8_t *dst_ip,

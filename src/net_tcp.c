@@ -38,6 +38,7 @@ typedef struct {
 static tcp_listener_t tcp_listeners[TCP_MAX_LISTENERS];
 static int tcp_listener_count = 0;
 
+static tcp_connection_t *tcp_find_user_listen(uint16_t port);
 static tcp_listener_t *tcp_find_listener(uint16_t port) {
     for (int i = 0; i < tcp_listener_count; i++) {
         if (tcp_listeners[i].port == port) return &tcp_listeners[i];
@@ -313,6 +314,8 @@ void tcp_cleanup_stale_connections(void) {
         next = conn->next;  // Save next before potential destruction
 
         uint64_t idle_time = now - conn->last_activity;
+
+        if (conn->owned) { conn = next; continue; }   /* socket still holds it */
 
         // Clean up TIME_WAIT connections after timeout
         if (conn->state == TCP_STATE_TIME_WAIT && idle_time > time_wait_ticks) {
@@ -699,7 +702,7 @@ static void tcp_send_rst_raw(const uint8_t *local_ip, uint16_t local_port,
 tcp_connection_t* tcp_connect(const uint8_t *remote_ip, uint16_t remote_port,
                              void (*connect_callback)(tcp_connection_t *conn)) {
     uint8_t local_ip[4];
-    net_get_ip_address(local_ip);
+    ip_select_src(remote_ip, local_ip);   /* 127.x talks from 127.x */
 
     // Find an available local port (49152-65535)
     uint16_t local_port = 49152;
@@ -756,7 +759,7 @@ int tcp_send(tcp_connection_t *conn, const uint8_t *data, uint32_t len) {
     if (!conn) return -EINVAL;
 
     TCP_LOCK();
-    if (conn->state != TCP_STATE_ESTABLISHED) {
+    if (conn->state != TCP_STATE_ESTABLISHED && conn->state != TCP_STATE_CLOSE_WAIT) {
         TCP_UNLOCK();
         printf("TCP: Connection not established\n");
         return -ENOTCONN;
@@ -816,12 +819,33 @@ int tcp_close(tcp_connection_t *conn) {
     if (!conn) return -EINVAL;
 
     TCP_LOCK();
+    if (conn->owned) conn->disowned = true;
+    conn->owned = false;
+    conn->half_close = false;
+    if (conn->state == TCP_STATE_LISTEN && conn->disowned && !conn->user_child) {
+        /* Socket listener going away: drop children nobody accepted. */
+        tcp_connection_t *c = tcp_connections, *nx;
+        while (c) {
+            nx = c->next;
+            if (c != conn && c->user_child && !c->accepted && c->local_port == conn->local_port)
+                tcp_destroy_connection_locked(c);
+            c = nx;
+        }
+    }
     if (conn->state == TCP_STATE_ESTABLISHED) {
         serial_printf("TCP: Closing connection\n");
         conn->state = TCP_STATE_FIN_WAIT_1;
         uint32_t fin_seq = conn->seq_num;
         tcp_retransmit_enqueue(conn, fin_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
         tcp_send_packet(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+    } else if (conn->state == TCP_STATE_CLOSE_WAIT) {
+        /* Peer already half-closed (socket semantics): send our FIN now. */
+        conn->state = TCP_STATE_LAST_ACK;
+        uint32_t fin_seq = conn->seq_num;
+        tcp_retransmit_enqueue(conn, fin_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+        tcp_send_packet(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+    } else if (conn->state == TCP_STATE_LAST_ACK) {
+        /* FIN already out; tcp_cleanup_stale_connections() reaps it. */
     } else {
         tcp_destroy_connection_locked(conn);
     }
@@ -895,7 +919,14 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
         if (rx_flags & TCP_FLAG_SYN) {
             // Only accept if we have a registered listener on this port
             tcp_listener_t *listener = tcp_find_listener(dst_port);
-            if (!listener) {
+            tcp_connection_t *ulisten = listener ? NULL : tcp_find_user_listen(dst_port);
+            if (ulisten) {
+                conn = tcp_create_connection(dst_ip, dst_port, src_ip, src_port);
+                if (!conn) return;
+                conn->state = TCP_STATE_LISTEN;
+                conn->user_child = true;
+                conn->half_close = true;
+            } else if (!listener) {
                 serial_printf("TCP: No listener on port %u, sending RST\n", dst_port);
                 // RFC 793: <SEQ=0><ACK=SEG.SEQ+SEG.LEN+1><CTL=RST,ACK>
                 tcp_send_rst_raw(dst_ip, dst_port, src_ip, src_port,
@@ -907,8 +938,8 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
 
             // Create the connection in LISTEN state so tcp_handle_syn
             // will send a SYN-ACK when it is called below.
-            conn = tcp_create_connection(dst_ip, dst_port, src_ip, src_port);
-            if (conn) {
+            if (!conn) conn = tcp_create_connection(dst_ip, dst_port, src_ip, src_port);
+            if (conn && !conn->user_child) {
                 conn->state = TCP_STATE_LISTEN;
                 /* Stash accept_callback so it can be fired on ESTABLISHED */
                 conn->connect_callback = listener->accept_callback;
@@ -975,6 +1006,8 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
         serial_printf("TCP: Received RST, closing connection\n");
         conn->state = TCP_STATE_CLOSED;
         tcp_retransmit_flush(conn);
+        if (conn->disowned || (conn->user_child && !conn->accepted))
+            tcp_destroy_connection_locked(conn);   /* no owner left to look */
         TCP_UNLOCK();
         return;
     }
@@ -1104,8 +1137,10 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
                 conn->ack_num = fin_seq + 1;
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_CLOSE_WAIT;
-                tcp_send_packet(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
-                conn->state = TCP_STATE_LAST_ACK;
+                if (!conn->half_close) {
+                    tcp_send_packet(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+                    conn->state = TCP_STATE_LAST_ACK;
+                }   /* socket: the owner may still write; FIN on close/shutdown */
             } else if (tcp_payload_len > 0) {
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
             } else if (tcp_header.flags & TCP_FLAG_ACK) {
@@ -1135,6 +1170,7 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_TIME_WAIT;
                 tcp_retransmit_flush(conn);
+                if (conn->owned) break;   /* after shutdown(SHUT_WR): owner frees on close */
                 tcp_destroy_connection_locked(conn);
                 TCP_UNLOCK();
                 return;
@@ -1157,6 +1193,11 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
                 serial_printf("TCP: Connection closed\n");
                 tcp_retransmit_flush(conn);
                 conn->state = TCP_STATE_CLOSED;
+                if (conn->disowned) {          /* socket already closed it */
+                    tcp_destroy_connection_locked(conn);
+                    TCP_UNLOCK();
+                    return;
+                }
                 break;
             }
             break;
@@ -1255,6 +1296,7 @@ int tcp_socket_bind(tcp_socket_t *sock, uint16_t port) {
     if (!conn) return -ENOBUFS;
 
     conn->state = TCP_STATE_LISTEN;
+    conn->owned = true;
     sock->connection = conn;
     sock->socket_fd = 0; // Dummy file descriptor
 
@@ -1276,21 +1318,25 @@ tcp_socket_t* tcp_socket_accept(tcp_socket_t *sock) {
     // Find a connection in SYN_RECEIVED state (ready to accept)
     TCP_LOCK();
     tcp_connection_t *conn = tcp_connections;
+    /* Oldest first is not tracked; any completed, not yet accepted child of
+     * this port will do.  The listener itself (remote port 0) never matches. */
     while (conn) {
-        if (conn->state == TCP_STATE_ESTABLISHED &&
-            memcmp(conn->local_ip, sock->connection->local_ip, 4) == 0 &&
+        if (conn != sock->connection && conn->user_child && !conn->accepted &&
+            conn->remote_port != 0 &&
+            (conn->state == TCP_STATE_ESTABLISHED || conn->state == TCP_STATE_CLOSE_WAIT) &&
             conn->local_port == sock->connection->local_port) {
             break;
         }
         conn = conn->next;
     }
+    if (conn) { conn->accepted = true; conn->owned = true; }
     TCP_UNLOCK();
 
     if (!conn) return NULL;
 
     // Create new socket for the accepted connection
     tcp_socket_t *new_sock = tcp_socket_create();
-    if (!new_sock) return NULL;
+    if (!new_sock) { tcp_close(conn); return NULL; }
 
     new_sock->connection = conn;
     new_sock->socket_fd = 1; // Dummy file descriptor
@@ -1303,6 +1349,10 @@ int tcp_socket_connect(tcp_socket_t *sock, const uint8_t *remote_ip, uint16_t re
 
     tcp_connection_t *conn = tcp_connect(remote_ip, remote_port, NULL);
     if (!conn) return -ECONNREFUSED;
+    TCP_LOCK();
+    conn->owned = true;
+    conn->half_close = true;
+    TCP_UNLOCK();
 
     sock->connection = conn;
     sock->socket_fd = 2; // Dummy file descriptor
@@ -1380,5 +1430,55 @@ int tcp_listen(uint16_t port, void (*accept_callback)(tcp_connection_t *conn)) {
     tcp_listeners[tcp_listener_count].accept_callback = accept_callback;
     tcp_listener_count++;
     serial_printf("TCP: listening on port %u\n", port);
+    return 0;
+}
+
+
+/* Socket-layer listener on @port: the LISTEN pseudo-connection created by
+ * tcp_socket_bind()+listen (remote 0.0.0.0:0, any local address). */
+static tcp_connection_t *tcp_find_user_listen(uint16_t port) {
+    TCP_LOCK();
+    tcp_connection_t *c = tcp_connections;
+    while (c) {
+        if (c->state == TCP_STATE_LISTEN && c->owned && c->local_port == port &&
+            c->remote_port == 0 && !c->user_child)
+            break;
+        c = c->next;
+    }
+    TCP_UNLOCK();
+    return c;
+}
+
+/* poll(POLLIN) on a listening socket: a completed child awaits accept(). */
+int tcp_socket_accept_ready(tcp_socket_t *sock) {
+    if (!sock || !sock->connection) return 0;
+    int ready = 0;
+    TCP_LOCK();
+    for (tcp_connection_t *c = tcp_connections; c; c = c->next) {
+        if (c != sock->connection && c->user_child && !c->accepted &&
+            c->local_port == sock->connection->local_port &&
+            (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_CLOSE_WAIT)) {
+            ready = 1;
+            break;
+        }
+    }
+    TCP_UNLOCK();
+    return ready;
+}
+
+/* shutdown(SHUT_WR): send our FIN but keep the connection (and its receive
+ * buffer) owned by the socket so the program can still read. */
+int tcp_socket_shutdown_wr(tcp_socket_t *sock) {
+    if (!sock || !sock->connection) return -ENOTCONN;
+    tcp_connection_t *conn = sock->connection;
+    TCP_LOCK();
+    if (conn->state == TCP_STATE_ESTABLISHED || conn->state == TCP_STATE_CLOSE_WAIT) {
+        conn->state = (conn->state == TCP_STATE_ESTABLISHED) ? TCP_STATE_FIN_WAIT_1
+                                                             : TCP_STATE_LAST_ACK;
+        uint32_t fin_seq = conn->seq_num;
+        tcp_retransmit_enqueue(conn, fin_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+        tcp_send_packet(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+    }
+    TCP_UNLOCK();
     return 0;
 }

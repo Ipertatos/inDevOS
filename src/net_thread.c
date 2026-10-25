@@ -59,6 +59,10 @@ int net_rx_service(void) {
         net_rx_packets_total += (uint64_t)processed;
     }
 
+    /* Local (127.x / own address) datagrams queued by ip_send_packet(). */
+    if (ip_loopback_pending())
+        processed += ip_loopback_drain();
+
     static uint64_t last_arpq_tick = 0;
     if (now - last_arpq_tick >= NET_ARPQ_TICK_MS) {
         ip_arpq_tick();

@@ -7,6 +7,7 @@
 #include "net_udp.h"
 #include "net_ethernet.h"
 #include "net_device.h"
+#include "net_ip.h"
 #include "../include/indevos_errno.h"
 
 /* ── Helper: drain the NIC receive queue (drives TCP state machine) ───────── */
@@ -23,6 +24,7 @@ void poll_network_once(void) {
         if (len > 0) ethernet_process_frame(pkt, (uint32_t)len);
         else break;
     }
+    if (ip_loopback_pending()) ip_loopback_drain();
     __atomic_store_n(&poll_net_busy, 0, __ATOMIC_RELEASE);
 }
 
@@ -40,8 +42,25 @@ int sys_sendto(int fd, const void *buf, uint32_t len, int flags,
 int sys_recvfrom(int fd, void *buf, uint32_t len, int flags,
                  sockaddr_in_t *src);
 
+typedef struct { uint64_t base, len; } lxs_ux_iov_t;
+void ux_release(kernel_socket_t *s);
+long ux_socket(process_t *p, long type);
+long ux_name(kernel_socket_t *s, void *uaddr, uint32_t *ualen, bool peer);
+long ux_shutdown(kernel_socket_t *s, int how);
+long ux_getsockopt(kernel_socket_t *s, int level, int opt, void *uval, uint32_t *ulen);
+long ux_sendmsg(process_t *p, int fd, kernel_socket_t *s, const lxs_ux_iov_t *iov, int niov,
+                const void *uname, uint32_t namelen, const void *uctl, uint64_t ctllen, int flags);
+long ux_recvmsg(process_t *p, int fd, kernel_socket_t *s, const lxs_ux_iov_t *iov, int niov,
+                void *uname, uint32_t *unamelen, void *uctl, uint64_t ctllen,
+                uint64_t *octl, int *oflags, int flags);
+
 void kernel_socket_destroy(kernel_socket_t *sock) {
     if (!sock) return;
+    if (sock->domain == 1 /* AF_UNIX */) {
+        ux_release(sock);
+        kfree(sock);
+        return;
+    }
     if (sock->type == SOCK_DGRAM) {
         if (sock->transport)
             udp_pcb_close((udp_pcb_t *)sock->transport);
@@ -197,6 +216,9 @@ int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen) {
             if (tcp_sock->connection &&
                 tcp_sock->connection->state == TCP_STATE_ESTABLISHED)
                 break;
+            if (tcp_sock->connection &&
+                tcp_sock->connection->state == TCP_STATE_CLOSED)
+                break;      /* RST: refused (loopback answers at once) */
             if (global_scheduler.scheduler_running)
                 thread_sleep(1);
             else
@@ -206,9 +228,11 @@ int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen) {
 
     if (!tcp_sock->connection ||
         tcp_sock->connection->state != TCP_STATE_ESTABLISHED) {
+        bool refused = tcp_sock->connection &&
+                       tcp_sock->connection->state == TCP_STATE_CLOSED;
         tcp_socket_close(tcp_sock);
         sock->transport = NULL;
-        return -ETIMEDOUT;
+        return refused ? -ECONNREFUSED : -ETIMEDOUT;
     }
 
     sock->connected = true;
@@ -600,6 +624,7 @@ bool tcp_conn_at_eof(tcp_connection_t *c) {
 
 long lx_sock_socket(long domain, long type, long protocol) {
     int base = (int)(type & 0xF);
+    if (domain == 1 /* AF_UNIX */) return ux_socket(get_current_process(), type);
     if (domain != AF_INET) return -EAFNOSUPPORT;
     int fd = sys_socket((int)domain, base, (int)protocol);
     if (fd < 0) return fd;
@@ -614,6 +639,11 @@ long lx_sock_recv(int fd, void *ubuf, size_t len, int flags) {
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
+    if (s->domain == 1) {
+        lxs_ux_iov_t v = { (uint64_t)ubuf, len };
+        uint64_t oc; int of;
+        return ux_recvmsg(p, fd, s, &v, 1, NULL, NULL, NULL, 0, &oc, &of, flags);
+    }
     bool nb = (p->fds[fd].flags & O_NONBLOCK) || (flags & LXS_MSG_DONTWAIT);
     if (s->type == SOCK_DGRAM) {
         if (nb) {
@@ -655,10 +685,19 @@ long lx_sock_send(int fd, const void *ubuf, size_t len, int flags) {
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
+    if (s->domain == 1) {
+        lxs_ux_iov_t v = { (uint64_t)ubuf, len };
+        return ux_sendmsg(p, fd, s, &v, 1, NULL, 0, NULL, 0, flags);
+    }
     if (s->type == SOCK_DGRAM) return sys_sendto(fd, ubuf, (uint32_t)len, 0, NULL);
     if (!s->transport) return -ENOTCONN;
     tcp_socket_t *ts = (tcp_socket_t *)s->transport;
-    if (!ts->connection || ts->connection->state != TCP_STATE_ESTABLISHED) return -ENOTCONN;
+#define LXS_CAN_SEND(c) ((c) && ((c)->state == TCP_STATE_ESTABLISHED || (c)->state == TCP_STATE_CLOSE_WAIT))
+    if (ts->connection && !LXS_CAN_SEND(ts->connection) &&
+        (ts->connection->state == TCP_STATE_FIN_WAIT_1 || ts->connection->state == TCP_STATE_LAST_ACK ||
+         ts->connection->state == TCP_STATE_CLOSING || ts->connection->state == TCP_STATE_TIME_WAIT))
+        return -EPIPE;   /* after shutdown(SHUT_WR) */
+    if (!LXS_CAN_SEND(ts->connection)) return -ENOTCONN;
     s->connected = true;
     if (len > 65536) len = 65536;
     if (len == 0) return 0;
@@ -672,7 +711,7 @@ long lx_sock_send(int fd, const void *ubuf, size_t len, int flags) {
         int r = sys_send(fd, ubuf, (uint32_t)len, 0);
         if (r != 0) return r;
         if (nb) return -EAGAIN;
-        if (!ts->connection || ts->connection->state != TCP_STATE_ESTABLISHED) return -EPIPE;
+        if (!LXS_CAN_SEND(ts->connection)) return -EPIPE;
         if (ktime_expired(deadline)) return -ETIMEDOUT;
         if (proc_kill_pending(p)) return -EINTR;
         poll_network_once();
@@ -686,6 +725,10 @@ long lx_sock_sendto(int fd, const void *ubuf, size_t len, int flags,
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
+    if (s->domain == 1) {
+        lxs_ux_iov_t v = { (uint64_t)ubuf, len };
+        return ux_sendmsg(p, fd, s, &v, 1, uaddr, uaddr ? alen : 0, NULL, 0, flags);
+    }
     if (s->type == SOCK_DGRAM && uaddr) {
         if (alen < sizeof(sockaddr_in_t)) return -EINVAL;
         return sys_sendto(fd, ubuf, (uint32_t)len, 0, (const sockaddr_in_t *)uaddr);
@@ -697,6 +740,12 @@ long lx_sock_recvfrom(int fd, void *ubuf, size_t len, int flags, void *uaddr, ui
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
+    if (s->domain == 1) {
+        lxs_ux_iov_t v = { (uint64_t)ubuf, len };
+        uint64_t oc; int of;
+        return ux_recvmsg(p, fd, s, &v, 1, (uaddr && ualen) ? uaddr : NULL,
+                          (uaddr && ualen) ? ualen : NULL, NULL, 0, &oc, &of, flags);
+    }
     if (s->type != SOCK_DGRAM) return lx_sock_recv(fd, ubuf, len, flags);
     bool nb = (p->fds[fd].flags & O_NONBLOCK) || (flags & LXS_MSG_DONTWAIT);
     if (!s->transport) return nb ? -EAGAIN : -EINVAL;
@@ -735,6 +784,7 @@ long lx_sock_name(int fd, void *uaddr, uint32_t *ualen, bool peer) {
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
+    if (s->domain == 1) return ux_name(s, uaddr, ualen, peer);
     uint8_t ip[4] = {0, 0, 0, 0};
     uint16_t port = 0;
     if (s->type == SOCK_STREAM && s->transport && ((tcp_socket_t *)s->transport)->connection) {
@@ -747,6 +797,7 @@ long lx_sock_name(int fd, void *uaddr, uint32_t *ualen, bool peer) {
     } else {
         port = s->local_port;
         if (s->type == SOCK_DGRAM && s->transport) port = udp_pcb_local_port((udp_pcb_t *)s->transport);
+        if (s->connected) ip_select_src(s->remote_ip, ip);   /* source we would use */
     }
     return lxs_put_name(uaddr, ualen, ip, port);
 }
@@ -755,6 +806,7 @@ long lx_sock_getsockopt(int fd, int level, int opt, void *uval, uint32_t *ulen) 
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
+    if (s->domain == 1) return ux_getsockopt(s, level, opt, uval, ulen);
     int v = 0;
     if (level == 1 && opt == 3) v = s->type;                 /* SO_TYPE */
     else if (level == 1 && opt == 4) {                       /* SO_ERROR */
@@ -784,10 +836,16 @@ long lx_sock_shutdown(int fd, int how) {
     process_t *p = get_current_process();
     kernel_socket_t *s = lxs_get(p, fd);
     if (!s) return -ENOTSOCK;
-    /* Accepted but deferred: sending our FIN here would let the FIN_WAIT_1
-     * path free the connection while the program still reads from it. The
-     * FIN goes out when the descriptor is closed. */
-    (void)how;
+    /* SHUT_WR / SHUT_RDWR on a stream: send our FIN now (half-close). The
+     * connection stays owned by the socket (tcp_connection_t.owned), so the
+     * FIN_WAIT/TIME_WAIT paths no longer free it while the program reads. */
+    if (how < 0 || how > 2) return -EINVAL;
+    if (s->domain == 1) return ux_shutdown(s, how);
+    if (s->type == SOCK_STREAM) {
+        if (!s->transport || !((tcp_socket_t *)s->transport)->connection || s->listening)
+            return -ENOTCONN;
+        if (how >= 1) tcp_socket_shutdown_wr((tcp_socket_t *)s->transport);
+    }
     return 0;
 }
 

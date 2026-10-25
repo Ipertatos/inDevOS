@@ -71,6 +71,7 @@ pipe_t* pipe_create(void) {
 
 void pipe_destroy(pipe_t *pipe) {
     if (!pipe || !pipe->active) return;
+    { extern void fifo_pipe_gone(pipe_t *); fifo_pipe_gone(pipe); }  /* named FIFO registry */
 
     spinlock_lock(&pipe_table_lock);
 

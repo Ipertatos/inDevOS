@@ -26,3 +26,7 @@ void ip_fragment_cleanup(void);
 // arp_insert) and drive retries/expiry (called from net_rx_service).
 void ip_arp_resolved(const uint8_t *ip);
 void ip_arpq_tick(void);
+int  ip_is_local_dst(const uint8_t *dst);
+void ip_select_src(const uint8_t *dst, uint8_t *src);
+int  ip_loopback_drain(void);
+int  ip_loopback_pending(void);

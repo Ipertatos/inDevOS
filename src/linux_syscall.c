@@ -155,6 +155,11 @@ enum {
     LX_pipe2 = 293, LX_prlimit64 = 302, LX_getcpu = 309,
     LX_renameat2 = 316, LX_copy_file_range = 326, LX_getrandom = 318, LX_membarrier = 324,
     LX_statx = 332, LX_rseq = 334, LX_faccessat2 = 439,
+    LX_utime = 132, LX_mknod = 133, LX_getpriority = 140, LX_setpriority = 141,
+    LX_sched_setaffinity = 203, LX_fadvise64 = 221, LX_utimes = 235,
+    LX_waitid = 247, LX_mknodat = 259, LX_futimesat = 261, LX_linkat = 265,
+    LX_symlinkat = 266, LX_fallocate = 285, LX_preadv = 295, LX_pwritev = 296,
+    LX_preadv2 = 327, LX_pwritev2 = 328, LX_memfd_create = 319,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -419,6 +424,8 @@ static uint64_t lx_random_u64(void) {
  * Resolve a user path (optionally relative to dirfd) into a normalised
  * absolute path: no "." / ".." / empty components, no trailing slash.
  */
+static long lx_resolve_k(process_t *p, long dirfd, const char *kpath,
+                         char *out, size_t outsz);
 static long lx_resolve(process_t *p, long dirfd, const char *upath,
                        char *out, size_t outsz, bool allow_empty)
 {
@@ -427,6 +434,13 @@ static long lx_resolve(process_t *p, long dirfd, const char *upath,
         return -EFAULT;
     if (kpath[0] == '\0' && !allow_empty)
         return -ENOENT;
+    return lx_resolve_k(p, dirfd, kpath, out, outsz);
+}
+
+/* Same as lx_resolve, for a path already in kernel memory. */
+static long lx_resolve_k(process_t *p, long dirfd, const char *kpath,
+                         char *out, size_t outsz)
+{
 
     const char *base = "";
     if (kpath[0] != '/') {
@@ -478,6 +492,66 @@ static long lx_resolve(process_t *p, long dirfd, const char *upath,
     out[o] = '\0';
     return 0;
 }
+
+/* AF_UNIX address -> registry name: abstract "\0name" (length-exact) or
+ * an absolute normalised path. *outlen 0 = unnamed. */
+long lx_unix_parse_addr(process_t *p, const void *uaddr, uint32_t alen,
+                        char *out, int *outlen)
+{
+    *outlen = 0;
+    if (!uaddr) return -EFAULT;
+    if (alen < 2 || alen > 110) return -EINVAL;
+    uint8_t raw[112];
+    if (copy_from_user(raw, uaddr, alen)) return -EFAULT;
+    if ((raw[0] | (raw[1] << 8)) != 1 /* AF_UNIX */) return -EINVAL;
+    if (alen == 2) return 0;
+    if (raw[2] == 0) {
+        memcpy(out, raw + 2, alen - 2);
+        *outlen = (int)(alen - 2);
+        return 0;
+    }
+    char kp[112];
+    uint32_t n = 0;
+    while (n < alen - 2 && raw[2 + n]) { kp[n] = (char)raw[2 + n]; n++; }
+    kp[n] = 0;
+    char abs[256];
+    long r = lx_resolve_k(p, LX_AT_FDCWD, kp, abs, sizeof(abs));
+    if (r < 0) return r;
+    size_t l = strlen(abs);
+    if (l >= 109) return -ENAMETOOLONG;
+    memcpy(out, abs, l + 1);
+    *outlen = (int)l;
+    return 0;
+}
+
+typedef struct { uint64_t base, len; } lx_ux_iov_t;
+long ux_socket(process_t *p, long type);
+long ux_socketpair(process_t *p, long type, int *usv);
+long ux_bind(process_t *p, kernel_socket_t *s, const void *uaddr, uint32_t alen);
+long ux_listen(kernel_socket_t *s, int backlog);
+long ux_connect(process_t *p, int fd, kernel_socket_t *s, const void *uaddr, uint32_t alen);
+long ux_accept(process_t *p, int fd, kernel_socket_t *s, void *uaddr, uint32_t *ualen, long flags);
+long ux_sendmsg(process_t *p, int fd, kernel_socket_t *s, const lx_ux_iov_t *iov, int niov,
+                const void *uname, uint32_t namelen, const void *uctl, uint64_t ctllen, int flags);
+long ux_recvmsg(process_t *p, int fd, kernel_socket_t *s, const lx_ux_iov_t *iov, int niov,
+                void *uname, uint32_t *unamelen, void *uctl, uint64_t ctllen,
+                uint64_t *octl, int *oflags, int flags);
+
+static kernel_socket_t *lx_unix_sock(process_t *p, long fd) {
+    if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use ||
+        p->fds[fd].fd_type != FD_TYPE_SOCKET) return NULL;
+    kernel_socket_t *s = (kernel_socket_t *)p->fds[fd].file_handle;
+    return (s && s->domain == 1) ? s : NULL;
+}
+
+extern long flk_op(process_t *p, void *owner, const char *path, int op);
+extern int  fifo_reg(const char *path);
+extern bool fifo_is(const char *path);
+extern void fifo_unreg(const char *path);
+extern void fifo_rename(const char *from, const char *to);
+extern long fifo_open(process_t *p, const char *path, int acc, bool nonblock, bool cloexec);
+extern int  lx_nice_get(uint32_t pid);
+extern void lx_nice_set(uint32_t pid, int v);
 
 static int lx_path_kind(const char *abspath, stat_t *st_out) {
     stat_t st;
@@ -646,6 +720,7 @@ static long lx_stat_path(const char *abspath, void *ubuf) {
         st.st_ino = 0xF000 + (uint64_t)strlen(abspath);
     } else if (lx_path_kind(abspath, &st)) {
         lx_mode_adjust(abspath, &st);
+        if (fifo_is(abspath)) { st.st_mode = LX_S_IFIFO | 0644; st.st_size = 0; }
     } else {
         if (!lx_synth_dir(abspath))
             return -ENOENT;
@@ -1092,6 +1167,13 @@ static long lx_openat(process_t *p, long dirfd, const char *upath, long lflags, 
     r = lx_open_special(p, path, lflags);
     if (r != -ENOENT) return r;
 
+    if (fifo_is(path)) {
+        if ((lflags & LX_O_CREAT) && (lflags & LX_O_EXCL)) return -EEXIST;
+        if (lflags & LX_O_DIRECTORY) return -ENOTDIR;
+        return fifo_open(p, path, (int)(lflags & LX_O_ACCMODE), (lflags & LX_O_NONBLOCK) != 0,
+                         (lflags & LX_O_CLOEXEC) != 0);
+    }
+
     int kind = lx_path_kind(path, NULL);
     if ((lflags & LX_O_CREAT) && (lflags & LX_O_EXCL) && kind)
         return -EEXIST;
@@ -1404,6 +1486,13 @@ static long lx_fcntl(process_t *p, long fd, long cmd, long arg) {
     }
 }
 
+/* the address space this syscall runs in (what sys_mmap mapped into) */
+static uint64_t *lx_cur_pml4(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    return (uint64_t *)phys_to_virt(cr3 & PTE_ADDR_MASK);
+}
+
 static long lx_mmap(process_t *p, uint64_t addr, uint64_t len, long prot, long flags,
                     long fd, int64_t off) {
     if (len == 0) return -EINVAL;
@@ -1424,6 +1513,17 @@ static long lx_mmap(process_t *p, uint64_t addr, uint64_t len, long prot, long f
         return -EBADF;
     if (off < 0 || (off & (PAGE_SIZE - 1)))
         return -EINVAL;
+    if (flags & LX_MAP_SHARED) {
+        /* MAP_SHARED file: shared frames + write-back record (mmap_shared.c) */
+        extern long shmf_map(uint64_t *pml4, uint64_t va, uint64_t len, int vfs_fd, uint64_t foff, bool writable);
+        int kf = MAP_ANONYMOUS | MAP_PRIVATE | SYS_MMAP_KSHARED | ((flags & LX_MAP_FIXED) ? MAP_FIXED : 0);
+        long va = (long)sys_mmap((void *)addr, (size_t)len, PROT_READ | PROT_WRITE | (int)(prot & PROT_EXEC), kf);
+        if (va < 0 && va > -4096) return va;
+        long r = shmf_map(lx_cur_pml4(), (uint64_t)va, len, p->fds[fd].vfs_fd, (uint64_t)off,
+                          (prot & PROT_WRITE) != 0);
+        if (r < 0) { sys_munmap((void *)va, (size_t)len); return r; }
+        return va;
+    }
     int kf = MAP_ANONYMOUS | MAP_PRIVATE | ((flags & LX_MAP_FIXED) ? MAP_FIXED : 0);
     long va = (long)sys_mmap((void *)addr, (size_t)len, PROT_READ | PROT_WRITE | (int)(prot & PROT_EXEC), kf);
     if (va < 0 && va > -4096) return va;
@@ -1468,6 +1568,86 @@ static long lx_wait4(process_t *p, long pid, int *uwstatus, long options, void *
         }
     }
     return r;
+}
+
+/* waitid(idtype, id, infop, options, rusage). Exited children only (no
+ * job-control stop/continue reporting); WNOWAIT peeks without reaping. */
+static void lx_siginfo_child(uint8_t *si, uint32_t pid, int raw) {
+    memset(si, 0, 128);
+    int signo = 17, code, st;                               /* SIGCHLD */
+    if (raw > 128 && raw < 128 + 32) { code = 2; st = raw - 128; }   /* CLD_KILLED */
+    else { code = 1; st = raw & 0xff; }                     /* CLD_EXITED */
+    memcpy(si + 0, &signo, 4);
+    memcpy(si + 8, &code, 4);
+    memcpy(si + 16, &pid, 4);
+    memcpy(si + 24, &st, 4);
+}
+
+static long lx_waitid(process_t *p, long idtype, long id, void *uinfo, long options, void *urusage) {
+    const long known = LX_WNOHANG | 2 | 4 | 8 | 0x01000000 | 0x20000000 | 0x40000000 | (long)0x80000000;
+    if (options & ~known) return -EINVAL;
+    if (!(options & (2 | 4 | 8))) return -EINVAL;
+    long pid;
+    switch (idtype) {
+        case 0: pid = -1; break;                                    /* P_ALL */
+        case 1: if (id <= 0) return -EINVAL; pid = id; break;       /* P_PID */
+        case 2: pid = id > 0 ? -id : 0; break;                      /* P_PGID */
+        default: return -EINVAL;
+    }
+    if (urusage) {
+        uint8_t z[144];
+        memset(z, 0, sizeof(z));
+        lx_put(urusage, z, sizeof(z));
+    }
+    uint8_t si[128];
+    memset(si, 0, sizeof(si));
+    bool match = false;
+    for (process_t *c = p->child; c; c = c->sibling)
+        if (pid == -1 || (pid > 0 && (long)c->pid == pid) || (pid < -1 && (long)c->pgid == -pid) ||
+            (pid == 0 && c->pgid == p->pgid)) { match = true; break; }
+    if (!match) return -ECHILD;
+    if (!(options & 4)) {                       /* only stop/continue asked: never reported */
+        if (options & LX_WNOHANG) return uinfo ? (lx_put(uinfo, si, sizeof(si)) ? -EFAULT : 0) : 0;
+        return -ECHILD;
+    }
+    if (options & 0x01000000) {                 /* WNOWAIT: report, leave the zombie */
+        for (;;) {
+            fork_release_pending(p);
+            process_t *z = NULL;
+            bool any = false;
+            for (process_t *c = p->child; c; c = c->sibling) {
+                bool m = pid == -1 || (pid > 0 && (long)c->pid == pid) ||
+                         (pid < -1 && (long)c->pgid == -pid) || (pid == 0 && c->pgid == p->pgid);
+                if (!m) continue;
+                any = true;
+                if (c->is_zombie) { z = c; break; }
+            }
+            if (!any) return -ECHILD;
+            if (z) {
+                lx_siginfo_child(si, z->pid, z->exit_status);
+                return uinfo ? (lx_put(uinfo, si, sizeof(si)) ? -EFAULT : 0) : 0;
+            }
+            if (options & LX_WNOHANG) return uinfo ? (lx_put(uinfo, si, sizeof(si)) ? -EFAULT : 0) : 0;
+            if (proc_kill_pending(p)) return -EINTR;
+            thread_sleep(5);
+        }
+    }
+    if (options & LX_WNOHANG) {
+        bool any = false;
+        for (process_t *c = p->child; c; c = c->sibling)
+            if (c->is_zombie && (pid == -1 || (pid > 0 && (long)c->pid == pid) ||
+                (pid < -1 && (long)c->pgid == -pid) || (pid == 0 && c->pgid == p->pgid))) { any = true; break; }
+        if (!any) return uinfo ? (lx_put(uinfo, si, sizeof(si)) ? -EFAULT : 0) : 0;
+    }
+    fork_release_pending(p);
+    /* the user infop doubles as the raw-status scratch (sys_wait_pid copies out) */
+    long r = sys_wait_pid(pid, uinfo ? (int *)uinfo : NULL);
+    if (r < 0) return r;
+    int raw = 0;
+    if (uinfo && lx_get(&raw, uinfo, sizeof(raw))) return -EFAULT;
+    lx_siginfo_child(si, (uint32_t)r, raw);
+    if (uinfo && lx_put(uinfo, si, sizeof(si))) return -EFAULT;
+    return 0;
 }
 
 static long lx_rlimit(long res, lx_rlimit_t *out) {
@@ -1796,6 +1976,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             r = vfs_rmdir(path);
         } else {
             r = vfs_unlink(path);
+            if (r >= 0) fifo_unreg(path);
         }
         return r < 0 ? (r == -1 ? -EIO : r) : 0;
     }
@@ -1808,6 +1989,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if ((r = lx_resolve(p, d2, u2, path2, sizeof(path2), false))) return r;
         if (!lx_path_kind(path, NULL)) return -ENOENT;
         r = vfs_rename(path, path2);
+        if (r >= 0) fifo_rename(path, path2);
         return r < 0 ? (r == -1 ? -EIO : r) : 0;
     }
     case LX_truncate: case LX_ftruncate: {
@@ -1853,6 +2035,174 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (!lx_path_kind(path, NULL)) return -ENOENT;
         return 0; /* timestamps not stored on FAT32 yet */
     }
+    case LX_utime: case LX_utimes: case LX_futimesat: {
+        /* Accepted, not stored: the FAT32/exFAT/ext drivers have no
+         * set-times hook. Validates the path like Linux. */
+        long dfd = nr == LX_futimesat ? (long)(int)a1 : LX_AT_FDCWD;
+        const char *up = (const char *)(nr == LX_futimesat ? a2 : a1);
+        if (!up) return -EFAULT;
+        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if (!lx_path_kind(path, NULL) && !fifo_is(path)) return -ENOENT;
+        return 0;
+    }
+    case LX_symlink: case LX_symlinkat: {
+        /* No filesystem driver here can create symlinks (FAT32/exFAT have
+         * none; ext4 driver and tmpfs lack the op): EPERM like vfat. */
+        const char *ut = (const char *)a1;
+        long dfd = nr == LX_symlinkat ? (long)(int)a2 : LX_AT_FDCWD;
+        const char *up = (const char *)(nr == LX_symlinkat ? a3 : a2);
+        if (!ut || !up) return -EFAULT;
+        char tchk[8];
+        if (lx_get(tchk, ut, 1)) return -EFAULT;
+        if (!tchk[0]) return -ENOENT;
+        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if (lx_path_kind(path, NULL) || fifo_is(path)) return -EEXIST;
+        {
+            char par[256]; size_t n = strlen(path);
+            memcpy(par, path, n + 1);
+            while (n > 1 && par[n - 1] != '/') n--;
+            par[n > 1 ? n - 1 : 1] = 0;
+            int pk = lx_path_kind(par, NULL);
+            if (!pk && !lx_synth_dir(par)) return -ENOENT;
+            if (pk == 1) return -ENOTDIR;
+        }
+        return -EPERM;
+    }
+    case LX_link: case LX_linkat: {
+        long d1 = nr == LX_linkat ? (long)(int)a1 : LX_AT_FDCWD;
+        const char *u1 = (const char *)(nr == LX_linkat ? a2 : a1);
+        long d2 = nr == LX_linkat ? (long)(int)a3 : LX_AT_FDCWD;
+        const char *u2 = (const char *)(nr == LX_linkat ? a4 : a2);
+        if (nr == LX_linkat && (a5 & ~(uint64_t)(0x400 | 0x1000))) return -EINVAL;
+        if ((r = lx_resolve(p, d1, u1, path, sizeof(path), nr == LX_linkat && (a5 & 0x1000)))) return r;
+        if ((r = lx_resolve(p, d2, u2, path2, sizeof(path2), false))) return r;
+        int k = lx_path_kind(path, NULL);
+        if (!k) return -ENOENT;
+        if (k == 2) return -EPERM;                      /* dirs: EPERM on Linux too */
+        if (lx_path_kind(path2, NULL)) return -EEXIST;
+        return -EPERM;                                  /* no hard-link support (vfat semantics) */
+    }
+    case LX_mknod: case LX_mknodat: {
+        long dfd = nr == LX_mknodat ? (long)(int)a1 : LX_AT_FDCWD;
+        const char *up = (const char *)(nr == LX_mknodat ? a2 : a1);
+        uint32_t mode = (uint32_t)(nr == LX_mknodat ? a3 : a2);
+        uint32_t fmt = mode & 0170000;
+        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if (lx_path_kind(path, NULL) || fifo_is(path)) return -EEXIST;
+        if (fmt == 0140000 || fmt == 0020000 || fmt == 0060000) return -EPERM; /* sock/chr/blk */
+        if (fmt != 0 && fmt != 0100000 && fmt != LX_S_IFIFO) return -EINVAL;
+        long fd = sys_open_kpath(path, O_CREAT | O_WRONLY, (mode_t)(mode & 0777));
+        if (fd < 0) return fd;
+        sys_close((int)fd);
+        if (fmt == LX_S_IFIFO) {
+            r = fifo_reg(path);
+            if (r < 0) { vfs_unlink(path); return r; }
+        }
+        return 0;
+    }
+    case LX_flock: {
+        if (!lx_fd_ok(p, (long)a1)) return -EBADF;
+        int op = (int)a2;
+        if ((op & ~4) != 1 && (op & ~4) != 2 && (op & ~4) != 8) return -EINVAL;
+        file_descriptor_t *fe = &p->fds[a1];
+        if (fe->fd_type != FD_TYPE_VFS || !fe->ref_count) return 0;  /* nothing to share */
+        char kp[VFS_MAX_PATH];
+        if (vfs_fd_get_path(fe->vfs_fd, kp, sizeof(kp)) < 0) return 0;
+        return flk_op(p, fe->ref_count, kp, op);
+    }
+    case LX_fallocate: {
+        long fd = (long)a1;
+        if (!lx_fd_ok(p, fd)) return -EBADF;
+        int64_t off = (int64_t)a3, len = (int64_t)a4;
+        uint8_t ty = p->fds[fd].fd_type;
+        if (ty == FD_TYPE_PIPE_READ || ty == FD_TYPE_PIPE_WRITE) return -ESPIPE;
+        if (ty != FD_TYPE_VFS) return -ENODEV;
+        if (off < 0 || len <= 0) return -EINVAL;
+        if (a2 & ~(uint64_t)1) return -EOPNOTSUPP;      /* punch/zero/collapse/insert */
+        if (a2 & 1) return 0;                           /* KEEP_SIZE: nothing to reserve */
+        if (off + len > 0x7fffffffLL) return -EFBIG;
+        int vfd = p->fds[fd].vfs_fd;
+        int cur = vfs_seek(vfd, 0, 1);
+        int end = vfs_seek(vfd, 0, 2);
+        if (cur < 0 || end < 0) return -EIO;
+        long res = 0;
+        if (off + len > end) {
+            uint8_t *z = (uint8_t *)kalloc(4096);
+            if (!z) { vfs_seek(vfd, cur, 0); return -ENOMEM; }
+            memset(z, 0, 4096);
+            int64_t left = off + len - end;
+            while (left > 0) {
+                int c = left > 4096 ? 4096 : (int)left;
+                int w = vfs_write(vfd, z, (uint32_t)c);
+                if (w <= 0) { res = w == 0 ? -ENOSPC : (w == -1 ? -EIO : w); break; }
+                left -= w;
+            }
+            kfree(z);
+        }
+        vfs_seek(vfd, cur, 0);
+        return res;
+    }
+    case LX_memfd_create: {
+        extern long memfd_create_k(process_t *p, const char *uname, unsigned flags);
+        return memfd_create_k(p, (const char *)a1, (unsigned)a2);
+    }
+    case LX_fadvise64: {
+        if (!lx_fd_ok(p, (long)a1)) return -EBADF;
+        uint8_t ty = p->fds[a1].fd_type;
+        if (ty == FD_TYPE_PIPE_READ || ty == FD_TYPE_PIPE_WRITE) return -ESPIPE;
+        if ((long)a4 < 0 || (long)a4 > 5) return -EINVAL;
+        return 0;
+    }
+    case LX_preadv: case LX_pwritev: case LX_preadv2: case LX_pwritev2: {
+        long fd = (long)a1;
+        bool wr = nr == LX_pwritev || nr == LX_pwritev2;
+        int64_t off = (int64_t)a4;
+        if (!lx_fd_ok(p, fd)) return -EBADF;
+        if ((nr == LX_preadv2 || nr == LX_pwritev2) && (a6 & ~(uint64_t)0x1f)) return -EOPNOTSUPP;
+        if ((nr == LX_preadv2 || nr == LX_pwritev2) && off == -1)
+            return lx_rw_vec(p, fd, (const void *)a2, (long)a3, wr);
+        if (p->fds[fd].fd_type != FD_TYPE_VFS) return -ESPIPE;
+        if (off < 0) return -EINVAL;
+        long cur = sys_seek((int)fd, 0, SEEK_CUR);
+        if (cur < 0) return cur;
+        r = sys_seek((int)fd, (off_t)off, SEEK_SET);
+        if (r < 0) return r;
+        r = lx_rw_vec(p, fd, (const void *)a2, (long)a3, wr);
+        sys_seek((int)fd, (off_t)cur, SEEK_SET);
+        return r;
+    }
+    case LX_getpriority: case LX_setpriority: {
+        long which = (long)a1, who = (long)(int)a2;
+        if (which < 0 || which > 2) return -EINVAL;
+        uint32_t tpid = (uint32_t)p->pid;
+        if (which == 0 && who != 0 && who != (long)p->pid) {
+            if (who < 0 || sys_kill((pid_t)who, 0) < 0) return -ESRCH;
+            tpid = (uint32_t)who;
+        } else if (which != 0 && who != 0 && who != (long)(which == 1 ? p->pgid : p->uid)) {
+            return -ESRCH;
+        }
+        if (nr == LX_getpriority) return 20 - lx_nice_get(tpid);   /* kernel ABI: 20 - nice */
+        long v = (long)(int)a3;
+        if (v < -20) v = -20;
+        if (v > 19) v = 19;
+        lx_nice_set(tpid, (int)v);
+        return 0;
+    }
+    case LX_sched_setaffinity: {
+        long who = (long)(int)a1;
+        if (who < 0) return -ESRCH;
+        if (who != 0 && who != (long)p->pid && sys_kill((pid_t)who, 0) < 0) return -ESRCH;
+        if (a2 == 0 || !a3) return a3 ? -EINVAL : -EFAULT;
+        uint8_t b0;
+        if (lx_get(&b0, (const void *)a3, 1)) return -EFAULT;
+        extern uint64_t cpu_count;
+        uint64_t ncpu = cpu_count ? cpu_count : 1;
+        uint64_t m = 0;
+        lx_get(&m, (const void *)a3, a2 < 8 ? (size_t)a2 : 8);
+        if (ncpu < 64) m &= (1ULL << ncpu) - 1;
+        if (!m) return -EINVAL;                         /* no online CPU in the mask */
+        return 0;                                       /* accepted; scheduler is not pinned */
+    }
     case LX_statfs: case LX_fstatfs: {
         uint64_t sf[15];                        /* struct statfs, 120 bytes */
         memset(sf, 0, sizeof(sf));
@@ -1869,7 +2219,14 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_munmap:  return sys_munmap((void *)a1, (size_t)a2);
     case LX_mprotect:
         return sys_mprotect((void *)a1, (size_t)a2, (int)a3);
-    case LX_madvise: case LX_msync:
+    case LX_msync: {
+        if (a1 & (PAGE_SIZE - 1)) return -EINVAL;
+        if (a3 & ~7ull) return -EINVAL;           /* MS_ASYNC|MS_INVALIDATE|MS_SYNC */
+        extern void shmf_range(uint64_t *pml4, uint64_t va, uint64_t len, bool unmap);
+        shmf_range(lx_cur_pml4(), a1, a2, false);
+        return 0;
+    }
+    case LX_madvise:
         return 0;
     case LX_mremap:  return -ENOMEM;            /* callers fall back to copy */
 
@@ -1983,6 +2340,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return 0;
     }
     case LX_wait4:   return lx_wait4(p, (long)(int)a1, (int *)a2, (long)a3, (void *)a4);
+    case LX_waitid:  return lx_waitid(p, (long)a1, (long)(int)a2, (void *)a3, (long)a4, (void *)a5);
     case LX_kill: {
         /* Queue + deliver (custom handlers / SIG_IGN). Do NOT always
          * lx_die_by_signal on self — that broke sig_self (SIGUSR1 handler). */
@@ -2301,8 +2659,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
     case LX_sched_yield: return 0;
     case LX_sched_getaffinity: {
-        if (a2 < 8) return -EINVAL;
-        uint64_t mask = 1;
+        if (a2 < 8 || (a2 & 7)) return -EINVAL;
+        if ((long)(int)a1 < 0) return -ESRCH;
+        if ((int)a1 != 0 && (long)(int)a1 != (long)p->pid && sys_kill((pid_t)a1, 0) < 0) return -ESRCH;
+        uint64_t mask = 1;                      /* unchanged: report one CPU (nproc = 1) */
         if (lx_put((void *)a3, &mask, sizeof(mask))) return -EFAULT;
         return 8;
     }
@@ -2326,6 +2686,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         /* stx_mask at 0x00 = STATX_BASIC_STATS */
         uint32_t mask = 0x000007ffu;
         memcpy(sx + 0x00, &mask, 4);
+        if (fifo_is(path)) { st.st_mode = LX_S_IFIFO | 0644; st.st_size = 0; }
         uint16_t mode = (uint16_t)st.st_mode;
         memcpy(sx + 0x1c, &mode, 2);
         uint64_t ino = st.st_ino, size = st.st_size;
@@ -2337,6 +2698,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_socket:      return lx_sock_socket((long)a1, (long)a2, (long)a3);
     case LX_connect: {
         if (!lx_fd_is_socket(p, (int)a1)) return -ENOTSOCK;
+        if (lx_unix_sock(p, a1))
+            return ux_connect(p, (int)a1, lx_unix_sock(p, a1), (const void *)a2, (uint32_t)a3);
         if (a3 < sizeof(sockaddr_in_t)) return -EINVAL;
         uint16_t fam = 0;
         if (lx_get(&fam, (const void *)a2, sizeof(fam))) return -EFAULT;
@@ -2345,13 +2708,26 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
     case LX_bind: {
         if (!lx_fd_is_socket(p, (int)a1)) return -ENOTSOCK;
+        if (lx_unix_sock(p, a1)) {
+            char nm[112];
+            int nl = 0;
+            long r = lx_unix_parse_addr(p, (const void *)a2, (uint32_t)a3, nm, &nl);
+            if (r < 0) return r;
+            if (nl > 0 && nm[0] && lx_path_kind(nm, NULL)) return -EADDRINUSE;
+            return ux_bind(p, lx_unix_sock(p, a1), (const void *)a2, (uint32_t)a3);
+        }
         uint16_t fam = 0;
         if (lx_get(&fam, (const void *)a2, sizeof(fam))) return -EFAULT;
         if (fam != AF_INET) return -EAFNOSUPPORT;
         return sys_bind((int)a1, (const sockaddr_in_t *)a2, (uint32_t)a3);
     }
-    case LX_listen:      return sys_listen((int)a1, (int)a2);
+    case LX_listen:
+        if (lx_unix_sock(p, a1)) return ux_listen(lx_unix_sock(p, a1), (int)a2);
+        return sys_listen((int)a1, (int)a2);
     case LX_accept: case LX_accept4: {
+        if (lx_unix_sock(p, a1))
+            return ux_accept(p, (int)a1, lx_unix_sock(p, a1), (void *)a2, (uint32_t *)a3,
+                             nr == LX_accept4 ? (long)a4 : 0);
         long fd = sys_accept((int)a1, (sockaddr_in_t *)a2, (uint32_t *)a3);
         if (fd >= 0 && nr == LX_accept4) {
             if (a4 & 04000) p->fds[fd].flags |= O_NONBLOCK;
@@ -2367,6 +2743,38 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         /* struct msghdr { name, namelen, iov, iovlen, control, controllen, flags } */
         struct { uint64_t name; uint32_t namelen, pad; uint64_t iov, iovlen, control, controllen; int flags; } m;
         if (lx_get(&m, (const void *)a2, sizeof(m))) return -EFAULT;
+        if (lx_unix_sock(p, a1)) {
+            if (m.iovlen > 1024) return -EMSGSIZE;
+            int niov = (int)m.iovlen;
+            lx_ux_iov_t kiov[64];
+            lx_ux_iov_t *iv = kiov;
+            if (niov > 64) {
+                iv = (lx_ux_iov_t *)kalloc(sizeof(lx_ux_iov_t) * (size_t)niov);
+                if (!iv) return -ENOMEM;
+            }
+            long r = 0;
+            if (niov && lx_get(iv, (const void *)m.iov, sizeof(lx_ux_iov_t) * (size_t)niov)) r = -EFAULT;
+            if (!r) {
+                if (nr == LX_sendmsg) {
+                    r = ux_sendmsg(p, (int)a1, lx_unix_sock(p, a1), iv, niov,
+                                   (const void *)m.name, m.namelen,
+                                   (const void *)m.control, m.controllen, (int)a3);
+                } else {
+                    uint64_t octl = 0;
+                    int oflags = 0;
+                    r = ux_recvmsg(p, (int)a1, lx_unix_sock(p, a1), iv, niov,
+                                   m.name ? (void *)m.name : NULL,
+                                   m.name ? (uint32_t *)((uint8_t *)a2 + 8) : NULL,
+                                   (void *)m.control, m.controllen, &octl, &oflags, (int)a3);
+                    if (r >= 0) {
+                        lx_put((uint8_t *)a2 + 40, &octl, sizeof(octl));
+                        lx_put((uint8_t *)a2 + 48, &oflags, sizeof(oflags));
+                    }
+                }
+            }
+            if (iv != kiov) kfree(iv);
+            return r;
+        }
         int flags = (int)a3 | m.flags;
         if (m.iovlen == 0) {
             /* Still must consume one datagram on recv so poll(POLLIN) clears. */
@@ -2407,7 +2815,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_getpeername: return lx_sock_name((int)a1, (void *)a2, (uint32_t *)a3, true);
     case LX_setsockopt:  return lx_sock_setsockopt((int)a1, (int)a2, (int)a3, (const void *)a4, (uint32_t)a5);
     case LX_getsockopt:  return lx_sock_getsockopt((int)a1, (int)a2, (int)a3, (void *)a4, (uint32_t *)a5);
-    case LX_socketpair:  return -EAFNOSUPPORT;
+    case LX_socketpair:
+        if (a1 != 1 /* AF_UNIX */) return -EAFNOSUPPORT;
+        if (a3 != 0) return -EPROTONOSUPPORT;
+        return ux_socketpair(p, (long)a2, (int *)a4);
     case LX_eventfd:     return lx_eventfd_create(p, (uint32_t)a1, 0);
     case LX_eventfd2:    return lx_eventfd_create(p, (uint32_t)a1, (long)a2);
 

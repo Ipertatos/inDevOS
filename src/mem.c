@@ -1309,6 +1309,8 @@ static void vmm_free_table(uint64_t *table, int level) {
 
 void vmm_destroy_address_space(uint64_t *pml4) {
     if (!pml4 || pml4 == kernel_pml4) return;
+    extern void shmf_as_destroy(uint64_t *pml4);
+    shmf_as_destroy(pml4);       /* MAP_SHARED file mappings: final write-back */
     vmm_free_table(pml4, 4);
 }
 

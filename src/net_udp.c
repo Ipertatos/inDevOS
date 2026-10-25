@@ -147,8 +147,8 @@ int udp_send(const uint8_t *dst_ip, uint16_t src_port, uint16_t dst_port, const 
     if (len > 0 && payload) memcpy(packet + 8, payload, len);
 
     uint8_t src_ip[4];
-    extern void net_get_ip_address(uint8_t *ip);
-    net_get_ip_address(src_ip);
+    extern void ip_select_src(const uint8_t *dst, uint8_t *src);
+    ip_select_src(dst_ip, src_ip);   /* 127.x replies come from 127.x */
     /* Checksum must be stored in network byte order (same swap as tcp_checksum in net_tcp.c). */
     uint16_t cs = udp_checksum(src_ip, dst_ip, packet, udp_len);
     if (cs == 0)

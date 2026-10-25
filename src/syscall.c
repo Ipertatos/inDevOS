@@ -462,11 +462,14 @@ static int fd_close_entry(process_t *proc, int fd) {
     }
 
     bool should_free_object = true;
+    void *last_rc_key = NULL;
     if (fde->ref_count) {
         if (*fde->ref_count > 1) {
             (*fde->ref_count)--;
             should_free_object = false;
         } else {
+            if (ty == FD_TYPE_VFS) { extern void flk_release(void *); flk_release(fde->ref_count); }
+            last_rc_key = fde->ref_count;       /* compared only, never dereferenced */
             kfree(fde->ref_count);
         }
     }
@@ -496,6 +499,7 @@ static int fd_close_entry(process_t *proc, int fd) {
             if (fde->vfs_fd >= 0) {
                 vfs_close(fde->vfs_fd);
             }
+            if (last_rc_key) { extern void memfd_release(void *); memfd_release(last_rc_key); }
         } else if (ty == FD_TYPE_VFS_DIR) {
             if (fde->file_handle) {
                 vfs_dircache_drop(fde->file_handle);
@@ -1215,6 +1219,8 @@ int sys_read(int fd, void *buf, size_t count) {
     } else if (proc->fds[fd].fd_type == FD_TYPE_VFS) {
         void *kbuf = kalloc(count);
         if (!kbuf) return -ENOMEM;
+        extern void shmf_before_read(int vfs_fd);
+        shmf_before_read(proc->fds[fd].vfs_fd);   /* dirty MAP_SHARED pages first */
         int bytes_read = vfs_read(proc->fds[fd].vfs_fd, kbuf, count);
         if (bytes_read >= 0) {
             if (copy_to_user(buf, kbuf, (size_t)bytes_read) != 0) {                kfree(kbuf);
@@ -1348,11 +1354,16 @@ int sys_write(int fd, const void *buf, size_t count) {
             int endpos = vfs_seek(proc->fds[fd].vfs_fd, 0, VFS_SEEK_END);
             if (endpos >= 0) proc->fds[fd].position = (uint32_t)endpos;
         }
+        extern volatile int shmf_count;
+        extern void shmf_after_write(int vfs_fd, uint64_t pos, const void *kbuf, uint32_t n);
+        int wpos = shmf_count ? vfs_seek(proc->fds[fd].vfs_fd, 0, VFS_SEEK_CUR) : -1;
         int bytes_written = vfs_write(proc->fds[fd].vfs_fd, kbuf, count);
         if (bytes_written == -1)
             bytes_written = -EIO;   /* fs drivers return bare -1; that is -EPERM to user */
         if (bytes_written >= 0) {
             proc->fds[fd].position += bytes_written;
+            if (wpos >= 0 && bytes_written > 0)   /* keep MAP_SHARED mappings coherent */
+                shmf_after_write(proc->fds[fd].vfs_fd, (uint64_t)wpos, kbuf, (uint32_t)bytes_written);
         }
         kfree(kbuf);
         return bytes_written;
@@ -1680,6 +1691,8 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
         /* MAP_FIXED replaces whatever is mapped there: release the old
          * frames first (vmm_map_page_in would just overwrite the PTEs and
          * leak them). */
+        extern void shmf_range(uint64_t *pml4, uint64_t va, uint64_t len, bool unmap);
+        shmf_range(proc->pml4, v0, pages * PAGE_SIZE, true);
         vmm_unmap_range_release_in(proc->pml4, v0, pages);
     } else {
         if (proc->mmap_anon_next == 0)
@@ -1818,6 +1831,8 @@ int sys_munmap(void *addr, size_t length) {
 
     /* Clear the PTEs, shoot down every CPU's TLB, then release the frames
      * (refcount-aware: sole owner frees, COW peers just drop a ref). */
+    extern void shmf_range(uint64_t *pml4, uint64_t va, uint64_t len, bool unmap);
+    shmf_range(proc->pml4, v, pages * PAGE_SIZE, true);   /* MAP_SHARED file write-back */
     vmm_unmap_range_release_in(proc->pml4, v, pages);
 
     proc_mmap_region_t **pp = &proc->mmap_regions;
@@ -3617,7 +3632,11 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
             } else if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
                        proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_SOCKET) {
                 kernel_socket_t *ks = (kernel_socket_t *)proc->fds[fd].file_handle;
-                if (ks && ks->type == SOCK_DGRAM) {
+                if (ks && ks->domain == 1 /* AF_UNIX */) {
+                    extern int ux_poll(kernel_socket_t *s, int events);
+                    kfds[i].revents |= (short)ux_poll(ks, kfds[i].events | 0x2000);
+                    if (!(kfds[i].events & 0x2000)) kfds[i].revents &= ~0x2000;
+                } else if (ks && ks->type == SOCK_DGRAM) {
                     udp_pcb_t *pcb = (udp_pcb_t *)ks->transport;
                     if ((kfds[i].events & POLLIN) && pcb && udp_pcb_rx_ready(pcb) > 0)
                         kfds[i].revents |= POLLIN;
@@ -3629,14 +3648,20 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
                     tcp_socket_t *ts = ks ? (tcp_socket_t *)ks->transport : NULL;
                     tcp_connection_t *conn = ts ? ts->connection : NULL;
                     extern bool tcp_conn_at_eof(tcp_connection_t *c);
-                    if ((kfds[i].events & POLLIN) && conn && conn->recv_buffer_used > 0) {
+                    if ((kfds[i].events & POLLIN) && ks && ks->listening && ts) {
+                        if (tcp_socket_accept_ready(ts)) kfds[i].revents |= POLLIN;
+                    } else if ((kfds[i].events & POLLIN) && conn && conn->recv_buffer_used > 0) {
                         kfds[i].revents |= POLLIN;
                     } else if (conn && ks->connected && tcp_conn_at_eof(conn)) {
-                        /* peer closed: readable (read returns 0) and hung up */
-                        kfds[i].revents |= POLLIN | POLLHUP;
+                        /* peer closed: readable (read returns 0); hung up unless
+                         * only the peer's half is closed (we may still write) */
+                        kfds[i].revents |= POLLIN;
+                        if (conn->state != TCP_STATE_CLOSE_WAIT) kfds[i].revents |= POLLHUP;
+                        else kfds[i].revents |= kfds[i].events & 0x2000 /* POLLRDHUP */;
                     }
                     if (kfds[i].events & (POLLOUT | 0x0100 /* POLLWRNORM */)) {
-                        if (conn && conn->state == TCP_STATE_ESTABLISHED) {
+                        if (conn && (conn->state == TCP_STATE_ESTABLISHED ||
+                                     conn->state == TCP_STATE_CLOSE_WAIT) && !ks->listening) {
                             kfds[i].revents |= POLLOUT;
                             if (kfds[i].events & 0x0100) kfds[i].revents |= 0x0100;
                             ks->connected = true;
@@ -4719,4 +4744,56 @@ bool process_pid_alive(uint32_t pid) {
             !processes[i].is_zombie)
             return true;
     return false;
+}
+
+/* ── Helpers for AF_UNIX (net_unix.c) ────────────────────────────────────
+ * SIGPIPE on a broken stream socket, same policy as pipe writes. */
+void proc_raise_sigpipe(process_t *proc) {
+    if (!proc) return;
+    if (!(proc->blocked_signals & (1u << SIGPIPE)) &&
+        proc->signal_handlers[SIGPIPE] != SIG_IGN) {
+        proc->pending_signals |= (1u << SIGPIPE);
+        sighandler_t sh = proc->signal_handlers[SIGPIPE];
+        if (sh == SIG_DFL || sh == SIG_ERR || !sh)
+            handle_pending_signals(proc);
+    }
+}
+
+/* SCM_RIGHTS: take an extra reference on fd (like dup) into *out. */
+int fd_flight_get(process_t *proc, int fd, file_descriptor_t *out) {
+    if (!proc || fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !proc->fds[fd].in_use)
+        return -EBADF;
+    if (!proc->fds[fd].ref_count) {
+        proc->fds[fd].ref_count = fd_refcount_create();
+        if (!proc->fds[fd].ref_count) return -ENOMEM;
+    } else {
+        (*proc->fds[fd].ref_count)++;
+    }
+    memcpy(out, &proc->fds[fd], sizeof(*out));
+    out->cloexec = false;
+    if (out->fd_type == FD_TYPE_PIPE_READ)
+        pipe_fork_dup_reader((pipe_t *)out->file_handle);
+    else if (out->fd_type == FD_TYPE_PIPE_WRITE)
+        pipe_fork_dup_writer((pipe_t *)out->file_handle);
+    return 0;
+}
+
+/* Install an in-flight descriptor into proc (lowest free slot). */
+int fd_flight_install(process_t *proc, const file_descriptor_t *f, bool cloexec) {
+    if (!proc) return -EINVAL;
+    int nfd = allocate_fd(proc);
+    if (nfd < 0) return nfd;
+    memcpy(&proc->fds[nfd], f, sizeof(*f));
+    proc->fds[nfd].in_use = true;
+    proc->fds[nfd].cloexec = cloexec;
+    return nfd;
+}
+
+/* Drop an in-flight descriptor that was never received: park it in a free
+ * slot of the current process and close it there (normal release path). */
+void fd_flight_release(file_descriptor_t *f) {
+    process_t *proc = get_current_process();
+    if (!proc) return;
+    int nfd = fd_flight_install(proc, f, false);
+    if (nfd >= 0) fd_close_entry(proc, nfd);
 }
