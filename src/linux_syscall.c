@@ -209,6 +209,11 @@ static bool lx_fd_ok(process_t *p, long fd) {
 /* fds 0..2 that were never redirected are the console. */
 #include "pty.h"
 #include "pipe.h"
+/* /dev/zero, /dev/urandom tags in a DEV_NULL fd's file_handle */
+#define LX_NULLTAG_ZERO    ((void *)1)
+#define LX_NULLTAG_RANDOM  ((void *)2)
+static long lx_read_nulltag(void *tag, void *ubuf, size_t count);
+static bool lx_proc_text_path(process_t *p, const char *path);
 /* kterm pty: fds on the desktop terminal's shell pipes are terminals. */
 static kpty_t *lx_fd_pty(process_t *p, long fd) {
     if (!lx_fd_ok(p, fd)) return NULL;
@@ -338,7 +343,7 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
     uint8_t ty = p->fds[fd].fd_type;
     if (ty == FD_TYPE_DEV_NULL)
-        return 0;
+        return p->fds[fd].file_handle ? lx_read_nulltag(p->fds[fd].file_handle, ubuf, count) : 0;
     if (ty == FD_TYPE_DEV_FB)
         return fbdev_read(p, &p->fds[fd].position, ubuf, count);
     if (ty == FD_TYPE_DEV_INPUT)
@@ -534,6 +539,8 @@ static uint32_t lx_dev_path(const char *path, uint32_t *mode) {
         { "/dev/tty2", (4u << 8) | 2, 0620 }, { "/dev/tty3", (4u << 8) | 3, 0620 },
         { "/dev/tty4", (4u << 8) | 4, 0620 }, { "/dev/tty", (5u << 8) | 0, 0666 },
         { "/dev/console", (5u << 8) | 1, 0600 }, { "/dev/null", (1u << 8) | 3, 0666 },
+        { "/dev/zero", (1u << 8) | 5, 0666 }, { "/dev/random", (1u << 8) | 8, 0666 },
+        { "/dev/urandom", (1u << 8) | 9, 0666 },
     };
     for (unsigned i = 0; i < sizeof(devs) / sizeof(devs[0]); i++)
         if (kstrcmp(path, devs[i].p) == 0) { if (mode) *mode = devs[i].mode; return devs[i].rdev; }
@@ -552,6 +559,69 @@ static bool lx_synth_dir(const char *path) {
     return input_dev_dir_list(path, nm, isd, 0) >= 0;
 }
 
+/* ---- permission bits on mode-less filesystems (FAT32, ISO) ----
+ * chmod() overrides live in a small in-memory table (per boot).  Without an
+ * override, regular files under /bin, /usr/bin, /sbin and files starting
+ * with an ELF header or "#!" report 0755 instead of the fs default 0644. */
+#define LX_MODE_OVR_MAX 256
+static struct { char path[160]; uint16_t mode; bool used; } lx_mode_ovr[LX_MODE_OVR_MAX];
+
+static int lx_mode_ovr_find(const char *abspath) {
+    for (int i = 0; i < LX_MODE_OVR_MAX; i++)
+        if (lx_mode_ovr[i].used && kstrcmp(lx_mode_ovr[i].path, abspath) == 0)
+            return i;
+    return -1;
+}
+
+static long lx_mode_set(const char *abspath, uint32_t mode) {
+    if (strlen(abspath) >= sizeof(lx_mode_ovr[0].path)) return 0;   /* accepted, not stored */
+    int i = lx_mode_ovr_find(abspath);
+    if (i < 0)
+        for (i = 0; i < LX_MODE_OVR_MAX && lx_mode_ovr[i].used; i++) ;
+    if (i >= LX_MODE_OVR_MAX) return 0;
+    kstrncpy(lx_mode_ovr[i].path, abspath, sizeof(lx_mode_ovr[i].path));
+    lx_mode_ovr[i].mode = (uint16_t)(mode & 07777);
+    lx_mode_ovr[i].used = true;
+    return 0;
+}
+
+static bool lx_file_looks_exec(const char *abspath) {
+    if (!kstrncmp(abspath, "/bin/", 5) || !kstrncmp(abspath, "/usr/bin/", 9) ||
+        !kstrncmp(abspath, "/sbin/", 6) || !kstrncmp(abspath, "/usr/local/bin/", 15))
+        return true;
+    char h[4];
+    int fd = vfs_open(abspath, VFS_O_READ);
+    if (fd < 0) return false;
+    int n = vfs_read(fd, h, 4);
+    vfs_close(fd);
+    if (n >= 4 && h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F') return true;
+    return n >= 2 && h[0] == '#' && h[1] == '!';
+}
+
+static void lx_mode_adjust(const char *abspath, stat_t *st) {
+    if ((st->st_mode & 0170000) != 0100000) return;    /* regular files only */
+    int i = lx_mode_ovr_find(abspath);
+    if (i >= 0) {
+        st->st_mode = (st->st_mode & ~07777u) | lx_mode_ovr[i].mode;
+        return;
+    }
+    if (!(st->st_mode & 0111) && lx_file_looks_exec(abspath))
+        st->st_mode |= 0111;
+}
+
+/* access()/faccessat() with real X_OK (R/W stay permissive: single user). */
+static long lx_access_path(const char *abspath, long amode) {
+    stat_t st;
+    memset(&st, 0, sizeof(st));
+    if (!lx_path_kind(abspath, &st)) return -ENOENT;
+    if (amode & 1) {                                    /* X_OK */
+        lx_mode_adjust(abspath, &st);
+        if ((st.st_mode & 0170000) != 0040000 && !(st.st_mode & 0111))
+            return -EACCES;
+    }
+    return 0;
+}
+
 static long lx_stat_path(const char *abspath, void *ubuf) {
     stat_t st;
     {
@@ -568,7 +638,15 @@ static long lx_stat_path(const char *abspath, void *ubuf) {
             return lx_put(ubuf, &ls, sizeof(ls));
         }
     }
-    if (!lx_path_kind(abspath, &st)) {
+    if (lx_proc_text_path(get_current_process(), abspath)) {
+        memset(&st, 0, sizeof(st));             /* /proc/cpuinfo etc: size 0 like Linux */
+        st.st_mode = 0100000 | 0444;
+        st.st_nlink = 1;
+        st.st_blksize = 1024;
+        st.st_ino = 0xF000 + (uint64_t)strlen(abspath);
+    } else if (lx_path_kind(abspath, &st)) {
+        lx_mode_adjust(abspath, &st);
+    } else {
         if (!lx_synth_dir(abspath))
             return -ENOENT;
         memset(&st, 0, sizeof(st));             /* /dev, /dev/input */
@@ -632,6 +710,8 @@ static long lx_fstat(process_t *p, long fd, void *ubuf) {
         st.st_nlink = 1;
         st.st_blksize = 4096;
         st.st_rdev = f->fd_type == FD_TYPE_DEV_NULL ? 0x103 : 0x500; /* 1,3 / 5,0 */
+        if (f->fd_type == FD_TYPE_DEV_NULL && f->file_handle)
+            st.st_rdev = f->file_handle == LX_NULLTAG_ZERO ? 0x105 : 0x109;   /* 1,5 / 1,9 */
         lx_stat_t ls;
         lx_fill_stat(&ls, &st);
         return lx_put(ubuf, &ls, sizeof(ls));
@@ -756,13 +836,145 @@ static long lx_pio(process_t *p, long fd, void *ubuf, size_t len, int64_t off, b
     return r;
 }
 
+/* ---- /dev/zero, /dev/urandom: FD_TYPE_DEV_NULL with a tag in file_handle
+ * (close never frees DEV_NULL handles). ---- */
+
+static long lx_read_nulltag(void *tag, void *ubuf, size_t count) {
+    uint8_t buf[256];
+    size_t done = 0;
+    if (count > (1u << 20)) count = 1u << 20;
+    while (done < count) {
+        size_t c = count - done;
+        if (c > sizeof(buf)) c = sizeof(buf);
+        if (tag == LX_NULLTAG_ZERO) memset(buf, 0, c);
+        else for (size_t i = 0; i < c; i += 8) { uint64_t v = lx_random_u64(); memcpy(buf + i, &v, c - i < 8 ? c - i : 8); }
+        if (lx_put((uint8_t *)ubuf + done, buf, c)) return done ? (long)done : -EFAULT;
+        done += c;
+    }
+    return (long)done;
+}
+
+/* ---- minimal /proc text files: cpuinfo, meminfo, self/stat, <pid>/stat.
+ * Content is generated at open() into a pipe whose write end is closed, so
+ * read() returns the text then EOF. ---- */
+static process_t *lx_proc_pid_stat(process_t *p, const char *path) {
+    if (kstrcmp(path, "/proc/self/stat") == 0 || kstrcmp(path, "/proc/thread-self/stat") == 0) return p;
+    if (kstrncmp(path, "/proc/", 6) != 0) return NULL;
+    const char *s = path + 6;
+    uint32_t pid = 0;
+    if (*s < '0' || *s > '9') return NULL;
+    while (*s >= '0' && *s <= '9') pid = pid * 10 + (uint32_t)(*s++ - '0');
+    if (kstrcmp(s, "/stat") != 0) return NULL;
+    /* self and ancestors (process table is private to syscall.c) */
+    int depth = 0;
+    for (process_t *q = p; q && depth < 64; q = q->parent, depth++)
+        if (q->pid == pid) return q;
+    return NULL;
+}
+
+static bool lx_proc_text_path(process_t *p, const char *path) {
+    return kstrcmp(path, "/proc/cpuinfo") == 0 || kstrcmp(path, "/proc/meminfo") == 0 ||
+           lx_proc_pid_stat(p, path) != NULL;
+}
+
+static int lx_proc_gen(process_t *p, const char *path, char *out, int cap) {
+    if (kstrcmp(path, "/proc/meminfo") == 0) {
+        extern uint64_t total_memory_bytes;
+        uint64_t tot = total_memory_bytes >> 10, fr = (num_pages_available * (uint64_t)PAGE_SIZE) >> 10;
+        return snprintf(out, (size_t)cap,
+            "MemTotal:       %8lu kB\nMemFree:        %8lu kB\nMemAvailable:   %8lu kB\n"
+            "Buffers:               0 kB\nCached:                0 kB\nSwapCached:            0 kB\n"
+            "SwapTotal:             0 kB\nSwapFree:              0 kB\nShmem:                 0 kB\n",
+            (unsigned long)tot, (unsigned long)fr, (unsigned long)fr);
+    }
+    if (kstrcmp(path, "/proc/cpuinfo") == 0) {
+        extern uint64_t smp_get_online_count(void);
+        char brand[49];
+        uint32_t r[12];
+        uint32_t a, b, c, d;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+        if (a >= 0x80000004u) {
+            for (uint32_t i = 0; i < 3; i++)
+                __asm__ volatile("cpuid" : "=a"(r[i*4]), "=b"(r[i*4+1]), "=c"(r[i*4+2]), "=d"(r[i*4+3])
+                                 : "a"(0x80000002u + i), "c"(0));
+            memcpy(brand, r, 48);
+            brand[48] = 0;
+        } else {
+            kstrncpy(brand, "x86_64 CPU", sizeof(brand));
+        }
+        char *bp = brand; while (*bp == ' ') bp++;
+        char vendor[13];
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0), "c"(0));
+        memcpy(vendor, &b, 4); memcpy(vendor + 4, &d, 4); memcpy(vendor + 8, &c, 4); vendor[12] = 0;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+        uint32_t fam = (a >> 8) & 0xf, model = (a >> 4) & 0xf, step = a & 0xf;
+        if (fam == 0xf) fam += (a >> 20) & 0xff;
+        if (fam == 0x6 || fam >= 0xf) model |= ((a >> 16) & 0xf) << 4;
+        int n = (int)smp_get_online_count();
+        if (n < 1) n = 1;
+        int len = 0;
+        for (int i = 0; i < n && len < cap - 400; i++)
+            len += snprintf(out + len, (size_t)(cap - len),
+                "processor\t: %d\nvendor_id\t: %s\ncpu family\t: %u\nmodel\t\t: %u\n"
+                "model name\t: %s\nstepping\t: %u\ncpu MHz\t\t: 0.000\nphysical id\t: 0\n"
+                "siblings\t: %d\ncore id\t\t: %d\ncpu cores\t: %d\nflags\t\t: fpu tsc msr pae cx8 apic sse sse2%s\n\n",
+                i, vendor, fam, model, bp, step, n, i, n, (c & (1u << 0)) ? " pni" : "");
+        return len;
+    }
+    process_t *t = lx_proc_pid_stat(p, path);
+    if (t) {
+        const char *exe = t->linux_exe_path[0] ? t->linux_exe_path : "init";
+        const char *bn = exe;
+        for (const char *q = exe; *q; q++) if (*q == '/') bn = q + 1;
+        char comm[16]; kstrncpy(comm, bn, sizeof(comm));
+        uint32_t ppid = t->parent ? t->parent->pid : 0;
+        char st = t->is_zombie ? 'Z' : (t == p ? 'R' : 'S');
+        /* 52 fields; times/sizes unknown -> 0 */
+        return snprintf(out, (size_t)cap,
+            "%u (%s) %c %u %u %u 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 "
+            "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            t->pid, comm, st, ppid, t->pgid ? t->pgid : t->pid, t->sid ? t->sid : t->pid);
+    }
+    return -1;
+}
+
+static long lx_open_proc_text(process_t *p, const char *path, long lflags) {
+    if (!lx_proc_text_path(p, path)) return -ENOENT;
+    if (lflags & LX_O_ACCMODE) return -EACCES;
+    char *buf = (char *)kalloc(PIPE_BUF_SIZE);
+    if (!buf) return -ENOMEM;
+    int n = lx_proc_gen(p, path, buf, PIPE_BUF_SIZE);
+    if (n < 0) { kfree(buf); return -ENOENT; }
+    if (n > PIPE_BUF_SIZE) n = PIPE_BUF_SIZE;
+    pipe_t *pp = pipe_create();
+    if (!pp) { kfree(buf); return -ENFILE; }
+    int w = pipe_write(pp, buf, (size_t)n);
+    kfree(buf);
+    (void)w;
+    int fd = allocate_fd(p);
+    if (fd < 0) { pipe_close_write(pp); pipe_close_read(pp); return -EMFILE; }
+    file_descriptor_t *f = &p->fds[fd];
+    memset(f, 0, sizeof(*f));
+    f->ref_count = fd_refcount_create();
+    if (!f->ref_count) { pipe_close_write(pp); pipe_close_read(pp); return -ENOMEM; }
+    f->in_use = true;
+    f->fd_type = FD_TYPE_PIPE_READ;
+    f->file_handle = pp;
+    f->vfs_fd = -1;
+    f->cloexec = (lflags & LX_O_CLOEXEC) != 0;
+    pipe_close_write(pp);          /* reader sees the text, then EOF */
+    return fd;
+}
+
 static long lx_open_special(process_t *p, const char *path, long lflags) {
     /* Synthetic devices used by musl/busybox (isatty, ash, redirects). */
-    if (kstrcmp(path, "/dev/null") == 0) {
+    if (kstrcmp(path, "/dev/null") == 0 || kstrcmp(path, "/dev/zero") == 0 ||
+        kstrcmp(path, "/dev/urandom") == 0 || kstrcmp(path, "/dev/random") == 0) {
         int fd = allocate_fd(p);
         if (fd < 0) return -EMFILE;
         p->fds[fd].fd_type = FD_TYPE_DEV_NULL;
-        p->fds[fd].file_handle = NULL;
+        p->fds[fd].file_handle = path[5] == 'z' ? LX_NULLTAG_ZERO
+                               : (path[5] == 'u' || path[5] == 'r') ? LX_NULLTAG_RANDOM : NULL;
         p->fds[fd].flags = (uint32_t)(lflags & 3);
         p->fds[fd].position = 0;
         p->fds[fd].cloexec = (lflags & LX_O_CLOEXEC) != 0;
@@ -867,6 +1079,8 @@ static long lx_open_special(process_t *p, const char *path, long lflags) {
         p->fds[fd].in_use = true;
         return fd;
     }
+    if (kstrncmp(path, "/proc/", 6) == 0)
+        return lx_open_proc_text(p, path, lflags);
     return -ENOENT; /* not special */
 }
 
@@ -1351,8 +1565,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
                                       1 | LX_O_CREAT | LX_O_TRUNC, (long)a2);
     case LX_openat:  return lx_openat(p, (long)(int)a1, (const char *)a2, (long)a3, (long)a4);
     case LX_close:
-        if (lx_fd_ok(p, (long)a1) && (long)a1 <= 2 && lx_fd_is_tty(p, (long)a1))
-            return 0;                           /* keep the console fds */
+        /* fds 0..2 are ordinary descriptors on Linux: close() must free the
+         * slot so open()/dup reuse it (ash `cmd &` -> close(0);
+         * open("/dev/null") == 0).  Old code returned 0 for tty 0..2 and
+         * sys_close refused fd < 3 with EBADF. */
         if (lx_fd_ok(p, (long)a1) && p->fds[a1].fd_type == FD_TYPE_DEV_FB) {
             p->fds[a1].in_use = false;
             p->fds[a1].fd_type = 0;
@@ -1366,7 +1582,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             p->fds[a1].fd_type = 0;
             return 0;
         }
-        return sys_close((int)a1);
+        { extern int sys_close_linux(int fd); return sys_close_linux((int)a1); }
     case LX_lseek:   return lx_lseek(p, (long)a1, (int64_t)a2, (long)a3);
     case LX_getdents64: return lx_getdents64(p, (long)a1, (void *)a2, (size_t)a3);
     case LX_ioctl:   return lx_ioctl(p, (long)a1, (unsigned long)a2, (void *)a3);
@@ -1500,14 +1716,16 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
     case LX_access:
         if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false))) return r;
-        if (lx_dev_path(path, NULL)) return 0;
+        if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
         lx_exe_alias(path, sizeof(path));
-        return lx_path_kind(path, NULL) ? 0 : -ENOENT;
+        if (!lx_path_kind(path, NULL)) return lx_synth_dir(path) ? 0 : -ENOENT;
+        return lx_access_path(path, (long)a2);
     case LX_faccessat: case LX_faccessat2:
         if ((r = lx_resolve(p, (long)(int)a1, (const char *)a2, path, sizeof(path), false))) return r;
-        if (lx_dev_path(path, NULL)) return 0;
+        if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
         lx_exe_alias(path, sizeof(path));
-        return lx_path_kind(path, NULL) ? 0 : -ENOENT;
+        if (!lx_path_kind(path, NULL)) return lx_synth_dir(path) ? 0 : -ENOENT;
+        return lx_access_path(path, (long)a3);
     case LX_readlink: case LX_readlinkat: {
         const char *up = (const char *)(nr == LX_readlink ? a1 : a2);
         long dfd = nr == LX_readlink ? LX_AT_FDCWD : (long)(int)a1;
@@ -1609,7 +1827,19 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return r < 0 ? (r == -1 ? -EIO : r) : 0;
     }
     case LX_umask:   return sys_umask((mode_t)a1);
-    case LX_chmod: case LX_fchmod: case LX_fchmodat:
+    case LX_chmod: case LX_fchmodat: {
+        const char *up = (const char *)(nr == LX_chmod ? a1 : a2);
+        long dfd = nr == LX_chmod ? LX_AT_FDCWD : (long)(int)a1;
+        uint32_t mode = (uint32_t)(nr == LX_chmod ? a2 : a3);
+        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
+        lx_exe_alias(path, sizeof(path));
+        if (!lx_path_kind(path, NULL)) return -ENOENT;
+        return lx_mode_set(path, mode);
+    }
+    case LX_fchmod:
+        if (!lx_fd_ok(p, (long)a1)) return -EBADF;
+        return 0;                               /* no path for an fd yet */
     case LX_chown: case LX_fchown: case LX_lchown: case LX_fchownat:
         return 0;                               /* accepted, not enforced */
     case LX_utimensat: {

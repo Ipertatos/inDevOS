@@ -152,63 +152,77 @@ static uint64_t exec_cpu_hwcap(void) {
  * layout is backwards compatible with the existing apps; static musl/glibc
  * binaries need envp + auxv (AT_PHDR for TLS, AT_RANDOM for the canary).
  */
+/* Write @n bytes at user VA @va of @pml4 (may span pages).  Returns 0, or
+ * -1 if a page is not mapped. */
+static int exec_ustack_write(uint64_t *pml4, uint64_t va, const void *src, size_t n) {
+    const uint8_t *s = (const uint8_t *)src;
+    while (n) {
+        uint64_t pv = va & ~0xFFFULL, po = va & 0xFFF;
+        uint64_t phys = vmm_is_mapped_in(pml4, pv);
+        if (!phys) return -1;
+        size_t chunk = PAGE_SIZE - po;
+        if (chunk > n) chunk = n;
+        memcpy((uint8_t *)phys_to_virt(phys) + po, s, chunk);
+        s += chunk; va += chunk; n -= chunk;
+    }
+    return 0;
+}
+
+/* Max bytes of argv/envp strings + pointer table placed on the new stack
+ * (the stack is USER_STACK_PAGES pages below ustack_top plus the top page). */
+#define EXEC_ABI_STR_MAX   (192 * 1024)
+#define EXEC_ABI_PTR_MAX   2048
+
 static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
                                      const char *fallback_name)
 {
-    uint64_t top_page_phys = vmm_is_mapped_in(user_pml4, ustack_top);
-    if (!top_page_phys)
+    if (!vmm_is_mapped_in(user_pml4, ustack_top))
         return ustack_top;
 
-    uint8_t *page = (uint8_t *)phys_to_virt(top_page_phys);
-    const char *args[EXEC_MAX_ARGS];
-    int argc = 0;
+    uint64_t *vals = (uint64_t *)kalloc(EXEC_ABI_PTR_MAX * 2 * sizeof(uint64_t) + 64 * 16);
+    if (!vals)
+        return ustack_top;
+    uint64_t *arg_virt = vals;
+    uint64_t *env_virt = vals + EXEC_ABI_PTR_MAX;
 
+    /* Strings grow down from the end of the top stack page. */
+    uint64_t sp = ustack_top + PAGE_SIZE;
+    uint64_t floor = sp - EXEC_ABI_STR_MAX;
+
+    /* AT_RANDOM: 16 bytes */
+    uint64_t rnd[2] = { exec_random_u64(), exec_random_u64() };
+    sp -= 16;
+    exec_ustack_write(user_pml4, sp, rnd, 16);
+    uint64_t random_va = sp;
+
+    static const char plat[] = "x86_64";
+    sp -= sizeof(plat);
+    exec_ustack_write(user_pml4, sp, plat, sizeof(plat));
+    uint64_t platform_va = sp;
+
+    /* Room kept for the pointer table is checked when it is built. */
+    int argc = 0;
+    const char *argv0 = "";
     if (exec_current_argv) {
-        for (int i = 0; i < EXEC_MAX_ARGS && exec_current_argv[i]; i++) {
-            args[i] = exec_current_argv[i];
-            argc++;
+        for (int i = 0; exec_current_argv[i] && argc < EXEC_ABI_PTR_MAX - 1; i++) {
+            const char *a = exec_current_argv[i];
+            size_t nlen = strlen(a) + 1;
+            if (sp - nlen < floor) break;
+            if (exec_ustack_write(user_pml4, sp - nlen, a, nlen) != 0) break;
+            sp -= nlen;
+            arg_virt[argc++] = sp;
+            if (i == 0) argv0 = a;
         }
     }
     if (argc == 0 && fallback_name) {
-        args[0] = fallback_name;
-        argc = 1;
+        size_t nlen = strlen(fallback_name) + 1;
+        if (exec_ustack_write(user_pml4, sp - nlen, fallback_name, nlen) == 0) {
+            sp -= nlen;
+            arg_virt[argc++] = sp;
+            argv0 = fallback_name;
+        }
     }
 
-    uint32_t str_off = PAGE_SIZE;
-
-    /* AT_RANDOM: 16 bytes */
-    str_off -= 16;
-    for (int i = 0; i < 2; i++) {
-        uint64_t r = exec_random_u64();
-        memcpy(page + str_off + i * 8, &r, 8);
-    }
-    uint64_t random_va = ustack_top + str_off;
-
-    /* AT_PLATFORM */
-    static const char plat[] = "x86_64";
-    str_off -= sizeof(plat);
-    memcpy(page + str_off, plat, sizeof(plat));
-    uint64_t platform_va = ustack_top + str_off;
-
-    /* Keep room for the pointer table: argc + argv + envp + auxv (~400 B). */
-    const uint32_t reserve = 768;
-
-    uint64_t arg_virt[EXEC_MAX_ARGS];
-    int stored_args = 0;
-    for (int i = 0; i < argc; i++) {
-        size_t nlen = strlen(args[i]) + 1;
-        if (nlen > 127) nlen = 127;
-        if (str_off < nlen + reserve)
-            break;
-        str_off -= (uint32_t)nlen;
-        memcpy(page + str_off, args[i], nlen);
-        page[str_off + nlen - 1] = '\0';
-        arg_virt[i] = ustack_top + str_off;
-        stored_args++;
-    }
-    argc = stored_args;
-
-    uint64_t env_virt[16];
     int envc = 0;
     /* exec_spawn_ex() extras (PWD, caller envp) first, then the defaults
      * whose keys the extras did not set. */
@@ -216,7 +230,7 @@ static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
         const char *const *list = pass == 0
             ? (exec_user_envp ? exec_user_envp : exec_abi_extra_env)
             : (exec_user_envp ? NULL : exec_default_envp);
-        for (int i = 0; list && list[i] && envc < 16; i++) {
+        for (int i = 0; list && list[i] && envc < EXEC_ABI_PTR_MAX - 1; i++) {
             bool dup = false;
             if (pass == 1 && exec_abi_extra_env) {
                 const char *eq = strchr(list[i], '=');
@@ -226,11 +240,10 @@ static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
             }
             if (dup) continue;
             size_t nlen = strlen(list[i]) + 1;
-            if (str_off < nlen + reserve)
-                break;
-            str_off -= (uint32_t)nlen;
-            memcpy(page + str_off, list[i], nlen);
-            env_virt[envc++] = ustack_top + str_off;
+            if (sp - nlen < floor) break;
+            if (exec_ustack_write(user_pml4, sp - nlen, list[i], nlen) != 0) break;
+            sp -= nlen;
+            env_virt[envc++] = sp;
         }
     }
 
@@ -259,27 +272,25 @@ static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
     uint32_t naux = (uint32_t)(sizeof(auxv) / sizeof(auxv[0]));
 
     uint32_t nwords = (uint32_t)(1 + argc + 1 + envc + 1 + 2 * naux);
-    uint32_t frame_bytes = nwords * 8;
-    uint32_t frame_off = (str_off - frame_bytes) & ~(uint32_t)0xF;
-    uint64_t *fp = (uint64_t *)(page + frame_off);
-    uint32_t w = 0;
-    fp[w++] = (uint64_t)argc;
-    for (int i = 0; i < argc; i++)
-        fp[w++] = arg_virt[i];
-    fp[w++] = 0;
-    for (int i = 0; i < envc; i++)
-        fp[w++] = env_virt[i];
-    fp[w++] = 0;
-    for (uint32_t i = 0; i < naux; i++) {
-        fp[w++] = auxv[i][0];
-        fp[w++] = auxv[i][1];
-    }
+    uint64_t frame = (sp - (uint64_t)nwords * 8) & ~0xFULL;
+    uint64_t w = frame;
+    uint64_t v = (uint64_t)argc;
+    int bad = exec_ustack_write(user_pml4, w, &v, 8); w += 8;
+    if (argc) bad |= exec_ustack_write(user_pml4, w, arg_virt, (size_t)argc * 8);
+    w += (uint64_t)argc * 8;
+    v = 0; bad |= exec_ustack_write(user_pml4, w, &v, 8); w += 8;
+    if (envc) bad |= exec_ustack_write(user_pml4, w, env_virt, (size_t)envc * 8);
+    w += (uint64_t)envc * 8;
+    v = 0; bad |= exec_ustack_write(user_pml4, w, &v, 8); w += 8;
+    bad |= exec_ustack_write(user_pml4, w, auxv, (size_t)naux * 16);
+    kfree(vals);
+    if (bad)
+        serial_printf("exec: ABI stack table write failed (argc=%d envc=%d)\n", argc, envc);
 
     ktrace("exec: ABI stack @ 0x%llx  argc=%d envc=%d argv0='%s' phdr=0x%llx\n",
-                  (unsigned long long)(ustack_top + frame_off),
-                  argc, envc, argc ? args[0] : "",
+                  (unsigned long long)frame, argc, envc, argv0,
                   (unsigned long long)exec_cur_aux.phdr);
-    return ustack_top + frame_off;
+    return frame;
 }
 
 /* Set by exec_notify_exit after its swapgs; lets callers like sys_exec

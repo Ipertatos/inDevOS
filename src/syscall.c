@@ -295,7 +295,10 @@ void process_set_cwd(process_t *proc, const char *path) {
 }
 
 int allocate_fd(process_t *process) {
-    for (int i = 3; i < MAX_OPEN_FILES_SYSCALL; i++) {  // Start from 3 (skip stdio)
+    /* POSIX: lowest free fd.  Linux-ABI processes may close 0..2 and expect
+     * open() to reuse them (ash `cmd &`: close(0); open("/dev/null")).
+     * Native inDevOS apps keep the old "skip stdio" behaviour. */
+    for (int i = process->linux_abi ? 0 : 3; i < MAX_OPEN_FILES_SYSCALL; i++) {
         if (!process->fds[i].in_use) {
             memset(&process->fds[i], 0, sizeof(file_descriptor_t));
             process->fds[i].in_use = true;
@@ -1505,6 +1508,23 @@ int sys_open_kpath(const char *kpath, int flags, mode_t mode) {
     /* All file access goes through the VFS; mounting a filesystem registers
      * it with the VFS (see mount_filesystem_device / vfs_fat32_register). */
     return -ENOENT;
+}
+
+/* Linux close(): fds 0..2 are ordinary descriptors (sys_close keeps the
+ * native-app rule of refusing them). */
+int sys_close_linux(int fd) {
+    process_t *proc = get_current_process();
+    if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !proc->fds[fd].in_use)
+        return -EBADF;
+    if (fd <= 2 && proc->fds[fd].fd_type == FD_TYPE_FILE &&
+        proc->fds[fd].file_handle == NULL) {
+        /* Console stdio placeholder: nothing to release. */
+        proc->fds[fd].in_use = false;
+        proc->fds[fd].fd_type = 0;
+        proc->fds[fd].cloexec = false;
+        return 0;
+    }
+    return fd_close_entry(proc, fd);
 }
 
 int sys_close(int fd) {
@@ -3149,8 +3169,81 @@ int sys_exec(const char *pathname, char *const argv[]) {
 
 /* execve with an environment: envp (user pointer, may be NULL) becomes the
  * new image's environment instead of the built-in defaults. */
-#define EXEC_ENV_MAX 15
-#define EXEC_ENV_LEN 256
+#define EXEC_ARGV_MAX 1024
+#define EXEC_ENVP_MAX 1024
+#define EXEC_ARG_BLK  (128 * 1024)   /* pointer tables + strings (Linux ARG_MAX-ish) */
+
+/* Copy one NUL-terminated user string into [dst, end); returns bytes used
+ * (incl. NUL) or -E2BIG / -EFAULT. */
+static long exec_copy_ustr(char *dst, char *end, const char *uptr) {
+    long room = (long)(end - dst);
+    for (long i = 0; i < room; i++) {
+        char c;
+        if (copy_from_user(&c, uptr + i, 1) != 0) return -EFAULT;
+        dst[i] = c;
+        if (!c) return i + 1;
+    }
+    return -E2BIG;
+}
+
+/* #! detection.  Returns 1 (interp only), 2 (interp + one arg), 0 (not a
+ * script / Lua script handled by the kernel runtime), <0 on error. */
+static int exec_shebang(const char *path, char *interp, size_t isz, char *arg, size_t asz) {
+    char head[256];
+    int fd = vfs_open(path, VFS_O_READ);
+    if (fd < 0) return 0;
+    int n = vfs_read(fd, head, sizeof(head) - 1);
+    vfs_close(fd);
+    if (n < 3 || head[0] != '#' || head[1] != '!') return 0;
+    head[n] = 0;
+    char *s = head + 2;
+    char *nl = s;
+    while (*nl && *nl != '\n') nl++;
+    *nl = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s;
+    while (*e && *e != ' ' && *e != '\t') e++;
+    if (e == s) return -ENOEXEC;
+    char save = *e; *e = 0;
+    kstrncpy(interp, s, isz);
+    if (strstr(interp, "lua")) return 0;    /* kernel Lua runtime keeps these */
+    *e = save;
+    s = e;
+    while (*s == ' ' || *s == '\t') s++;
+    e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) e--;
+    *e = 0;
+    if (!*s) { arg[0] = 0; return 1; }
+    kstrncpy(arg, s, asz);
+    return 2;
+}
+/* Linux programs exec /usr/bin/env, /bin/sed, ... which are BusyBox applets
+ * here (no symlinks on FAT32/ISO).  If such a path does not exist, run
+ * /bin/busybox.exe with argv[0] = applet name. Returns the applet name or NULL. */
+static const char *exec_busybox_applet(process_t *p, const char *resolved) {
+    static const char *const applets[] = {
+        "env", "sh", "ash", "sed", "awk", "grep", "egrep", "fgrep", "cat", "ls", "cp", "mv",
+        "rm", "rmdir", "mkdir", "test", "[", "expr", "tr", "sort", "uniq", "head", "tail",
+        "wc", "find", "xargs", "basename", "dirname", "printf", "echo", "true", "false",
+        "touch", "chmod", "ln", "uname", "date", "sleep", "cut", "tee", "diff", "cmp",
+        "install", "readlink", "realpath", "mktemp", "od", "gzip", "gunzip", "tar", "patch",
+        "md5sum", "sha256sum", "stat", "id", "whoami", "pwd", "seq", "yes", "which", "kill",
+        "ps", "du", "df", "hexdump", "xxd", "strings", "nproc", "getconf", "sync", "less", "more",
+        "vi", "unzip", "bzip2", "xz", NULL };
+    if (!p || !p->linux_abi || !resolved) return NULL;
+    const char *bn;
+    if (!kstrncmp(resolved, "/bin/", 5)) bn = resolved + 5;
+    else if (!kstrncmp(resolved, "/usr/bin/", 9)) bn = resolved + 9;
+    else if (!kstrncmp(resolved, "/sbin/", 6)) bn = resolved + 6;
+    else if (!kstrncmp(resolved, "/usr/sbin/", 10)) bn = resolved + 10;
+    else return NULL;
+    for (const char *q = bn; *q; q++) if (*q == '/') return NULL;
+    if (vfs_exists(resolved) || !vfs_exists("/bin/busybox.exe")) return NULL;
+    for (int i = 0; applets[i]; i++)
+        if (kstrcmp(bn, applets[i]) == 0) return applets[i];
+    return NULL;
+}
+
 int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]) {
     process_t *p = get_current_process();
 
@@ -3166,53 +3259,49 @@ int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]) {
     if (kpath[0] == '\0')
         return -ENOENT;
 
-    /* Close all CLOEXEC fds (Linux execve), including 0..2 if marked. */
-    for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
-        if (p->fds[i].in_use && p->fds[i].cloexec)
-            fd_close_entry(p, i);
-    }
-    char kargs[16][128];
-    char *kargv[17];
-    int argc = 0;
+    /* Copy argv and envp out of user memory into one kernel block BEFORE
+     * anything else: a CLONE_VM/vfork child's argv/envp live in the parent's
+     * (shared) address space, and the old fixed 16x128 / 15x256 tables
+     * silently truncated long recipes and make's environment. */
+    char *argblk = (char *)kalloc(EXEC_ARG_BLK);
+    if (!argblk) return -ENOMEM;
+    char **kargv = (char **)argblk;                          /* [EXEC_ARGV_MAX+1+3] */
+    const char **kenvp = (const char **)(argblk + (EXEC_ARGV_MAX + 4) * sizeof(char *));
+    char *strs = argblk + (EXEC_ARGV_MAX + 4 + EXEC_ENVP_MAX + 1) * sizeof(char *);
+    char *strs_end = argblk + EXEC_ARG_BLK;
+    int argc = 0, envc = 0;
+    long cerr = 0;
     if (argv && is_user_address((uint64_t)argv)) {
-        for (; argc < 16; argc++) {
+        for (;; argc++) {
             char *uptr = NULL;
-            if (copy_from_user(&uptr, &argv[argc], sizeof(uptr)) != 0)
-                break;
-            if (!uptr)
-                break;
-            if (!is_user_address((uint64_t)uptr))
-                break;
-            if (!strncpy_from_user(kargs[argc], uptr, sizeof(kargs[argc])))
-                break;
-            kargv[argc] = kargs[argc];
+            if (copy_from_user(&uptr, &argv[argc], sizeof(uptr)) != 0) { cerr = -EFAULT; break; }
+            if (!uptr) break;
+            if (argc >= EXEC_ARGV_MAX) { cerr = -E2BIG; break; }
+            if (!is_user_address((uint64_t)uptr)) { cerr = -EFAULT; break; }
+            long n = exec_copy_ustr(strs, strs_end, uptr);
+            if (n < 0) { cerr = n; break; }
+            kargv[argc] = strs;
+            strs += n;
         }
     }
     kargv[argc] = NULL;
-    /* Copy envp into one kernel block: pointer table + strings. */
-    char *envblk = NULL;
-    const char **kenvp = NULL;
-    if (envp && is_user_address((uint64_t)envp)) {
-        envblk = (char *)kalloc((EXEC_ENV_MAX + 1) * sizeof(char *) + EXEC_ENV_MAX * EXEC_ENV_LEN);
-        if (envblk) {
-            kenvp = (const char **)envblk;
-            char *strs = envblk + (EXEC_ENV_MAX + 1) * sizeof(char *);
-            int ne = 0;
-            for (int i = 0; ne < EXEC_ENV_MAX && i < 256; i++) {
-                char *uptr = NULL;
-                if (copy_from_user(&uptr, &envp[i], sizeof(uptr)) != 0 || !uptr)
-                    break;
-                if (!is_user_address((uint64_t)uptr))
-                    break;
-                char *dst = strs + ne * EXEC_ENV_LEN;
-                if (!strncpy_from_user(dst, uptr, EXEC_ENV_LEN))
-                    break;
-                dst[EXEC_ENV_LEN - 1] = '\0';
-                kenvp[ne++] = dst;
-            }
-            kenvp[ne] = NULL;
+    bool have_env = envp && is_user_address((uint64_t)envp);
+    if (!cerr && have_env) {
+        for (;; envc++) {
+            char *uptr = NULL;
+            if (copy_from_user(&uptr, &envp[envc], sizeof(uptr)) != 0) { cerr = -EFAULT; break; }
+            if (!uptr) break;
+            if (envc >= EXEC_ENVP_MAX) { cerr = -E2BIG; break; }
+            if (!is_user_address((uint64_t)uptr)) { cerr = -EFAULT; break; }
+            long n = exec_copy_ustr(strs, strs_end, uptr);
+            if (n < 0) { cerr = n; break; }
+            kenvp[envc] = strs;
+            strs += n;
         }
     }
+    kenvp[envc] = NULL;
+    if (cerr) { kfree(argblk); return (int)cerr; }
+    if (!have_env) kenvp = NULL;
     char resolved[256];
     exec_resolve_path(p, kpath, resolved, sizeof(resolved));
 
@@ -3224,22 +3313,80 @@ int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]) {
     if (p->is_usermode && p->pml4) {
         extern int exec_replace_env(process_t *proc, const char *filename, char *const argv[],
                                     const char *const envp[]);
+        /* #! scripts (Linux binfmt_script): argv becomes
+         * interp [optarg] <path as given> argv[1..].  Up to 4 levels. */
+        char sb_interp[128], sb_arg[128], sb_path[256];
+        for (int depth = 0; depth < 4; depth++) {
+            int sr = exec_shebang(resolved, sb_interp, sizeof(sb_interp), sb_arg, sizeof(sb_arg));
+            if (sr <= 0) break;
+            if (argc + 3 >= EXEC_ARGV_MAX + 4) { kfree(argblk); return -E2BIG; }
+            kstrncpy(sb_path, depth == 0 ? kpath : resolved, sizeof(sb_path));
+            int shift = sr == 2 ? 2 : 1;            /* interp [+ arg], path replaces argv[0] */
+            int old_argc = argc ? argc : 1;
+            if (!argc) { kargv[0] = sb_path; kargv[1] = NULL; }
+            for (int i = old_argc; i >= 1; i--)     /* incl. NULL terminator */
+                kargv[i + shift] = kargv[i];
+            /* strings for interp/arg/path must outlive this loop: carve from strs */
+            long n1 = (long)strlen(sb_interp) + 1, n2 = (long)strlen(sb_arg) + 1, n3 = (long)strlen(sb_path) + 1;
+            if (strs + n1 + n2 + n3 > strs_end) { kfree(argblk); return -E2BIG; }
+            memcpy(strs, sb_interp, n1); kargv[0] = strs; strs += n1;
+            if (shift == 2) { memcpy(strs, sb_arg, n2); kargv[1] = strs; strs += n2; }
+            memcpy(strs, sb_path, n3); kargv[shift] = strs; strs += n3;
+            argc = old_argc + shift;
+            exec_resolve_path(p, sb_interp, resolved, sizeof(resolved));
+            /* "#!/usr/bin/env prog" and "#!/usr/bin/foo": fall back to
+             * /bin/<basename> when the interpreter path does not exist. */
+            if (!vfs_exists(resolved)) {
+                const char *bn = sb_interp;
+                for (const char *q = sb_interp; *q; q++)
+                    if (*q == '/') bn = q + 1;
+                char alt[160];
+                snprintf(alt, sizeof(alt), "/bin/%s", bn);
+                exec_resolve_path(p, alt, resolved, sizeof(resolved));
+            }
+        }
+        {
+            const char *ap = exec_busybox_applet(p, resolved);
+            if (ap) {
+                kstrncpy(resolved, "/bin/busybox.exe", sizeof(resolved));
+                if (argc == 0) { kargv[1] = NULL; argc = 1; }
+                kargv[0] = (char *)ap;          /* busybox dispatches on argv[0] */
+            }
+        }
+        /* /bin/sh resolves to the native inDevOS shell (/bin/sh.exe), which
+         * is not a POSIX sh: Linux programs (make's SHELL, system(), popen(),
+         * posix_spawn, #!/bin/sh scripts) get BusyBox ash instead. */
+        if (p->linux_abi &&
+            (kstrcmp(resolved, "/bin/sh.exe") == 0 || kstrcmp(resolved, "/bin/sh") == 0 ||
+             kstrcmp(resolved, "/bin/ash") == 0 || kstrcmp(resolved, "/bin/ash.exe") == 0) &&
+            vfs_exists("/bin/busybox.exe")) {
+            kstrncpy(resolved, "/bin/busybox.exe", sizeof(resolved));
+            if (argc == 0) { kargv[0] = "sh"; kargv[1] = NULL; argc = 1; }
+        }
         int ir = exec_replace_env(p, resolved, argc ? kargv : NULL, kenvp);
-        if (envblk)
-            kfree(envblk);
+        kfree(argblk);
         if (ir < 0)
-            return ir;
+            return ir;   /* failed execve leaves fds untouched (posix_spawn error pipe) */
+        /* Success: close CLOEXEC fds now (Linux closes them only on success). */
+        for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
+            if (p->fds[i].in_use && p->fds[i].cloexec)
+                fd_close_entry(p, i);
+        }
         /* Success: do not nest. Caller rewrites the SYSCALL frame. */
         return 0;
     }
 
-    if (envblk)
-        kfree(envblk);
+    /* Nested (kernel/shell first launch) path: legacy ordering. */
+    for (int i = 0; i < MAX_OPEN_FILES_SYSCALL; i++) {
+        if (p->fds[i].in_use && p->fds[i].cloexec)
+            fd_close_entry(p, i);
+    }
     /* Kernel/shell first launch: nested blocking exec_file (unchanged). */
     bool nested_exec = get_program_running();
     if (nested_exec)
         exec_push_return_ctx();
     int ret = exec_file(resolved, argc ? kargv : NULL);
+    kfree(argblk);
     if (nested_exec)
         exec_pop_return_ctx();
 
@@ -4375,7 +4522,7 @@ int sys_fcntl(int fd, int cmd, int arg) {
             int minfd = arg;
             if (minfd < 0)
                 return -EINVAL;
-            if (minfd < 3)
+            if (minfd < 3 && !proc->linux_abi)
                 minfd = 3;
             int newfd = -1;
             for (int i = minfd; i < MAX_OPEN_FILES_SYSCALL; i++) {

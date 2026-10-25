@@ -1365,6 +1365,87 @@ static int t_pty_basic(char *d, size_t n) {
       te ? te : "-", li ? li : "-", co ? co : "-");
 }
 
+/* ===================== compat (exec/shebang/modes/stdio/proc/tmp) ===================== */
+#define CB_NARG 60
+#define CB_NENV 90
+static void cb_str(char *b, int i, int len, char tag) { int o = snprintf(b, 16, "%c%03d=", tag, i); for (int k = o; k < len; k++) b[k] = 'a' + (i + k) % 26; b[len] = 0; }
+static int cb_child(int argc, char **argv) {
+    char b[260]; int bad = 0, envs = 0;
+    if (argc != CB_NARG + 2) return 20;
+    for (int i = 0; i < CB_NARG; i++) { cb_str(b, i, 200, 'A'); if (strcmp(argv[i + 2], b)) bad++; }
+    for (int i = 0; i < CB_NENV; i++) { cb_str(b, i, 150, 'E'); char k[8]; snprintf(k, sizeof(k), "E%03d", i); const char *v = getenv(k); if (v && !strcmp(v, b + 5)) envs++; }
+    return bad ? 21 : (envs == CB_NENV ? 9 : 22);
+}
+static int t_cx_bigexec(char *d, size_t n) {
+    static char ab[CB_NARG][201], eb[CB_NENV][151];
+    char *av[CB_NARG + 3], *ev[CB_NENV + 2];
+    av[0] = (char *)self_path; av[1] = "--child-big";
+    for (int i = 0; i < CB_NARG; i++) { cb_str(ab[i], i, 200, 'A'); av[i + 2] = ab[i]; } av[CB_NARG + 2] = NULL;
+    for (int i = 0; i < CB_NENV; i++) { cb_str(eb[i], i, 150, 'E'); ev[i] = eb[i]; } ev[CB_NENV] = "PATH=/bin"; ev[CB_NENV + 1] = NULL;
+    int st; pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (!c) { execve(self_path, av, ev); _exit(127); }
+    waitpid(c, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 9, "fork+execve child status 0x%x", st);
+    c = vfork(); CHECKE(c >= 0, "vfork");
+    if (!c) { execve(self_path, av, ev); _exit(127); }
+    waitpid(c, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 9, "vfork+execve child status 0x%x", st);
+    int pf[2]; CHECKE(pipe2(pf, O_CLOEXEC) == 0, "pipe2");
+    c = fork(); CHECKE(c >= 0, "fork");
+    if (!c) { char *a2[] = { "x", NULL }; execve("/nonexistent_ostest", a2, ev); _exit(write(pf[1], "k", 1) == 1 ? 0 : 5); }
+    close(pf[1]); waitpid(c, &st, 0); close(pf[0]);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "failed execve closed CLOEXEC fd (0x%x)", st);
+    R(PASS, "%d args x200B + %d env x150B via fork/vfork execve; failed execve keeps CLOEXEC", CB_NARG, CB_NENV);
+}
+static int t_cx_shebang(char *d, size_t n) {
+    const char *body[3] = { "#!/bin/sh\necho \"SB1:$1\"\nexit 11\n", "#!/bin/sh -e\necho \"SB2:$1\"\nexit 12\n", "#!/usr/bin/env sh\necho \"SB3:$1\"\nexit 13\n" };
+    for (int i = 0; i < 3; i++) {
+        char p[200], out[256]; snprintf(p, sizeof(p), "%s/sb%d.sh", tmpdir, i);
+        CHECKE(put_file(p, body[i], strlen(body[i])) == 0, "write script"); chmod(p, 0755);
+        char *av[] = { p, "zz", NULL };
+        int r = run_capture(av, out, sizeof(out), 5000);
+        char want[16]; snprintf(want, sizeof(want), "SB%d:zz", i + 1);
+        CHECK(r == 11 + i && strstr(out, want), "script %d rc=%d out='%.60s'", i + 1, r, out);
+    }
+    R(PASS, "#!/bin/sh, #!/bin/sh -e, #!/usr/bin/env sh");
+}
+static int t_cx_modes(char *d, size_t n) {
+    char p[200]; tpath(p, sizeof(p), "modef"); CHECKE(put_file(p, "x", 1) == 0, "create");
+    struct stat st; CHECKE(chmod(p, 0751) == 0, "chmod 0751"); stat(p, &st); int m1 = st.st_mode & 07777, a1 = access(p, X_OK);
+    CHECKE(chmod(p, 0640) == 0, "chmod 0640"); stat(p, &st); int m2 = st.st_mode & 07777, a2 = access(p, X_OK);
+    CHECK(m1 == 0751 && m2 == 0640 && a1 == 0 && a2 == -1, "modes %o/%o access %d/%d", m1, m2, a1, a2);
+    CHECK(stat("/bin/busybox.exe", &st) == 0 && (st.st_mode & 0111) && access("/bin/busybox.exe", X_OK) == 0, "/bin/busybox.exe not executable (mode %o)", st.st_mode & 0777);
+    R(PASS, "chmod sticks (0751/0640), X_OK honest, /bin exec bits");
+}
+static int t_cx_close_stdio(char *d, size_t n) {
+    int st; pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (!c) { close(0); int f = open("/dev/null", O_RDONLY); int c2 = close(2); int g = open("/dev/null", O_WRONLY); int h = dup(1); _exit((f == 0 && c2 == 0 && g == 2 && h >= 3) ? 0 : 10 + (f & 7)); }
+    waitpid(c, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "child status 0x%x", st);
+    R(PASS, "close(0)/open->0, close(2)/open->2");
+}
+static int t_cx_proc(char *d, size_t n) {
+    const char *pf[3] = { "/proc/cpuinfo", "/proc/meminfo", "/proc/self/stat" }, *key[3] = { "processor", "MemTotal:", " (" };
+    char b[4096]; char res[160] = "";
+    for (int i = 0; i < 3; i++) {
+        ssize_t r = get_file(pf[i], b, sizeof(b) - 1); CHECK(r > 0, "%s: %s", pf[i], strerror(errno)); b[r] = 0;
+        CHECK(strstr(b, key[i]) != NULL, "%s lacks '%s'", pf[i], key[i]);
+        snprintf(res + strlen(res), sizeof(res) - strlen(res), "%s=%zdB ", pf[i] + 6, r);
+    }
+    CHECK(atoi(b) == getpid(), "/proc/self/stat pid %d != %d", atoi(b), getpid());
+    R(PASS, "%s", res);
+}
+static int t_cx_tmp_big(char *d, size_t n) {
+    char p[200], q[200]; snprintf(p, sizeof(p), "/tmp/ostest_big.%d", getpid()); snprintf(q, sizeof(q), "%s.r", p);
+    static uint8_t blk[65536]; int fd = open(p, O_CREAT | O_TRUNC | O_WRONLY, 0644); CHECKE(fd >= 0, "open /tmp");
+    uint32_t h1 = 2166136261u, h2 = 2166136261u;
+    for (int i = 0; i < 64; i++) { fill(blk, sizeof(blk), i); h1 = fnv(blk, sizeof(blk), h1); if (writeall(fd, blk, sizeof(blk)) != (ssize_t)sizeof(blk)) { close(fd); unlink(p); R(FAIL, "write chunk %d: %s", i, strerror(errno)); } }
+    close(fd);
+    CHECKE(rename(p, q) == 0, "rename in /tmp");
+    fd = open(q, O_RDONLY); CHECKE(fd >= 0, "reopen");
+    for (int i = 0; i < 64; i++) { if (readall(fd, blk, sizeof(blk)) != (ssize_t)sizeof(blk)) break; h2 = fnv(blk, sizeof(blk), h2); }
+    close(fd); unlink(q);
+    CHECK(h1 == h2, "4 MB /tmp readback hash mismatch");
+    R(PASS, "4 MB file in /tmp written, renamed, read back");
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -1396,6 +1477,9 @@ static const struct test tests[] = {
     { "tty", "pty_basic", t_pty_basic, 10, 0 },
     { "misc", "cwd", t_cwd, 5, 0 }, { "misc", "dup", t_dup, 5, 0 }, { "misc", "fcntl", t_fcntl, 5, 0 },
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },
+    { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
+    { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 
@@ -1478,6 +1562,7 @@ static int run_one(const struct test *t, char *detail, size_t dn, long long *ms)
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--child-big")) return cb_child(argc, argv);
     if (argc >= 2 && !strcmp(argv[1], "--child-argv")) {
         printf("argc=%d", argc); for (int i = 2; i < argc; i++) printf("|%s", argv[i]);
         const char *e = getenv("OSTEST_ENV"); printf("|env=%s\n", e ? e : "(null)"); return 7;
