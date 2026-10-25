@@ -476,7 +476,7 @@ static int fd_close_entry(process_t *proc, int fd) {
     fde->ref_count = NULL;
 
     if (should_free_object && ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) {
-        if (ty == 8 /* FD_TYPE_EVENTFD */) {
+        if (ty == 8 /* FD_TYPE_EVENTFD */ || ty == 13 /* FD_TYPE_EPOLL */) {
             if (fde->file_handle) kfree(fde->file_handle);
         } else if (ty == 10 /* FD_TYPE_DEV_INPUT */) {
             extern void evdev_release(void *handle);

@@ -151,6 +151,8 @@ enum {
     LX_newfstatat = 262, LX_unlinkat = 263, LX_renameat = 264,
     LX_readlinkat = 267, LX_fchmodat = 268, LX_faccessat = 269,
     LX_pselect6 = 270, LX_ppoll = 271, LX_set_robust_list = 273,
+    LX_epoll_create = 213, LX_epoll_wait = 232, LX_epoll_ctl = 233,
+    LX_epoll_pwait = 281, LX_epoll_create1 = 291, LX_epoll_pwait2 = 441,
     LX_get_robust_list = 274, LX_utimensat = 280, LX_dup3 = 292,
     LX_pipe2 = 293, LX_prlimit64 = 302, LX_getcpu = 309,
     LX_renameat2 = 316, LX_copy_file_range = 326, LX_getrandom = 318, LX_membarrier = 324,
@@ -322,6 +324,138 @@ static long lx_eventfd_create(process_t *p, uint64_t initval, long flags) {
     return fd;
 }
 
+/* epoll: interest list over sys_poll_kernel (level-triggered).
+ * EPOLLET is approximated as level-triggered; EPOLLONESHOT disarms the
+ * entry after it is reported (re-arm with EPOLL_CTL_MOD). Entries whose fd
+ * was closed or reused for another object are dropped silently. */
+#define FD_TYPE_EPOLL 13
+#define LX_EPOLL_MAX  64
+#define LX_EPOLLONESHOT (1u << 30)
+#define LX_EPOLLET      (1u << 31)
+typedef struct __attribute__((packed)) { uint32_t events; uint64_t data; } lx_epoll_event_t;
+typedef struct {
+    int      fd;
+    uint32_t events;
+    uint64_t data;
+    void    *key;        /* file_handle at ADD time: detects fd reuse */
+    uint8_t  type;
+    bool     armed;
+} lx_epitem_t;
+typedef struct { int n; lx_epitem_t it[LX_EPOLL_MAX]; } lx_epoll_t;
+
+static bool lx_ep_valid(process_t *p, const lx_epitem_t *e) {
+    if (e->fd < 0 || e->fd >= MAX_OPEN_FILES_SYSCALL) return false;
+    const file_descriptor_t *f = &p->fds[e->fd];
+    return f->in_use && f->file_handle == e->key && f->fd_type == e->type;
+}
+static void lx_ep_gc(process_t *p, lx_epoll_t *ep) {
+    int w = 0;
+    for (int i = 0; i < ep->n; i++)
+        if (lx_ep_valid(p, &ep->it[i])) ep->it[w++] = ep->it[i];
+    ep->n = w;
+}
+static long lx_epoll_create(process_t *p, long flags) {
+    if (flags & ~02000000L) return -EINVAL;               /* only EPOLL_CLOEXEC */
+    int fd = allocate_fd(p);
+    if (fd < 0) return -EMFILE;
+    lx_epoll_t *ep = (lx_epoll_t *)kalloc(sizeof(lx_epoll_t));
+    if (!ep) { p->fds[fd].in_use = false; return -ENOMEM; }
+    memset(ep, 0, sizeof(*ep));
+    p->fds[fd].ref_count = fd_refcount_create();
+    if (!p->fds[fd].ref_count) { kfree(ep); p->fds[fd].in_use = false; return -ENOMEM; }
+    p->fds[fd].fd_type = FD_TYPE_EPOLL;
+    p->fds[fd].file_handle = ep;
+    p->fds[fd].flags = 0;
+    p->fds[fd].position = 0;
+    p->fds[fd].cloexec = (flags & 02000000L) != 0;
+    p->fds[fd].in_use = true;
+    return fd;
+}
+static lx_epoll_t *lx_ep_get(process_t *p, long epfd, long *err) {
+    if (epfd < 0 || epfd >= MAX_OPEN_FILES_SYSCALL || !p->fds[epfd].in_use) { *err = -EBADF; return NULL; }
+    if (p->fds[epfd].fd_type != FD_TYPE_EPOLL) { *err = -EINVAL; return NULL; }
+    return (lx_epoll_t *)p->fds[epfd].file_handle;
+}
+static long lx_epoll_ctl(process_t *p, long epfd, long op, long fd, const void *uev) {
+    long err = 0;
+    lx_epoll_t *ep = lx_ep_get(p, epfd, &err);
+    if (!ep) return err;
+    if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use) return -EBADF;
+    if (fd == epfd) return -EINVAL;
+    uint8_t ty = p->fds[fd].fd_type;
+    if (ty == FD_TYPE_EPOLL) return -EINVAL;              /* nested epoll: not supported */
+    if (ty == FD_TYPE_VFS || ty == FD_TYPE_FILE || ty == FD_TYPE_VFS_DIR)
+        return -EPERM;                                    /* Linux: regular files/dirs */
+    lx_epoll_event_t ev = {0, 0};
+    if (op != 2 /* DEL */) {
+        if (!uev) return -EFAULT;
+        if (lx_get(&ev, uev, sizeof(ev))) return -EFAULT;
+    }
+    lx_ep_gc(p, ep);
+    int idx = -1;
+    for (int i = 0; i < ep->n; i++) if (ep->it[i].fd == fd) { idx = i; break; }
+    switch (op) {
+    case 1: /* EPOLL_CTL_ADD */
+        if (idx >= 0) return -EEXIST;
+        if (ep->n >= LX_EPOLL_MAX) return -ENOSPC;
+        idx = ep->n++;
+        ep->it[idx].fd = (int)fd;
+        ep->it[idx].key = p->fds[fd].file_handle;
+        ep->it[idx].type = ty;
+        /* fallthrough */
+    case 3: /* EPOLL_CTL_MOD */
+        if (idx < 0) return -ENOENT;
+        ep->it[idx].events = ev.events;
+        ep->it[idx].data = ev.data;
+        ep->it[idx].armed = true;
+        return 0;
+    case 2: /* EPOLL_CTL_DEL */
+        if (idx < 0) return -ENOENT;
+        ep->it[idx] = ep->it[--ep->n];
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, int timeout_ms) {
+    long err = 0;
+    lx_epoll_t *ep = lx_ep_get(p, epfd, &err);
+    if (!ep) return err;
+    if (maxevents <= 0 || maxevents > 0x7fffffff / (long)sizeof(lx_epoll_event_t)) return -EINVAL;
+    if (!uevs) return -EFAULT;
+    lx_ep_gc(p, ep);
+    pollfd_t pf[LX_EPOLL_MAX];
+    int map[LX_EPOLL_MAX];
+    int np = 0;
+    for (int i = 0; i < ep->n; i++) {
+        if (!ep->it[i].armed) continue;
+        pf[np].fd = ep->it[i].fd;
+        /* poll bit values match EPOLLIN/PRI/OUT/ERR/HUP/RDNORM/WRNORM/RDHUP */
+        pf[np].events = (short)(ep->it[i].events & 0x23ff);
+        pf[np].revents = 0;
+        map[np++] = i;
+    }
+    if (np == 0) {                    /* nothing to watch: sleep (fd -1 is ignored) */
+        pf[0].fd = -1; pf[0].events = 0; pf[0].revents = 0;
+        long r = sys_poll_kernel(pf, 1, timeout_ms);
+        return r < 0 ? r : 0;
+    }
+    long r = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
+    if (r <= 0) return r;
+    long out = 0;
+    for (int j = 0; j < np && out < maxevents; j++) {
+        /* ERR/HUP are always reported, like poll */
+        uint32_t rev = (uint16_t)pf[j].revents &
+                       ((ep->it[map[j]].events & 0x23ff) | 0x18);
+        if (!rev) continue;
+        lx_epoll_event_t e = { rev, ep->it[map[j]].data };
+        if (lx_put((char *)uevs + out * sizeof(e), &e, sizeof(e))) return out ? out : -EFAULT;
+        if (ep->it[map[j]].events & LX_EPOLLONESHOT) ep->it[map[j]].armed = false;
+        out++;
+    }
+    return out;
+}
+
 static long lx_eventfd_rw(process_t *p, long fd, void *ubuf, size_t len, bool wr) {
     if (len < 8) return -EINVAL;
     volatile uint64_t *ctr = (volatile uint64_t *)p->fds[fd].file_handle;
@@ -378,6 +512,7 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
         return lx_read_tty(p, fd, ubuf, count);
     if (ty == FD_TYPE_SOCKET)
         return lx_sock_recv((int)fd, ubuf, count, 0);
+    if (ty == FD_TYPE_EPOLL) return -EINVAL;
     if (ty == FD_TYPE_EVENTFD)
         return lx_eventfd_rw(p, fd, ubuf, count, false);
     return (long)sys_read((int)fd, ubuf, count);
@@ -862,6 +997,7 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
         return -EINVAL;
     if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
         return lx_sock_send((int)fd, ubuf, len, 0);
+    if (p->fds[fd].fd_type == FD_TYPE_EPOLL) return -EINVAL;
     if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
         return lx_eventfd_rw(p, fd, (void *)ubuf, len, true);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_TTY) {
@@ -2821,6 +2957,22 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return ux_socketpair(p, (long)a2, (int *)a4);
     case LX_eventfd:     return lx_eventfd_create(p, (uint32_t)a1, 0);
     case LX_eventfd2:    return lx_eventfd_create(p, (uint32_t)a1, (long)a2);
+    case LX_epoll_create:  return (long)(int)a1 <= 0 ? -EINVAL : lx_epoll_create(p, 0);
+    case LX_epoll_create1: return lx_epoll_create(p, (long)(int)a1);
+    case LX_epoll_ctl:     return lx_epoll_ctl(p, (long)(int)a1, (long)(int)a2, (long)(int)a3, (const void *)a4);
+    case LX_epoll_wait:
+    case LX_epoll_pwait:   /* sigmask ignored, as for ppoll/pselect6 */
+        return lx_epoll_wait(p, (long)(int)a1, (void *)a2, (long)(int)a3, (int)a4);
+    case LX_epoll_pwait2: {
+        int ms = -1;
+        if (a4) {
+            lx_timespec_t ts;
+            if (lx_get(&ts, (void *)a4, sizeof(ts))) return -EFAULT;
+            if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
+            ms = (int)(ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000);
+        }
+        return lx_epoll_wait(p, (long)(int)a1, (void *)a2, (long)(int)a3, ms);
+    }
 
     case LX_getrandom: {
         size_t n = (size_t)a2;

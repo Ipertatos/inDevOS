@@ -50,26 +50,35 @@ static uint8_t *shmf_page(uint64_t *pml4, uint64_t va, bool need_dirty) {
     return (uint8_t *)phys_to_virt(*pte & PTE_ADDR_MASK);
 }
 
-/* write record pages [a, b) (record VAs) back; caller holds the lock */
+/* write record pages [a, b) (record VAs) back; caller holds the lock.
+ * The file size comes from vfs_stat() or, for filesystems without a stat op
+ * (FAT32), from seeking the write handle to the end: vfs_stat() returned
+ * -ENOSYS on FAT32 and the flush silently wrote nothing. */
 static void shmf_flush(shmf_rec_t *r, uint64_t a, uint64_t b, bool dirty_only) {
     if (a < r->va) a = r->va;
     if (b > r->va + r->len) b = r->va + r->len;
     if (a >= b || !r->writable) return;
-    vfs_stat_t st;
-    if (vfs_stat(r->path, &st) != 0) return;
-    uint64_t fend = st.size;
     int fd = -1;
+    uint64_t fend = 0;
     for (uint64_t p = a & ~0xFFFull; p < b; p += 0x1000) {
-        uint64_t s = p < a ? a : p, e = p + 0x1000 > b ? b : p + 0x1000;
-        uint64_t fo = r->foff + (s - r->va);
-        if (fo >= fend) break;
-        if (fo + (e - s) > fend) e = s + (fend - fo);
         uint8_t *pg = shmf_page(r->pml4, p, dirty_only);
         if (!pg) continue;
         if (fd < 0) {
             fd = vfs_open(r->path, VFS_O_READ | VFS_O_WRITE);
             if (fd < 0) return;
+            vfs_stat_t st;
+            if (vfs_stat(r->path, &st) == 0) {
+                fend = st.size;
+            } else {
+                int e = vfs_seek(fd, 0, VFS_SEEK_END);
+                if (e < 0) break;
+                fend = (uint64_t)(uint32_t)e;
+            }
         }
+        uint64_t s = p < a ? a : p, e = p + 0x1000 > b ? b : p + 0x1000;
+        uint64_t fo = r->foff + (s - r->va);
+        if (fo >= fend) break;
+        if (fo + (e - s) > fend) e = s + (fend - fo);
         if (vfs_seek(fd, (int32_t)fo, VFS_SEEK_SET) < 0) break;
         vfs_write(fd, pg + (s & 0xFFF), (uint32_t)(e - s));
     }

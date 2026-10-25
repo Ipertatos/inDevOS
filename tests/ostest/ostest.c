@@ -44,6 +44,7 @@
 #include <sys/resource.h>
 #include <sys/file.h>
 #include <sys/uio.h>
+#include <sys/epoll.h>
 #include <sched.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1463,6 +1464,135 @@ static int t_eventfd(char *d, size_t n) {
     close(e); R(PASS, "counter 5+2=7");
 }
 
+/* ===================== epoll ===================== */
+/* epoll.pipe: level-triggered EPOLLIN/EPOLLOUT on a pipe, data passthrough,
+ * timeout, wakeup by a forked writer, EPOLLHUP when the writer goes away. */
+static int t_ep_pipe(char *d, size_t n) {
+    int ep = epoll_create1(EPOLL_CLOEXEC); if (ep < 0) R(SKIP, "epoll_create1: %s", strerror(errno));
+    CHECK(fcntl(ep, F_GETFD) & FD_CLOEXEC, "EPOLL_CLOEXEC not set");
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    struct epoll_event ev = { .events = EPOLLIN, .data.u64 = 0x1122334455667788ULL }, out[4];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) == 0, "ctl ADD read end");
+    long long t0 = mono_ms(); int r = epoll_wait(ep, out, 4, 200); long long el = mono_ms() - t0;
+    CHECK(r == 0 && el >= 150 && el < 1000, "empty wait r=%d %lldms", r, el);
+    write(pf[1], "x", 1);
+    r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 1 && (out[0].events & EPOLLIN) && out[0].data.u64 == 0x1122334455667788ULL,
+          "readable r=%d ev=0x%x data=%llx", r, r > 0 ? out[0].events : 0, r > 0 ? (unsigned long long)out[0].data.u64 : 0ULL);
+    r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 1, "level-triggered: second wait r=%d", r);
+    char c; read(pf[0], &c, 1);
+    CHECK(epoll_wait(ep, out, 4, 0) == 0, "still ready after drain");
+    struct epoll_event wv = { .events = EPOLLOUT, .data.fd = pf[1] };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[1], &wv) == 0, "ctl ADD write end");
+    r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 1 && out[0].data.fd == pf[1] && (out[0].events & EPOLLOUT), "EPOLLOUT r=%d", r);
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_DEL, pf[1], NULL) == 0, "ctl DEL");
+    pid_t k = fork(); if (k == 0) { msleep(100); write(pf[1], "y", 1); _exit(0); }
+    t0 = mono_ms(); r = epoll_wait(ep, out, 4, 2000); long long el2 = mono_ms() - t0; waitpid(k, NULL, 0);
+    CHECK(r == 1 && (out[0].events & EPOLLIN) && el2 >= 50 && el2 < 1500, "wakeup r=%d after %lldms", r, el2);
+    read(pf[0], &c, 1);
+    close(pf[1]);
+    r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 1 && (out[0].events & EPOLLHUP), "no EPOLLHUP after writer close r=%d ev=0x%x", r, r > 0 ? out[0].events : 0);
+    close(pf[0]); close(ep);
+    R(PASS, "timeout %lldms, LT IN/OUT, wakeup %lldms, HUP", el, el2);
+}
+/* epoll.unix_socket: socketpair readiness, EPOLLONESHOT + MOD re-arm,
+ * EPOLLRDHUP/HUP after peer close, maxevents limit. */
+static int t_ep_sock(char *d, size_t n) {
+    int ep = epoll_create(4); if (ep < 0) R(SKIP, "epoll_create: %s", strerror(errno));
+    int sv[2]; CHECKE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLONESHOT, .data.u32 = 7 }, out[4];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, sv[1], &ev) == 0, "ctl ADD");
+    CHECK(epoll_wait(ep, out, 4, 0) == 0, "ready before data");
+    write(sv[0], "hi", 2);
+    int r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 1 && out[0].data.u32 == 7 && (out[0].events & EPOLLIN), "data ready r=%d", r);
+    CHECK(epoll_wait(ep, out, 4, 0) == 0, "ONESHOT reported twice");
+    ev.events = EPOLLIN | EPOLLRDHUP; ev.data.u32 = 8;
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_MOD, sv[1], &ev) == 0, "ctl MOD re-arm");
+    r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 1 && out[0].data.u32 == 8, "re-armed r=%d", r);
+    char b[4]; CHECK(read(sv[1], b, 2) == 2 && !memcmp(b, "hi", 2), "socket data");
+    struct epoll_event ov = { .events = EPOLLOUT, .data.u32 = 9 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &ov) == 0, "ctl ADD peer");
+    write(sv[0], "z", 1);                       /* both entries ready now */
+    r = epoll_wait(ep, out, 1, 0);
+    CHECK(r == 1, "maxevents=1 returned %d", r);
+    r = epoll_wait(ep, out, 4, 0);
+    CHECK(r == 2, "two ready entries, got %d", r);
+    read(sv[1], b, 1);
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_DEL, sv[0], NULL) == 0, "ctl DEL peer");
+    close(sv[0]);
+    r = epoll_wait(ep, out, 4, 500);
+    CHECK(r == 1 && (out[0].events & (EPOLLRDHUP | EPOLLHUP | EPOLLIN)), "peer close r=%d ev=0x%x", r, r > 0 ? out[0].events : 0);
+    unsigned hev = out[0].events;
+    close(sv[1]); close(ep);
+    R(PASS, "readiness, ONESHOT/MOD, maxevents, close ev=0x%x", hev);
+}
+/* epoll.ctl_errors: errno contract + stale-fd cleanup + epoll_pwait/eventfd. */
+static int t_ep_ctl(char *d, size_t n) {
+    int ep = epoll_create1(0); if (ep < 0) R(SKIP, "epoll_create1: %s", strerror(errno));
+    struct epoll_event ev = { .events = EPOLLIN }, out[2];
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    errno = 0; CHECK(epoll_create1(12345) < 0 && errno == EINVAL, "create1(bad flags) errno %d", errno);
+    errno = 0; CHECK(epoll_create(0) < 0 && errno == EINVAL, "create(0) errno %d", errno);
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) == 0, "ADD");
+    errno = 0; CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) < 0 && errno == EEXIST, "dup ADD errno %d", errno);
+    errno = 0; CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, pf[1], &ev) < 0 && errno == ENOENT, "MOD missing errno %d", errno);
+    errno = 0; CHECK(epoll_ctl(ep, EPOLL_CTL_DEL, pf[1], NULL) < 0 && errno == ENOENT, "DEL missing errno %d", errno);
+    errno = 0; CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, 999, &ev) < 0 && errno == EBADF, "bad fd errno %d", errno);
+    errno = 0; CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, ep, &ev) < 0 && errno == EINVAL, "self ADD errno %d", errno);
+    errno = 0; CHECK(epoll_ctl(pf[0], EPOLL_CTL_ADD, pf[1], &ev) < 0 && errno == EINVAL, "non-epoll epfd errno %d", errno);
+    errno = 0; CHECK(epoll_wait(ep, out, 0, 0) < 0 && errno == EINVAL, "maxevents 0 errno %d", errno);
+    errno = 0; CHECK(read(ep, out, 1) < 0 && errno == EINVAL, "read(epfd) errno %d", errno);
+    char fp[256]; tpath(fp, sizeof(fp), "ep_reg.txt");
+    int rf = open(fp, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (rf >= 0) {
+        errno = 0; int er = epoll_ctl(ep, EPOLL_CTL_ADD, rf, &ev) < 0 ? errno : 0;
+        close(rf); unlink(fp);
+        CHECK(er == EPERM, "regular file ADD errno %d (want EPERM)", er);
+    }
+    /* closed fds drop out of the interest set */
+    write(pf[1], "x", 1);
+    CHECK(epoll_wait(ep, out, 2, 0) == 1, "ready before close");
+    close(pf[0]);
+    CHECK(epoll_wait(ep, out, 2, 0) == 0, "closed fd still reported");
+    close(pf[1]);
+    /* eventfd + epoll_pwait with an empty mask */
+    extern int eventfd(unsigned int, int);
+    int e = eventfd(0, 0);
+    if (e >= 0) {
+        struct epoll_event ee = { .events = EPOLLIN, .data.fd = e };
+        CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, e, &ee) == 0, "ADD eventfd");
+        sigset_t m; sigemptyset(&m);
+        CHECK(epoll_pwait(ep, out, 2, 0, &m) == 0, "eventfd ready at 0");
+        uint64_t v = 3; write(e, &v, 8);
+        int r = epoll_pwait(ep, out, 2, 100, &m);
+        CHECK(r == 1 && out[0].data.fd == e, "eventfd pwait r=%d", r);
+        close(e);
+    }
+    /* empty set: plain timeout */
+    long long t0 = mono_ms(); int r = epoll_wait(ep, out, 2, 150); long long el = mono_ms() - t0;
+    CHECK(r == 0 && el >= 100 && el < 1000, "empty set wait r=%d %lldms", r, el);
+    close(ep);
+    R(PASS, "EINVAL/EEXIST/ENOENT/EBADF/EPERM, stale fd, pwait+eventfd, empty %lldms", el);
+}
+/* epoll.tty: terminal fds can be added; stdout reports EPOLLOUT. */
+static int t_ep_tty(char *d, size_t n) {
+    int fd = isatty(1) ? 1 : isatty(0) ? 0 : -1;
+    if (fd < 0) R(SKIP, "no tty on stdin/stdout");
+    int ep = epoll_create1(0); if (ep < 0) R(SKIP, "epoll_create1: %s", strerror(errno));
+    struct epoll_event ev = { .events = fd == 1 ? EPOLLOUT : EPOLLIN, .data.fd = fd }, out[2];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) == 0, "ADD tty");
+    int r = epoll_wait(ep, out, 2, 0);
+    if (fd == 1) CHECK(r == 1 && (out[0].events & EPOLLOUT), "tty EPOLLOUT r=%d", r);
+    else CHECK(r >= 0, "tty wait r=%d %s", r, strerror(errno));
+    close(ep);
+    R(PASS, "tty fd %d added, wait r=%d", fd, r);
+}
+
 /* ===================== registry ===================== */
 /* tty.pty_basic: stdin of the desktop terminal is a pty-like device:
  * isatty, raw-mode termios round-trip, TIOCGWINSZ/TIOCSWINSZ round-trip. */
@@ -1696,6 +1826,8 @@ static const struct test tests[] = {
     { "tty", "pty_basic", t_pty_basic, 10, 0 },
     { "misc", "cwd", t_cwd, 5, 0 }, { "misc", "dup", t_dup, 5, 0 }, { "misc", "fcntl", t_fcntl, 5, 0 },
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },
+    { "epoll", "pipe", t_ep_pipe, 15, 0 }, { "epoll", "unix_socket", t_ep_sock, 10, 0 },
+    { "epoll", "ctl_errors", t_ep_ctl, 10, 0 }, { "epoll", "tty", t_ep_tty, 5, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
     { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
