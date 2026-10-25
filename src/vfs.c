@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "inotify.h"
 #include "kprof.h"
 #include "string.h"
 #include "utils.h"
@@ -179,6 +180,33 @@ vfs_filesystem_t* vfs_find_mount(const char *path, const char **rel_path_out) {
 
 // ---- File operations --------------------------------------------------------
 
+/* Read-only medium (boot CD): modifications fail with -EROFS like Linux,
+ * instead of reaching the filesystem and failing as ENOENT/EIO. */
+static bool vfs_fs_ro(vfs_filesystem_t *fs) {
+    return fs && fs->ops && fs->ops->read_only && fs->ops->read_only(fs);
+}
+static bool vfs_fs_has(vfs_filesystem_t *fs, const char *rel) {
+    return fs->ops->exists && fs->ops->exists(fs, rel ? rel : "");
+}
+
+/* inotify: events are queued after the operation succeeded, outside the
+ * VFS lock.  Directory-ness is looked up (under the lock) only while an
+ * inotify instance exists. */
+static bool vfs_isdir_locked(vfs_filesystem_t *fs, const char *rel) {
+    if (!inotify_active || !fs || !fs->ops || !fs->ops->stat) return false;
+    vfs_stat_t st;
+    memset(&st, 0, sizeof(st));
+    return fs->ops->stat(fs, rel ? rel : "", &st) == 0 && (st.mode & 0170000) == 0040000;
+}
+static void vfs_ino_fd(int fd, char *buf) {
+    buf[0] = '\0';
+    if (!inotify_active) return;
+    size_t n = strlen(open_files[fd].path);
+    if (n >= VFS_MAX_PATH) n = VFS_MAX_PATH - 1;
+    memcpy(buf, open_files[fd].path, n);
+    buf[n] = '\0';
+}
+
 int vfs_open(const char *path, uint32_t flags) {
     VFS_LOCK();
     const char *rel = NULL;
@@ -186,6 +214,11 @@ int vfs_open(const char *path, uint32_t flags) {
     if (!fs || !fs->ops || !fs->ops->open) {
         printf("vfs: No filesystem for '%s'\n", path);
         VFS_UNLOCK(); return -ENODEV;
+    }
+
+    if ((flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND)) && vfs_fs_ro(fs)) {
+        int e = (!(flags & VFS_O_CREATE) && !vfs_fs_has(fs, rel)) ? -ENOENT : -EROFS;
+        VFS_UNLOCK(); return e;
     }
 
     // Find free file descriptor
@@ -203,12 +236,15 @@ int vfs_open(const char *path, uint32_t flags) {
 
     // Auto-create if O_CREATE and the fs supports it
     uint32_t open_flags = flags;
+    bool created = false;
     if ((flags & VFS_O_CREATE) && fs->ops->create) {
         if (!fs->ops->exists || !fs->ops->exists(fs, rel)) {
             /* A file created just now is empty: O_TRUNC has nothing to do,
              * and on FAT32 it cost another lookup and a directory write. */
-            if (fs->ops->create(fs, rel) == 0 && fs->ops->exists)
+            if (fs->ops->create(fs, rel) == 0 && fs->ops->exists) {
                 open_flags &= ~VFS_O_TRUNC;
+                created = true;
+            }
         }
     }
 
@@ -225,14 +261,30 @@ int vfs_open(const char *path, uint32_t flags) {
     if (plen >= VFS_MAX_PATH) plen = VFS_MAX_PATH - 1;
     memmove(open_files[fd].path, path, plen);
     open_files[fd].path[plen] = '\0';
+    bool isdir = vfs_isdir_locked(fs, rel);
 
-    VFS_UNLOCK(); return fd;
+    VFS_UNLOCK();
+    if (inotify_active) {
+        if (created) inotify_vfs_event(path, IN_CREATE);
+        inotify_vfs_event(path, IN_OPEN | (isdir ? IN_ISDIR : 0));
+        if ((flags & VFS_O_TRUNC) && !created) inotify_vfs_event(path, IN_MODIFY);
+    }
+    return fd;
 }
 
 int vfs_close(int fd) {
     VFS_LOCK();
+    char ip[VFS_MAX_PATH];
+    uint32_t cm = 0;
+    if (fd >= 0 && fd < VFS_MAX_OPEN_FILES && open_files[fd].in_use) {
+        vfs_ino_fd(fd, ip);
+        cm = (open_files[fd].flags & (VFS_O_WRITE | VFS_O_APPEND | VFS_O_TRUNC | VFS_O_CREATE))
+             ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE;
+    } else ip[0] = '\0';
     int ret = vfs_close_locked(fd);
-    VFS_UNLOCK(); return ret;
+    VFS_UNLOCK();
+    if (ip[0]) inotify_vfs_event(ip, cm);
+    return ret;
 }
 
 int vfs_read(int fd, void *buffer, uint32_t size) {
@@ -242,7 +294,11 @@ int vfs_read(int fd, void *buffer, uint32_t size) {
     vfs_file_t *vf = &open_files[fd];
     if (!vf->fs || !vf->fs->ops || !vf->fs->ops->read) { VFS_UNLOCK(); return -EINVAL; }
     int ret = vf->fs->ops->read(vf->fs, vf->fs_handle, buffer, size);
-    VFS_UNLOCK(); return ret;
+    char ip[VFS_MAX_PATH];
+    if (ret > 0) vfs_ino_fd(fd, ip); else ip[0] = '\0';
+    VFS_UNLOCK();
+    if (ip[0]) inotify_vfs_event(ip, IN_ACCESS);
+    return ret;
 }
 
 int vfs_write(int fd, const void *buffer, uint32_t size) {
@@ -253,7 +309,11 @@ int vfs_write(int fd, const void *buffer, uint32_t size) {
     if (!(vf->flags & VFS_O_WRITE)) { VFS_UNLOCK(); return -EBADF; }  // not opened for writing
     if (!vf->fs || !vf->fs->ops || !vf->fs->ops->write) { VFS_UNLOCK(); return -EINVAL; }
     int ret = vf->fs->ops->write(vf->fs, vf->fs_handle, buffer, size);
-    VFS_UNLOCK(); return ret;
+    char ip[VFS_MAX_PATH];
+    if (ret > 0) vfs_ino_fd(fd, ip); else ip[0] = '\0';
+    VFS_UNLOCK();
+    if (ip[0]) inotify_vfs_event(ip, IN_MODIFY);
+    return ret;
 }
 
 int vfs_seek(int fd, int32_t offset, int whence) {
@@ -417,8 +477,12 @@ int vfs_create(const char *path) {
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     if (!fs || !fs->ops || !fs->ops->create) { VFS_UNLOCK(); return -ENODEV; }
+    if (vfs_fs_ro(fs)) { VFS_UNLOCK(); return -EROFS; }
+    bool had = inotify_active && vfs_fs_has(fs, rel);
     int ret = fs->ops->create(fs, rel);
-    VFS_UNLOCK(); return ret;
+    VFS_UNLOCK();
+    if (ret == 0 && !had) inotify_vfs_event(path, IN_CREATE);
+    return ret;
 }
 
 int vfs_mkdir(const char *path) {
@@ -426,8 +490,12 @@ int vfs_mkdir(const char *path) {
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     if (!fs || !fs->ops || !fs->ops->mkdir) { VFS_UNLOCK(); return -ENODEV; }
+    if (vfs_fs_ro(fs)) { int e = vfs_fs_has(fs, rel) ? -EEXIST : -EROFS; VFS_UNLOCK(); return e; }
+    bool had = inotify_active && vfs_fs_has(fs, rel);
     int ret = fs->ops->mkdir(fs, rel);
-    VFS_UNLOCK(); return ret;
+    VFS_UNLOCK();
+    if (ret == 0 && !had) inotify_vfs_event(path, IN_CREATE | IN_ISDIR);
+    return ret;
 }
 
 int vfs_mkdir_p(const char *path) {
@@ -539,8 +607,12 @@ int vfs_unlink(const char *path) {
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     if (!fs || !fs->ops || !fs->ops->unlink) { VFS_UNLOCK(); return -ENODEV; }
+    if (vfs_fs_ro(fs)) { int e = vfs_fs_has(fs, rel) ? -EROFS : -ENOENT; VFS_UNLOCK(); return e; }
+    bool isdir = vfs_isdir_locked(fs, rel);
     int ret = fs->ops->unlink(fs, rel);
-    VFS_UNLOCK(); return ret;
+    VFS_UNLOCK();
+    if (ret == 0) inotify_vfs_event(path, IN_DELETE | (isdir ? IN_ISDIR : 0));
+    return ret;
 }
 
 int vfs_exists(const char *path) {
@@ -575,22 +647,27 @@ int vfs_fd_get_path(int fd, char *buf, size_t buflen) {
 int vfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || !newpath) return -EINVAL;
     if (!vfs_has_root_mount()) return -ENODEV;
+    bool isdir = false;
     {
         VFS_LOCK();
         const char *r1 = NULL, *r2 = NULL;
         vfs_filesystem_t *f1 = vfs_find_mount(oldpath, &r1);
         vfs_filesystem_t *f2 = vfs_find_mount(newpath, &r2);
         if (f1 != f2) { VFS_UNLOCK(); return -EXDEV; }   /* mv falls back to copy */
+        if (vfs_fs_ro(f1)) { int e = vfs_fs_has(f1, r1) ? -EROFS : -ENOENT; VFS_UNLOCK(); return e; }
+        isdir = vfs_isdir_locked(f1, r1);
         if (f1 && f1->ops && f1->ops->rename) {
             int rr = f1->ops->rename(f1, r1, r2);
-            VFS_UNLOCK(); return rr;
+            VFS_UNLOCK();
+            if (rr == 0) inotify_vfs_rename(oldpath, newpath, isdir);
+            return rr;
         }
         VFS_UNLOCK();
     }
     /* Same-filesystem rename only for now (single FAT32 root mount). */
     extern int fat32_rename(const char *oldpath, const char *newpath);
     int r = fat32_rename(oldpath, newpath);
-    if (r == 0) return 0;
+    if (r == 0) { inotify_vfs_rename(oldpath, newpath, isdir); return 0; }
     if (r == -ENOENT || r == -ENOTEMPTY || r == -EIO || r == -EINVAL)
         return r;
     return r < 0 ? r : -EIO;
@@ -601,10 +678,18 @@ int vfs_rmdir(const char *path) {
     VFS_LOCK();
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
-    if (fs && fs->ops && fs->ops->rmdir) { int r = fs->ops->rmdir(fs, rel); VFS_UNLOCK(); return r; }
+    if (vfs_fs_ro(fs)) { int e = vfs_fs_has(fs, rel) ? -EROFS : -ENOENT; VFS_UNLOCK(); return e; }
+    if (fs && fs->ops && fs->ops->rmdir) {
+        int r = fs->ops->rmdir(fs, rel);
+        VFS_UNLOCK();
+        if (r == 0) inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
+        return r;
+    }
     VFS_UNLOCK();
     extern int fat32_remove_empty_directory(const char *path);
-    return fat32_remove_empty_directory(path);               /* FAT32: unchanged */
+    int fr = fat32_remove_empty_directory(path);             /* FAT32: unchanged */
+    if (fr == 0) inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
+    return fr;
 }
 
 int vfs_stat(const char *path, vfs_stat_t *st) {
@@ -623,11 +708,18 @@ int vfs_truncate(const char *path, uint64_t len) {
     VFS_LOCK();
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
-    if (fs && fs->ops && fs->ops->truncate) { int r = fs->ops->truncate(fs, rel, len); VFS_UNLOCK(); return r; }
+    if (vfs_fs_ro(fs)) { VFS_UNLOCK(); return -EROFS; }
+    if (fs && fs->ops && fs->ops->truncate) {
+        int r = fs->ops->truncate(fs, rel, len);
+        VFS_UNLOCK();
+        if (r == 0) inotify_vfs_event(path, IN_MODIFY);
+        return r;
+    }
     VFS_UNLOCK();
     extern int fat32_truncate_to(const char *path, uint32_t len);
     if (len > 0xFFFFFFFFull) return -EINVAL;                 /* FAT32 4 GiB limit */
     int fr = fat32_truncate_to(path, (uint32_t)len);
+    if (fr == 0) inotify_vfs_event(path, IN_MODIFY);
     return fr == 0 ? 0 : (fr < -1 ? fr : -EIO);
 }
 
@@ -642,7 +734,11 @@ int vfs_ftruncate(int fd, uint64_t len) {
         r = vf->fs->ops->ftruncate(vf->fs, vf->fs_handle, len);
     else if (vf->fs && vf->fs->ops == vfs_fat32_get_ops())  /* FAT32 */
         r = len > 0xFFFFFFFFull ? -EINVAL : fat32_truncate_handle_v(vf->fs_handle, (uint32_t)len);
-    VFS_UNLOCK(); return r;
+    char ip[VFS_MAX_PATH];
+    if (r == 0) vfs_ino_fd(fd, ip); else ip[0] = '\0';
+    VFS_UNLOCK();
+    if (ip[0]) inotify_vfs_event(ip, IN_MODIFY);
+    return r;
 }
 
 int vfs_sync_all(void) {

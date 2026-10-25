@@ -45,6 +45,8 @@
 #include <sys/file.h>
 #include <sys/uio.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/timerfd.h>
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
@@ -1853,6 +1855,203 @@ static int t_ep_edge(char *d, size_t n) {
     R(PASS, "single edge, no repeat (%lldms), new-data edge, writer edge %lldms", el, el2);
 }
 
+/* epoll.edge_strict: EPOLLET semantics verified against Linux: a partial read
+ * makes no new EPOLLIN edge, new data does; EPOLLOUT edges when a full pipe
+ * gains room; eventfd and socketpair edges; EPOLLET|EPOLLONESHOT re-arm. */
+static int ep_n(int ep, struct epoll_event *o, int m) { return epoll_wait(ep, o, m, 0); }
+static int t_ep_edge2(char *d, size_t n) {
+    int ep = epoll_create1(0); if (ep < 0) R(SKIP, "epoll_create1: %s", strerror(errno));
+    struct epoll_event o[4]; char b[256]; int r;
+    /* pipe read end */
+    int pf[2]; CHECKE(pipe2(pf, O_NONBLOCK) == 0, "pipe2");
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.u32 = 1 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) == 0, "ADD pipe ET");
+    CHECK(ep_n(ep, o, 4) == 0, "pipe: ready when empty");
+    CHECK(write(pf[1], "0123456789", 10) == 10, "write");
+    r = ep_n(ep, o, 4); CHECK(r == 1 && o[0].events == EPOLLIN, "pipe: first edge r=%d ev=0x%x", r, r > 0 ? o[0].events : 0);
+    CHECK(ep_n(ep, o, 4) == 0, "pipe: repeated edge");
+    CHECK(read(pf[0], b, 4) == 4, "partial read");
+    r = ep_n(ep, o, 4); CHECK(r == 0, "pipe: edge after partial read (r=%d)", r);
+    CHECK(write(pf[1], "x", 1) == 1, "write2");
+    r = ep_n(ep, o, 4); CHECK(r == 1, "pipe: no edge for new data while readable (r=%d)", r);
+    CHECK(ep_n(ep, o, 4) == 0, "pipe: repeated edge 2");
+    CHECK(read(pf[0], b, sizeof(b)) == 7, "drain");
+    CHECK(read(pf[0], b, 1) < 0 && errno == EAGAIN, "EAGAIN after drain");
+    CHECK(ep_n(ep, o, 4) == 0, "pipe: ready after drain");
+    CHECK(write(pf[1], "y", 1) == 1, "refill");
+    CHECK(ep_n(ep, o, 4) == 1, "pipe: no edge after refill");
+    read(pf[0], b, sizeof(b));
+    /* pipe write end: EPOLLOUT edges */
+    struct epoll_event wv = { .events = EPOLLOUT | EPOLLET, .data.u32 = 2 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_DEL, pf[0], NULL) == 0, "DEL pipe");
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[1], &wv) == 0, "ADD wr ET");
+    r = ep_n(ep, o, 4); CHECK(r == 1 && o[0].events == EPOLLOUT, "wr: initial OUT r=%d ev=0x%x", r, r > 0 ? o[0].events : 0);
+    CHECK(ep_n(ep, o, 4) == 0, "wr: repeated OUT");
+    long tot = 0; for (;;) { long w = write(pf[1], b, sizeof(b)); if (w <= 0) break; tot += w; }
+    CHECK(errno == EAGAIN && tot > 0, "fill pipe (tot=%ld errno=%d)", tot, errno);
+    CHECK(ep_n(ep, o, 4) == 0, "wr: OUT while full");
+    long g = 0; for (;;) { long k = read(pf[0], b, sizeof(b)); if (k <= 0) break; g += k; }
+    CHECK(g == tot, "drain full pipe %ld/%ld", g, tot);
+    r = ep_n(ep, o, 4); CHECK(r == 1 && (o[0].events & EPOLLOUT), "wr: no OUT edge after room (r=%d)", r);
+    CHECK(ep_n(ep, o, 4) == 0, "wr: repeated OUT 2");
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_DEL, pf[1], NULL) == 0, "DEL wr");
+    /* eventfd */
+    int efd = eventfd(0, EFD_NONBLOCK); CHECKE(efd >= 0, "eventfd");
+    struct epoll_event fv = { .events = EPOLLIN | EPOLLET, .data.u32 = 3 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, efd, &fv) == 0, "ADD efd");
+    CHECK(ep_n(ep, o, 4) == 0, "efd: ready at 0");
+    unsigned long long one = 1, v;
+    write(efd, &one, 8);
+    CHECK(ep_n(ep, o, 4) == 1, "efd: first edge");
+    CHECK(ep_n(ep, o, 4) == 0, "efd: repeated edge");
+    write(efd, &one, 8);
+    CHECK(ep_n(ep, o, 4) == 1, "efd: no edge on second write");
+    CHECK(read(efd, &v, 8) == 8 && v == 2, "efd read v=%llu", v);
+    CHECK(ep_n(ep, o, 4) == 0, "efd: edge after read");
+    close(efd);
+    /* socketpair: partial recv, then new data */
+    int sv[2]; CHECKE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0, "socketpair");
+    struct epoll_event sev = { .events = EPOLLIN | EPOLLET, .data.u32 = 4 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, sv[1], &sev) == 0, "ADD sock");
+    CHECK(ep_n(ep, o, 4) == 0, "sock: ready when empty");
+    write(sv[0], "abcdef", 6);
+    CHECK(ep_n(ep, o, 4) == 1, "sock: first edge");
+    CHECK(read(sv[1], b, 2) == 2, "sock partial read");
+    CHECK(ep_n(ep, o, 4) == 0, "sock: edge after partial read");
+    write(sv[0], "g", 1);
+    CHECK(ep_n(ep, o, 4) == 1, "sock: no edge for new data");
+    CHECK(ep_n(ep, o, 4) == 0, "sock: repeated edge");
+    /* ET|ONESHOT */
+    sev.events = EPOLLIN | EPOLLET | EPOLLONESHOT; sev.data.u32 = 5;
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_MOD, sv[1], &sev) == 0, "MOD oneshot");
+    r = ep_n(ep, o, 4); CHECK(r == 1 && o[0].data.u32 == 5, "oneshot: MOD on ready fd r=%d", r);
+    write(sv[0], "h", 1);
+    CHECK(ep_n(ep, o, 4) == 0, "oneshot: reported while disarmed");
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_MOD, sv[1], &sev) == 0, "MOD re-arm");
+    CHECK(ep_n(ep, o, 4) == 1, "oneshot: re-arm not reported");
+    CHECK(ep_n(ep, o, 4) == 0, "oneshot: twice");
+    close(sv[0]); close(sv[1]); close(pf[0]); close(pf[1]); close(ep);
+    R(PASS, "pipe IN/OUT, eventfd, socketpair, ET|ONESHOT edges as on Linux (fill %ld)", tot);
+}
+
+/* compat.erofs: on a read-only root (boot CD) every modification fails with
+ * EROFS (EEXIST/ENOENT where Linux checks those first); skipped if / is writable. */
+/* inotify (verified against Linux: tmpfs, ext4/overlay, /dev/shm) */
+/* inotify: read all pending events as "MASK:name" tokens ('.' = no name),
+ * masks in hex; cookies of MOVED_FROM/TO must pair up. */
+static int ino_drain(int fd, char *out, size_t cap, int *wd_seen) {
+    char buf[4096] __attribute__((aligned(8))); size_t o = 0; out[0] = 0;
+    uint32_t cookie = 0;
+    for (;;) {
+        ssize_t k = read(fd, buf, sizeof(buf));
+        if (k < 0) { if (errno == EAGAIN) break; return -errno; }
+        if (k == 0) break;
+        for (char *p = buf; p < buf + k; ) {
+            struct inotify_event *e = (struct inotify_event *)p;
+            if (wd_seen && (e->mask & IN_IGNORED)) *wd_seen = e->wd;
+            if (e->mask & IN_MOVED_FROM) cookie = e->cookie;
+            if ((e->mask & IN_MOVED_TO) && (!e->cookie || e->cookie != cookie)) return -1000;
+            o += snprintf(out + o, cap - o, "%s%x:%s", o ? " " : "", e->mask, e->len ? e->name : ".");
+            if (o >= cap) return -1001;
+            p += sizeof(*e) + e->len;
+        }
+    }
+    return (int)o;
+}
+static int ino_dir(const char *dir, char *d, size_t n) {
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC); CHECKE(fd >= 0, "inotify_init1");
+    CHECK(fcntl(fd, F_GETFD) & FD_CLOEXEC, "IN_CLOEXEC not set");
+    char b[64], ev[600], p1[256], p2[256], p3[256];
+    errno = 0; CHECK(read(fd, b, sizeof(b)) < 0 && errno == EAGAIN, "empty read errno %d", errno);
+    int wd = inotify_add_watch(fd, dir, IN_CREATE | IN_DELETE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO);
+    CHECKE(wd >= 1, "add_watch");
+    CHECK(inotify_add_watch(fd, dir, IN_CREATE | IN_DELETE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO) == wd, "re-add gave a new wd");
+    int ep = epoll_create1(0); CHECKE(ep >= 0, "epoll_create1");
+    struct epoll_event ee = { .events = EPOLLIN, .data.u32 = 77 }, eo[2];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ee) == 0, "epoll ADD inotify fd");
+    struct pollfd pf = { fd, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 0) == 0 && epoll_wait(ep, eo, 2, 0) == 0, "ready with no events");
+    snprintf(p1, sizeof(p1), "%s/a.txt", dir); snprintf(p2, sizeof(p2), "%s/b.txt", dir); snprintf(p3, sizeof(p3), "%s/sub", dir);
+    int f = open(p1, O_WRONLY | O_CREAT | O_TRUNC, 0644); CHECKE(f >= 0, "create a.txt");
+    CHECK(poll(&pf, 1, 0) == 1 && (pf.revents & POLLIN), "poll after create revents 0x%x", pf.revents);
+    CHECK(epoll_wait(ep, eo, 2, 0) == 1 && eo[0].data.u32 == 77, "epoll after create");
+    CHECK(write(f, "hi", 2) == 2, "write"); close(f);
+    int r = ino_drain(fd, ev, sizeof(ev), NULL); CHECK(r >= 0, "drain1 %d", r);
+    CHECK(!strcmp(ev, "100:a.txt 2:a.txt 8:a.txt"), "create/write/close events '%s'", ev);
+    CHECK(poll(&pf, 1, 0) == 0, "still readable after drain");
+    CHECKE(mkdir(p3, 0755) == 0, "mkdir");
+    CHECKE(rename(p1, p2) == 0, "rename");
+    CHECKE(unlink(p2) == 0, "unlink");
+    CHECKE(rmdir(p3) == 0, "rmdir");
+    r = ino_drain(fd, ev, sizeof(ev), NULL); CHECK(r >= 0, "drain2 %d (cookie pairing)", r);
+    CHECK(!strcmp(ev, "40000100:sub 40:a.txt 80:b.txt 200:b.txt 40000200:sub"), "mkdir/rename/unlink/rmdir events '%s'", ev);
+    /* wakeup from another process */
+    pid_t c = fork(); if (c == 0) { msleep(100); int g = open(p1, O_WRONLY | O_CREAT, 0644); if (g >= 0) close(g); _exit(0); }
+    long long t0 = mono_ms(); r = epoll_wait(ep, eo, 2, 2000); long long el = mono_ms() - t0; waitpid(c, NULL, 0);
+    CHECK(r == 1 && el >= 50 && el < 1500, "epoll wakeup r=%d after %lldms", r, el);
+    errno = 0; CHECK(read(fd, b, 1) < 0 && errno == EINVAL, "short buffer errno %d", errno);
+    r = ino_drain(fd, ev, sizeof(ev), NULL);
+    CHECK(r >= 0 && !strcmp(ev, "100:a.txt 8:a.txt"), "child create events '%s'", ev);
+    /* watch on the file itself */
+    int wf = inotify_add_watch(fd, p1, IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF); CHECKE(wf > wd, "add_watch file");
+    f = open(p1, O_WRONLY | O_APPEND); CHECKE(f >= 0, "reopen"); write(f, "x", 1); close(f);
+    unlink(p1);
+    int lw = 0; r = ino_drain(fd, ev, sizeof(ev), &lw);
+    CHECK(r >= 0 && !strcmp(ev, "2:a.txt 2:. 8:a.txt 8:. 400:. 8000:. 200:a.txt"), "file watch events '%s'", ev);
+    CHECK(lw == wf, "IN_IGNORED wd %d want %d", lw, wf);
+    errno = 0; CHECK(inotify_rm_watch(fd, wf) < 0 && errno == EINVAL, "rm_watch auto-removed wd errno %d", errno);
+    CHECKE(inotify_rm_watch(fd, wd) == 0, "rm_watch");
+    r = ino_drain(fd, ev, sizeof(ev), &lw);
+    CHECK(r >= 0 && !strcmp(ev, "8000:.") && lw == wd, "IN_IGNORED after rm_watch '%s'", ev);
+    errno = 0; CHECK(inotify_rm_watch(fd, wd) < 0 && errno == EINVAL, "rm_watch twice errno %d", errno);
+    snprintf(p3, sizeof(p3), "%s/no_such_dir_x", dir);
+    errno = 0; CHECK(inotify_add_watch(fd, p3, IN_CREATE) < 0 && errno == ENOENT, "watch missing errno %d", errno);
+    errno = 0; CHECK(inotify_add_watch(ep, dir, IN_CREATE) < 0 && errno == EINVAL, "watch on non-inotify fd errno %d", errno);
+    close(ep); close(fd);
+    R(PASS, "create/modify/close_write/mkdir/move/delete/self, poll+epoll, wakeup %lldms", el);
+}
+static int t_inotify_tmp(char *d, size_t n) {
+    char dir[64]; snprintf(dir, sizeof(dir), "/tmp/ostest_ino.%d", getpid());
+    if (mkdir(dir, 0755) != 0) R(FAIL, "mkdir %s: %s", dir, strerror(errno));
+    int r = ino_dir(dir, d, n);
+    rmdir(dir);
+    return r;
+}
+/* inotify.volumes: the same sequence on every writable /mnt volume
+ * (FAT32 / exFAT go through the same VFS hooks as tmpfs). */
+static int t_inotify_vols(char *d, size_t n) {
+    char names[8][64]; int k = vol_list(names, 8); if (!k) R(SKIP, "nothing mounted under /mnt");
+    char res[300] = ""; int o = 0, tested = 0;
+    for (int i = 0; i < k; i++) {
+        if (!strcmp(names[i], "badcs")) continue;
+        char dir[160]; snprintf(dir, sizeof(dir), "/mnt/%s/ostest_ino.%d", names[i], getpid());
+        if (mkdir(dir, 0755) != 0) continue;
+        tested++;
+        char sub[700]; int r = ino_dir(dir, sub, sizeof(sub));
+        rmdir(dir);
+        if (r != PASS) R(FAIL, "%s: %s", names[i], sub);
+        o += snprintf(res + o, sizeof(res) - o, "%s ok; ", names[i]);
+    }
+    if (!tested) R(SKIP, "no writable volume under /mnt");
+    R(PASS, "%s", res);
+}
+static int t_cx_erofs(char *d, size_t n) {
+    const char *probe = "/ostest_erofs_probe";
+    int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { close(fd); unlink(probe); R(SKIP, "root is writable"); }
+    CHECK(errno == EROFS, "creat on ro root errno %d (%s)", errno, strerror(errno));
+    errno = 0; CHECK(mkdir("/ostest_erofs_dir", 0755) < 0 && errno == EROFS, "mkdir errno %d", errno);
+    errno = 0; CHECK(mkdir("/bin", 0755) < 0 && errno == EEXIST, "mkdir existing errno %d", errno);
+    errno = 0; CHECK(open("/bin/busybox.exe", O_WRONLY) < 0 && errno == EROFS, "open O_WRONLY errno %d", errno);
+    errno = 0; CHECK(open("/bin/busybox.exe", O_RDONLY | O_APPEND | O_WRONLY) < 0 && errno == EROFS, "open O_APPEND errno %d", errno);
+    errno = 0; CHECK(unlink("/bin/busybox.exe") < 0 && errno == EROFS, "unlink errno %d", errno);
+    errno = 0; CHECK(unlink("/ostest_no_such") < 0 && errno == ENOENT, "unlink missing errno %d", errno);
+    errno = 0; CHECK(rename("/bin/busybox.exe", "/bin/bb2") < 0 && errno == EROFS, "rename errno %d", errno);
+    errno = 0; CHECK(truncate("/bin/busybox.exe", 0) < 0 && errno == EROFS, "truncate errno %d", errno);
+    int r = open("/bin/busybox.exe", O_RDONLY); CHECKE(r >= 0, "read-only open still works"); close(r);
+    R(PASS, "creat/mkdir/open-w/unlink/rename/truncate -> EROFS, mkdir existing EEXIST");
+}
+
 /* ===================== registry ===================== */
 /* tty.pty_basic: stdin of the desktop terminal is a pty-like device:
  * isatty, raw-mode termios round-trip, TIOCGWINSZ/TIOCSWINSZ round-trip. */
@@ -2088,13 +2287,13 @@ static const struct test tests[] = {
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },
     { "epoll", "pipe", t_ep_pipe, 15, 0 }, { "epoll", "unix_socket", t_ep_sock, 10, 0 },
     { "epoll", "ctl_errors", t_ep_ctl, 10, 0 }, { "epoll", "tty", t_ep_tty, 5, 0 },
-    { "epoll", "edge", t_ep_edge, 10, 0 },
+    { "epoll", "edge", t_ep_edge, 10, 0 }, { "epoll", "edge_strict", t_ep_edge2, 10, 0 },
     { "futex", "wait_wake", t_fx_wait_wake, 15, 0 }, { "futex", "private_requeue", t_fx_requeue, 15, 0 },
     { "futex", "bitset_abs", t_fx_bitset, 10, 0 },
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
-    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

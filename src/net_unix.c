@@ -64,6 +64,7 @@ typedef struct ux_ep {
     bool shut_rd, shut_wr;
     ux_msg_t *rxh, *rxt;
     uint32_t rx_bytes, rx_count;
+    uint32_t in_gen, out_gen;  /* EPOLLET: data queued here / room freed for our sends */
     int nlen;
     bool reg;                /* name is in the registry (bound socket) */
     char name[UX_NAMEMAX];   /* registry key: resolved absolute path or abstract */
@@ -167,6 +168,16 @@ static void ux_destroy(ux_ep_t *e) {
 void ux_release(kernel_socket_t *s) {
     if (s && s->transport) ux_destroy(UX(s));
     if (s) s->transport = NULL;
+}
+
+/* EPOLLET edge generations of an AF_UNIX socket fd (false: not AF_UNIX). */
+bool ux_fd_gens(void *file_handle, uint32_t *in_gen, uint32_t *out_gen) {
+    kernel_socket_t *ks = (kernel_socket_t *)file_handle;
+    if (!ks || ks->domain != AF_UNIX_ || !ks->transport) return false;
+    ux_ep_t *e = (ux_ep_t *)ks->transport;
+    *in_gen = e->in_gen;
+    *out_gen = e->out_gen;
+    return true;
 }
 
 /* ── fd creation ─────────────────────────────────────────────────────────── */
@@ -365,6 +376,7 @@ long ux_connect(process_t *p, int fd, kernel_socket_t *s, const void *uaddr, uin
             e->peer_pid = t->pid;
             e->state = UXS_CONN;
             t->bl[t->nbl++] = srv;
+            t->in_gen++;
             kunlock(&ux_lock);
             s->connected = true;
             return 0;
@@ -659,6 +671,7 @@ long ux_sendmsg(process_t *p, int fd, kernel_socket_t *s, const ux_iov_t *iov, i
                 t->rxt = m;
                 t->rx_bytes += m->len;
                 t->rx_count++;
+                t->in_gen++;
                 kunlock(&ux_lock);
                 break;
             }
@@ -762,6 +775,7 @@ long ux_recvmsg(process_t *p, int fd, kernel_socket_t *s, const ux_iov_t *iov, i
                 froml = e->peer ? ux_dn(e->peer, from) : 0;
                 if (got == 0 && cap == 0) { /* zero-length read with data pending */ }
             }
+            if (!peek && got && e->peer) e->peer->out_gen++;   /* room for the sender */
             kunlock(&ux_lock);
             r = msgmode ? (long)got : (long)got;
             break;

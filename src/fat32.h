@@ -132,6 +132,7 @@ typedef struct {
 } fat32_dir_list_t;
 
 extern fat32_fs_t fat32_filesystem;
+int fat32_medium_read_only(void);   /* 1 on optical (read-only) media */
 extern fat32_file_t open_files[FAT32_MAX_OPEN_FILES];
 
 // Function declarations

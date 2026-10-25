@@ -109,6 +109,9 @@ typedef struct vfs_fs_ops {
     int   (*sync)(struct vfs_filesystem *fs);
     /* Optional: real inode metadata (follows symlinks).  0 or -errno. */
     int   (*stat)(struct vfs_filesystem *fs, const char *rel_path, struct vfs_stat *st);
+    /* Optional: nonzero when the medium is read-only; the VFS then refuses
+     * every modification with -EROFS before calling the filesystem. */
+    int   (*read_only)(struct vfs_filesystem *fs);
 } vfs_fs_ops_t;
 
 // A mounted filesystem instance

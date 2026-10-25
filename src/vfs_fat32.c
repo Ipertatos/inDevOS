@@ -10,6 +10,11 @@
 // Translates VFS calls into fat32_* calls.  The VFS handle (cookie) is
 // simply a pointer to a fat32_file_t returned by fat32_open().
 
+static int fat32_vfs_read_only(vfs_filesystem_t *fs) {
+    (void)fs;
+    return fat32_medium_read_only();
+}
+
 static void* fat32_vfs_open(vfs_filesystem_t *fs, const char *rel_path,
                             uint32_t flags) {
     (void)fs;
@@ -188,6 +193,7 @@ static vfs_fs_ops_t fat32_vfs_ops = {
     .mkdir   = fat32_vfs_mkdir,
     .unlink  = fat32_vfs_unlink,
     .exists  = fat32_vfs_exists,
+    .read_only = fat32_vfs_read_only,
 };
 
 // ---- Public -----------------------------------------------------------------

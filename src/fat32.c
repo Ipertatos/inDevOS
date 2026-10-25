@@ -2429,6 +2429,11 @@ static int fat32_dir_place_named_entry(fat32_fs_t *fs, uint32_t parent_cluster,
     return 0;
 }
 
+/* Boot CD (or any optical medium): nothing on it can be changed. */
+int fat32_medium_read_only(void) {
+    return fat32_filesystem.storage_dev && fat32_filesystem.storage_dev->optical;
+}
+
 static int fat32_create_file_impl(const char *filename) {
     FS_LOCK();    if (!fat32_is_mounted()) {
         printf("fat32: Filesystem not mounted\n");
@@ -2456,6 +2461,10 @@ static int fat32_create_file_impl(const char *filename) {
         }
     }
 
+    if (fat32_medium_read_only()) {
+        printf("fat32: read-only medium, cannot create '%s'\n", filename);
+        FS_UNLOCK(); return -30;   /* -EROFS */
+    }
     if (basename[0] == '\0') {
         FS_UNLOCK(); return -1;
     }
@@ -2525,10 +2534,14 @@ static int fat32_create_directory_impl(const char *dirname) {
         }
     }
 
+    if (fat32_medium_read_only()) {
+        printf("fat32: read-only medium, cannot create directory '%s'\n", dirname);
+        FS_UNLOCK(); return -30;   /* -EROFS */
+    }
     uint32_t new_cluster = fat32_allocate_cluster(&fat32_filesystem);
     if (new_cluster == FAT32_CLUSTER_END) {
         printf("fat32: No space to allocate directory cluster\n");
-        FS_UNLOCK(); return -1;
+        FS_UNLOCK(); return -28;   /* -ENOSPC */
     }
 
     void *new_dir_buf = kalloc(fat32_filesystem.bytes_per_cluster);

@@ -479,6 +479,10 @@ static int fd_close_entry(process_t *proc, int fd) {
         if (ty == 8 /* FD_TYPE_EVENTFD */ || ty == 13 /* FD_TYPE_EPOLL */ ||
             ty == 14 /* FD_TYPE_TIMERFD */ || ty == 15 /* FD_TYPE_SIGNALFD */) {
             if (fde->file_handle) kfree(fde->file_handle);
+        } else if (ty == 16 /* FD_TYPE_INOTIFY */) {
+            extern void inotify_release(void *h);
+            inotify_release(fde->file_handle);
+            fde->file_handle = NULL;
         } else if (ty == 10 /* FD_TYPE_DEV_INPUT */) {
             extern void evdev_release(void *handle);
             evdev_release(fde->file_handle);
@@ -1514,7 +1518,7 @@ int sys_open_kpath(const char *kpath, int flags, mode_t mode) {
                 return -EISDIR;
             return open_directory_fd(proc, abspath, flags);
         }
-        return -ENOENT;
+        return vfd == -EROFS ? -EROFS : -ENOENT;
     }
 
     /* All file access goes through the VFS; mounting a filesystem registers
@@ -3131,8 +3135,54 @@ extern int snprintf(char *str, size_t size, const char *fmt, ...);
 
 /* Resolve a user exec path the same way Zeus does: absolute as-is,
  * otherwise cwd, /bin, /, /apps, /os/apps, each with an optional .exe suffix. */
+/* Lexically normalise an absolute path in place: collapse "//", drop "."
+ * components and resolve ".." (VFS mounts expect clean absolute paths, so
+ * "/tmp/./hello" would otherwise not be found). */
+static void exec_norm_path(char *path) {
+    char out[256];
+    size_t o = 0;
+    const char *s = path;
+    while (*s) {
+        while (*s == '/') s++;
+        if (!*s) break;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t n = (size_t)(e - s);
+        if (n == 1 && s[0] == '.') {
+            /* skip */
+        } else if (n == 2 && s[0] == '.' && s[1] == '.') {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+        } else {
+            if (o + 1 + n >= sizeof(out)) break;
+            out[o++] = '/';
+            memcpy(out + o, s, n);
+            o += n;
+        }
+        s = e;
+    }
+    if (o == 0) out[o++] = '/';
+    out[o] = 0;
+    memcpy(path, out, o + 1);
+}
+
 static int exec_resolve_path(process_t *proc, const char *name, char *out, size_t outsz) {
     if (!name || !out || outsz < 4) return -EINVAL;
+    /* A name containing '/' is never searched for (POSIX): resolve it against
+     * the cwd and normalise, so "./hello" and "sub/../x" run from the cwd. */
+    if (proc && name[0] != '/' && strchr(name, '/') && vfs_has_root_mount()) {
+        char cand[256];
+        const char *cwd = proc->cwd[0] ? proc->cwd : "/";
+        snprintf(cand, sizeof(cand), "%s/%s", cwd, name);
+        exec_norm_path(cand);
+        if (!vfs_exists(cand)) {
+            char ex[256];
+            snprintf(ex, sizeof(ex), "%s.exe", cand);
+            if (vfs_exists(ex)) kstrncpy(cand, ex, sizeof(cand));
+        }
+        kstrncpy(out, cand, outsz);
+        return 0;
+    }
     /* busybox ash re-execs applets via /proc/self/exe */
     if (proc && (kstrcmp(name, "/proc/self/exe") == 0 ||
                  kstrcmp(name, "/proc/self/exe/") == 0)) {
@@ -3151,6 +3201,13 @@ static int exec_resolve_path(process_t *proc, const char *name, char *out, size_
     }
 
     char cand[256];
+    if (name[0] == '/' && (strstr(name, "/./") || strstr(name, "/../") || strstr(name, "//"))) {
+        kstrncpy(cand, name, sizeof(cand));
+        exec_norm_path(cand);
+        if (vfs_exists(cand)) { kstrncpy(out, cand, outsz); return 0; }
+        name = out;
+        kstrncpy(out, cand, outsz);
+    }
     if (name[0] == '/') {
         snprintf(cand, sizeof(cand), "%s.exe", name);
         if (vfs_exists(cand)) {
@@ -3684,6 +3741,12 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
                 if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
             }
             if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 16 /* FD_TYPE_INOTIFY */) {
+                extern bool inotify_ready(void *h);
+                if ((kfds[i].events & (POLLIN | 0x0040)) && inotify_ready(proc->fds[fd].file_handle))
+                    kfds[i].revents |= kfds[i].events & (POLLIN | 0x0040);
+            }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
                 proc->fds[fd].fd_type == 14 /* FD_TYPE_TIMERFD */) {
                 extern bool lx_timerfd_ready(void *h);
                 if ((kfds[i].events & POLLIN) && lx_timerfd_ready(proc->fds[fd].file_handle))
@@ -4015,8 +4078,8 @@ int sys_rmdir(const char *pathname) {
         return -ENODEV;
 
     int r = vfs_unlink(abspath);
-    if (r == -ENOTEMPTY)
-        return -ENOTEMPTY;
+    if (r == -ENOTEMPTY || r == -EROFS)
+        return r;
     if (r != 0)
         return -ENOENT;
     return 0;

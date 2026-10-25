@@ -44,6 +44,8 @@ typedef struct pipe {
     void *waiting_reader;       /**< thread_t* blocked in read */
     void *waiting_writer;       /**< thread_t* blocked in write */
     void *pty;                  /**< kpty_t* when this pipe is a terminal (kterm) */
+    uint32_t in_gen;            /**< bumped when data is added (EPOLLET EPOLLIN edges) */
+    uint32_t out_gen;           /**< bumped when room is freed (EPOLLET EPOLLOUT edges) */
 } pipe_t;
 
 /**

@@ -117,6 +117,8 @@ int pipe_read(pipe_t *pipe, void *buf, size_t count) {
         dst[i] = pipe->buffer[pipe->read_pos];
         pipe->read_pos = (pipe->read_pos + 1) % pipe->buf_size;
     }
+    /* Linux wakes EPOLLOUT waiters only when a full pipe gains room */
+    if (to_read && pipe->count == pipe->buf_size) pipe->out_gen++;
     pipe->count -= to_read;
     void *ww = pipe->waiting_writer;
     pipe->waiting_writer = NULL;
@@ -153,6 +155,7 @@ int pipe_write(pipe_t *pipe, const void *buf, size_t count) {
         pipe->write_pos = (pipe->write_pos + 1) % pipe->buf_size;
     }
     pipe->count += to_write;
+    if (to_write) pipe->in_gen++;
     void *wr = pipe->waiting_reader;
     pipe->waiting_reader = NULL;
     spinlock_unlock(&pipe->lock);

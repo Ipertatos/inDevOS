@@ -16,6 +16,7 @@
  * syscall number ("linux: unimplemented syscall ..."), so running a new
  * program shows exactly what it still needs.
  */
+#include "inotify.h"
 #include "lx_fbdev.h"
 #include "wm_dev.h"
 #include "input.h"
@@ -312,9 +313,11 @@ static long lx_get(void *k, const void *uptr, size_t n);
 static long lx_eventfd_create(process_t *p, uint64_t initval, long flags) {
     int fd = allocate_fd(p);
     if (fd < 0) return -EMFILE;
-    uint64_t *ctr = (uint64_t *)kalloc(sizeof(uint64_t));
+    /* ctr[0] = counter, ctr[1] = EPOLLET edge generations (lo32 in, hi32 out) */
+    uint64_t *ctr = (uint64_t *)kalloc(2 * sizeof(uint64_t));
     if (!ctr) { p->fds[fd].in_use = false; return -ENOMEM; }
-    *ctr = initval;
+    ctr[0] = initval;
+    ctr[1] = 0;
     p->fds[fd].ref_count = fd_refcount_create();
     if (!p->fds[fd].ref_count) { kfree(ctr); p->fds[fd].in_use = false; return -ENOMEM; }
     p->fds[fd].fd_type = FD_TYPE_EVENTFD;
@@ -326,10 +329,16 @@ static long lx_eventfd_create(process_t *p, uint64_t initval, long flags) {
     return fd;
 }
 
-/* epoll: interest list over sys_poll_kernel (level-triggered).
- * EPOLLET is approximated as level-triggered; EPOLLONESHOT disarms the
- * entry after it is reported (re-arm with EPOLL_CTL_MOD). Entries whose fd
- * was closed or reused for another object are dropped silently. */
+/* epoll: interest list over sys_poll_kernel.
+ * Level-triggered by default.  EPOLLET reports an entry only on a new
+ * readiness edge, as Linux does: when it becomes ready (or gains new bits
+ * such as HUP), or when a new wakeup arrives for a reported bit -- data
+ * added (EPOLLIN) / room freed (EPOLLOUT).  Pipes, AF_UNIX sockets and
+ * eventfds keep exact edge generations; other objects use a per-object I/O
+ * counter (any data-moving syscall on that object), which can only add a
+ * spurious wakeup, never lose one.  EPOLLONESHOT disarms the entry after it
+ * is reported (re-arm with EPOLL_CTL_MOD).  Entries whose fd was closed or
+ * reused for another object are dropped silently. */
 #define FD_TYPE_EPOLL 13
 #define LX_EPOLL_MAX  64
 #define LX_EPOLLONESHOT (1u << 30)
@@ -342,9 +351,8 @@ typedef struct {
     void    *key;        /* file_handle at ADD time: detects fd reuse */
     uint8_t  type;
     bool     armed;
-    bool     et_reported;   /* EPOLLET: reported and not seen un-ready since */
-    uint32_t et_rev;
-    uint64_t et_seq;
+    uint32_t et_rev;        /* EPOLLET: bits reported and still ready since */
+    uint32_t et_in, et_out; /* edge generations at the last report */
 } lx_epitem_t;
 typedef struct { int n; lx_epitem_t it[LX_EPOLL_MAX]; } lx_epoll_t;
 
@@ -413,7 +421,7 @@ static long lx_epoll_ctl(process_t *p, long epfd, long op, long fd, const void *
         ep->it[idx].events = ev.events;
         ep->it[idx].data = ev.data;
         ep->it[idx].armed = true;
-        ep->it[idx].et_reported = false;
+        ep->it[idx].et_rev = 0;          /* ADD/MOD on a ready fd reports it */
         return 0;
     case 2: /* EPOLL_CTL_DEL */
         if (idx < 0) return -ENOENT;
@@ -423,12 +431,41 @@ static long lx_epoll_ctl(process_t *p, long epfd, long op, long fd, const void *
         return -EINVAL;
     }
 }
-/* Global I/O sequence: bumped by every read/write/send/recv-style syscall.
- * EPOLLET re-reports a still-ready entry only after some I/O happened since
- * it was last reported (or its readiness dropped / gained new bits), so a
- * consumer that drains to EAGAIN and a producer that writes more both
- * produce a new edge. */
-static volatile uint64_t lx_io_seq;
+/* Per-object I/O counters for EPOLLET on objects without exact edge
+ * generations (TCP/UDP sockets, ttys, timerfd, ...): bumped by every
+ * data-moving syscall on an fd of that object.  A hash slot collision only
+ * causes an extra (harmless) edge. */
+#define LX_IOTAB 256
+static volatile uint32_t lx_io_tab[LX_IOTAB];
+static inline uint32_t lx_io_slot(const void *h) {
+    uint64_t x = (uint64_t)(uintptr_t)h;
+    x ^= x >> 17; x *= 0x9E3779B97F4A7C15ULL; x ^= x >> 29;
+    return (uint32_t)(x & (LX_IOTAB - 1));
+}
+static void lx_io_bump(process_t *p, long fd) {
+    if (!p || fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use) return;
+    __atomic_add_fetch(&lx_io_tab[lx_io_slot(p->fds[fd].file_handle)], 1, __ATOMIC_RELEASE);
+}
+bool ux_fd_gens(void *file_handle, uint32_t *in_gen, uint32_t *out_gen);
+/* Edge generations of an epoll entry's object. */
+static void lx_ep_gens(process_t *p, const lx_epitem_t *it, uint32_t *gi, uint32_t *go) {
+    const file_descriptor_t *f = &p->fds[it->fd];
+    void *h = f->file_handle;
+    if ((f->fd_type == FD_TYPE_PIPE_READ || f->fd_type == FD_TYPE_PIPE_WRITE) && h) {
+        pipe_t *pp = (pipe_t *)h;
+        *gi = __atomic_load_n(&pp->in_gen, __ATOMIC_ACQUIRE);
+        *go = __atomic_load_n(&pp->out_gen, __ATOMIC_ACQUIRE);
+        return;
+    }
+    if (f->fd_type == FD_TYPE_EVENTFD && h) {
+        uint64_t g = __atomic_load_n(&((volatile uint64_t *)h)[1], __ATOMIC_ACQUIRE);
+        *gi = (uint32_t)g; *go = (uint32_t)(g >> 32);
+        return;
+    }
+    if (f->fd_type == FD_TYPE_SOCKET && ux_fd_gens(h, gi, go)) return;
+    if (f->fd_type == FD_TYPE_INOTIFY && h) { *gi = inotify_gen(h); *go = 0; return; }
+    *gi = *go = __atomic_load_n(&lx_io_tab[lx_io_slot(h)], __ATOMIC_ACQUIRE);
+}
 static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, int timeout_ms) {
     long err = 0;
     lx_epoll_t *ep = lx_ep_get(p, epfd, &err);
@@ -455,24 +492,28 @@ static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, i
         long r = 0;
         if (np) r = sys_poll_kernel(pf, (unsigned)np, 0);
         if (r < 0) return r;
-        uint64_t seq = __atomic_load_n(&lx_io_seq, __ATOMIC_ACQUIRE);
         long out = 0;
         bool suppressed = false;
         for (int j = 0; j < np; j++) {
             lx_epitem_t *it = &ep->it[map[j]];
             /* ERR/HUP are always reported, like poll */
             uint32_t rev = (uint16_t)pf[j].revents & ((it->events & 0x23ff) | 0x18);
+            uint32_t gi = 0, go = 0;
             if (it->events & LX_EPOLLET) {
-                if (!rev) { it->et_reported = false; it->et_rev = 0; continue; }
-                if (it->et_reported && it->et_seq == seq && !(rev & ~it->et_rev)) {
-                    suppressed = true; continue;
-                }
+                lx_ep_gens(p, it, &gi, &go);
+                /* bits that went un-ready since the last report re-arm */
+                it->et_rev &= rev;
+                if (!rev) { it->et_in = gi; it->et_out = go; continue; }
+                bool edge = (rev & ~it->et_rev) != 0 ||
+                            ((rev & 0x41) && gi != it->et_in) ||      /* IN|RDNORM: new data */
+                            ((rev & 0x104) && go != it->et_out);      /* OUT|WRNORM: new room */
+                if (!edge) { suppressed = true; continue; }
             }
             if (!rev || out >= maxevents) continue;
             lx_epoll_event_t e = { rev, it->data };
             if (lx_put((char *)uevs + out * sizeof(e), &e, sizeof(e))) return out ? out : -EFAULT;
             if (it->events & LX_EPOLLONESHOT) it->armed = false;
-            if (it->events & LX_EPOLLET) { it->et_reported = true; it->et_seq = seq; it->et_rev = rev; }
+            if (it->events & LX_EPOLLET) { it->et_rev = rev; it->et_in = gi; it->et_out = go; }
             out++;
         }
         if (out) return out;
@@ -486,7 +527,7 @@ static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, i
         int k = 0;
         for (int j = 0; j < np; j++) {
             lx_epitem_t *it = &ep->it[map[j]];
-            if ((it->events & LX_EPOLLET) && it->et_reported && pf[j].revents) continue;
+            if ((it->events & LX_EPOLLET) && it->et_rev && pf[j].revents) continue;
             pf[k].fd = pf[j].fd; pf[k].events = (short)(it->events & 0x23ff); pf[k].revents = 0; k++;
         }
         if (!k) { pf[0].fd = -1; pf[0].events = 0; pf[0].revents = 0; k = 1; }
@@ -506,6 +547,7 @@ static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, i
 #define FD_TYPE_SIGNALFD 15
 static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len);
 static long lx_signalfd_read(process_t *p, long fd, void *ubuf, size_t len);
+static long lx_inotify_read(process_t *p, long fd, void *ubuf, size_t len);
 static void lx_futex_wake_addr(uint64_t uaddr, int n);
 static long lx_eventfd_rw(process_t *p, long fd, void *ubuf, size_t len, bool wr) {
     if (len < 8) return -EINVAL;
@@ -518,11 +560,13 @@ static long lx_eventfd_rw(process_t *p, long fd, void *ubuf, size_t len, bool wr
         if (lx_get(&v, ubuf, 8)) return -EFAULT;
         if (v == ~0ULL) return -EINVAL;
         *ctr += v;
+        ctr[1] = (ctr[1] & ~0xffffffffULL) | (uint32_t)(ctr[1] + 1);   /* in edge */
         return 8;
     }
     for (;;) {
         v = *ctr;
-        if (v) { *ctr = 0; return lx_put(ubuf, &v, 8) ? -EFAULT : 8; }
+        if (v) { *ctr = 0; ctr[1] += 1ULL << 32;   /* out edge */
+                 return lx_put(ubuf, &v, 8) ? -EFAULT : 8; }
         if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
         if (proc_kill_pending(p)) return -EINTR;
         thread_sleep(1);
@@ -564,6 +608,7 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
     if (ty == FD_TYPE_SOCKET)
         return lx_sock_recv((int)fd, ubuf, count, 0);
     if (ty == FD_TYPE_EPOLL) return -EINVAL;
+    if (ty == FD_TYPE_INOTIFY) return lx_inotify_read(p, fd, ubuf, count);
     if (ty == FD_TYPE_TIMERFD) return lx_timerfd_read(p, fd, ubuf, count);
     if (ty == FD_TYPE_SIGNALFD) return lx_signalfd_read(p, fd, ubuf, count);
     if (ty == FD_TYPE_EVENTFD)
@@ -1051,7 +1096,7 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
     if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
         return lx_sock_send((int)fd, ubuf, len, 0);
     if (p->fds[fd].fd_type == FD_TYPE_EPOLL || p->fds[fd].fd_type == FD_TYPE_TIMERFD ||
-        p->fds[fd].fd_type == FD_TYPE_SIGNALFD) return -EINVAL;
+        p->fds[fd].fd_type == FD_TYPE_SIGNALFD || p->fds[fd].fd_type == FD_TYPE_INOTIFY) return -EINVAL;
     if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
         return lx_eventfd_rw(p, fd, (void *)ubuf, len, true);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_TTY) {
@@ -1541,8 +1586,74 @@ static long lx_pty_ioctl(process_t *p, long fd, kpty_t *pt, unsigned long req, v
     }
 }
 
+/* inotify (253 init, 254 add_watch, 255 rm_watch, 294 init1): see inotify.c */
+static long lx_inotify_init(process_t *p, long flags) {
+    if (flags & ~(long)(04000 | 02000000)) return -EINVAL;
+    int fd = allocate_fd(p);
+    if (fd < 0) return -EMFILE;
+    void *h = inotify_create();
+    if (!h) { p->fds[fd].in_use = false; return -ENOMEM; }
+    p->fds[fd].ref_count = fd_refcount_create();
+    if (!p->fds[fd].ref_count) { inotify_release(h); p->fds[fd].in_use = false; return -ENOMEM; }
+    p->fds[fd].fd_type = FD_TYPE_INOTIFY;
+    p->fds[fd].file_handle = h;
+    p->fds[fd].flags = (flags & 04000) ? O_NONBLOCK : 0;    /* IN_NONBLOCK */
+    p->fds[fd].position = 0;
+    p->fds[fd].cloexec = (flags & 02000000) != 0;           /* IN_CLOEXEC */
+    p->fds[fd].in_use = true;
+    return fd;
+}
+static void *lx_ino_get(process_t *p, long fd, long *err) {
+    if (!lx_fd_ok(p, fd)) { *err = -EBADF; return NULL; }
+    if (p->fds[fd].fd_type != FD_TYPE_INOTIFY || !p->fds[fd].file_handle) { *err = -EINVAL; return NULL; }
+    return p->fds[fd].file_handle;
+}
+static long lx_inotify_add(process_t *p, long fd, const char *upath, uint32_t mask) {
+    long err = 0;
+    void *h = lx_ino_get(p, fd, &err);
+    if (!h) return err;
+    char path[256];
+    long r = lx_resolve(p, LX_AT_FDCWD, upath, path, sizeof(path), false);
+    if (r) return r;
+    int kind = lx_path_kind(path, NULL);
+    if (!kind) return -ENOENT;
+    return inotify_add(h, path, mask, kind == 2);
+}
+static long lx_inotify_rm(process_t *p, long fd, long wd) {
+    long err = 0;
+    void *h = lx_ino_get(p, fd, &err);
+    if (!h) return err;
+    return inotify_rm(h, (int)wd);
+}
+static long lx_inotify_read(process_t *p, long fd, void *ubuf, size_t len) {
+    void *h = p->fds[fd].file_handle;
+    extern bool proc_signal_interrupts(process_t *);
+    char kb[512];
+    for (;;) {
+        if (inotify_ready(h)) {
+            size_t n = len < sizeof(kb) ? len : sizeof(kb);
+            long got = inotify_take(h, kb, n);
+            if (got == -EINVAL && n < len) return -EINVAL;
+            if (got < 0) return got;
+            if (got > 0) return lx_put(ubuf, kb, (size_t)got) ? -EFAULT : got;
+        }
+        if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
+        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
+        fork_release_pending(p);
+        thread_sleep(1);
+    }
+}
+
 static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
     if (!lx_fd_ok(p, fd)) return -EBADF;
+    if (p->fds[fd].fd_type == FD_TYPE_INOTIFY) {
+        if (req == LX_FIONREAD) {
+            int n = (int)inotify_pending_bytes(p->fds[fd].file_handle);
+            return lx_put(arg, &n, sizeof(n));
+        }
+        if (req == LX_FIONBIO) return sys_ioctl((int)fd, req, arg);
+        return -ENOTTY;
+    }
     {
         kpty_t *pt = lx_fd_pty(p, fd);
         if (pt) return lx_pty_ioctl(p, fd, pt, req, arg);
@@ -2354,10 +2465,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         p->sigsuspend_restore = false;
     }
 
-    switch (nr) {   /* EPOLLET edge source: any data-moving syscall */
+    switch (nr) {   /* EPOLLET edge source for objects without edge generations */
     case LX_read: case LX_write: case LX_readv: case LX_writev: case 17: case 18:
     case 43: case 44: case 45: case 46: case 47: case LX_accept4:
-        __atomic_add_fetch(&lx_io_seq, 1, __ATOMIC_RELEASE);
+        lx_io_bump(p, (long)(int)a1);
         break;
     default: break;
     }
@@ -3451,6 +3562,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return ux_socketpair(p, (long)a2, (int *)a4);
     case LX_eventfd:     return lx_eventfd_create(p, (uint32_t)a1, 0);
     case LX_eventfd2:    return lx_eventfd_create(p, (uint32_t)a1, (long)a2);
+    case 253 /* inotify_init */:      return lx_inotify_init(p, 0);
+    case 294 /* inotify_init1 */:     return lx_inotify_init(p, (long)(int)a1);
+    case 254 /* inotify_add_watch */: return lx_inotify_add(p, (long)(int)a1, (const char *)a2, (uint32_t)a3);
+    case 255 /* inotify_rm_watch */:  return lx_inotify_rm(p, (long)(int)a1, (long)(int)a2);
     case LX_timerfd_create:  return lx_timerfd_create(p, (long)(int)a1, (long)(int)a2);
     case LX_timerfd_settime: return lx_timerfd_settime(p, (long)(int)a1, (long)(int)a2, (const void *)a3, (void *)a4);
     case LX_timerfd_gettime: return lx_timerfd_gettime(p, (long)(int)a1, (void *)a2);
