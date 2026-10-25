@@ -142,12 +142,23 @@ static fat32_fat_slot_t *fat32_fat_slot(fat32_fs_t *fs, uint32_t sector) {
         if (fat_slots[i].sector == sector)
             return &fat_slots[i];
     }
-    fat32_fat_slot_t *slot = &fat_slots[fat_slot_hand];
-    fat_slot_hand = (fat_slot_hand + 1) % FAT32_FAT_CACHE_SLOTS;
-    if (slot->dirty) {
-        if (fat32_fat_slot_write(fs, slot) != 0)
-            return NULL;
+    /* Pick a victim round-robin. A dirty slot whose write-back fails keeps
+     * its data (and stays dirty) and is skipped: failing the lookup instead
+     * made fat32_get_next_cluster() report a false end of chain for an
+     * unrelated sector, so seeks deep into a file stopped early and reads
+     * returned the wrong clusters with a full byte count (doom1.wad's
+     * directory on the boot CD, where writes always fail). */
+    fat32_fat_slot_t *slot = NULL;
+    for (int tries = 0; tries < FAT32_FAT_CACHE_SLOTS; tries++) {
+        fat32_fat_slot_t *cand = &fat_slots[fat_slot_hand];
+        fat_slot_hand = (fat_slot_hand + 1) % FAT32_FAT_CACHE_SLOTS;
+        if (cand->dirty && fat32_fat_slot_write(fs, cand) != 0)
+            continue;
+        slot = cand;
+        break;
     }
+    if (!slot)
+        return NULL;
     if (storage_read_sectors(fs->storage_dev->device_id,
                              fs->fat_start_sector + sector, 1, slot->data) != 0) {
         slot->sector = 0xFFFFFFFFu;
@@ -178,6 +189,11 @@ static int fat32_fat_load(fat32_fs_t *fs, uint32_t cluster, uint32_t *raw) {
 
 static int fat32_fat_store(fat32_fs_t *fs, uint32_t cluster, uint32_t value) {
     if (!fat_cache_live || !fs || !fs->storage_dev || cluster < 2)
+        return -1;
+    /* Read-only medium (boot CD): never dirty the cached FAT. The change
+     * could not be written back, and a dirty slot that can never be cleaned
+     * used to poison later FAT lookups. */
+    if (fs->storage_dev->optical)
         return -1;
     uint32_t bps = fs->boot_sector.bytes_per_sector;
     if (bps == 0) bps = 512;
@@ -1885,13 +1901,26 @@ int fat32_seek(fat32_file_t *file, uint32_t position) {
         steps = target_cluster_index;
     }
 
+    uint32_t walked = 0;
     for (uint32_t i = 0; i < steps; i++) {
         uint32_t next = fat32_get_next_cluster(file->filesystem, cluster);
-        if (next == FAT32_CLUSTER_END || next == FAT32_CLUSTER_BAD) {
+        if (next == FAT32_CLUSTER_END || next == FAT32_CLUSTER_BAD ||
+            next == FAT32_CLUSTER_FREE) {
             // Position is beyond the cluster chain; stop at last valid cluster
             break;
         }
         cluster = next;
+        walked++;
+    }
+    /* The chain ended before a cluster the file size says must exist: the
+     * FAT lookup failed or the chain is short. Report it instead of leaving
+     * the file positioned on the wrong cluster (reads would return the
+     * wrong data with a full byte count). */
+    if (walked < steps &&
+        target_cluster_index < (file->file_size + bytes_per_cluster - 1) / bytes_per_cluster) {
+        serial_printf("fat32: seek to %u in '%s' failed: cluster chain ends early\n",
+                      position, file->filename);
+        FS_UNLOCK(); return -1;
     }
 
     file->file_position = position;

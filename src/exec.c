@@ -1883,7 +1883,13 @@ int exec_spawn(const char *filename, char *const argv[]) {
         kstrncpy(proc->linux_exe_path, filename, sizeof(proc->linux_exe_path));
     else
         proc->linux_exe_path[0] = 0;
-    proc->parent           = get_current_process();
+    /* A desktop-terminal shell (stdio on kterm pipes) belongs to the kernel,
+     * not to whatever process happens to be current when the desktop opens
+     * the window. Otherwise a terminal opened while Doom ran became Doom's
+     * (or another shell's) descendant, and Ctrl+C in that other terminal
+     * (process_signal_tree on its shell) also killed this window's jobs. */
+    proc->parent           = (spawn_in || spawn_out) ? get_kernel_process()
+                                                     : get_current_process();
     {
         process_t *par = proc->parent;
         if (par && par->cont_tty >= 0 && par->cont_tty < 4)

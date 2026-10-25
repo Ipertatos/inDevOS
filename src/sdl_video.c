@@ -260,6 +260,10 @@ bool sdl_destroy_window_sharing_pixels(uint32_t *pixels) {
         if (window->surface && window->surface->pixels == (void *)pixels) {
             *pp = window->next;
             window->next = NULL;
+            /* Drop the syscall handle and any renderer bound to this window
+             * so a stale pointer can never validate again. */
+            extern void sys_sdl_forget_window(void *window);
+            sys_sdl_forget_window(window);
             SDL_FreeSurface(window->surface);
             window->surface = NULL;
             kfree(window);

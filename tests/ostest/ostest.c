@@ -45,6 +45,11 @@
 #include <sys/file.h>
 #include <sys/uio.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <sys/signalfd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#include <pthread.h>
 #include <sched.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -402,6 +407,57 @@ static int t_exit_codes(char *d, size_t n) {
     msleep(20); kill(c, SIGKILL); int st; waitpid(c, &st, 0);
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "SIGKILL -> status 0x%x", st);
     R(PASS, "0/1/42/255 + SIGKILL status");
+}
+/* doom1.wad's lump directory is the last 20 KB of a 4 MB file on the boot
+ * volume. Reading it the way w_wad.c does (lseek far into the file, one big
+ * read) used to return a full byte count with the wrong clusters' data when
+ * the FAT cache could not evict a dirty slot (boot CD), so seeks stopped on
+ * the wrong cluster. Compare against a sequential read of the whole file. */
+static int t_fs_seek_far_read(char *d, size_t n) {
+    const char *path = "/doom1.wad";
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) R(SKIP, "%s missing", path);
+    unsigned char hdr[12];
+    CHECK(read(fd, hdr, 12) == 12 && memcmp(hdr + 1, "WAD", 3) == 0, "bad WAD header");
+    uint32_t num, ofs; memcpy(&num, hdr + 4, 4); memcpy(&ofs, hdr + 8, 4);
+    struct stat st; CHECK(fstat(fd, &st) == 0, "fstat");
+    size_t len = (size_t)num * 16;
+    CHECK(num > 0 && num < 100000 && (off_t)ofs + (off_t)len <= st.st_size, "num %u ofs %u size %lld", num, ofs, (long long)st.st_size);
+    unsigned char *ref = malloc(len), *buf = malloc(len), *chunk = malloc(65536);
+    CHECK(ref && buf && chunk, "malloc");
+    /* reference: sequential 64 KiB reads from offset 0 */
+    CHECK(lseek(fd, 0, SEEK_SET) == 0, "lseek 0");
+    off_t pos = 0; size_t got = 0; ssize_t r;
+    while ((r = read(fd, chunk, 65536)) > 0) {
+        for (ssize_t i = 0; i < r; i++) {
+            off_t p = pos + i;
+            if (p >= (off_t)ofs && p < (off_t)ofs + (off_t)len) { ref[p - ofs] = chunk[i]; got++; }
+        }
+        pos += r;
+    }
+    if (got != len || pos != st.st_size) { free(ref); free(buf); free(chunk); close(fd); R(FAIL, "sequential read got %lld of %lld bytes", (long long)pos, (long long)st.st_size); }
+    int bad = 0;
+    for (uint32_t i = 0; i < num; i++) {
+        const unsigned char *nm = ref + i * 16 + 8;
+        if (!nm[0]) { bad++; continue; }
+        for (int k = 0; k < 8 && nm[k]; k++) if (nm[k] < 0x20 || nm[k] > 0x7e) { bad++; break; }
+    }
+    if (bad) { free(ref); free(buf); free(chunk); close(fd); R(FAIL, "sequential read: %d bad lump names", bad); }
+    /* w_wad.c pattern, repeated; seek back to the start in between so each
+     * far seek walks the whole cluster chain again */
+    for (int pass = 0; pass < 8; pass++) {
+        if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, hdr, 12) != 12) { free(ref); free(buf); free(chunk); close(fd); R(FAIL, "pass %d: header re-read", pass); }
+        off_t o = lseek(fd, ofs, SEEK_SET);
+        ssize_t rr = o == (off_t)ofs ? read(fd, buf, len) : -1;
+        if (rr != (ssize_t)len) { free(ref); free(buf); free(chunk); close(fd); R(FAIL, "pass %d: lseek %lld read %zd of %zu", pass, (long long)o, rr, len); }
+        if (memcmp(buf, ref, len) != 0) {
+            size_t k = 0; while (k < len && buf[k] == ref[k]) k++;
+            free(ref); free(buf); free(chunk); close(fd);
+            R(FAIL, "pass %d: directory differs from sequential read at byte %zu", pass, k);
+        }
+    }
+    free(ref); free(buf); free(chunk); close(fd);
+    R(PASS, "%u-entry directory at %u: 8 far seek+reads match sequential read", num, ofs);
 }
 static int t_exec_busybox(char *d, size_t n) {
     if (access("/bin/busybox.exe", F_OK)) R(SKIP, "/bin/busybox.exe missing");
@@ -767,7 +823,8 @@ static int t_fs_fd_offsets(char *d, size_t n) {
 }
 
 /* Links -dump of a page served on the host (python3 -m http.server 8080 in the
- * slirp host, 10.0.2.2).  SKIP when /bin/links or the host server is absent. */
+ * slirp host, 10.0.2.2; --http-port N overrides 8080).  SKIP when /bin/links or the
+ * host server is absent. */
 static int links_dump(const char *url, char *out, size_t cap) {
     static int seq; char f[160]; snprintf(f, sizeof(f), "%s/lk.%d.%d", tmpdir, getpid(), seq++);
     pid_t c = fork();
@@ -786,14 +843,16 @@ static int links_dump(const char *url, char *out, size_t cap) {
     if (w == 0) return -2;
     return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
+static int http_port = 8080;   /* --http-port N: host test server on 10.0.2.2 */
 static void oneline(char *s) { for (; *s; s++) if (*s == '\n' || *s == '\r') *s = '|'; }
 static int t_net_links_http(char *d, size_t n) {
     if (access("/bin/links", X_OK) && access("/bin/links", F_OK)) R(SKIP, "/bin/links missing");
     static char out[4096];
-    int r = links_dump("http://10.0.2.2:8080/", out, sizeof(out));
-    CHECK(r != -2, "links -dump timed out (20 s)");
+    char url[64]; snprintf(url, sizeof(url), "http://10.0.2.2:%d/", http_port);
+    int r = links_dump(url, out, sizeof(out));
+    if (r == -2) { oneline(out); R(FAIL, "links -dump %s timed out (20 s): '%.120s' (guest net not on slirp 10.0.2.x? run ddhcp)", url, out); }
     if (!strstr(out, "LINKS_OK")) {
-        if (strstr(out, "efused") || strstr(out, "rror")) { oneline(out); R(SKIP, "no host server on 10.0.2.2:8080 (rc %d: %.80s)", r, out); }
+        if (strstr(out, "efused") || strstr(out, "rror")) { oneline(out); R(SKIP, "no host server on 10.0.2.2:%d (rc %d: %.80s)", http_port, r, out); }
         oneline(out); R(FAIL, "rc %d, no LINKS_OK marker: '%.160s'", r, out);
     }
     char *p = strstr(out, "LINKS_OK"); char snip[64]; snprintf(snip, sizeof(snip), "%.40s", p); oneline(snip);
@@ -804,7 +863,8 @@ static int t_net_links_http(char *d, size_t n) {
         hosts[hl] = 0; static char nh[8256];
         snprintf(nh, sizeof(nh), "%s%s10.0.2.2 testhost\n", hosts, (hl && hosts[hl - 1] != '\n') ? "\n" : "");
         if (put_file("/etc/hosts", nh, strlen(nh)) == 0) {
-            int r2 = links_dump("http://testhost:8080/", out, sizeof(out));
+            snprintf(url, sizeof(url), "http://testhost:%d/", http_port);
+            int r2 = links_dump(url, out, sizeof(out));
             put_file("/etc/hosts", hosts, (size_t)hl);
             byname = (r2 == 0 && strstr(out, "LINKS_OK")) ? "testhost ok" : "testhost FAILED";
             if (strcmp(byname, "testhost ok")) { oneline(out); R(FAIL, "by IP ok, by /etc/hosts name rc %d: '%.120s'", r2, out); }
@@ -1593,6 +1653,206 @@ static int t_ep_tty(char *d, size_t n) {
     R(PASS, "tty fd %d added, wait r=%d", fd, r);
 }
 
+/* ===================== futex / timerfd / signalfd / epoll ET ===================== */
+static long fx(volatile uint32_t *u, int op, uint32_t v, const struct timespec *ts, volatile uint32_t *u2, uint32_t v3) {
+    return syscall(SYS_futex, u, op, v, ts, u2, v3);
+}
+/* futex.wait_wake: EAGAIN on mismatch, relative timeout, and a real WAKE
+ * (word unchanged) from another process on a MAP_SHARED word. */
+static int t_fx_wait_wake(char *d, size_t n) {
+    volatile uint32_t *sh = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECKE(sh != MAP_FAILED, "mmap shared");
+    sh[0] = 5; sh[1] = 0; sh[2] = 0;
+    errno = 0; CHECK(fx(&sh[0], FUTEX_WAIT, 4, NULL, NULL, 0) == -1 && errno == EAGAIN, "mismatch errno %d", errno);
+    struct timespec to = { 0, 100 * 1000000L };
+    long long t0 = mono_ms(); errno = 0; long r = fx(&sh[0], FUTEX_WAIT, 5, &to, NULL, 0); long long el = mono_ms() - t0;
+    CHECK(r == -1 && errno == ETIMEDOUT && el >= 80 && el < 1000, "timeout r=%ld errno %d %lldms", r, errno, el);
+    errno = 0; CHECK(fx(&sh[0], FUTEX_WAKE, 1, NULL, NULL, 0) == 0, "WAKE with no waiters != 0");
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) {
+        /* wake until the parent is really queued (WAKE returns 1); word never changes */
+        for (int i = 0; i < 200; i++) { msleep(10); long w = fx(&sh[0], FUTEX_WAKE, 1, NULL, NULL, 0); if (w) { sh[1] = (uint32_t)w; _exit(0); } }
+        _exit(3);
+    }
+    struct timespec to2 = { 3, 0 };
+    t0 = mono_ms(); errno = 0; r = fx(&sh[0], FUTEX_WAIT, 5, &to2, NULL, 0); el = mono_ms() - t0;
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(r == 0, "shared WAIT r=%ld errno %d after %lldms (child st %d)", r, errno, el, st);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0 && sh[1] == 1, "child WAKE count %u st %d", sh[1], st);
+    CHECK(el < 2500, "woke only after %lldms", el);
+    munmap((void *)sh, 4096);
+    R(PASS, "EAGAIN, ETIMEDOUT %lldms, cross-process WAKE=1", el);
+}
+static volatile uint32_t fx_w1, fx_w2, fx_done;
+static void *fx_waiter(void *arg) {
+    volatile uint32_t *w = arg;
+    long r = fx(w, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    __atomic_add_fetch(&fx_done, r == 0 ? 1 : 100, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+static int wake_until(volatile uint32_t *u, int op, int want, int ms) {
+    int got = 0;
+    for (int i = 0; i < ms / 10 && got < want; i++) { long w = fx(u, op, (uint32_t)(want - got), NULL, NULL, 0); if (w > 0) got += (int)w; else msleep(10); }
+    return got;
+}
+/* futex.private_requeue: PRIVATE WAIT/WAKE between threads, CMP_REQUEUE
+ * (EAGAIN on stale val3; wake 1 + move 1), then WAKE on the target word. */
+static int t_fx_requeue(char *d, size_t n) {
+    pthread_t a, b;
+    fx_w1 = 0; fx_w2 = 0; fx_done = 0;
+    if (pthread_create(&a, NULL, fx_waiter, (void *)&fx_w1)) R(SKIP, "pthread_create failed");
+    int got = wake_until(&fx_w1, FUTEX_WAKE_PRIVATE, 1, 2000);
+    pthread_join(a, NULL);
+    CHECK(got == 1 && fx_done == 1, "private WAKE got %d done %u", got, fx_done);
+    fx_done = 0;
+    CHECK(pthread_create(&a, NULL, fx_waiter, (void *)&fx_w1) == 0, "pthread_create a");
+    CHECK(pthread_create(&b, NULL, fx_waiter, (void *)&fx_w1) == 0, "pthread_create b");
+    msleep(150);                                   /* both queued on w1 */
+    errno = 0; long r = fx(&fx_w1, FUTEX_CMP_REQUEUE_PRIVATE, 1, (const struct timespec *)1L, &fx_w2, 7);
+    CHECK(r == -1 && errno == EAGAIN, "stale CMP_REQUEUE r=%ld errno %d", r, errno);
+    r = fx(&fx_w1, FUTEX_CMP_REQUEUE_PRIVATE, 1, (const struct timespec *)1L, &fx_w2, 0);
+    CHECK(r == 2, "CMP_REQUEUE woke+moved %ld (want 2)", r);
+    for (int i = 0; i < 100 && fx_done < 1; i++) msleep(10);
+    msleep(50);
+    CHECK(fx_done == 1, "after requeue done=%u (want 1)", fx_done);
+    long w1 = fx(&fx_w1, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    long w2 = fx(&fx_w2, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    pthread_join(a, NULL); pthread_join(b, NULL);
+    CHECK(w1 == 0 && w2 == 1 && fx_done == 2, "after requeue WAKE w1=%ld w2=%ld done=%u", w1, w2, fx_done);
+    R(PASS, "private wake, CMP_REQUEUE EAGAIN + 1 woken/1 moved, target WAKE=1");
+}
+/* futex.bitset_abs: WAIT_BITSET absolute deadlines (MONOTONIC and
+ * CLOCK_REALTIME), EINVAL on bitset 0, non-matching WAKE_BITSET wakes none. */
+static int t_fx_bitset(char *d, size_t n) {
+    static volatile uint32_t w = 3;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_nsec += 100000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    long long t0 = mono_ms(); errno = 0; long r = fx(&w, FUTEX_WAIT_BITSET_PRIVATE, 3, &ts, NULL, FUTEX_BITSET_MATCH_ANY); long long el = mono_ms() - t0;
+    CHECK(r == -1 && errno == ETIMEDOUT && el >= 70 && el < 1000, "abs mono r=%ld errno %d %lldms", r, errno, el);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 100000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    t0 = mono_ms(); errno = 0; r = fx(&w, FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME, 3, &ts, NULL, FUTEX_BITSET_MATCH_ANY); long long el2 = mono_ms() - t0;
+    CHECK(r == -1 && errno == ETIMEDOUT && el2 >= 50 && el2 < 1500, "abs realtime r=%ld errno %d %lldms", r, errno, el2);
+    errno = 0; CHECK(fx(&w, FUTEX_WAIT_BITSET_PRIVATE, 3, NULL, NULL, 0) == -1 && errno == EINVAL, "bitset 0 errno %d", errno);
+    CHECK(fx(&w, FUTEX_WAKE_BITSET_PRIVATE, 1, NULL, NULL, 2) == 0, "WAKE_BITSET no waiters");
+    R(PASS, "abs mono %lldms, abs realtime %lldms, EINVAL", el, el2);
+}
+/* timerfd.basic: one-shot + periodic expirations, gettime/settime old value,
+ * nonblocking EAGAIN, ABSTIME, poll and epoll readiness, disarm. */
+static int t_tfd_basic(char *d, size_t n) {
+    int t = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC); if (t < 0) R(SKIP, "timerfd_create: %s", strerror(errno));
+    struct itimerspec cur, its = { { 0, 0 }, { 0, 100 * 1000000L } }, old;
+    CHECKE(timerfd_gettime(t, &cur) == 0, "gettime");
+    CHECK(!cur.it_value.tv_sec && !cur.it_value.tv_nsec, "fresh timer armed");
+    CHECKE(timerfd_settime(t, 0, &its, NULL) == 0, "settime 100ms");
+    uint64_t v = 0; long long t0 = mono_ms(); ssize_t rr = read(t, &v, 8); long long el = mono_ms() - t0;
+    CHECK(rr == 8 && v == 1 && el >= 70 && el < 1000, "one-shot read %zd v=%llu %lldms", rr, (unsigned long long)v, el);
+    CHECKE(timerfd_gettime(t, &cur) == 0, "gettime after");
+    CHECK(!cur.it_value.tv_sec && !cur.it_value.tv_nsec, "one-shot still armed");
+    errno = 0; CHECK(read(t, &v, 4) < 0 && errno == EINVAL, "short read errno %d", errno);
+    int fl = fcntl(t, F_GETFL); fcntl(t, F_SETFL, fl | O_NONBLOCK);
+    errno = 0; CHECK(read(t, &v, 8) < 0 && errno == EAGAIN, "nonblock read errno %d", errno);
+    struct itimerspec per = { { 0, 20 * 1000000L }, { 0, 20 * 1000000L } };
+    CHECKE(timerfd_settime(t, 0, &per, NULL) == 0, "settime periodic");
+    msleep(130);
+    v = 0; CHECK(read(t, &v, 8) == 8 && v >= 4 && v <= 8, "periodic expirations %llu (want ~6)", (unsigned long long)v);
+    CHECKE(timerfd_gettime(t, &cur) == 0, "gettime periodic");
+    CHECK(cur.it_interval.tv_sec == 0 && cur.it_interval.tv_nsec == 20 * 1000000L, "interval %ld", cur.it_interval.tv_nsec);
+    CHECK(cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 0 && cur.it_value.tv_nsec <= 20 * 1000000L, "remaining %ld", cur.it_value.tv_nsec);
+    struct itimerspec off = { { 0, 0 }, { 0, 0 } };
+    CHECKE(timerfd_settime(t, 0, &off, &old) == 0, "disarm");
+    CHECK(old.it_interval.tv_nsec == 20 * 1000000L, "old interval %ld", old.it_interval.tv_nsec);
+    struct pollfd pf = { t, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 60) == 0, "disarmed timer readable");
+    struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+    struct itimerspec ab = { { 0, 0 }, { now.tv_sec, now.tv_nsec } };
+    ab.it_value.tv_nsec += 80 * 1000000L; if (ab.it_value.tv_nsec >= 1000000000L) { ab.it_value.tv_sec++; ab.it_value.tv_nsec -= 1000000000L; }
+    int tr = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK); CHECKE(tr >= 0, "timerfd REALTIME");
+    CHECKE(timerfd_settime(tr, TFD_TIMER_ABSTIME, &ab, NULL) == 0, "settime abstime");
+    struct pollfd pr = { tr, POLLIN, 0 }; t0 = mono_ms(); int pn = poll(&pr, 1, 2000); long long el2 = mono_ms() - t0;
+    CHECK(pn == 1 && (pr.revents & POLLIN) && el2 >= 40 && el2 < 1500, "abstime poll %d after %lldms", pn, el2);
+    v = 0; CHECK(read(tr, &v, 8) == 8 && v == 1, "abstime read %llu", (unsigned long long)v);
+    int ep = epoll_create1(0); CHECKE(ep >= 0, "epoll_create1");
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = t }, out[2];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, t, &ev) == 0, "epoll ADD timerfd");
+    its.it_value.tv_nsec = 50 * 1000000L; timerfd_settime(t, 0, &its, NULL);
+    t0 = mono_ms(); int en = epoll_wait(ep, out, 2, 2000); long long el3 = mono_ms() - t0;
+    CHECK(en == 1 && out[0].data.fd == t && el3 >= 30 && el3 < 1500, "epoll timerfd %d after %lldms", en, el3);
+    errno = 0; CHECK(timerfd_create(12345, 0) < 0 && errno == EINVAL, "bad clock errno %d", errno);
+    close(ep); close(tr); close(t);
+    R(PASS, "one-shot %lldms, periodic, abstime %lldms, poll/epoll %lldms", el, el2, el3);
+}
+/* signalfd.basic: blocked signals are read from a signalfd (nonblocking
+ * EAGAIN, poll/epoll readiness, mask update, blocking read woken by a
+ * signal from a child), and rt_sigtimedwait dequeues / times out. */
+static int t_sfd_basic(char *d, size_t n) {
+    sigset_t m, om; sigemptyset(&m); sigaddset(&m, SIGUSR1); sigaddset(&m, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &m, &om);
+    sigset_t m1; sigemptyset(&m1); sigaddset(&m1, SIGUSR1);
+    int s = signalfd(-1, &m1, SFD_NONBLOCK | SFD_CLOEXEC); if (s < 0) R(SKIP, "signalfd: %s", strerror(errno));
+    struct signalfd_siginfo si;
+    errno = 0; CHECK(read(s, &si, sizeof(si)) < 0 && errno == EAGAIN, "empty read errno %d", errno);
+    kill(getpid(), SIGUSR1);
+    struct pollfd pf = { s, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 500) == 1 && (pf.revents & POLLIN), "poll after kill 0x%x", pf.revents);
+    memset(&si, 0, sizeof(si));
+    CHECK(read(s, &si, sizeof(si)) == sizeof(si) && si.ssi_signo == SIGUSR1, "read signo %u", si.ssi_signo);
+    errno = 0; CHECK(read(s, &si, sizeof(si)) < 0 && errno == EAGAIN, "second read errno %d", errno);
+    errno = 0; CHECK(read(s, &si, 16) < 0 && errno == EINVAL, "short read errno %d", errno);
+    kill(getpid(), SIGUSR2);                       /* not in the signalfd mask yet */
+    CHECK(poll(&pf, 1, 50) == 0, "SIGUSR2 visible through USR1-only signalfd");
+    CHECK(signalfd(s, &m, 0) == s, "mask update");
+    int ep = epoll_create1(0); CHECKE(ep >= 0, "epoll_create1");
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = s }, out[2];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, s, &ev) == 0, "epoll ADD signalfd");
+    CHECK(epoll_wait(ep, out, 2, 500) == 1, "epoll ready for pending SIGUSR2");
+    CHECK(read(s, &si, sizeof(si)) == sizeof(si) && si.ssi_signo == SIGUSR2, "USR2 signo %u", si.ssi_signo);
+    int fl = fcntl(s, F_GETFL); fcntl(s, F_SETFL, fl & ~O_NONBLOCK);
+    pid_t par = getpid(), c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) { msleep(100); kill(par, SIGUSR1); _exit(0); }
+    long long t0 = mono_ms(); ssize_t rr = read(s, &si, sizeof(si)); long long el = mono_ms() - t0;
+    waitpid(c, NULL, 0);
+    CHECK(rr == sizeof(si) && si.ssi_signo == SIGUSR1 && el >= 50 && el < 2000, "blocking read %zd signo %u %lldms", rr, si.ssi_signo, el);
+    close(ep); close(s);
+    kill(getpid(), SIGUSR2);
+    siginfo_t inf; struct timespec z = { 1, 0 };
+    int g = sigtimedwait(&m, &inf, &z);
+    CHECK(g == SIGUSR2 && inf.si_signo == SIGUSR2, "sigtimedwait got %d", g);
+    struct timespec sh = { 0, 60 * 1000000L };
+    t0 = mono_ms(); errno = 0; g = sigtimedwait(&m, &inf, &sh); long long el2 = mono_ms() - t0;
+    CHECK(g < 0 && errno == EAGAIN && el2 >= 40 && el2 < 1000, "sigtimedwait timeout %d errno %d %lldms", g, errno, el2);
+    sigprocmask(SIG_SETMASK, &om, NULL);
+    R(PASS, "nonblock/poll/epoll/mask update, blocking read %lldms, sigtimedwait", el);
+}
+/* epoll.edge: EPOLLET reports once per edge: no repeat while nothing
+ * changes, a new edge after more data is written, and after drain+refill. */
+static int t_ep_edge(char *d, size_t n) {
+    int ep = epoll_create1(0); if (ep < 0) R(SKIP, "epoll_create1: %s", strerror(errno));
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.u32 = 1 }, out[2];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) == 0, "ADD ET");
+    CHECK(epoll_wait(ep, out, 2, 0) == 0, "ready before data");
+    write(pf[1], "a", 1);
+    CHECK(epoll_wait(ep, out, 2, 0) == 1, "first edge");
+    long long t0 = mono_ms(); int r = epoll_wait(ep, out, 2, 150); long long el = mono_ms() - t0;
+    CHECK(r == 0 && el >= 100, "ET repeated without new data (r=%d after %lldms)", r, el);
+    write(pf[1], "b", 1);
+    CHECK(epoll_wait(ep, out, 2, 0) == 1, "no edge for new data while still readable");
+    char b[8]; CHECK(read(pf[0], b, sizeof(b)) == 2, "drain");
+    CHECK(epoll_wait(ep, out, 2, 0) == 0, "ready after drain");
+    pid_t c = fork(); if (c == 0) { msleep(100); write(pf[1], "c", 1); _exit(0); }
+    t0 = mono_ms(); r = epoll_wait(ep, out, 2, 2000); long long el2 = mono_ms() - t0; waitpid(c, NULL, 0);
+    CHECK(r == 1 && el2 >= 50 && el2 < 1500, "edge from writer r=%d %lldms", r, el2);
+    /* level-triggered entry on the same pipe still repeats */
+    struct epoll_event lv = { .events = EPOLLOUT, .data.u32 = 2 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[1], &lv) == 0, "ADD LT");
+    r = epoll_wait(ep, out, 2, 0);
+    CHECK(r == 1 && out[0].data.u32 == 2, "LT entry r=%d", r);
+    CHECK(epoll_wait(ep, out, 2, 0) == 1, "LT entry repeat");
+    close(pf[0]); close(pf[1]); close(ep);
+    R(PASS, "single edge, no repeat (%lldms), new-data edge, writer edge %lldms", el, el2);
+}
+
 /* ===================== registry ===================== */
 /* tty.pty_basic: stdin of the desktop terminal is a pty-like device:
  * isatty, raw-mode termios round-trip, TIOCGWINSZ/TIOCSWINSZ round-trip. */
@@ -1809,7 +2069,7 @@ static const struct test tests[] = {
     { "fs", "rw_seek", t_fs_rw, 10, 0 }, { "fs", "append", t_fs_append, 10, 0 }, { "fs", "truncate", t_fs_truncate, 15, 0 },
     { "fs", "rename", t_fs_rename, 10, 0 }, { "fs", "dirs", t_fs_dirs, 15, 0 }, { "fs", "readdir_stat", t_fs_readdir_stat, 10, 0 }, { "fs", "readdir_many", t_fs_readdir_many, 120, 0 },
     { "fs", "many_files", t_fs_many, 120, 0 }, { "fs", "large_24mb", t_fs_large, 180, 0 },
-    { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 },
+    { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 }, { "fs", "seek_far_read", t_fs_seek_far_read, 30, 0 },
     { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 }, { "vol", "ext_write", t_vol_extwrite, 60, 0 }, { "vol", "ext_ns", t_vol_extns, 120, 0 }, { "vol", "ext_dir", t_vol_extdir, 60, 0 }, { "vol", "ext_htree", t_vol_exthtree, 120, 0 }, { "vol", "ext_sparse", t_vol_extsparse, 60, 0 }, { "vol", "ext_deep", t_vol_extdeep, 120, 0 }, { "vol", "ext_journal", t_vol_extjournal, 120, 0 }, { "vol", "ext_e4dw", t_vol_exte4dw, 60, 0 }, { "vol", "mount_slots", t_vol_mountslots, 30, 0 },
     { "vol", "ext_meta", t_vol_extmeta, 180, 0 },
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
@@ -1828,6 +2088,10 @@ static const struct test tests[] = {
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },
     { "epoll", "pipe", t_ep_pipe, 15, 0 }, { "epoll", "unix_socket", t_ep_sock, 10, 0 },
     { "epoll", "ctl_errors", t_ep_ctl, 10, 0 }, { "epoll", "tty", t_ep_tty, 5, 0 },
+    { "epoll", "edge", t_ep_edge, 10, 0 },
+    { "futex", "wait_wake", t_fx_wait_wake, 15, 0 }, { "futex", "private_requeue", t_fx_requeue, 15, 0 },
+    { "futex", "bitset_abs", t_fx_bitset, 10, 0 },
+    { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
     { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
@@ -1926,7 +2190,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-vv")) verbose = 2;
         else if (!strcmp(argv[i], "-v")) { verbose++; if (i + 1 < argc && !strcmp(argv[i + 1], "draw")) { draw = 1; i++; } }
         else if (!strcmp(argv[i], "--destructive")) destructive = 1;
-        else { fprintf(stderr, "usage: ostest [-g group,group] [-l] [-v [draw]] [--destructive]\n"); return 255; }
+        else if (!strcmp(argv[i], "--http-port") && i + 1 < argc) http_port = atoi(argv[++i]);
+        else { fprintf(stderr, "usage: ostest [-g group,group] [-l] [-v [draw]] [--destructive] [--http-port N]\n"); return 255; }
     }
     if (argv[0] && strchr(argv[0], '/') && access(argv[0], F_OK) == 0) self_path = argv[0];
     if (list) {

@@ -95,6 +95,20 @@ static bool sdl_handle_valid(void **table, void *h) {
 #define sdl_window_valid(w)   sdl_handle_valid(sdl_window_handles, (void *)(w))
 #define sdl_renderer_valid(r) sdl_handle_valid(sdl_renderer_handles, (void *)(r))
 
+/* sdl_video.c freed this window (its desktop window was closed or its owner
+ * died): forget the handle and destroy renderers that point at it. */
+void sys_sdl_forget_window(void *window) {
+    if (!window) return;
+    for (int i = 0; i < SDL_MAX_HANDLES; i++) {
+        SDL_Renderer *r = (SDL_Renderer *)sdl_renderer_handles[i];
+        if (r && r->window == (SDL_Window *)window) {
+            sdl_renderer_handles[i] = NULL;
+            SDL_DestroyRenderer(r);
+        }
+    }
+    sdl_handle_unregister(sdl_window_handles, window);
+}
+
 static void sdl_handles_clear_all(void) {
     for (int i = 0; i < SDL_MAX_HANDLES; i++) {
         if (sdl_renderer_handles[i]) {

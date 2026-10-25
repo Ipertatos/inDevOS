@@ -153,6 +153,8 @@ enum {
     LX_pselect6 = 270, LX_ppoll = 271, LX_set_robust_list = 273,
     LX_epoll_create = 213, LX_epoll_wait = 232, LX_epoll_ctl = 233,
     LX_epoll_pwait = 281, LX_epoll_create1 = 291, LX_epoll_pwait2 = 441,
+    LX_timerfd_create = 283, LX_timerfd_settime = 286, LX_timerfd_gettime = 287,
+    LX_signalfd = 282, LX_signalfd4 = 289, LX_rt_sigtimedwait = 128,
     LX_get_robust_list = 274, LX_utimensat = 280, LX_dup3 = 292,
     LX_pipe2 = 293, LX_prlimit64 = 302, LX_getcpu = 309,
     LX_renameat2 = 316, LX_copy_file_range = 326, LX_getrandom = 318, LX_membarrier = 324,
@@ -340,6 +342,9 @@ typedef struct {
     void    *key;        /* file_handle at ADD time: detects fd reuse */
     uint8_t  type;
     bool     armed;
+    bool     et_reported;   /* EPOLLET: reported and not seen un-ready since */
+    uint32_t et_rev;
+    uint64_t et_seq;
 } lx_epitem_t;
 typedef struct { int n; lx_epitem_t it[LX_EPOLL_MAX]; } lx_epoll_t;
 
@@ -408,6 +413,7 @@ static long lx_epoll_ctl(process_t *p, long epfd, long op, long fd, const void *
         ep->it[idx].events = ev.events;
         ep->it[idx].data = ev.data;
         ep->it[idx].armed = true;
+        ep->it[idx].et_reported = false;
         return 0;
     case 2: /* EPOLL_CTL_DEL */
         if (idx < 0) return -ENOENT;
@@ -417,45 +423,90 @@ static long lx_epoll_ctl(process_t *p, long epfd, long op, long fd, const void *
         return -EINVAL;
     }
 }
+/* Global I/O sequence: bumped by every read/write/send/recv-style syscall.
+ * EPOLLET re-reports a still-ready entry only after some I/O happened since
+ * it was last reported (or its readiness dropped / gained new bits), so a
+ * consumer that drains to EAGAIN and a producer that writes more both
+ * produce a new edge. */
+static volatile uint64_t lx_io_seq;
 static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, int timeout_ms) {
     long err = 0;
     lx_epoll_t *ep = lx_ep_get(p, epfd, &err);
     if (!ep) return err;
     if (maxevents <= 0 || maxevents > 0x7fffffff / (long)sizeof(lx_epoll_event_t)) return -EINVAL;
     if (!uevs) return -EFAULT;
-    lx_ep_gc(p, ep);
+    extern uint64_t ktime_deadline_ms(uint64_t);
+    extern bool     ktime_expired(uint64_t);
+    extern bool     proc_signal_interrupts(process_t *);
+    uint64_t dl = timeout_ms > 0 ? ktime_deadline_ms((uint64_t)timeout_ms) : 0;
     pollfd_t pf[LX_EPOLL_MAX];
     int map[LX_EPOLL_MAX];
-    int np = 0;
-    for (int i = 0; i < ep->n; i++) {
-        if (!ep->it[i].armed) continue;
-        pf[np].fd = ep->it[i].fd;
-        /* poll bit values match EPOLLIN/PRI/OUT/ERR/HUP/RDNORM/WRNORM/RDHUP */
-        pf[np].events = (short)(ep->it[i].events & 0x23ff);
-        pf[np].revents = 0;
-        map[np++] = i;
+    for (;;) {
+        lx_ep_gc(p, ep);
+        int np = 0;
+        for (int i = 0; i < ep->n; i++) {
+            if (!ep->it[i].armed) continue;
+            pf[np].fd = ep->it[i].fd;
+            /* poll bit values match EPOLLIN/PRI/OUT/ERR/HUP/RDNORM/WRNORM/RDHUP */
+            pf[np].events = (short)(ep->it[i].events & 0x23ff);
+            pf[np].revents = 0;
+            map[np++] = i;
+        }
+        long r = 0;
+        if (np) r = sys_poll_kernel(pf, (unsigned)np, 0);
+        if (r < 0) return r;
+        uint64_t seq = __atomic_load_n(&lx_io_seq, __ATOMIC_ACQUIRE);
+        long out = 0;
+        bool suppressed = false;
+        for (int j = 0; j < np; j++) {
+            lx_epitem_t *it = &ep->it[map[j]];
+            /* ERR/HUP are always reported, like poll */
+            uint32_t rev = (uint16_t)pf[j].revents & ((it->events & 0x23ff) | 0x18);
+            if (it->events & LX_EPOLLET) {
+                if (!rev) { it->et_reported = false; it->et_rev = 0; continue; }
+                if (it->et_reported && it->et_seq == seq && !(rev & ~it->et_rev)) {
+                    suppressed = true; continue;
+                }
+            }
+            if (!rev || out >= maxevents) continue;
+            lx_epoll_event_t e = { rev, it->data };
+            if (lx_put((char *)uevs + out * sizeof(e), &e, sizeof(e))) return out ? out : -EFAULT;
+            if (it->events & LX_EPOLLONESHOT) it->armed = false;
+            if (it->events & LX_EPOLLET) { it->et_reported = true; it->et_seq = seq; it->et_rev = rev; }
+            out++;
+        }
+        if (out) return out;
+        if (timeout_ms == 0) return 0;
+        if (timeout_ms > 0 && ktime_expired(dl)) return 0;
+        /* sleep until something not yet reported may be ready: wait on the
+         * non-suppressed entries in short slices (suppressed ET entries are
+         * re-checked each slice) */
+        int slice = 10;
+        if (!suppressed) slice = timeout_ms < 0 ? 50 : timeout_ms;
+        int k = 0;
+        for (int j = 0; j < np; j++) {
+            lx_epitem_t *it = &ep->it[map[j]];
+            if ((it->events & LX_EPOLLET) && it->et_reported && pf[j].revents) continue;
+            pf[k].fd = pf[j].fd; pf[k].events = (short)(it->events & 0x23ff); pf[k].revents = 0; k++;
+        }
+        if (!k) { pf[0].fd = -1; pf[0].events = 0; pf[0].revents = 0; k = 1; }
+        if (timeout_ms > 0) {
+            extern uint64_t ktime_now_ms(void);
+            uint64_t now = ktime_now_ms();
+            int left = dl > now ? (int)(dl - now) : 0;
+            if (slice > left) slice = left;
+        }
+        r = sys_poll_kernel(pf, (unsigned)k, slice);
+        if (r < 0) return r;
+        if (proc_signal_interrupts(p)) return -EINTR;
     }
-    if (np == 0) {                    /* nothing to watch: sleep (fd -1 is ignored) */
-        pf[0].fd = -1; pf[0].events = 0; pf[0].revents = 0;
-        long r = sys_poll_kernel(pf, 1, timeout_ms);
-        return r < 0 ? r : 0;
-    }
-    long r = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
-    if (r <= 0) return r;
-    long out = 0;
-    for (int j = 0; j < np && out < maxevents; j++) {
-        /* ERR/HUP are always reported, like poll */
-        uint32_t rev = (uint16_t)pf[j].revents &
-                       ((ep->it[map[j]].events & 0x23ff) | 0x18);
-        if (!rev) continue;
-        lx_epoll_event_t e = { rev, ep->it[map[j]].data };
-        if (lx_put((char *)uevs + out * sizeof(e), &e, sizeof(e))) return out ? out : -EFAULT;
-        if (ep->it[map[j]].events & LX_EPOLLONESHOT) ep->it[map[j]].armed = false;
-        out++;
-    }
-    return out;
 }
 
+#define FD_TYPE_TIMERFD  14
+#define FD_TYPE_SIGNALFD 15
+static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len);
+static long lx_signalfd_read(process_t *p, long fd, void *ubuf, size_t len);
+static void lx_futex_wake_addr(uint64_t uaddr, int n);
 static long lx_eventfd_rw(process_t *p, long fd, void *ubuf, size_t len, bool wr) {
     if (len < 8) return -EINVAL;
     volatile uint64_t *ctr = (volatile uint64_t *)p->fds[fd].file_handle;
@@ -513,6 +564,8 @@ static long lx_read(process_t *p, long fd, void *ubuf, size_t count) {
     if (ty == FD_TYPE_SOCKET)
         return lx_sock_recv((int)fd, ubuf, count, 0);
     if (ty == FD_TYPE_EPOLL) return -EINVAL;
+    if (ty == FD_TYPE_TIMERFD) return lx_timerfd_read(p, fd, ubuf, count);
+    if (ty == FD_TYPE_SIGNALFD) return lx_signalfd_read(p, fd, ubuf, count);
     if (ty == FD_TYPE_EVENTFD)
         return lx_eventfd_rw(p, fd, ubuf, count, false);
     return (long)sys_read((int)fd, ubuf, count);
@@ -997,7 +1050,8 @@ static long lx_write(process_t *p, long fd, const void *ubuf, size_t len) {
         return -EINVAL;
     if (p->fds[fd].fd_type == FD_TYPE_SOCKET)
         return lx_sock_send((int)fd, ubuf, len, 0);
-    if (p->fds[fd].fd_type == FD_TYPE_EPOLL) return -EINVAL;
+    if (p->fds[fd].fd_type == FD_TYPE_EPOLL || p->fds[fd].fd_type == FD_TYPE_TIMERFD ||
+        p->fds[fd].fd_type == FD_TYPE_SIGNALFD) return -EINVAL;
     if (p->fds[fd].fd_type == FD_TYPE_EVENTFD)
         return lx_eventfd_rw(p, fd, (void *)ubuf, len, true);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_TTY) {
@@ -1493,6 +1547,18 @@ static long lx_ioctl(process_t *p, long fd, unsigned long req, void *arg) {
         kpty_t *pt = lx_fd_pty(p, fd);
         if (pt) return lx_pty_ioctl(p, fd, pt, req, arg);
     }
+    if (p->fds[fd].fd_type == FD_TYPE_DEV_TTY) {
+        /* /dev/tty in a desktop-terminal process is that window's pty, so
+         * each terminal has its own termios, winsize and foreground pgid.
+         * Before this, ash's job control (tcgetpgrp/tcsetpgrp on /dev/tty)
+         * used the console's global foreground pgid: the first terminal's
+         * ash claimed it, and every later terminal's ash saw a foreign pgid
+         * and stopped itself with SIGTTIN (exit status 149). */
+        for (long f = 0; f <= 2; f++) {
+            kpty_t *ct = lx_fd_pty(p, f);
+            if (ct) return lx_pty_ioctl(p, fd, ct, req, arg);
+        }
+    }
     if (p->fds[fd].fd_type == FD_TYPE_DEV_FB)
         return fbdev_ioctl(p, req, arg);
     if (p->fds[fd].fd_type == FD_TYPE_DEV_INPUT)
@@ -1853,6 +1919,426 @@ static void fork_snapshot_frame(process_t *p, linux_syscall_frame_t *fr) {
 
 int lx_strace;   /* zeus `lxtrace on`: log Linux syscalls to serial */
 
+/* ---- futex: real wait queues ----
+ * Key: (address space, va) -- or, for a non-PRIVATE futex on a VMM_SHARED
+ * page (MAP_SHARED anon/file), the physical address of the word so that
+ * waiters in different processes meet.  Waiters live on their own kernel
+ * stack; WAKE/REQUEUE flip w->woken / retarget w->key under lx_futex_lock.
+ * A waiter whose word changed before it was queued returns -EAGAIN; once
+ * queued it sleeps until woken, timed out or signalled (it still polls the
+ * word as a spurious-wake fallback for exits that clear a word without
+ * FUTEX_WAKE, e.g. killed threads). */
+typedef struct lx_futex_waiter {
+    struct lx_futex_waiter *next;
+    uint64_t key_as, key_addr;
+    uint32_t bitset;
+    volatile int woken;
+    bool requeued;
+} lx_futex_waiter_t;
+static lx_futex_waiter_t *lx_futex_q;
+static spinlock_t lx_futex_lock;
+#define LX_FUTEX_PRIVATE 128
+#define LX_FUTEX_CLOCK_RT 256
+
+static int lx_futex_key(uint64_t uaddr, long opflags, uint64_t *as, uint64_t *addr) {
+    if (uaddr & 3) return -EINVAL;
+    uint64_t *pml4 = lx_cur_pml4();
+    if (!(opflags & LX_FUTEX_PRIVATE)) {
+        uint64_t *pte = vmm_get_pte_in(pml4, uaddr & ~0xFFFULL);
+        if (pte && (*pte & 1) && (*pte & VMM_SHARED)) {
+            *as = 0;                                   /* global (physical) key */
+            *addr = (*pte & PTE_ADDR_MASK) | (uaddr & 0xFFF);
+            return 0;
+        }
+    }
+    *as = (uint64_t)(uintptr_t)pml4;
+    *addr = uaddr;
+    return 0;
+}
+static void lx_futex_unlink(lx_futex_waiter_t *w) {
+    for (lx_futex_waiter_t **pp = &lx_futex_q; *pp; pp = &(*pp)->next)
+        if (*pp == w) { *pp = w->next; w->next = NULL; return; }
+}
+/* wake up to n waiters on key (bitset match); caller holds the lock */
+static int lx_futex_wake_locked(uint64_t as, uint64_t addr, int n, uint32_t bitset) {
+    int woke = 0;
+    lx_futex_waiter_t **pp = &lx_futex_q;
+    while (*pp && woke < n) {
+        lx_futex_waiter_t *w = *pp;
+        if (w->key_as == as && w->key_addr == addr && (w->bitset & bitset)) {
+            *pp = w->next; w->next = NULL;
+            __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
+            woke++;
+        } else pp = &w->next;
+    }
+    return woke;
+}
+/* used on thread exit (CLONE_CHILD_CLEARTID): FUTEX_WAKE(tid word, 1) */
+static void lx_futex_wake_addr(uint64_t uaddr, int n) {
+    uint64_t as, addr;
+    if (lx_futex_key(uaddr, 0, &as, &addr)) return;
+    klock(&lx_futex_lock);
+    lx_futex_wake_locked(as, addr, n, 0xffffffffu);
+    kunlock(&lx_futex_lock);
+}
+static long lx_futex(process_t *p, uint64_t uaddr, long opw, uint32_t val, uint64_t a4,
+                     uint64_t uaddr2, uint32_t val3) {
+    long op = opw & 0x7f;
+    uint64_t as, addr;
+    long r;
+    uint32_t cur;
+    switch (op) {
+    case 0: /* WAIT */
+    case 9: /* WAIT_BITSET */ {
+        uint32_t bitset = op == 9 ? val3 : 0xffffffffu;
+        if (!bitset) return -EINVAL;
+        if ((r = lx_futex_key(uaddr, opw, &as, &addr))) return r;
+        extern uint64_t ktime_deadline_ms(uint64_t);
+        extern bool     ktime_expired(uint64_t);
+        extern bool     proc_signal_interrupts(process_t *);
+        bool has_to = a4 != 0;
+        uint64_t dl = 0;
+        if (has_to) {
+            lx_timespec_t ts;
+            if (lx_get(&ts, (void *)a4, sizeof(ts))) return -EFAULT;
+            if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
+            uint64_t rel_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+            if (op == 9) {          /* absolute: CLOCK_MONOTONIC or CLOCK_REALTIME */
+                uint64_t now = (opw & LX_FUTEX_CLOCK_RT) ? lx_real_us() : lx_mono_us();
+                rel_us = rel_us > now ? rel_us - now : 0;
+            }
+            dl = ktime_deadline_ms((rel_us + 999) / 1000);
+        }
+        if (lx_get(&cur, (void *)uaddr, 4)) return -EFAULT;   /* fault the page in */
+        lx_futex_waiter_t w = { NULL, as, addr, bitset, 0, false };
+        klock(&lx_futex_lock);
+        if (lx_get(&cur, (void *)uaddr, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
+        if (cur != val) { kunlock(&lx_futex_lock); return -EAGAIN; }
+        w.next = lx_futex_q; lx_futex_q = &w;
+        kunlock(&lx_futex_lock);
+        long ret = 0;
+        for (;;) {
+            if (__atomic_load_n(&w.woken, __ATOMIC_ACQUIRE)) return 0;
+            if (has_to && ktime_expired(dl)) { ret = -ETIMEDOUT; break; }
+            if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) { ret = -EINTR; break; }
+            if (!w.requeued && lx_get(&cur, (void *)uaddr, 4) == 0 && cur != val) { ret = 0; break; }
+            fork_release_pending(p);
+            thread_sleep(1);
+        }
+        klock(&lx_futex_lock);
+        if (__atomic_load_n(&w.woken, __ATOMIC_ACQUIRE)) ret = 0;   /* woken meanwhile */
+        else lx_futex_unlink(&w);
+        kunlock(&lx_futex_lock);
+        return ret;
+    }
+    case 1:  /* WAKE */
+    case 10: /* WAKE_BITSET */ {
+        uint32_t bitset = op == 10 ? val3 : 0xffffffffu;
+        if (!bitset) return -EINVAL;
+        if ((r = lx_futex_key(uaddr, opw, &as, &addr))) return r;
+        klock(&lx_futex_lock);
+        int n = lx_futex_wake_locked(as, addr, (int)(val > 0x7fffffff ? 0x7fffffff : val), bitset);
+        kunlock(&lx_futex_lock);
+        return n;
+    }
+    case 3: /* REQUEUE */
+    case 4: /* CMP_REQUEUE */ {
+        uint64_t as2, addr2;
+        if ((r = lx_futex_key(uaddr, opw, &as, &addr))) return r;
+        if ((r = lx_futex_key(uaddr2, opw, &as2, &addr2))) return r;
+        int nreq = (int)((uint32_t)a4 > 0x7fffffff ? 0x7fffffff : (uint32_t)a4);
+        if ((int)val < 0 || nreq < 0) return -EINVAL;
+        if (op == 4 && lx_get(&cur, (void *)uaddr, 4)) return -EFAULT;
+        klock(&lx_futex_lock);
+        if (op == 4) {
+            if (lx_get(&cur, (void *)uaddr, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
+            if (cur != val3) { kunlock(&lx_futex_lock); return -EAGAIN; }
+        }
+        int woke = lx_futex_wake_locked(as, addr, (int)val, 0xffffffffu);
+        int moved = 0;
+        for (lx_futex_waiter_t *w = lx_futex_q; w && moved < nreq; w = w->next)
+            if (w->key_as == as && w->key_addr == addr) {
+                w->key_as = as2; w->key_addr = addr2; w->requeued = true; moved++;
+            }
+        kunlock(&lx_futex_lock);
+        return op == 4 ? woke + moved : woke;
+    }
+    case 5: /* WAKE_OP: atomic w.r.t. other futex ops (not user atomics) */ {
+        uint64_t as2, addr2;
+        if ((r = lx_futex_key(uaddr, opw, &as, &addr))) return r;
+        if ((r = lx_futex_key(uaddr2, opw, &as2, &addr2))) return r;
+        uint32_t fop = (val3 >> 28) & 7, cmp = (val3 >> 24) & 15;
+        uint32_t oparg = (val3 >> 12) & 0xfff, cmparg = val3 & 0xfff;
+        if ((val3 >> 28) & 8) oparg = 1u << (oparg & 31);
+        uint32_t old, nv;
+        if (lx_get(&old, (void *)uaddr2, 4)) return -EFAULT;
+        klock(&lx_futex_lock);
+        if (lx_get(&old, (void *)uaddr2, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
+        switch (fop) {
+        case 0: nv = oparg; break;
+        case 1: nv = old + oparg; break;
+        case 2: nv = old | oparg; break;
+        case 3: nv = old & ~oparg; break;
+        case 4: nv = old ^ oparg; break;
+        default: kunlock(&lx_futex_lock); return -ENOSYS;
+        }
+        if (lx_put((void *)uaddr2, &nv, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
+        int woke = lx_futex_wake_locked(as, addr, (int)val, 0xffffffffu);
+        bool c;
+        int32_t so = (int32_t)old, sa = (int32_t)cmparg;
+        switch (cmp) {
+        case 0: c = so == sa; break; case 1: c = so != sa; break;
+        case 2: c = so < sa;  break; case 3: c = so <= sa; break;
+        case 4: c = so > sa;  break; case 5: c = so >= sa; break;
+        default: c = false;
+        }
+        if (c) woke += lx_futex_wake_locked(as2, addr2, (int)(uint32_t)a4, 0xffffffffu);
+        kunlock(&lx_futex_lock);
+        return woke;
+    }
+    default:
+        return -ENOSYS;
+    }
+}
+
+/* ---- timerfd: lazily evaluated deadline on the monotonic clock ---- */
+typedef struct {
+    spinlock_t lock;
+    int clock;
+    uint64_t next_us;       /* monotonic deadline, 0 = disarmed */
+    uint64_t interval_us;
+    uint64_t exp;           /* expirations not yet read */
+} lx_timerfd_t;
+static void lx_tfd_update(lx_timerfd_t *t) {
+    if (!t->next_us) return;
+    uint64_t now = lx_mono_us();
+    if (now < t->next_us) return;
+    if (t->interval_us) {
+        uint64_t k = (now - t->next_us) / t->interval_us + 1;
+        t->exp += k;
+        t->next_us += k * t->interval_us;
+    } else {
+        t->exp++;
+        t->next_us = 0;
+    }
+}
+bool lx_timerfd_ready(void *h) {
+    lx_timerfd_t *t = (lx_timerfd_t *)h;
+    if (!t) return false;
+    spinlock_lock(&t->lock);
+    lx_tfd_update(t);
+    bool r = t->exp != 0;
+    spinlock_unlock(&t->lock);
+    return r;
+}
+static long lx_timerfd_create(process_t *p, long clockid, long flags) {
+    if (clockid != 0 && clockid != 1 && clockid != 7 && clockid != 8 && clockid != 9) return -EINVAL;
+    if (flags & ~(04000L | 02000000L)) return -EINVAL;
+    int fd = allocate_fd(p);
+    if (fd < 0) return -EMFILE;
+    lx_timerfd_t *t = (lx_timerfd_t *)kalloc(sizeof(*t));
+    if (!t) { p->fds[fd].in_use = false; return -ENOMEM; }
+    memset(t, 0, sizeof(*t));
+    t->clock = (int)clockid;
+    p->fds[fd].ref_count = fd_refcount_create();
+    if (!p->fds[fd].ref_count) { kfree(t); p->fds[fd].in_use = false; return -ENOMEM; }
+    p->fds[fd].fd_type = FD_TYPE_TIMERFD;
+    p->fds[fd].file_handle = t;
+    p->fds[fd].flags = (flags & 04000) ? O_NONBLOCK : 0;
+    p->fds[fd].position = 0;
+    p->fds[fd].cloexec = (flags & 02000000L) != 0;
+    p->fds[fd].in_use = true;
+    return fd;
+}
+static lx_timerfd_t *lx_tfd_get(process_t *p, long fd, long *err) {
+    if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use) { *err = -EBADF; return NULL; }
+    if (p->fds[fd].fd_type != FD_TYPE_TIMERFD) { *err = -EINVAL; return NULL; }
+    return (lx_timerfd_t *)p->fds[fd].file_handle;
+}
+static void lx_tfd_cur(lx_timerfd_t *t, lx_timespec_t out[2]) {
+    uint64_t now = lx_mono_us();
+    uint64_t left = t->next_us ? (t->next_us > now ? t->next_us - now : 1) : 0;
+    out[0].tv_sec = (int64_t)(t->interval_us / 1000000ULL);
+    out[0].tv_nsec = (int64_t)(t->interval_us % 1000000ULL) * 1000;
+    out[1].tv_sec = (int64_t)(left / 1000000ULL);
+    out[1].tv_nsec = (int64_t)(left % 1000000ULL) * 1000;
+}
+static long lx_timerfd_settime(process_t *p, long fd, long flags, const void *unew, void *uold) {
+    long err = 0;
+    lx_timerfd_t *t = lx_tfd_get(p, fd, &err);
+    if (!t) return err;
+    if (flags & ~3L) return -EINVAL;
+    lx_timespec_t nv[2];
+    if (lx_get(nv, unew, sizeof(nv))) return -EFAULT;
+    for (int i = 0; i < 2; i++)
+        if (nv[i].tv_sec < 0 || nv[i].tv_nsec < 0 || nv[i].tv_nsec >= 1000000000) return -EINVAL;
+    uint64_t iv = (uint64_t)nv[0].tv_sec * 1000000ULL + (uint64_t)nv[0].tv_nsec / 1000;
+    uint64_t v  = (uint64_t)nv[1].tv_sec * 1000000ULL + (uint64_t)nv[1].tv_nsec / 1000;
+    if (!v && (nv[1].tv_sec || nv[1].tv_nsec)) v = 1;
+    if (!iv && (nv[0].tv_sec || nv[0].tv_nsec)) iv = 1;
+    spinlock_lock(&t->lock);
+    lx_tfd_update(t);
+    lx_timespec_t old[2];
+    lx_tfd_cur(t, old);
+    t->exp = 0;
+    t->interval_us = iv;
+    if (!v && !(nv[1].tv_sec || nv[1].tv_nsec)) {
+        t->next_us = 0;                                   /* disarm */
+    } else if (flags & 1) {                               /* TFD_TIMER_ABSTIME */
+        bool rt = t->clock == 0 || t->clock == 8;
+        uint64_t now_c = rt ? lx_real_us() : lx_mono_us(), mono = lx_mono_us();
+        uint64_t abs = (uint64_t)nv[1].tv_sec * 1000000ULL + (uint64_t)nv[1].tv_nsec / 1000;
+        t->next_us = abs > now_c ? mono + (abs - now_c) : mono;
+        if (!t->next_us) t->next_us = 1;
+    } else {
+        t->next_us = lx_mono_us() + v;
+    }
+    spinlock_unlock(&t->lock);
+    if (uold && lx_put(uold, old, sizeof(old))) return -EFAULT;
+    return 0;
+}
+static long lx_timerfd_gettime(process_t *p, long fd, void *ucur) {
+    long err = 0;
+    lx_timerfd_t *t = lx_tfd_get(p, fd, &err);
+    if (!t) return err;
+    lx_timespec_t c[2];
+    spinlock_lock(&t->lock);
+    lx_tfd_update(t);
+    lx_tfd_cur(t, c);
+    spinlock_unlock(&t->lock);
+    return lx_put(ucur, c, sizeof(c));
+}
+static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len) {
+    if (len < 8) return -EINVAL;
+    lx_timerfd_t *t = (lx_timerfd_t *)p->fds[fd].file_handle;
+    extern bool proc_signal_interrupts(process_t *);
+    for (;;) {
+        spinlock_lock(&t->lock);
+        lx_tfd_update(t);
+        uint64_t v = t->exp;
+        t->exp = 0;
+        spinlock_unlock(&t->lock);
+        if (v) return lx_put(ubuf, &v, 8) ? -EFAULT : 8;
+        if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
+        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
+        fork_release_pending(p);
+        thread_sleep(1);
+    }
+}
+
+/* ---- signalfd: reads dequeue pending signals in its mask ---- */
+typedef struct { uint32_t mask; } lx_signalfd_t;   /* internal bits: 1u << signo */
+bool lx_signalfd_ready(void *h, process_t *proc) {
+    lx_signalfd_t *s = (lx_signalfd_t *)h;
+    return s && proc && (__atomic_load_n(&proc->pending_signals, __ATOMIC_ACQUIRE) & s->mask);
+}
+static uint32_t lx_sigmask_from_user(uint64_t m) {
+    uint32_t sm = (uint32_t)((m << 1) & 0xFFFFFFFEu);
+    return sm & ~((1u << 9) | (1u << 19));          /* never KILL/STOP */
+}
+static long lx_signalfd(process_t *p, long fd, const void *umask, size_t sz, long flags) {
+    if (flags & ~(04000L | 02000000L)) return -EINVAL;
+    if (sz != 8) return -EINVAL;
+    uint64_t m = 0;
+    if (lx_get(&m, umask, 8)) return -EFAULT;
+    if (fd != -1) {
+        if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use) return -EBADF;
+        if (p->fds[fd].fd_type != FD_TYPE_SIGNALFD) return -EINVAL;
+        ((lx_signalfd_t *)p->fds[fd].file_handle)->mask = lx_sigmask_from_user(m);
+        return fd;
+    }
+    int nfd = allocate_fd(p);
+    if (nfd < 0) return -EMFILE;
+    lx_signalfd_t *s = (lx_signalfd_t *)kalloc(sizeof(*s));
+    if (!s) { p->fds[nfd].in_use = false; return -ENOMEM; }
+    s->mask = lx_sigmask_from_user(m);
+    p->fds[nfd].ref_count = fd_refcount_create();
+    if (!p->fds[nfd].ref_count) { kfree(s); p->fds[nfd].in_use = false; return -ENOMEM; }
+    p->fds[nfd].fd_type = FD_TYPE_SIGNALFD;
+    p->fds[nfd].file_handle = s;
+    p->fds[nfd].flags = (flags & 04000) ? O_NONBLOCK : 0;
+    p->fds[nfd].position = 0;
+    p->fds[nfd].cloexec = (flags & 02000000L) != 0;
+    p->fds[nfd].in_use = true;
+    return nfd;
+}
+/* take the lowest pending signal in mask; 0 if none */
+static int lx_sig_dequeue(process_t *p, uint32_t mask) {
+    for (;;) {
+        uint32_t pend = __atomic_load_n(&p->pending_signals, __ATOMIC_ACQUIRE) & mask;
+        if (!pend) return 0;
+        int s = __builtin_ctz(pend);
+        uint32_t bit = 1u << s;
+        uint32_t prev = __atomic_fetch_and(&p->pending_signals, ~bit, __ATOMIC_SEQ_CST);
+        if (prev & bit) return s;
+    }
+}
+typedef struct {
+    uint32_t ssi_signo; int32_t ssi_errno; int32_t ssi_code; uint32_t ssi_pid;
+    uint32_t ssi_uid; int32_t ssi_fd; uint32_t ssi_tid; uint32_t ssi_band;
+    uint32_t ssi_overrun; uint32_t ssi_trapno; int32_t ssi_status; int32_t ssi_int;
+    uint64_t ssi_ptr; uint64_t ssi_utime; uint64_t ssi_stime; uint64_t ssi_addr;
+    uint16_t ssi_addr_lsb; uint8_t pad[46];
+} lx_sfd_siginfo_t;
+_Static_assert(sizeof(lx_sfd_siginfo_t) == 128, "signalfd_siginfo is 128 bytes");
+static long lx_signalfd_read(process_t *p, long fd, void *ubuf, size_t len) {
+    if (len < sizeof(lx_sfd_siginfo_t)) return -EINVAL;
+    lx_signalfd_t *s = (lx_signalfd_t *)p->fds[fd].file_handle;
+    extern bool proc_signal_interrupts(process_t *);
+    size_t got = 0;
+    for (;;) {
+        while (got + sizeof(lx_sfd_siginfo_t) <= len) {
+            int sig = lx_sig_dequeue(p, s->mask);
+            if (!sig) break;
+            lx_sfd_siginfo_t si;
+            memset(&si, 0, sizeof(si));
+            si.ssi_signo = (uint32_t)sig;
+            si.ssi_code = 0;                              /* SI_USER */
+            if (lx_put((char *)ubuf + got, &si, sizeof(si))) return got ? (long)got : -EFAULT;
+            got += sizeof(si);
+        }
+        if (got) return (long)got;
+        if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
+        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
+        fork_release_pending(p);
+        thread_sleep(1);
+    }
+}
+/* rt_sigtimedwait(set, info, timeout, sigsetsize): same dequeue */
+static long lx_sigtimedwait(process_t *p, const void *uset, void *uinfo, const void *uts, size_t sz) {
+    if (sz != 8) return -EINVAL;
+    uint64_t m = 0;
+    if (lx_get(&m, uset, 8)) return -EFAULT;
+    uint32_t mask = lx_sigmask_from_user(m);
+    extern uint64_t ktime_deadline_ms(uint64_t);
+    extern bool     ktime_expired(uint64_t);
+    extern bool     proc_signal_interrupts(process_t *);
+    bool has_to = uts != NULL;
+    uint64_t dl = 0;
+    if (has_to) {
+        lx_timespec_t ts;
+        if (lx_get(&ts, uts, sizeof(ts))) return -EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
+        dl = ktime_deadline_ms((uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000);
+    }
+    for (;;) {
+        int sig = lx_sig_dequeue(p, mask);
+        if (sig) {
+            if (uinfo) {
+                uint8_t si[128];
+                memset(si, 0, sizeof(si));
+                *(int32_t *)si = sig;                     /* si_signo; errno/code 0 */
+                if (lx_put(uinfo, si, sizeof(si))) return -EFAULT;
+            }
+            return sig;
+        }
+        if (has_to && ktime_expired(dl)) return -EAGAIN;
+        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
+        fork_release_pending(p);
+        thread_sleep(1);
+    }
+}
+
 static long lx_dispatch(linux_syscall_frame_t *fr) {
     process_t *p = lx_proc();
     const uint64_t nr = fr->nr;
@@ -1868,6 +2354,13 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         p->sigsuspend_restore = false;
     }
 
+    switch (nr) {   /* EPOLLET edge source: any data-moving syscall */
+    case LX_read: case LX_write: case LX_readv: case LX_writev: case 17: case 18:
+    case 43: case 44: case 45: case 46: case 47: case LX_accept4:
+        __atomic_add_fetch(&lx_io_seq, 1, __ATOMIC_RELEASE);
+        break;
+    default: break;
+    }
     switch (nr) {
     /* ---- file I/O ---- */
     case LX_read:    return lx_read(p, (long)a1, (void *)a2, (size_t)a3);
@@ -2372,7 +2865,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             /* CLONE_CHILD_CLEARTID: zero the tid word so pthread_join's
              * futex wait (polling) sees the thread is gone. */
             uint32_t z = 0;
-            lx_put((void *)p->linux_clear_child_tid, &z, 4);
+            if (lx_put((void *)p->linux_clear_child_tid, &z, 4) == 0)
+                lx_futex_wake_addr(p->linux_clear_child_tid, 1);
             p->linux_clear_child_tid = 0;
         }
         sys_exit((int)(a1 & 0xff));
@@ -2957,6 +3451,12 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return ux_socketpair(p, (long)a2, (int *)a4);
     case LX_eventfd:     return lx_eventfd_create(p, (uint32_t)a1, 0);
     case LX_eventfd2:    return lx_eventfd_create(p, (uint32_t)a1, (long)a2);
+    case LX_timerfd_create:  return lx_timerfd_create(p, (long)(int)a1, (long)(int)a2);
+    case LX_timerfd_settime: return lx_timerfd_settime(p, (long)(int)a1, (long)(int)a2, (const void *)a3, (void *)a4);
+    case LX_timerfd_gettime: return lx_timerfd_gettime(p, (long)(int)a1, (void *)a2);
+    case LX_signalfd:        return lx_signalfd(p, (long)(int)a1, (const void *)a2, (size_t)a3, 0);
+    case LX_signalfd4:       return lx_signalfd(p, (long)(int)a1, (const void *)a2, (size_t)a3, (long)(int)a4);
+    case LX_rt_sigtimedwait: return lx_sigtimedwait(p, (const void *)a1, (void *)a2, (const void *)a3, (size_t)a4);
     case LX_epoll_create:  return (long)(int)a1 <= 0 ? -EINVAL : lx_epoll_create(p, 0);
     case LX_epoll_create1: return lx_epoll_create(p, (long)(int)a1);
     case LX_epoll_ctl:     return lx_epoll_ctl(p, (long)(int)a1, (long)(int)a2, (long)(int)a3, (const void *)a4);
@@ -3082,37 +3582,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
 
     case LX_futex: {
-        long op = (long)(a2 & 0x7f);
-        if (op == 1 /* WAKE */ || op == 10 /* WAKE_BITSET */)
-            return 0;
-        if (op == 0 /* WAIT */ || op == 9 /* WAIT_BITSET */) {
-            /* Threads are VM-sharing processes: WAIT sleeps until the word
-             * changes (WAKE is implicit via polling), the timeout expires, or
-             * a kill is pending. BITSET timeouts are absolute: sleep a 10 ms
-             * slice and report a spurious wake (-EAGAIN) so libc rechecks. */
-            extern uint64_t ktime_deadline_ms(uint64_t);
-            extern bool     ktime_expired(uint64_t);
-            uint32_t cur;
-            if (lx_get(&cur, (void *)a1, 4)) return -EFAULT;
-            if (cur != (uint32_t)a3) return -EAGAIN;
-            bool has_to = a4 != 0;
-            uint64_t ms = 0;
-            if (has_to) {
-                lx_timespec_t ts;
-                if (lx_get(&ts, (void *)a4, sizeof(ts))) return -EFAULT;
-                if (op == 9) ms = 10;
-                else ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-            }
-            uint64_t dl = ktime_deadline_ms(ms);
-            for (;;) {
-                if (lx_get(&cur, (void *)a1, 4)) return -EFAULT;
-                if (cur != (uint32_t)a3) return 0;
-                if (has_to && ktime_expired(dl)) return op == 9 ? -EAGAIN : -ETIMEDOUT;
-                if (proc_kill_pending(p)) return -EINTR;
-                thread_sleep(1);
-            }
-        }
-        return lx_enosys(p, nr);
+        long fr_ = lx_futex(p, a1, (long)a2, (uint32_t)a3, a4, a5, (uint32_t)a6);
+        if (fr_ == -ENOSYS) return lx_enosys(p, nr);
+        return fr_;
     }
 
     case 1000: {    /* inDevOS private: network helper for /bin/dhcp.

@@ -46,6 +46,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+static void dt_reap_orphan_windows(void);
+
 /* ---- extern helpers from utils.c ---- */
 extern void putpixel(uint64_t x, uint64_t y, uint32_t color);
 extern void fillrect(uint32_t color, uint64_t x, uint64_t y, uint64_t w, uint64_t h);
@@ -1283,6 +1285,17 @@ static bool dt_present_window_fast(desktop_window_t *win) {
      * screen again and draws wallpaper where the window was. */
     if (!win || !win->visible || win->minimized || !win->pixels || !fb || !fb->address)
         return false;
+    /* Never blit a client onto a text VT. A Doom/SDL client keeps calling
+     * the present syscall after Ctrl+F2; desktop_composite_frame already
+     * bails on a text VT, this fast path did not, so Doom frames showed on
+     * the TTY. The window buffer still gets the frame; the switch back to
+     * the desktop VT repaints the full screen. */
+    {
+        extern bool vconsole_graphics_active(void);
+        extern bool fbdev_display_owned(void);
+        if (!vconsole_graphics_active() || fbdev_display_owned())
+            return false;
+    }
     /* Fullscreen enter/leave sets dt_dirty. A client-rect blit would
      * leave the previous fullscreen (or chrome) pixels on screen. */
     if (dt_dirty)
@@ -1308,6 +1321,22 @@ static bool dt_present_window_fast(desktop_window_t *win) {
         gpu_hal_present_rect(0, (uint32_t)dy, (uint32_t)scr_w, (uint32_t)dh);
         win->dirty = false;
         return true;
+    }
+
+    /* A direct blit ignores z-order: with Doom and NetSurf both open, Doom
+     * painted over the focused NetSurf window. Take the composited path
+     * whenever a visible window above this one overlaps it. */
+    {
+        int ax, ay, aw, ah;
+        dt_win_frame(win, &ax, &ay, &aw, &ah);
+        for (desktop_window_t *o = win->next; o; o = o->next) {
+            if (!o->id || !o->visible || o->minimized)
+                continue;
+            int bx, by, bw, bh;
+            dt_win_frame(o, &bx, &by, &bw, &bh);
+            if (bx < ax + aw && bx + bw > ax && by < ay + ah && by + bh > ay)
+                return false;
+        }
     }
 
     int cx, cy, cw, ch;
@@ -3050,6 +3079,7 @@ void desktop_composite_frame(void) {
     files_tick();
     kterm_tick();
     settings_app_tick();
+    dt_reap_orphan_windows();
 
     bool any_window_dirty = false;
     spinlock_lock(&desktop_lock);
@@ -3793,10 +3823,84 @@ void desktop_destroy_window(desktop_window_t *win) {
     }
 }
 
+/* Destroy a client window whose pixels may be an SDL surface shared with
+ * the compositor (SDL_CreateWindow under the desktop). The SDL window owns
+ * that buffer: release it through SDL (which also drops the syscall handle
+ * and any renderer bound to it) instead of kfree'ing it here, which left the
+ * SDL window list holding a freed surface. Returns true if an SDL window was
+ * released. */
+static bool dt_destroy_client_window(desktop_window_t *w) {
+    extern bool sdl_destroy_window_sharing_pixels(uint32_t *pixels);
+    if (!w || w->id == 0) return false;
+    w->visible = false;
+    w->fullscreen = false;
+    w->dragging = false;
+    w->resize_edges = 0;
+    if (dt_grab_id == w->id)
+        dt_grab_id = 0;
+    uint32_t *pix = w->pixels;
+    bool sdl = false;
+    if (pix) {
+        spinlock_lock(&w->content_lock);
+        w->pixels = NULL;              /* compositor stops reading it */
+        spinlock_unlock(&w->content_lock);
+        sdl = sdl_destroy_window_sharing_pixels(pix);
+        if (!sdl)
+            w->pixels = pix;           /* ours: desktop_destroy_window frees it */
+    }
+    desktop_destroy_window(w);
+    return sdl;
+}
+
 void desktop_destroy_windows_for_pid(uint32_t pid) {
+    if (pid == 0) return;
     for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
         if (windows[i].id != 0 && windows[i].pid == pid)
-            desktop_destroy_window(&windows[i]);
+            dt_destroy_client_window(&windows[i]);
+    }
+    for (int i = 0; i < 8; i++) {
+        if ((uint32_t)dt_dock_spawned_pid[i] == pid)
+            dt_dock_spawned_pid[i] = 0;
+    }
+    dt_dirty = true;
+}
+
+/* Tear down windows whose owning process is gone, whatever the exit path
+ * (exit, exit_group, SIGINT/SIGKILL, fault). Only exec_spawned_exit used to
+ * destroy a client's windows, so a Doom started from the desktop terminal
+ * and killed with Ctrl+C (fork child -> fork_child_zombie_exit) left a
+ * frozen window nobody could close. /dev/wm windows are skipped: wm_dev
+ * tears those down when the last fd to the connection closes. Runs from the
+ * compositor tick, so it never races the dying process's own syscall. */
+static void dt_reap_orphan_windows(void) {
+    static uint64_t last;
+    static uint32_t calls;
+    uint64_t now = hpet_get_ticks();
+    if (++calls < 400 && now >= last && now - last < 200)
+        return;
+    calls = 0;
+    last = now;
+    int n = 0;
+    for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
+        desktop_window_t *w = &windows[i];
+        if (w->id == 0 || w->pid == 0 || w->parent_id != 0)
+            continue;
+        if (wm_dev_owns_window(w->id) || process_pid_alive(w->pid))
+            continue;
+        uint32_t pid = w->pid;
+        serial_printf("[desktop] reaping window %u '%s': owner pid %u is gone\n",
+                      w->id, w->title, pid);
+        dt_destroy_client_window(w);
+        for (int d = 0; d < 8; d++) {
+            if ((uint32_t)dt_dock_spawned_pid[d] == pid)
+                dt_dock_spawned_pid[d] = 0;
+        }
+        n++;
+    }
+    if (n) {
+        dt_apply_keyboard_focus();      /* raw mode follows the new focus */
+        dt_dirty = true;
+        dt_damage_add(0, 0, (int)fb_get_width(), (int)fb_get_height());
     }
 }
 

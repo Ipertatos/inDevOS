@@ -21,6 +21,101 @@
 #define KT_GR 80      /* max grid rows */
 #define KT_GC 160     /* max grid cols */
 
+/* ---- Per-window instance state ----------------------------------------
+ * Every terminal window has its own shell, pipes, pty, VT grid, scrollback
+ * and history. They live in a fixed pool (not kmalloc'd): the shell's pipes
+ * keep a pointer to the instance's pty, and children can hold those pipe
+ * ends after the window is gone. K is the instance the code below works on;
+ * every public entry point selects it while holding kt_busy. */
+#define KT_MAX 6
+#define KT_ADEF 0x88   /* fg 8 / bg 8 = default colours */
+struct kt_inst {
+    bool     used;
+    volatile bool closing;           /* window destroyed; pump ends the shell */
+    char     txq[1024];              /* typed input not yet in the shell pipe */
+    int      txlen;
+    pipe_t  *sh_in;                  /* we write: shell stdin  */
+    pipe_t  *sh_out;                 /* we read:  shell stdout+stderr */
+    int      sh_pid;
+    bool     sh_dead;                /* shell exited; empty Enter restarts */
+    int      esc;                    /* VT parser state (kt_vt_feed) */
+    kpty_t   pty;                    /* terminal state of the shell pipes */
+    char     env_lines[16], env_cols[16];
+    int      ws_last_rows, ws_last_cols;
+    desktop_window_t *win;
+    char     lines[KT_ROWS][KT_COLS];
+    int      nlines, scroll;
+    char     in[160];
+    int      inlen;
+    bool     need;
+    char     hist[KT_HIST][160];
+    int      nhist, hpos;
+    char     g[KT_GR][KT_GC];
+    uint16_t ga[KT_GR][KT_GC];
+    int      gr, gc;
+    int      cy, cx;
+    bool     wrapnext;
+    uint16_t attr;
+    int      top, bot;
+    int      sy, sx;
+    uint16_t sattr;
+    bool     curvis, appcur;
+    int      cs[2];                  /* G0/G1: 0 ASCII, 1 DEC line drawing */
+    int      gl;                     /* 0 = G0 active, 1 = G1 (SO) */
+    int      view;                   /* scrollback lines shown (0 = live) */
+    int      par[8], npar;
+    char     priv;
+    bool     vt_inited;
+};
+static struct kt_inst  kt_pool[KT_MAX];
+static struct kt_inst *K = &kt_pool[0];
+static struct kt_inst *kt_last;      /* most recently opened */
+static volatile int    kt_busy;      /* one CPU in kterm code at a time */
+#define kt_txq (K->txq)
+#define kt_txlen (K->txlen)
+#define kt_sh_in (K->sh_in)
+#define kt_sh_out (K->sh_out)
+#define kt_sh_pid (K->sh_pid)
+#define kt_sh_dead (K->sh_dead)
+#define kt_esc (K->esc)
+#define kt_pty (K->pty)
+#define kt_env_lines (K->env_lines)
+#define kt_env_cols (K->env_cols)
+#define kt_ws_last_rows (K->ws_last_rows)
+#define kt_ws_last_cols (K->ws_last_cols)
+#define kt_win (K->win)
+#define kt_lines (K->lines)
+#define kt_nlines (K->nlines)
+#define kt_scroll (K->scroll)
+#define kt_in (K->in)
+#define kt_inlen (K->inlen)
+#define kt_need (K->need)
+#define kt_hist (K->hist)
+#define kt_nhist (K->nhist)
+#define kt_hpos (K->hpos)
+#define kt_g (K->g)
+#define kt_ga (K->ga)
+#define kt_gr (K->gr)
+#define kt_gc (K->gc)
+#define kt_cy (K->cy)
+#define kt_cx (K->cx)
+#define kt_wrapnext (K->wrapnext)
+#define kt_attr (K->attr)
+#define kt_top (K->top)
+#define kt_bot (K->bot)
+#define kt_sy (K->sy)
+#define kt_sx (K->sx)
+#define kt_sattr (K->sattr)
+#define kt_curvis (K->curvis)
+#define kt_appcur (K->appcur)
+#define kt_cs (K->cs)
+#define kt_gl (K->gl)
+#define kt_view (K->view)
+#define kt_par (K->par)
+#define kt_npar (K->npar)
+#define kt_priv (K->priv)
+#define kt_vt_inited (K->vt_inited)
+
 /* Shell mode: the window runs BusyBox ash with stdin/stdout/stderr on two
  * kernel pipes (pty-like, no line discipline). The window does the line
  * editing and local echo, then writes whole lines to the shell. When no
@@ -30,32 +125,12 @@ extern int  process_signal_tree(uint32_t root_pid, int sig, bool include_root);
 extern bool process_pid_alive(uint32_t pid);
 extern int  pipe_try_read(pipe_t *pipe, void *buf, size_t count);
 extern int  pipe_try_write(pipe_t *pipe, const void *buf, size_t count);
-static char    kt_txq[1024];      /* typed input not yet in the shell pipe */
-static int     kt_txlen;
 static void    kt_tx_flush(void);
-static pipe_t *kt_sh_in;    /* we write: shell stdin  */
-static pipe_t *kt_sh_out;   /* we read:  shell stdout+stderr */
-static int     kt_sh_pid;
 static bool    kt_ctrl;
-static bool    kt_sh_dead;   /* shell exited; empty Enter restarts */
-static int     kt_esc;             /* VT parser state (kt_vt_feed) */
 static char    kt_start_dir[256];  /* cwd for the next shell (kterm_open_in) */
-static kpty_t  kt_pty;             /* terminal state of the shell pipes */
-static char    kt_env_lines[16], kt_env_cols[16];
-static int     kt_ws_last_rows, kt_ws_last_cols;
 
-static desktop_window_t *kt_win;
 
-static char kt_lines[KT_ROWS][KT_COLS];
-static int kt_nlines;
-static int kt_scroll;
-static char kt_in[160];
-static int kt_inlen;
 static bool kt_shift;
-static bool kt_need;
-static char kt_hist[KT_HIST][160];
-static int kt_nhist;
-static int kt_hpos;
 
 static void kt_request(void) { kt_need = true; }
 static void kt_vt_puts(const char *s);
@@ -63,9 +138,6 @@ static void kt_vt_feed(const char *buf, int n);
 static void kt_vt_resize(int rows, int cols);
 static void kt_vt_to_sb(void);
 static void kt_add_line(const char *s);
-static bool kt_vt_inited;
-static int  kt_view;
-static int  kt_gr;
 
 static int kt_vis(void) {
     if (!kt_win) return 1;
@@ -234,8 +306,8 @@ static bool kt_shell_start(void) {
     return false;
 }
 
-/* Drain shell output. Safe to call every main-loop pass. */
-bool kterm_pump(void) {
+/* Drain the current instance's shell output. */
+static bool kt_pump_one(void) {
     kt_tx_flush();
     if (!kt_sh_out) return false;
     bool got = false;
@@ -300,26 +372,8 @@ static char kt_shifted(char c) {
  * kt_lines scrollback (Shift+PgUp/PgDn, or PgUp/PgDn in cooked mode). */
 
 
-#define KT_ADEF 0x88                 /* fg 8 / bg 8 = default colours */
 #define KT_A_BOLD 0x100
 #define KT_A_REV  0x200
-static char     kt_g[KT_GR][KT_GC];
-static uint16_t kt_ga[KT_GR][KT_GC];
-static int      kt_gr = 24, kt_gc = 80;
-static int      kt_cy, kt_cx;
-static bool     kt_wrapnext;
-static uint16_t kt_attr = KT_ADEF;
-static int      kt_top, kt_bot = 23;
-static int      kt_sy, kt_sx;
-static uint16_t kt_sattr = KT_ADEF;
-static bool     kt_curvis = true;
-static bool     kt_appcur;
-static int      kt_cs[2];             /* G0/G1: 0 ASCII, 1 DEC line drawing */
-static int      kt_gl;                /* 0 = G0 active, 1 = G1 (SO) */
-static int      kt_view;              /* scrollback lines shown (0 = live) */
-static int      kt_par[8], kt_npar;
-static char     kt_priv;
-static bool     kt_vt_inited;
 
 static void kt_sb_add(const char *s);
 
@@ -845,20 +899,98 @@ static void kt_run(const char *line) {
     if (cap[0]) kt_add_text(cap);
 }
 
-void kterm_open(void) {
-    if (kt_win && kt_win->id) {
-        desktop_focus_window(kt_win);
-        kt_request();
-        return;
+/* ---- Instance pool / locking ----------------------------------------- */
+static bool kt_try_enter(void) {
+    return __atomic_exchange_n(&kt_busy, 1, __ATOMIC_ACQUIRE) == 0;
+}
+/* Bounded spin: the holder may be a preempted syscall-context compositor
+ * pass on this CPU. Gives up (caller drops the event) rather than hang. */
+static bool kt_enter(void) {
+    for (uint32_t i = 0; i < 4000000u; i++) {
+        if (kt_try_enter()) return true;
+        __asm__ volatile("pause");
     }
+    serial_puts("[kterm] busy: event dropped\n");
+    return false;
+}
+static void kt_leave(void) { __atomic_store_n(&kt_busy, 0, __ATOMIC_RELEASE); }
+
+static struct kt_inst *kt_find(const desktop_window_t *win) {
+    if (!win) return NULL;
+    for (int i = 0; i < KT_MAX; i++) {
+        struct kt_inst *t = &kt_pool[i];
+        if (t->used && !t->closing && t->win == win && win->id != 0)
+            return t;
+    }
+    return NULL;
+}
+
+static int kt_count_open(void) {
+    int n = 0;
+    for (int i = 0; i < KT_MAX; i++)
+        if (kt_pool[i].used && !kt_pool[i].closing && kt_pool[i].win) n++;
+    return n;
+}
+
+/* A free slot, reset to power-on defaults; NULL when all are in use. */
+static struct kt_inst *kt_alloc(void) {
+    static int next;
+    for (int k = 0; k < KT_MAX; k++) {
+        int i = (next + k) % KT_MAX;
+        struct kt_inst *t = &kt_pool[i];
+        if (t->used) continue;
+        memset(t, 0, sizeof(*t));
+        t->used = true;
+        t->gr = 24; t->gc = 80; t->bot = 23;
+        t->attr = t->sattr = KT_ADEF;
+        t->curvis = true;
+        next = (i + 1) % KT_MAX;
+        return t;
+    }
+    return NULL;
+}
+
+/* Window destroyed earlier (kterm_on_window_destroyed): end its shell and
+ * free the slot. Caller holds kt_busy. */
+static void kt_reap_closing(void) {
+    for (int i = 0; i < KT_MAX; i++) {
+        struct kt_inst *t = &kt_pool[i];
+        if (!t->used || !t->closing) continue;
+        K = t;
+        kt_win = NULL;
+        kt_shell_close();
+        serial_printf("[kterm] instance %d closed\n", i);
+        if (kt_last == t) kt_last = NULL;
+        t->closing = false;
+        t->used = false;
+    }
+}
+
+/* Open a new terminal window with its own shell (in kt_start_dir when set).
+ * Caller holds kt_busy. Returns false when the pool is full (the newest
+ * terminal is focused instead) or the window could not be created. */
+static bool kt_open_new(void) {
+    kt_reap_closing();
+    struct kt_inst *t = kt_alloc();
+    if (!t) {
+        serial_printf("[kterm] %d terminals open, focusing the newest\n", KT_MAX);
+        if (kt_last && kt_last->win && kt_last->win->id)
+            desktop_focus_window(kt_last->win);
+        return false;
+    }
+    int nopen = kt_count_open();
+    K = t;
     int sw = (int)fb_get_width();
     int sh = (int)fb_get_height();
-    int x = (sw - KT_W) / 2;
-    int y = (sh - KT_H) / 4;
+    int x = (sw - KT_W) / 2 + nopen * 28;    /* cascade */
+    int y = (sh - KT_H) / 4 + nopen * 28;
+    if (x + KT_W > sw) x = sw - KT_W;
+    if (y + KT_H > sh) y = sh - KT_H;
     if (x < 12) x = 12;
     if (y < 40) y = 40;
     kt_win = desktop_create_window(0, x, y, KT_W, KT_H, "Terminal");
-    if (!kt_win) return;
+    if (!kt_win) { t->used = false; return false; }
+    kt_last = t;
     if (!kt_shell_mode()) {
         bool first = kt_nlines == 0 && !kt_vt_inited;
         if (kt_shell_start()) {
@@ -873,22 +1005,53 @@ void kterm_open(void) {
     spinlock_lock(&kt_win->content_lock);
     kt_redraw();
     spinlock_unlock(&kt_win->content_lock);
-    serial_puts("[kterm] opened\n");
+    serial_printf("[kterm] opened (instance %d, window %u, %d open)\n",
+                  (int)(t - kt_pool), kt_win->id, nopen + 1);
+    return true;
 }
 
-bool kterm_is_open(void) { return kt_win && kt_win->id != 0; }
-bool kterm_is_window(const desktop_window_t *win) {
-    return win && kt_win && win == kt_win && kt_win->id != 0;
+/* Every call opens another terminal window (up to KT_MAX). */
+void kterm_open(void) {
+    if (!kt_enter()) return;
+    kt_open_new();
+    kt_leave();
 }
+
+bool kterm_is_open(void) { return kt_count_open() > 0; }
+
+/* Also selects the instance for an immediately following on_key/on_mouse. */
+bool kterm_is_window(const desktop_window_t *win) {
+    return kt_find(win) != NULL;
+}
+
+/* Called from desktop_destroy_window, possibly with desktop_lock held:
+ * only mark the slot; kterm_pump (under kt_busy) ends the shell. */
 void kterm_on_window_destroyed(desktop_window_t *win) {
-    if (win == kt_win) {
-        kt_win = NULL;
-        kt_shell_close();
+    if (!win) return;
+    for (int i = 0; i < KT_MAX; i++) {
+        struct kt_inst *t = &kt_pool[i];
+        if (t->used && !t->closing && t->win == win) {
+            t->win = NULL;
+            t->closing = true;
+        }
     }
 }
 
+static void kt_on_key(int32_t keycode, bool pressed);
+
+/* Keys go to the focused terminal window. */
 void kterm_on_key(int32_t keycode, bool pressed) {
-    if (!kterm_is_open()) return;
+    extern desktop_window_t *desktop_get_focused(void);
+    if (!kt_enter()) return;
+    struct kt_inst *t = kt_find(desktop_get_focused());
+    if (t) {
+        K = t;
+        kt_on_key(keycode, pressed);
+    }
+    kt_leave();
+}
+
+static void kt_on_key(int32_t keycode, bool pressed) {
     if (keycode == SDLK_LSHIFT || keycode == SDLK_RSHIFT) {
         kt_shift = pressed;
         return;
@@ -1048,52 +1211,75 @@ void kterm_on_mouse(int rx, int ry, bool down) {
     (void)rx; (void)ry; (void)down;
 }
 
-bool kterm_tick(void) {
-    kterm_pump();
-    kt_ws_update();
-    if (!kterm_is_open() || !kt_need) return false;
-    spinlock_lock(&kt_win->content_lock);
-    kt_redraw();
-    spinlock_unlock(&kt_win->content_lock);
-    return true;
+/* Drain every terminal's shell output. Safe to call every main-loop pass;
+ * skips the pass if another CPU is in kterm code. */
+bool kterm_pump(void) {
+    if (!kt_try_enter()) return false;
+    kt_reap_closing();
+    bool got = false;
+    for (int i = 0; i < KT_MAX; i++) {
+        if (!kt_pool[i].used || kt_pool[i].closing) continue;
+        K = &kt_pool[i];
+        if (kt_pump_one()) got = true;
+    }
+    kt_leave();
+    return got;
 }
 
-/* Open the terminal with its shell in @dir: a new shell starts there; a
- * running one gets a cd. */
+bool kterm_tick(void) {
+    if (!kt_try_enter()) return false;
+    kt_reap_closing();
+    bool drew = false;
+    for (int i = 0; i < KT_MAX; i++) {
+        if (!kt_pool[i].used || kt_pool[i].closing) continue;
+        K = &kt_pool[i];
+        kt_pump_one();
+        kt_ws_update();
+        if (!kt_win || kt_win->id == 0 || !kt_need) continue;
+        spinlock_lock(&kt_win->content_lock);
+        kt_redraw();
+        spinlock_unlock(&kt_win->content_lock);
+        drew = true;
+    }
+    kt_leave();
+    return drew;
+}
+
+/* Open a new terminal window whose shell starts in @dir. */
 void kterm_open_in(const char *dir) {
+    if (!kt_enter()) return;
+    kt_start_dir[0] = '\0';
     if (dir && dir[0]) {
         kstrncpy(kt_start_dir, dir, sizeof(kt_start_dir));
-        if (kt_sh_in && kt_sh_pid > 0) {
-            char cmd[300];
-            int n = 0;
-            const char *p = "cd '";
-            while (*p) cmd[n++] = *p++;
-            for (p = dir; *p && n < (int)sizeof(cmd) - 4; p++) cmd[n++] = *p;
-            cmd[n++] = '\'';
-            cmd[n++] = '\n';
-            if (kt_txlen + n <= (int)sizeof(kt_txq)) {
-                memcpy(kt_txq + kt_txlen, cmd, (size_t)n);
-                kt_txlen += n;
-            }
-        }
         serial_printf("[kterm] open in %s\n", dir);
     }
-    kterm_open();
+    kt_open_new();
+    kt_start_dir[0] = '\0';
+    kt_leave();
 }
 
-/* Open the terminal in @dir and type @cmdline into its shell (desktop
- * shortcuts with Exec=terminal-run ...).  The shell is BusyBox ash on pipes,
- * so full-screen programs should use non-interactive modes for now. */
+/* Open a new terminal window in @dir and type @cmdline into its shell
+ * (desktop shortcuts with Exec=terminal-run ...). Each shortcut gets its own
+ * window, so a busy terminal (Doom running in it) no longer swallows it.
+ * The shell is BusyBox ash on pipes, so full-screen programs should use
+ * non-interactive modes for now. */
 void kterm_run_in(const char *dir, const char *cmdline) {
-    kterm_open_in(dir);
-    if (!cmdline || !cmdline[0]) return;
-    int n = 0;
-    while (cmdline[n]) n++;
-    if (kt_sh_in) {
-        kt_shell_send(cmdline, n);
-        kt_shell_send("\n", 1);
-        serial_printf("[kterm] run: %s\n", cmdline);
-    } else {
-        kt_add_line("No disk shell: cannot run the shortcut command.");
+    if (!kt_enter()) return;
+    kt_start_dir[0] = '\0';
+    if (dir && dir[0])
+        kstrncpy(kt_start_dir, dir, sizeof(kt_start_dir));
+    bool opened = kt_open_new();
+    kt_start_dir[0] = '\0';
+    if (opened && cmdline && cmdline[0]) {
+        int n = 0;
+        while (cmdline[n]) n++;
+        if (kt_sh_in) {
+            kt_shell_send(cmdline, n);
+            kt_shell_send("\n", 1);
+            serial_printf("[kterm] run: %s\n", cmdline);
+        } else {
+            kt_add_line("No disk shell: cannot run the shortcut command.");
+        }
     }
+    kt_leave();
 }

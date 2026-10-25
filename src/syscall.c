@@ -476,7 +476,8 @@ static int fd_close_entry(process_t *proc, int fd) {
     fde->ref_count = NULL;
 
     if (should_free_object && ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) {
-        if (ty == 8 /* FD_TYPE_EVENTFD */ || ty == 13 /* FD_TYPE_EPOLL */) {
+        if (ty == 8 /* FD_TYPE_EVENTFD */ || ty == 13 /* FD_TYPE_EPOLL */ ||
+            ty == 14 /* FD_TYPE_TIMERFD */ || ty == 15 /* FD_TYPE_SIGNALFD */) {
             if (fde->file_handle) kfree(fde->file_handle);
         } else if (ty == 10 /* FD_TYPE_DEV_INPUT */) {
             extern void evdev_release(void *handle);
@@ -2659,6 +2660,10 @@ static void process_signal_terminate(process_t *proc, int signum) {
 // Handle pending signals for a process
 static void handle_pending_signals(process_t *proc) {
     for (int signum = 1; signum < NSIG; signum++) {
+        /* A blocked signal stays pending (kill() to self with the signal
+         * blocked must not run its default action; signalfd/sigtimedwait
+         * dequeue it). KILL/STOP can never be in blocked_signals. */
+        if (proc->blocked_signals & (1u << signum)) continue;
         if (proc->pending_signals & (1 << signum)) {
             // Clear the pending signal
             proc->pending_signals &= ~(1 << signum);
@@ -3677,6 +3682,18 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
                 uint64_t v = *(volatile uint64_t *)proc->fds[fd].file_handle;
                 if ((kfds[i].events & POLLIN) && v) kfds[i].revents |= POLLIN;
                 if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
+            }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 14 /* FD_TYPE_TIMERFD */) {
+                extern bool lx_timerfd_ready(void *h);
+                if ((kfds[i].events & POLLIN) && lx_timerfd_ready(proc->fds[fd].file_handle))
+                    kfds[i].revents |= POLLIN;
+            }
+            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
+                proc->fds[fd].fd_type == 15 /* FD_TYPE_SIGNALFD */) {
+                extern bool lx_signalfd_ready(void *h, process_t *proc);
+                if ((kfds[i].events & POLLIN) && lx_signalfd_ready(proc->fds[fd].file_handle, proc))
+                    kfds[i].revents |= POLLIN;
             }
             if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
                 proc->fds[fd].fd_type == 10 /* FD_TYPE_DEV_INPUT */) {
