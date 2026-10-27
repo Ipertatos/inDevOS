@@ -1508,7 +1508,10 @@ int sys_open_kpath(const char *kpath, int flags, mode_t mode) {
             proc->fds[fd].cloexec = false;
             if ((flags & O_CREAT) && !existed) {
                 mode_t eff = (mode & 0777) & ~proc->file_umask;
-                perm_set(abspath, proc->uid, proc->gid, (uint16_t)eff);
+                if (vfs_has_inode_perms(abspath))    /* tmpfs/ext4: mode in the inode */
+                    vfs_setattr(abspath, VFS_SA_MODE | VFS_SA_QUIET, eff, 0, 0);
+                else
+                    perm_set(abspath, proc->uid, proc->gid, (uint16_t)eff);
             }
             return fd;
         }
@@ -3166,7 +3169,18 @@ static void exec_norm_path(char *path) {
     memcpy(path, out, o + 1);
 }
 
+static int exec_resolve_path0(process_t *proc, const char *name, char *out, size_t outsz);
+/* exec path lookup, then symlinks expanded (tmpfs/ext4: "./link-to-binary") */
 static int exec_resolve_path(process_t *proc, const char *name, char *out, size_t outsz) {
+    int r = exec_resolve_path0(proc, name, out, outsz);
+    if (r == 0 && out[0] == '/' && vfs_has_root_mount()) {
+        char rp[256];
+        if (vfs_resolve(out, rp, sizeof(rp), true) == 0 && vfs_exists(rp))
+            kstrncpy(out, rp, outsz);
+    }
+    return r;
+}
+static int exec_resolve_path0(process_t *proc, const char *name, char *out, size_t outsz) {
     if (!name || !out || outsz < 4) return -EINVAL;
     /* A name containing '/' is never searched for (POSIX): resolve it against
      * the cwd and normalise, so "./hello" and "sub/../x" run from the cwd. */
@@ -4124,12 +4138,12 @@ static void stat_fill_common(stat_t *st, uint32_t mode, uint64_t size,
     st->st_atime = st->st_mtime = st->st_ctime = sec;
 }
 
-static int stat_vfs_path(const char *abspath, stat_t *st) {
+static int stat_vfs_path2(const char *abspath, stat_t *st, bool nofollow) {
     uint32_t uid = 0, gid = 0;
     uint16_t pm = 0644;
     {
         vfs_stat_t vs;
-        int vr = vfs_stat(abspath, &vs);
+        int vr = nofollow ? vfs_lstat(abspath, &vs) : vfs_stat(abspath, &vs);
         if (vr == 0) {                      /* filesystem with real inodes (ext2/3/4) */
             stat_fill_common(st, vs.mode, vs.size, abspath, vs.uid, vs.gid);
             st->st_ino = vs.ino;
@@ -4165,11 +4179,15 @@ static int stat_vfs_path(const char *abspath, stat_t *st) {
     return -ENOENT;
 }
 
-/* Fill an inDevOS stat_t for an absolute VFS path (Linux ABI layer). */
+static int stat_vfs_path(const char *abspath, stat_t *st) { return stat_vfs_path2(abspath, st, false); }
+
+/* Fill an inDevOS stat_t for an absolute VFS path (Linux ABI layer).  The
+ * Linux layer resolves symlinks itself (vfs_resolve), so a symlink still in
+ * the final component is reported as the link (lstat). */
 int syscall_stat_abspath(const char *abspath, stat_t *st) {
     if (!abspath || !st || !vfs_has_root_mount())
         return -ENOENT;
-    return stat_vfs_path(abspath, st);
+    return stat_vfs_path2(abspath, st, true);
 }
 
 static int resolve_abspath(process_t *proc, const char *kpath, char *abspath, size_t absmax) {

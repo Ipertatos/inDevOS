@@ -445,6 +445,8 @@ int vfs_readdir(const char *path, vfs_dirent_t *entries, uint32_t max) {
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     int ret = (fs && fs->ops && fs->ops->readdir) ? fs->ops->readdir(fs, rel, entries, max)
                                                    : -ENODEV;
+    if (ret > 0 && !fs->ops->readlink)          /* only link-aware filesystems set .lnk */
+        for (int i = 0; i < ret; i++) entries[i].lnk = 0;
     /* Show mount points that live directly under @path (e.g. /mnt/ventoy
      * in /mnt), even if the parent filesystem has no such directory. */
     int n = ret > 0 ? ret : 0, added = 0;
@@ -699,6 +701,141 @@ int vfs_stat(const char *path, vfs_stat_t *st) {
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
     if (!fs || !fs->ops || !fs->ops->stat) { VFS_UNLOCK(); return -ENOSYS; }
     int r = fs->ops->stat(fs, rel ? rel : "", st);
+    VFS_UNLOCK();
+    return r;
+}
+
+/* ---- symlinks, hard links, inode attributes ---- */
+int vfs_resolve(const char *path, char *out, size_t outsz, bool follow_last) {
+    if (!path || path[0] != '/' || !out || outsz < 2) return -EINVAL;
+    size_t pl = strlen(path);
+    if (pl >= VFS_MAX_PATH) return -ENAMETOOLONG;
+    char *rest = (char *)kalloc(2 * VFS_MAX_PATH);
+    if (!rest) return -ENOMEM;
+    char *lnk = rest + VFS_MAX_PATH;
+    memcpy(rest, path, pl + 1);
+    size_t o = 0;
+    int loops = 0, rc = 0;
+    const char *s = rest;
+    for (;;) {
+        while (*s == '/') s++;
+        if (!*s) break;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t cl = (size_t)(e - s);
+        if (cl == 1 && s[0] == '.') { s = e; continue; }
+        if (cl == 2 && s[0] == '.' && s[1] == '.') {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+            s = e;
+            continue;
+        }
+        if (o + 1 + cl + 1 > outsz) { rc = -ENAMETOOLONG; break; }
+        size_t save = o;
+        out[o++] = '/';
+        memcpy(out + o, s, cl);
+        o += cl;
+        out[o] = '\0';
+        const char *t = e;
+        while (*t == '/') t++;
+        bool last = !*t && !*e;              /* "link/" is followed like Linux */
+        if (last && !follow_last) { s = e; continue; }
+        int n = -EINVAL;
+        VFS_LOCK();
+        const char *rel = NULL;
+        vfs_filesystem_t *fs = vfs_find_mount(out, &rel);
+        if (fs && fs->ops && fs->ops->readlink)
+            n = fs->ops->readlink(fs, rel ? rel : "", lnk, VFS_MAX_PATH - 1);
+        VFS_UNLOCK();
+        if (n < 0) { s = e; continue; }      /* not a link (or missing: the caller's op reports it) */
+        if (++loops > VFS_SYMLOOP_MAX) { rc = -ELOOP; break; }
+        if (n == 0) { rc = -ENOENT; break; }
+        if (n > VFS_MAX_PATH - 1) n = VFS_MAX_PATH - 1;
+        size_t el = strlen(e);
+        if ((size_t)n + el + 1 > VFS_MAX_PATH) { rc = -ENAMETOOLONG; break; }
+        memmove(rest + n, e, el + 1);        /* rest = target + remaining components */
+        memcpy(rest, lnk, (size_t)n);
+        o = lnk[0] == '/' ? 0 : save;        /* absolute target restarts at / */
+        out[o] = '\0';
+        s = rest;
+    }
+    kfree(rest);
+    if (rc) return rc;
+    if (o == 0) out[o++] = '/';
+    out[o] = '\0';
+    return 0;
+}
+
+int vfs_readlink(const char *path, char *buf, uint32_t cap) {
+    if (!path || !buf) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    int r = (fs && fs->ops && fs->ops->readlink) ? fs->ops->readlink(fs, rel ? rel : "", buf, cap) : -EINVAL;
+    VFS_UNLOCK();
+    return r;
+}
+
+int vfs_lstat(const char *path, vfs_stat_t *st) {
+    if (!path || !st) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    int r = -ENOSYS;
+    if (fs && fs->ops && fs->ops->lstat) r = fs->ops->lstat(fs, rel ? rel : "", st);
+    else if (fs && fs->ops && fs->ops->stat) r = fs->ops->stat(fs, rel ? rel : "", st);
+    VFS_UNLOCK();
+    return r;
+}
+
+int vfs_symlink(const char *target, const char *path) {
+    if (!path || !target) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    if (!fs || !fs->ops) { VFS_UNLOCK(); return -ENOENT; }
+    if (vfs_fs_ro(fs)) { int e = vfs_fs_has(fs, rel) ? -EEXIST : -EROFS; VFS_UNLOCK(); return e; }
+    if (!fs->ops->symlink) { VFS_UNLOCK(); return -EPERM; }
+    int r = fs->ops->symlink(fs, rel ? rel : "", target);
+    VFS_UNLOCK();
+    if (r == 0) inotify_vfs_event(path, IN_CREATE);
+    return r;
+}
+
+int vfs_link(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -EINVAL;
+    VFS_LOCK();
+    const char *r1 = NULL, *r2 = NULL;
+    vfs_filesystem_t *f1 = vfs_find_mount(oldpath, &r1);
+    vfs_filesystem_t *f2 = vfs_find_mount(newpath, &r2);
+    if (!f1 || !f1->ops) { VFS_UNLOCK(); return -ENOENT; }
+    if (f1 != f2) { VFS_UNLOCK(); return -EXDEV; }
+    if (vfs_fs_ro(f1)) { VFS_UNLOCK(); return -EROFS; }
+    if (!f1->ops->link) { VFS_UNLOCK(); return -EPERM; }
+    int r = f1->ops->link(f1, r1 ? r1 : "", r2 ? r2 : "");
+    VFS_UNLOCK();
+    if (r == 0) { inotify_vfs_event(newpath, IN_CREATE); inotify_vfs_event(oldpath, IN_ATTRIB); }
+    return r;
+}
+
+int vfs_setattr(const char *path, int what, uint32_t mode, uint32_t uid, uint32_t gid) {
+    if (!path) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    if (!fs || !fs->ops || !fs->ops->setattr) { VFS_UNLOCK(); return -ENOSYS; }
+    if (vfs_fs_ro(fs)) { int e = vfs_fs_has(fs, rel) ? -EROFS : -ENOENT; VFS_UNLOCK(); return e; }
+    int r = fs->ops->setattr(fs, rel ? rel : "", what & (VFS_SA_MODE | VFS_SA_OWNER), mode, uid, gid);
+    VFS_UNLOCK();
+    if (r == 0 && !(what & VFS_SA_QUIET)) inotify_vfs_event(path, IN_ATTRIB);
+    return r;
+}
+
+bool vfs_has_inode_perms(const char *path) {
+    if (!path) return false;
+    VFS_LOCK();
+    vfs_filesystem_t *fs = vfs_find_mount(path, NULL);
+    bool r = fs && fs->ops && fs->ops->setattr;
     VFS_UNLOCK();
     return r;
 }

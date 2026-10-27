@@ -51,6 +51,7 @@ typedef struct vfs_dirent {
     char     name[VFS_MAX_NAME];
     uint32_t inode;        // filesystem-specific identifier
     uint8_t  type;         // VFS_FILE, VFS_DIRECTORY, etc.
+    uint8_t  lnk;          // 1: the entry is a symlink (type = its target's type, VFS_FILE if dangling)
     uint32_t size;
 } vfs_dirent_t;
 
@@ -112,7 +113,24 @@ typedef struct vfs_fs_ops {
     /* Optional: nonzero when the medium is read-only; the VFS then refuses
      * every modification with -EROFS before calling the filesystem. */
     int   (*read_only)(struct vfs_filesystem *fs);
+    /* Optional symlink / hard link / attribute ops.  None of them follows a
+     * symlink in the final component (the VFS resolver, vfs_resolve(), has
+     * already expanded links in the earlier components).
+     * readlink: target length (no NUL) or -EINVAL (not a link) / -ENOENT.
+     * lstat:    like stat, but a final symlink reports S_IFLNK itself.
+     * setattr:  VFS_SA_MODE sets the low 12 mode bits, VFS_SA_OWNER uid/gid
+     *           ((uint32_t)-1 = leave unchanged).  0 or -errno. */
+    int   (*readlink)(struct vfs_filesystem *fs, const char *rel_path, char *buf, uint32_t cap);
+    int   (*symlink)(struct vfs_filesystem *fs, const char *rel_path, const char *target);
+    int   (*link)(struct vfs_filesystem *fs, const char *old_rel, const char *new_rel);
+    int   (*lstat)(struct vfs_filesystem *fs, const char *rel_path, struct vfs_stat *st);
+    int   (*setattr)(struct vfs_filesystem *fs, const char *rel_path, int what,
+                     uint32_t mode, uint32_t uid, uint32_t gid);
 } vfs_fs_ops_t;
+#define VFS_SA_MODE  1
+#define VFS_SA_QUIET 0x100   /* vfs_setattr: no IN_ATTRIB (create-time mode) */
+#define VFS_SA_OWNER 2
+#define VFS_SYMLOOP_MAX 40
 
 // A mounted filesystem instance
 typedef struct vfs_filesystem {
@@ -181,6 +199,24 @@ int  vfs_rmdir(const char *path);
 int  vfs_truncate(const char *path, uint64_t len);
 /* Filesystem-provided metadata; -ENOSYS when the fs has no stat op. */
 int vfs_stat(const char *path, vfs_stat_t *st);
+/* Symlinks (filesystems with a readlink op: tmpfs, ext2/3/4).
+ * vfs_resolve: normalise absolute @path (".", "..", "//") into @out, expanding
+ * every symlink on the way (and the last component too when @follow_last).
+ * ".." after a link is physical, like Linux.  -ELOOP after VFS_SYMLOOP_MAX
+ * expansions, -ENAMETOOLONG, 0 on success (missing components are kept). */
+int vfs_resolve(const char *path, char *out, size_t outsz, bool follow_last);
+/* Target of the symlink @path (not followed): length, -EINVAL if not a link. */
+int vfs_readlink(const char *path, char *buf, uint32_t cap);
+/* lstat: -ENOSYS when the fs has neither lstat nor stat. */
+int vfs_lstat(const char *path, vfs_stat_t *st);
+/* Create symlink @path -> @target / hard link @newpath -> @oldpath.
+ * -EPERM when the filesystem has no such op (FAT32, exFAT), -EXDEV across mounts. */
+int vfs_symlink(const char *target, const char *path);
+int vfs_link(const char *oldpath, const char *newpath);
+/* chmod/chown stored in the inode: -ENOSYS when the fs has no setattr op. */
+int vfs_setattr(const char *path, int what, uint32_t mode, uint32_t uid, uint32_t gid);
+/* true when @path lives on a filesystem with real permission bits (setattr op) */
+bool vfs_has_inode_perms(const char *path);
 int  vfs_ftruncate(int fd, uint64_t len);
 int  vfs_sync_all(void);
 int  vfs_exists(const char *path);

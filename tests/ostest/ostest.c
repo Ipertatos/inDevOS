@@ -237,6 +237,189 @@ static int t_mmap_shared_coh(char *d, size_t n) {
     R(PASS, "map<->read/write coherent, fork child store written back");
 }
 
+/* ---- batch 6: symlinks, hard links, inode permissions ----
+ * lk_sym/lk_hard/lk_perm run in directory @b on a filesystem that supports
+ * them (tmpfs, ext4); verified against Linux tmpfs/ext4 on the build box. */
+static int lk_sym(const char *b, char *d, size_t n) {
+    char f[300], l[300], p[300], q[300], buf[1100]; struct stat st, lst;
+    snprintf(f, sizeof f, "%s/tgt.txt", b); snprintf(l, sizeof l, "%s/l_rel", b);
+    CHECKE(put_file(f, "target-data", 11) == 0, "create target");
+    CHECKE(symlink("tgt.txt", l) == 0, "symlink rel");
+    ssize_t r = readlink(l, buf, sizeof buf); CHECK(r == 7 && !memcmp(buf, "tgt.txt", 7), "readlink rel: %zd '%.*s'", r, (int)(r > 0 ? r : 0), buf);
+    CHECK(readlink(l, buf, 3) == 3 && !memcmp(buf, "tgt", 3), "readlink truncation");
+    CHECK(readlink(f, buf, sizeof buf) == -1 && errno == EINVAL, "readlink of a file: errno %d (want EINVAL)", errno);
+    CHECKE(lstat(l, &lst) == 0, "lstat link");
+    CHECK(S_ISLNK(lst.st_mode) && lst.st_size == 7 && (lst.st_mode & 0777) == 0777, "lstat: mode %o size %lld", lst.st_mode, (long long)lst.st_size);
+    CHECKE(stat(l, &st) == 0, "stat via link");
+    CHECK(S_ISREG(st.st_mode) && st.st_size == 11, "stat via link: mode %o size %lld", st.st_mode, (long long)st.st_size);
+    CHECK(get_file(l, buf, sizeof buf) == 11 && !memcmp(buf, "target-data", 11), "read through link");
+    CHECKE(put_file(l, "written-via-link", 16) == 0, "write through link");
+    CHECK(get_file(f, buf, sizeof buf) == 16 && !memcmp(buf, "written-via-link", 16), "target content after write via link");
+    CHECK(lstat(l, &lst) == 0 && S_ISLNK(lst.st_mode), "link replaced by write");
+    /* directory link, walk through it, physical ".." */
+    snprintf(p, sizeof p, "%s/dA", b); CHECKE(mkdir(p, 0755) == 0, "mkdir dA");
+    snprintf(p, sizeof p, "%s/dA/sub", b); CHECKE(mkdir(p, 0755) == 0, "mkdir dA/sub");
+    snprintf(p, sizeof p, "%s/dA/sub/in.txt", b); CHECKE(put_file(p, "inner", 5) == 0, "create dA/sub/in.txt");
+    snprintf(l, sizeof l, "%s/l_dir", b); CHECKE(symlink("dA/sub", l) == 0, "symlink dir");
+    snprintf(p, sizeof p, "%s/l_dir/in.txt", b);
+    CHECK(get_file(p, buf, sizeof buf) == 5 && !memcmp(buf, "inner", 5), "read l_dir/in.txt: %s", strerror(errno));
+    snprintf(p, sizeof p, "%s/l_dir/../sub/in.txt", b);       /* ".." of dA/sub is dA */
+    CHECK(stat(p, &st) == 0 && st.st_size == 5, "physical '..' after a dir link: %s", strerror(errno));
+    snprintf(p, sizeof p, "%s/l_dir/", b); CHECK(stat(p, &st) == 0 && S_ISDIR(st.st_mode), "trailing slash follows");
+    CHECK(lstat(l, &lst) == 0 && S_ISLNK(lst.st_mode), "lstat dir link");
+    snprintf(p, sizeof p, "%s/l_dir/new.txt", b); CHECKE(put_file(p, "nw", 2) == 0, "create through dir link");
+    snprintf(p, sizeof p, "%s/dA/sub/new.txt", b); CHECK(stat(p, &st) == 0 && st.st_size == 2, "file created via dir link missing");
+    CHECK(rmdir(l) == -1 && errno == ENOTDIR, "rmdir on dir link: errno %d (want ENOTDIR)", errno);
+    /* getdents d_type */
+    DIR *D = opendir(b); CHECKE(D, "opendir"); struct dirent *e; int tl = 0, tr = 0;
+    while ((e = readdir(D))) { if (!strcmp(e->d_name, "l_dir") && e->d_type == DT_LNK) tl++; if (!strcmp(e->d_name, "tgt.txt") && e->d_type == DT_REG) tr++; }
+    closedir(D); CHECK(tl == 1 && tr == 1, "d_type: l_dir DT_LNK %d, tgt.txt DT_REG %d", tl, tr);
+    /* absolute + slow (long) target */
+    char lt[400]; int k = snprintf(lt, sizeof lt, "%s", b);
+    while (k < 200) k += snprintf(lt + k, sizeof lt - k, "/.");
+    snprintf(lt + k, sizeof lt - k, "/tgt.txt");
+    snprintf(l, sizeof l, "%s/l_slow", b); CHECKE(symlink(lt, l) == 0, "symlink long abs");
+    r = readlink(l, buf, sizeof buf); CHECK(r == (ssize_t)strlen(lt) && !memcmp(buf, lt, r), "readlink slow: %zd want %zu", r, strlen(lt));
+    CHECK(lstat(l, &lst) == 0 && lst.st_size == (off_t)strlen(lt), "lstat slow size %lld", (long long)lst.st_size);
+    CHECK(get_file(l, buf, sizeof buf) == 16, "read via slow link: %s", strerror(errno));
+    /* dangling, O_CREAT through dangling, O_NOFOLLOW, O_EXCL */
+    snprintf(l, sizeof l, "%s/l_dang", b); CHECKE(symlink("dang.txt", l) == 0, "symlink dangling");
+    CHECK(stat(l, &st) == -1 && errno == ENOENT, "stat dangling: errno %d", errno);
+    CHECK(lstat(l, &lst) == 0 && S_ISLNK(lst.st_mode), "lstat dangling");
+    CHECK(open(l, O_RDONLY) == -1 && errno == ENOENT, "open dangling: errno %d", errno);
+    CHECK(open(l, O_WRONLY | O_CREAT | O_EXCL, 0644) == -1 && errno == EEXIST, "O_CREAT|O_EXCL on link: errno %d", errno);
+    int fd = open(l, O_WRONLY | O_CREAT, 0644); CHECKE(fd >= 0, "O_CREAT through dangling link"); write(fd, "dg", 2); close(fd);
+    snprintf(p, sizeof p, "%s/dang.txt", b); CHECK(stat(p, &st) == 0 && st.st_size == 2, "target of dangling link not created");
+    CHECK(open(l, O_RDONLY | O_NOFOLLOW) == -1 && errno == ELOOP, "O_NOFOLLOW: errno %d (want ELOOP)", errno);
+    fd = open(f, O_RDONLY | O_NOFOLLOW); CHECK(fd >= 0, "O_NOFOLLOW on a plain file: %s", strerror(errno)); close(fd);
+    /* fstatat / readlinkat with dirfd */
+    int dfd = open(b, O_RDONLY | O_DIRECTORY); CHECKE(dfd >= 0, "open dir");
+    CHECK(fstatat(dfd, "l_rel", &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode), "fstatat NOFOLLOW");
+    CHECK(fstatat(dfd, "l_rel", &st, 0) == 0 && S_ISREG(st.st_mode), "fstatat follow");
+    CHECK(readlinkat(dfd, "l_dir", buf, sizeof buf) == 6 && !memcmp(buf, "dA/sub", 6), "readlinkat");
+    CHECK(symlinkat("tgt.txt", dfd, "l_at") == 0, "symlinkat: %s", strerror(errno));
+    close(dfd);
+    /* loops: self, pair, 40-link chain ok, 41 ELOOP */
+    snprintf(l, sizeof l, "%s/l_self", b); CHECKE(symlink("l_self", l) == 0, "symlink self");
+    CHECK(stat(l, &st) == -1 && errno == ELOOP, "self loop: errno %d (want ELOOP)", errno);
+    CHECK(open(l, O_RDONLY) == -1 && errno == ELOOP, "open self loop: errno %d", errno);
+    for (int i = 0; i <= 40; i++) {
+        char nm[300], tg[32]; snprintf(nm, sizeof nm, "%s/c%02d", b, i);
+        if (i == 40) snprintf(tg, sizeof tg, "tgt.txt"); else snprintf(tg, sizeof tg, "c%02d", i + 1);
+        CHECK(symlink(tg, nm) == 0, "chain symlink %d: %s", i, strerror(errno));
+    }
+    snprintf(p, sizeof p, "%s/c01", b); CHECK(stat(p, &st) == 0, "40-link chain: %s", strerror(errno));
+    snprintf(p, sizeof p, "%s/c00", b); CHECK(stat(p, &st) == -1 && errno == ELOOP, "41-link chain: errno %d (want ELOOP)", errno);
+    /* rename / unlink a link leave the target alone */
+    snprintf(p, sizeof p, "%s/l_rel", b); snprintf(q, sizeof q, "%s/l_ren", b);
+    CHECKE(rename(p, q) == 0, "rename link");
+    CHECK(readlink(q, buf, sizeof buf) == 7, "renamed link readlink");
+    CHECKE(unlink(q) == 0, "unlink link");
+    CHECK(stat(f, &st) == 0 && st.st_size == 16, "target gone after unlinking link");
+    CHECK(symlink("", q) == -1 && errno == ENOENT, "empty target: errno %d", errno);
+    CHECK(symlink("x", f) == -1 && errno == EEXIST, "symlink onto file: errno %d", errno);
+    /* cleanup */
+    const char *rm[] = { "l_dir/new.txt", "l_dir", "l_slow", "l_dang", "dang.txt", "l_at", "l_self", "dA/sub/in.txt", "dA/sub", "dA", "tgt.txt", NULL };
+    for (int i = 0; i <= 40; i++) { snprintf(p, sizeof p, "%s/c%02d", b, i); unlink(p); }
+    for (int i = 0; rm[i]; i++) { snprintf(p, sizeof p, "%s/%s", b, rm[i]); if (unlink(p) != 0) CHECK(rmdir(p) == 0, "cleanup %s: %s", p, strerror(errno)); }
+    R(PASS, "readlink/lstat/stat, rel+abs+slow(%zu B) targets, dir link walk + physical '..', DT_LNK, dangling + O_CREAT, O_NOFOLLOW ELOOP, O_EXCL EEXIST, ELOOP self/41 (40 ok), rename/unlink", strlen(lt));
+}
+static int lk_hard(const char *b, char *d, size_t n) {
+    char f[300], h[300], h2[300], p[300], buf[64]; struct stat s1, s2;
+    snprintf(f, sizeof f, "%s/h_a", b); snprintf(h, sizeof h, "%s/h_b", b); snprintf(h2, sizeof h2, "%s/h_c", b);
+    CHECKE(put_file(f, "hard", 4) == 0, "create");
+    CHECKE(link(f, h) == 0, "link");
+    CHECK(stat(f, &s1) == 0 && stat(h, &s2) == 0, "stat both");
+    CHECK(s1.st_ino == s2.st_ino && s1.st_nlink == 2 && s2.st_nlink == 2, "ino %llu/%llu nlink %lu/%lu", (unsigned long long)s1.st_ino, (unsigned long long)s2.st_ino, (unsigned long)s1.st_nlink, (unsigned long)s2.st_nlink);
+    CHECKE(linkat(AT_FDCWD, h, AT_FDCWD, h2, 0) == 0, "linkat");
+    CHECK(stat(f, &s1) == 0 && s1.st_nlink == 3, "nlink after linkat %lu", (unsigned long)s1.st_nlink);
+    int fd = open(h, O_WRONLY | O_APPEND); CHECKE(fd >= 0, "open b"); write(fd, "-more", 5); close(fd);
+    CHECK(get_file(f, buf, sizeof buf) == 9 && !memcmp(buf, "hard-more", 9), "write via one name not seen via other");
+    CHECK(link(f, h) == -1 && errno == EEXIST, "link onto existing: errno %d", errno);
+    snprintf(p, sizeof p, "%s/h_dir", b); CHECKE(mkdir(p, 0755) == 0, "mkdir");
+    snprintf(buf, sizeof buf, "x"); char hd[300]; snprintf(hd, sizeof hd, "%s/h_dirl", b);
+    CHECK(link(p, hd) == -1 && errno == EPERM, "link of a dir: errno %d (want EPERM)", errno);
+    rmdir(p);
+    CHECK(rename(f, h) == 0 && stat(f, &s1) == 0 && stat(h, &s2) == 0, "rename between hard links of one inode must be a no-op");
+    CHECKE(unlink(f) == 0, "unlink a");
+    CHECK(stat(h, &s2) == 0 && s2.st_nlink == 2 && s2.st_size == 9, "after unlink: nlink %lu size %lld", (unsigned long)s2.st_nlink, (long long)s2.st_size);
+    fd = open(h, O_RDONLY); CHECKE(fd >= 0, "open b");
+    CHECKE(unlink(h) == 0 && unlink(h2) == 0, "unlink last names");
+    CHECK(access(h, F_OK) != 0 && access(h2, F_OK) != 0, "names still visible");
+    memset(buf, 0, sizeof buf);
+    CHECK(pread(fd, buf, 9, 0) == 9 && !memcmp(buf, "hard-more", 9), "read via fd after last unlink: %s", strerror(errno));
+    close(fd);
+    /* link to a symlink: plain link() does not follow */
+    char sl[300], sh[300]; snprintf(sl, sizeof sl, "%s/h_sym", b); snprintf(sh, sizeof sh, "%s/h_symh", b);
+    CHECKE(symlink("nowhere", sl) == 0, "symlink");
+    CHECKE(link(sl, sh) == 0, "link to a dangling symlink");
+    struct stat ls; CHECK(lstat(sh, &ls) == 0 && S_ISLNK(ls.st_mode) && ls.st_nlink == 2, "hard link of symlink: mode %o nlink %lu", ls.st_mode, (unsigned long)ls.st_nlink);
+    unlink(sl); unlink(sh);
+    R(PASS, "same ino, nlink 2->3->2, shared data, EEXIST, dir EPERM, rename-same-inode no-op, data lives on via open fd, link of symlink");
+}
+static int lk_perm(const char *b, int owner, char *d, size_t n) {
+    char f[300], l[300], p[300]; struct stat st;
+    snprintf(f, sizeof f, "%s/p_f", b); snprintf(l, sizeof l, "%s/p_l", b); snprintf(p, sizeof p, "%s/p_d", b);
+    mode_t om = umask(022);
+    int fd = open(f, O_WRONLY | O_CREAT | O_EXCL, 0777); CHECKE(fd >= 0, "create 0777");
+    CHECK(fstat(fd, &st) == 0 && (st.st_mode & 07777) == 0755, "create mode: %o (want 0755 after umask 022)", st.st_mode & 07777);
+    CHECKE(fchmod(fd, 0604) == 0, "fchmod");
+    close(fd);
+    CHECK(stat(f, &st) == 0 && (st.st_mode & 07777) == 0604, "after fchmod: %o", st.st_mode & 07777);
+    CHECKE(chmod(f, 04755) == 0, "chmod 04755");
+    CHECK(stat(f, &st) == 0 && (st.st_mode & 07777) == 04755, "after chmod: %o", st.st_mode & 07777);
+    CHECK(access(f, X_OK) == 0, "X_OK after chmod 755");
+    CHECKE(chmod(f, 0644) == 0, "chmod 0644");
+    CHECK(access(f, X_OK) == -1, "X_OK on 0644 should fail");
+    CHECKE(mkdir(p, 0700) == 0, "mkdir 0700");
+    CHECK(stat(p, &st) == 0 && (st.st_mode & 07777) == 0700, "mkdir mode %o", st.st_mode & 07777);
+    CHECKE(symlink("p_f", l) == 0, "symlink");
+    CHECKE(chmod(l, 0600) == 0, "chmod via link");
+    CHECK(stat(f, &st) == 0 && (st.st_mode & 07777) == 0600, "chmod via link did not reach target: %o", st.st_mode & 07777);
+    struct stat ls; CHECK(lstat(l, &ls) == 0 && (ls.st_mode & 0777) == 0777, "link mode changed: %o", ls.st_mode);
+    if (owner) {
+        CHECKE(chmod(f, 06755) == 0, "chmod 06755");
+        CHECKE(chown(f, 1234, 4321) == 0, "chown");
+        CHECK(stat(f, &st) == 0 && st.st_uid == 1234 && st.st_gid == 4321, "chown: uid %u gid %u", st.st_uid, st.st_gid);
+        CHECK((st.st_mode & 07777) == 0755, "chown should clear setuid/setgid: %o", st.st_mode & 07777);
+        CHECKE(lchown(l, 77, 88) == 0, "lchown");
+        CHECK(lstat(l, &ls) == 0 && ls.st_uid == 77 && ls.st_gid == 88, "lchown: link uid %u gid %u", ls.st_uid, ls.st_gid);
+        CHECK(stat(f, &st) == 0 && st.st_uid == 1234, "lchown changed the target");
+        fd = open(f, O_RDONLY); CHECKE(fd >= 0, "open");
+        CHECKE(fchown(fd, 5, -1) == 0, "fchown");
+        close(fd);
+        CHECK(stat(f, &st) == 0 && st.st_uid == 5 && st.st_gid == 4321, "fchown uid 5 keep gid: %u %u", st.st_uid, st.st_gid);
+        CHECKE(fchownat(AT_FDCWD, p, 9, 9, 0) == 0, "fchownat");
+        CHECK(stat(p, &st) == 0 && st.st_uid == 9 && st.st_gid == 9, "fchownat dir: %u %u", st.st_uid, st.st_gid);
+        CHECK(fchmodat(AT_FDCWD, l, 0600, AT_SYMLINK_NOFOLLOW) == -1 && (errno == EOPNOTSUPP || errno == ENOTSUP), "fchmodat NOFOLLOW on link: errno %d", errno);
+    }
+    umask(om);
+    unlink(l); unlink(f); rmdir(p);
+    R(PASS, "create mode+umask, fchmod/chmod, X_OK, mkdir mode, chmod via link%s", owner ? ", chown/lchown/fchown/fchownat, chown clears suid/sgid" : "");
+}
+/* sc.symlinks / sc.hardlinks / sc.perms in the ostest tmpdir: tmpfs or a
+ * filesystem with links does the full run; FAT32/exFAT (/tmp on the gate
+ * disk) must keep refusing with EPERM. */
+static int lk_fat_eperm(char *d, size_t n) {
+    char f[160], l[160]; tpath(f, sizeof f, "lk_f"); tpath(l, sizeof l, "lk_l");
+    CHECKE(put_file(f, "x", 1) == 0, "create");
+    CHECK(symlink("lk_f", l) == -1 && errno == EPERM, "symlink on FAT: errno %d (want EPERM)", errno);
+    CHECK(link(f, l) == -1 && errno == EPERM, "link on FAT: errno %d (want EPERM)", errno);
+    struct stat a, b2; CHECK(lstat(f, &a) == 0 && stat(f, &b2) == 0 && a.st_mode == b2.st_mode, "lstat != stat");
+    char buf[16]; CHECK(readlink(f, buf, sizeof buf) == -1 && errno == EINVAL, "readlink: errno %d", errno);
+    CHECKE(chmod(f, 0640) == 0, "chmod");
+    CHECK(stat(f, &a) == 0 && (a.st_mode & 0777) == 0640, "chmod table: %o", a.st_mode & 0777);
+    unlink(f);
+    R(SKIP, "no symlink support in %s (FAT32/exFAT): EPERM for symlink/link, lstat==stat, chmod via table", tmpdir);
+}
+static int lk_has_links(void) {
+    char f[160]; tpath(f, sizeof f, "lk_probe"); unlink(f);
+    int r = symlink("x", f); unlink(f); return r == 0;
+}
+static int t_lk_sym(char *d, size_t n) { if (!lk_has_links()) return lk_fat_eperm(d, n); char b[200]; tpath(b, sizeof b, "lks"); CHECKE(mkdir(b, 0755) == 0, "mkdir"); int r = lk_sym(b, d, n); if (r == PASS) rmdir(b); return r; }
+static int t_lk_hard(char *d, size_t n) { if (!lk_has_links()) return lk_fat_eperm(d, n); char b[200]; tpath(b, sizeof b, "lkh"); CHECKE(mkdir(b, 0755) == 0, "mkdir"); int r = lk_hard(b, d, n); if (r == PASS) rmdir(b); return r; }
+static int t_lk_perm(char *d, size_t n) { if (!lk_has_links()) return lk_fat_eperm(d, n); char b[200]; tpath(b, sizeof b, "lkp"); CHECKE(mkdir(b, 0755) == 0, "mkdir"); int r = lk_perm(b, geteuid() == 0, d, n); if (r == PASS) rmdir(b); return r; }
+
 /* ---- batch 2 item 4: small calls ---- */
 static int t_sc_links(char *d, size_t n) {
     char f[160], s2[160], h[160]; tpath(f, sizeof f, "sc_lnk"); tpath(s2, sizeof s2, "sc_sym"); tpath(h, sizeof h, "sc_hard");
@@ -885,7 +1068,9 @@ static void walk_dir(const char *dir, int depth, struct walk *w, int limit) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char p[1024]; snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
         struct stat st, lst;
-        if (lstat(p, &lst) == 0 && S_ISLNK(lst.st_mode)) w->symlinks++;
+        int islnk = lstat(p, &lst) == 0 && S_ISLNK(lst.st_mode);
+        if (islnk) w->symlinks++;
+        if (stat(p, &st) != 0 && islnk && errno == ENOENT) continue;   /* dangling link (e.g. absolute target off this volume) */
         if (stat(p, &st) != 0) { w->errors++; snprintf(w->err, sizeof(w->err), "stat %s: %s", p, strerror(errno)); continue; }
         if (S_ISDIR(st.st_mode)) { w->dirs++; walk_dir(p, depth + 1, w, limit); continue; }
         w->files++;
@@ -1253,6 +1438,35 @@ static int t_vol_exte4dw(char *d, size_t n) {
     snprintf(d, n, "plain ext4w on the ext4d copy (journaled): write, mkdir, unlink, unlink-while-open (orphan) read via fd, close frees it");
     return PASS;
 }
+/* vol.ext_links: symlinks / hard links / chmod+chown on the journaled
+ * ext4d copy; the lk_keep/ entries stay for the host check (e4dw_check.py:
+ * debugfs must see the fast + slow symlink, nlink 2 and the stored mode/owner). */
+static int t_vol_extlinks(char *d, size_t n) {
+    struct stat st; const char *b = "/mnt/e4dw/lk_t";
+    if (stat("/mnt/e4dw/big.bin", &st) != 0) R(SKIP, "no /mnt/e4dw scratch copy of ext4d");
+    CHECK(mkdir(b, 0755) == 0, "mkdir %s: %s", b, strerror(errno));
+    char sub[700]; int r;
+    if ((r = lk_sym(b, sub, sizeof sub)) != PASS) R(r, "symlinks: %s", sub);
+    if ((r = lk_hard(b, sub, sizeof sub)) != PASS) R(r, "hard links: %s", sub);
+    if ((r = lk_perm(b, 1, sub, sizeof sub)) != PASS) R(r, "perms: %s", sub);
+    CHECK(rmdir(b) == 0, "rmdir %s: %s", b, strerror(errno));
+    /* persistent fixture for the host check */
+    const char *k = "/mnt/e4dw/lk_keep";
+    CHECK(mkdir(k, 0755) == 0, "mkdir lk_keep: %s", strerror(errno));
+    CHECK(put_file("/mnt/e4dw/lk_keep/data.bin", "e4dw-link-data\n", 15) == 0, "data.bin: %s", strerror(errno));
+    CHECK(symlink("data.bin", "/mnt/e4dw/lk_keep/fast") == 0, "fast symlink: %s", strerror(errno));
+    char lt[200]; int o = snprintf(lt, sizeof lt, "../lk_keep");
+    while (o < 120) o += snprintf(lt + o, sizeof lt - o, "/.");
+    snprintf(lt + o, sizeof lt - o, "/data.bin");
+    CHECK(symlink(lt, "/mnt/e4dw/lk_keep/slow") == 0, "slow symlink: %s", strerror(errno));
+    CHECK(link("/mnt/e4dw/lk_keep/data.bin", "/mnt/e4dw/lk_keep/hard") == 0, "hard link: %s", strerror(errno));
+    CHECK(put_file("/mnt/e4dw/lk_keep/perm.bin", "p", 1) == 0, "perm.bin");
+    CHECK(chmod("/mnt/e4dw/lk_keep/perm.bin", 0640) == 0 && chown("/mnt/e4dw/lk_keep/perm.bin", 1234, 4321) == 0, "chmod/chown perm.bin: %s", strerror(errno));
+    char buf[32]; CHECK(get_file("/mnt/e4dw/lk_keep/slow", buf, sizeof buf) == 15, "read via slow link");
+    CHECK(stat("/mnt/e4dw/lk_keep/hard", &st) == 0 && st.st_nlink == 2, "hard nlink %lu", (unsigned long)st.st_nlink);
+    sync();
+    R(PASS, "e4dw: %s; hard links + perms ok; lk_keep/ left for the host check (fast, slow %zu B, hard, perm.bin 0640 1234:4321)", sub, strlen(lt));
+}
 static int t_vol_mountslots(char *d, size_t n) {
     struct stat st; const char *want[] = { "ext4d", "e4rw", "e4j", "e4dw" }; int found = 0, total = 0;
     if (stat("/mnt/e4j", &st) != 0) R(SKIP, "no ext4 fixture mounts");
@@ -1274,7 +1488,7 @@ static int t_vol_mountslots(char *d, size_t n) {
 static int t_vol_extmeta(char *d, size_t n) {
     FILE *f = fopen("/home/user/ext_manifest.txt", "r");
     if (!f) R(SKIP, "no /home/user/ext_manifest.txt");
-    char line[700], err[300] = ""; int nf = 0, nd = 0, nc = 0, nx = 0, bad = 0;
+    char line[700], err[300] = ""; int nf = 0, nd = 0, nc = 0, nx = 0, nl = 0, bad = 0;
 #define EXTBAD(...) do { if (!bad++) snprintf(err, sizeof(err), __VA_ARGS__); } while (0)
     while (fgets(line, sizeof(line), f)) {
         char t, rel[500], p[600]; unsigned long mode = 0; unsigned long uid = 0, gid = 0; long long size = 0, mt = 0, cnt = 0; unsigned long crc = 0;
@@ -1299,6 +1513,14 @@ static int t_vol_extmeta(char *d, size_t n) {
         } else if (t == 'C' && sscanf(line, "%*c %*s %lld %lx", &size, &crc) == 2) {
             nc++;
             if (file_crc(p, &c, &len) || c != crc || len != size) EXTBAD("%s: content crc %08x len %lld, want %08lx %lld", p, c, len, crc, size);
+        } else if (t == 'L') {
+            char want[500], got[600]; nl++;
+            if (sscanf(line, "%*c %*s %499s", want) != 1) continue;
+            ssize_t r = readlink(p, got, sizeof(got) - 1); struct stat ls;
+            if (r < 0) { EXTBAD("readlink %s: %s", p, strerror(errno)); continue; }
+            got[r] = 0;
+            if (strcmp(got, want)) EXTBAD("%s -> '%s', want '%s'", p, got, want);
+            else if (lstat(p, &ls) != 0 || !S_ISLNK(ls.st_mode) || ls.st_size != r) EXTBAD("%s: lstat mode %o size %lld", p, ls.st_mode, (long long)ls.st_size);
         } else if (t == 'X') {
             nx++;
             int fd = open(p, O_RDONLY); int e1 = errno;
@@ -1310,7 +1532,7 @@ static int t_vol_extmeta(char *d, size_t n) {
     fclose(f);
     if (!nf && !nd) R(SKIP, "manifest empty");
     CHECK(!bad, "%d mismatches; first: %s", bad, err);
-    R(PASS, "%d files, %d dirs, %d content, %d bad-csum rejected", nf, nd, nc, nx);
+    R(PASS, "%d files, %d dirs, %d content, %d symlinks, %d bad-csum rejected", nf, nd, nc, nl, nx);
 }
 
 /* ===================== dev ===================== */
@@ -2269,7 +2491,7 @@ static const struct test tests[] = {
     { "fs", "rename", t_fs_rename, 10, 0 }, { "fs", "dirs", t_fs_dirs, 15, 0 }, { "fs", "readdir_stat", t_fs_readdir_stat, 10, 0 }, { "fs", "readdir_many", t_fs_readdir_many, 120, 0 },
     { "fs", "many_files", t_fs_many, 120, 0 }, { "fs", "large_24mb", t_fs_large, 180, 0 },
     { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 }, { "fs", "seek_far_read", t_fs_seek_far_read, 30, 0 },
-    { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 }, { "vol", "ext_write", t_vol_extwrite, 60, 0 }, { "vol", "ext_ns", t_vol_extns, 120, 0 }, { "vol", "ext_dir", t_vol_extdir, 60, 0 }, { "vol", "ext_htree", t_vol_exthtree, 120, 0 }, { "vol", "ext_sparse", t_vol_extsparse, 60, 0 }, { "vol", "ext_deep", t_vol_extdeep, 120, 0 }, { "vol", "ext_journal", t_vol_extjournal, 120, 0 }, { "vol", "ext_e4dw", t_vol_exte4dw, 60, 0 }, { "vol", "mount_slots", t_vol_mountslots, 30, 0 },
+    { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 }, { "vol", "ext_write", t_vol_extwrite, 60, 0 }, { "vol", "ext_ns", t_vol_extns, 120, 0 }, { "vol", "ext_dir", t_vol_extdir, 60, 0 }, { "vol", "ext_htree", t_vol_exthtree, 120, 0 }, { "vol", "ext_sparse", t_vol_extsparse, 60, 0 }, { "vol", "ext_deep", t_vol_extdeep, 120, 0 }, { "vol", "ext_journal", t_vol_extjournal, 120, 0 }, { "vol", "ext_e4dw", t_vol_exte4dw, 60, 0 }, { "vol", "ext_links", t_vol_extlinks, 120, 0 }, { "vol", "mount_slots", t_vol_mountslots, 30, 0 },
     { "vol", "ext_meta", t_vol_extmeta, 180, 0 },
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
     { "dev", "fb0", t_dev_fb, 10, 0 }, { "dev", "evdev", t_dev_evdev, 10, 0 }, { "dev", "uinput", t_dev_uinput, 10, 0 },
@@ -2282,6 +2504,7 @@ static const struct test tests[] = {
     { "sc", "links", t_sc_links, 10, 0 }, { "sc", "fifo", t_sc_fifo, 15, 0 }, { "sc", "flock", t_sc_flock, 15, 0 },
     { "sc", "fallocate_pv", t_sc_fallocate, 15, 0 }, { "sc", "utimes", t_sc_times, 10, 0 },
     { "sc", "waitid", t_sc_waitid, 15, 0 }, { "sc", "prio_affinity", t_sc_sched, 10, 0 },
+    { "lnk", "symlinks", t_lk_sym, 30, 0 }, { "lnk", "hardlinks", t_lk_hard, 20, 0 }, { "lnk", "perms", t_lk_perm, 20, 0 },
     { "tty", "pty_basic", t_pty_basic, 10, 0 },
     { "misc", "cwd", t_cwd, 5, 0 }, { "misc", "dup", t_dup, 5, 0 }, { "misc", "fcntl", t_fcntl, 5, 0 },
     { "misc", "poll", t_poll, 10, 0 }, { "misc", "select", t_select, 10, 0 }, { "misc", "eventfd", t_eventfd, 5, 0 },

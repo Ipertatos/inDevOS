@@ -2659,12 +2659,15 @@ static int e4_empty_cb(const char *nm, int nl, uint32_t ino, uint8_t ft, void *a
     return 1;
 }
 /* Drop one link of inode @t (already removed from its directory). */
+static void e4_hrefresh(e4_vol_t *v, uint32_t ino);
 static int e4_release(e4_vol_t *v, e4_inode_t *t, bool isdir) {
     uint32_t now = (uint32_t)rtc_unix_epoch();
-    if (!isdir && t->links > 1) {
+    if (!isdir && t->links > 1) {                                  /* another hard link remains */
         *(uint16_t *)(t->raw + 0x1A) = (uint16_t)(t->links - 1);
         *(uint32_t *)(t->raw + 0x0C) = now;
-        return e4_iwrite(v, t->ino, t->raw) ? -5 : 0;
+        if (e4_iwrite(v, t->ino, t->raw)) return -5;
+        e4_hrefresh(v, t->ino);                                    /* open fds must not write the old count back */
+        return 0;
     }
     bool has_blocks = (t->mode & S_IFMT_) == S_IFREG_ || (t->mode & S_IFMT_) == S_IFDIR_ ||
                       (t->flags & FL_EXTENTS) || *(uint32_t *)(t->raw + 0x1C);
@@ -2780,7 +2783,7 @@ static int e4_unlink_in(e4_vol_t *v, const char *rel, bool busy, bool want_dir) 
         if (e < 0) { rc = -5; goto out; }
         if (e == 1) { rc = -39; goto out; }                        /* ENOTEMPTY */
     }
-    if (busy && (isdir || !v->jw)) { rc = -16; goto out; }   /* journaled: an open file becomes an orphan */
+    if (busy && (isdir || (!v->jw && t->links <= 1))) { rc = -16; goto out; }   /* journaled: an open file becomes an orphan */
     if (e4_mark_dirty(v) != 0) { rc = -5; goto out; }
     if ((rc = e4_dir_del(v, d, nm, nl)) != 0) goto out;
     if (isdir) { e4_iget(v, d->ino, d); e4_link_adj(v, d, -1); e4_touch(v, d); }
@@ -2923,7 +2926,7 @@ static int e4_rename_in(e4_vol_t *v, const char *orel, const char *nrel, bool tb
         if (sdir && !tdir) { rc = -20; goto out; }
         if (!sdir && tdir) { rc = -21; goto out; }
         if (tdir) { int e = e4_dir_iter(v, T, e4_empty_cb, NULL); if (e) { rc = e < 0 ? -5 : -39; goto out; } }
-        if (!tdir && tbusy) { rc = -16; goto out; }
+        if (!tdir && tbusy && T->links <= 1) { rc = -16; goto out; }
         if (*(uint32_t *)(T->raw + 0x68) || *(uint16_t *)(T->raw + 0x76)) { rc = -95; goto out; }
     }
     if (sdir && !(v->ro_compat & 0x0020) && N->ino != P->ino && N->links >= 65000 && !tino) { rc = -31; goto out; }
@@ -2958,6 +2961,163 @@ out:
     return rc;
 }
 
+/* ---- symlinks, hard links, chmod/chown (batch 6) ---- */
+static uint8_t e4_ftype(uint16_t mode) {
+    switch (mode & S_IFMT_) {
+    case S_IFDIR_: return 2;
+    case S_IFLNK_: return 7;
+    case 0x1000: return 5;      /* fifo */
+    case 0x2000: return 3;      /* chr */
+    case 0x6000: return 4;      /* blk */
+    case 0xC000: return 6;      /* sock */
+    default: return 1;
+    }
+}
+/* target of symlink inode @in into @buf (NUL-terminated, cap >= 2); length or -errno */
+static int e4_link_target(e4_vol_t *v, const e4_inode_t *in, char *buf, uint32_t cap) {
+    if ((in->mode & S_IFMT_) != S_IFLNK_) return -22;
+    if (in->size == 0 || in->size >= 4096) return -5;
+    uint32_t tl = (uint32_t)in->size;
+    char *t = (char *)kalloc(4096);
+    if (!t) return -12;
+    if (in->size < 60 && !(in->flags & (FL_EXTENTS | FL_INLINE)) && *(uint32_t *)(in->raw + 28) == 0)
+        memcpy(t, in->iblock, tl);                                 /* fast symlink */
+    else if (e4_pread(v, in, 0, (uint8_t *)t, tl) != (int)tl) { kfree(t); return -5; }
+    if (tl > cap) tl = cap;
+    memcpy(buf, t, tl);
+    kfree(t);
+    return (int)tl;
+}
+/* symlink: fast (target < 60 bytes, in i_block) or slow (one data block) */
+static int e4_symlink_in(e4_vol_t *v, const char *rel, const char *tgt) {
+    if (!v->rw) return -30;
+    uint32_t tl = (uint32_t)strlen(tgt);
+    if (!tl) return -2;
+    if (tl >= v->bs || tl >= 4096) return -36;
+    char dir[512]; const char *nm;
+    int nl = e4_split(rel, dir, sizeof(dir), &nm);
+    if (nl < 0) return nl;
+    e4_inode_t *d = (e4_inode_t *)kalloc(sizeof(e4_inode_t)), *in = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    uint8_t *raw = NULL, *blk = NULL;
+    int rc = 0;
+    uint32_t ino = 0;
+    if (!d || !in) { rc = -12; goto out; }
+    if (!e4_namei(v, dir, d, 0, true) || (d->mode & S_IFMT_) != S_IFDIR_) { rc = -2; goto out; }
+    if (d->flags & FL_INLINE) { rc = -95; goto out; }
+    if (e4_dir_lookup(v, d, nm, nl)) { rc = -17; goto out; }
+    if (e4_mark_dirty(v) != 0) { rc = -5; goto out; }
+    ino = e4_ialloc(v, (d->ino - 1) / v->ipg);
+    if (!ino) { rc = -28; goto out; }
+    raw = (uint8_t *)kalloc(v->isz);
+    if (!raw) { e4_ifree(v, ino); rc = -12; goto out; }
+    memset(raw, 0, v->isz);
+    uint32_t now = (uint32_t)rtc_unix_epoch();
+    bool fast = tl < 60;
+    *(uint16_t *)(raw + 0x00) = (uint16_t)(S_IFLNK_ | 0777);
+    *(uint32_t *)(raw + 0x08) = now; *(uint32_t *)(raw + 0x0C) = now; *(uint32_t *)(raw + 0x10) = now;
+    *(uint16_t *)(raw + 0x1A) = 1;
+    uint32_t gen; __asm__ volatile("rdtsc" : "=a"(gen) : : "edx");
+    *(uint32_t *)(raw + 0x64) = gen ^ ino;
+    if (fast) {
+        memcpy(raw + 0x28, tgt, tl);
+        *(uint32_t *)(raw + 0x04) = tl;
+    } else if (v->incompat & I_EXTENTS) {
+        *(uint32_t *)(raw + 0x20) = FL_EXTENTS;
+        *(uint16_t *)(raw + 0x28) = 0xF30A; *(uint16_t *)(raw + 0x2C) = 4;
+    }
+    if (v->isz > 128) {
+        uint16_t ex = v->want_extra ? v->want_extra : 32;
+        if (128u + ex > v->isz) ex = (uint16_t)(v->isz - 128);
+        *(uint16_t *)(raw + 0x80) = ex;
+        if (ex >= 0x18) *(uint32_t *)(raw + 0x90) = now;
+    }
+    if (e4_iwrite(v, ino, raw) != 0) { e4_ifree(v, ino); rc = -5; goto out; }
+    if (!fast) {
+        if (e4_iget(v, ino, in) != 0) { rc = -5; goto undo; }
+        uint64_t goal = 0;
+        e4_map_end(v, in, &goal);
+        uint64_t pb = e4_alloc_block(v, goal);
+        if (!pb) { rc = -28; goto undo; }
+        blk = (uint8_t *)kalloc(v->bs);
+        if (!blk) { e4_free_block(v, pb); rc = -12; goto undo; }
+        memset(blk, 0, v->bs);
+        memcpy(blk, tgt, tl);                                      /* NUL-padded: e2fsck wants strnlen == i_size */
+        if (e4_wdata(v, pb, blk) != 0) { e4_free_block(v, pb); rc = -5; goto undo; }
+        int r = e4_map_append(v, in, 0, pb);
+        if (r) { e4_free_block(v, pb); rc = r; goto undo; }
+        e4_iblocks_add(v, in, 1);
+        in->size = tl;
+        if (e4_touch(v, in) != 0) { rc = -5; goto undo; }
+    }
+    rc = e4_dir_add(v, d, nm, nl, ino, 7);
+    if (rc == 0) goto out;
+undo:
+    if (e4_iget(v, ino, in) == 0) { in->links = 1; e4_release(v, in, false); }
+    else e4_ifree(v, ino);
+out:
+    if (blk) kfree(blk);
+    if (raw) kfree(raw);
+    if (in) kfree(in);
+    if (d) kfree(d);
+    return rc;
+}
+/* hard link @nrel -> inode of @orel (not followed) */
+static int e4_link_in(e4_vol_t *v, const char *orel, const char *nrel) {
+    if (!v->rw) return -30;
+    char dir[512]; const char *nm;
+    int nl = e4_split(nrel, dir, sizeof(dir), &nm);
+    if (nl < 0) return nl;
+    e4_inode_t *d = (e4_inode_t *)kalloc(sizeof(e4_inode_t)), *s = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    int rc = 0;
+    if (!d || !s) { rc = -12; goto out; }
+    if (!e4_namei(v, orel, s, 0, false)) { rc = -2; goto out; }
+    if ((s->mode & S_IFMT_) == S_IFDIR_) { rc = -1; goto out; }     /* EPERM */
+    if (s->links >= 65000) { rc = -31; goto out; }                 /* EMLINK */
+    if (!e4_namei(v, dir, d, 0, true)) { rc = -2; goto out; }
+    if ((d->mode & S_IFMT_) != S_IFDIR_) { rc = -20; goto out; }
+    if (d->flags & FL_INLINE) { rc = -95; goto out; }
+    if (e4_dir_lookup(v, d, nm, nl)) { rc = -17; goto out; }
+    if (e4_mark_dirty(v) != 0) { rc = -5; goto out; }
+    if ((rc = e4_dir_add(v, d, nm, nl, s->ino, e4_ftype(s->mode))) != 0) goto out;
+    if (e4_iget(v, s->ino, s) != 0) { rc = -5; goto out; }
+    *(uint16_t *)(s->raw + 0x1A) = (uint16_t)(s->links + 1);
+    *(uint32_t *)(s->raw + 0x0C) = (uint32_t)rtc_unix_epoch();
+    if (e4_iwrite(v, s->ino, s->raw) != 0) { rc = -5; goto out; }
+    e4_hrefresh(v, s->ino);
+out:
+    if (s) kfree(s);
+    if (d) kfree(d);
+    return rc;
+}
+/* chmod (low 12 mode bits) / chown (uid, gid incl. the high 16 bits in osd2) */
+static int e4_setattr_in(e4_vol_t *v, const char *rel, int what, uint32_t mode, uint32_t uid, uint32_t gid) {
+    if (!v->rw) return -30;
+    e4_inode_t *in = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    if (!in) return -12;
+    int rc = 0;
+    if (!e4_namei(v, rel, in, 0, false)) { rc = -2; goto out; }
+    if (e4_mark_dirty(v) != 0) { rc = -5; goto out; }
+    uint8_t *r = in->raw;
+    uint16_t m = in->mode;
+    bool lnk = (m & S_IFMT_) == S_IFLNK_, dir = (m & S_IFMT_) == S_IFDIR_;
+    if ((what & 1) && !lnk) m = (uint16_t)((m & S_IFMT_) | (mode & 07777));
+    if (what & 2) {
+        if (uid != 0xFFFFFFFFu) { *(uint16_t *)(r + 0x02) = (uint16_t)uid; *(uint16_t *)(r + 0x78) = (uint16_t)(uid >> 16); }
+        if (gid != 0xFFFFFFFFu) { *(uint16_t *)(r + 0x18) = (uint16_t)gid; *(uint16_t *)(r + 0x7A) = (uint16_t)(gid >> 16); }
+        if (!lnk && !dir) {                                        /* Linux: chown drops setuid, and setgid if group-exec */
+            m &= (uint16_t)~04000;
+            if (m & 0010) m &= (uint16_t)~02000;
+        }
+    }
+    *(uint16_t *)(r + 0x00) = m;
+    *(uint32_t *)(r + 0x0C) = (uint32_t)rtc_unix_epoch();          /* ctime */
+    if (e4_iwrite(v, in->ino, r) != 0) { rc = -5; goto out; }
+    e4_hrefresh(v, in->ino);
+out:
+    kfree(in);
+    return rc;
+}
+
 /* ---- VFS adapter ---- */
 #define E4_MAX_H 32
 typedef struct { bool in_use; e4_vol_t *v; e4_inode_t in; uint64_t pos; } e4_h_t;
@@ -2968,6 +3128,12 @@ static void e4_hsync(e4_vol_t *v, const e4_inode_t *in, const e4_h_t *skip) {
     for (int i = 0; i < E4_MAX_H; i++)
         if (e4_h[i].in_use && &e4_h[i] != skip && e4_h[i].v == v && e4_h[i].in.ino == in->ino)
             memcpy(&e4_h[i].in, in, sizeof(*in));
+}
+/* re-read inode @ino into every open handle after a metadata change (links, mode, owner) */
+static void e4_hrefresh(e4_vol_t *v, uint32_t ino) {
+    for (int i = 0; i < E4_MAX_H; i++)
+        if (e4_h[i].in_use && e4_h[i].v == v && e4_h[i].in.ino == ino)
+            e4_iget(v, ino, &e4_h[i].in);
 }
 static void *e4_open(vfs_filesystem_t *fs, const char *rel, uint32_t flags) {
     e4_vol_t *v = (e4_vol_t *)fs->fs_data;
@@ -3015,6 +3181,7 @@ static int e4_ls_cb(const char *nm, int nl, uint32_t ino, uint8_t ft, void *arg)
     int k = nl < VFS_MAX_NAME - 1 ? nl : VFS_MAX_NAME - 1;
     memcpy(d->name, nm, k); d->name[k] = 0;
     d->inode = ino;
+    d->lnk = 0;
     e4_inode_t *in = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
     if (!in) return -1;
     bool isdir = ft == 2, ok = true;
@@ -3027,8 +3194,10 @@ static int e4_ls_cb(const char *nm, int nl, uint32_t ino, uint8_t ft, void *arg)
             if (o) p[o++] = '/';
             for (int i = 0; i < k && o < 590; i++) p[o++] = nm[i];
             p[o] = 0;
-            if (e4_namei(l->v, p, in, 0, true)) { isdir = (in->mode & S_IFMT_) == S_IFDIR_; sz = in->size; }
-            else ok = false;                           /* dangling: hide */
+            sz = in->size;
+            d->lnk = 1;
+            if (e4_namei(l->v, p, in, 0, true)) isdir = (in->mode & S_IFMT_) == S_IFDIR_;
+            else isdir = false;                        /* dangling (or points off the volume) */
         } else { isdir = (in->mode & S_IFMT_) == S_IFDIR_; sz = in->size; }
     }
     kfree(in);
@@ -3057,11 +3226,11 @@ static int e4_exists(vfs_filesystem_t *fs, const char *rel) {
     kfree(d); return ok;
 }
 /* Real inode metadata for stat(): follows symlinks like stat(2). */
-static int e4_stat(vfs_filesystem_t *fs, const char *rel, vfs_stat_t *st) {
+static int e4_stat2(vfs_filesystem_t *fs, const char *rel, vfs_stat_t *st, bool follow) {
     e4_vol_t *v = (e4_vol_t *)fs->fs_data;
     e4_inode_t *in = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
     if (!in) return -12;
-    uint32_t ino = e4_namei(v, rel ? rel : "", in, 0, true);
+    uint32_t ino = e4_namei(v, rel ? rel : "", in, 0, follow);
     if (!ino) { kfree(in); return -2; /* ENOENT */ }
     const uint8_t *r = in->raw;
     memset(st, 0, sizeof(*st));
@@ -3080,6 +3249,22 @@ static int e4_stat(vfs_filesystem_t *fs, const char *rel, vfs_stat_t *st) {
     st->atime = at; st->mtime = mt; st->ctime = ct;
     kfree(in);
     return 0;
+}
+static int e4_stat(vfs_filesystem_t *fs, const char *rel, vfs_stat_t *st) { return e4_stat2(fs, rel, st, true); }
+static int e4_lstat(vfs_filesystem_t *fs, const char *rel, vfs_stat_t *st) { return e4_stat2(fs, rel, st, false); }
+static int e4_readlinkop(vfs_filesystem_t *fs, const char *rel, char *buf, uint32_t cap) {
+    if (!rel || !rel[0]) return -22;
+    e4_vol_t *v = (e4_vol_t *)fs->fs_data;
+    e4_inode_t *in = (e4_inode_t *)kalloc(sizeof(e4_inode_t));
+    if (!in) return -12;
+    int r = e4_namei(v, rel, in, 0, false) ? e4_link_target(v, in, buf, cap) : -2;
+    kfree(in);
+    return r;
+}
+static int e4_symlinkop(vfs_filesystem_t *fs, const char *rel, const char *tgt) { return e4_symlink_in((e4_vol_t *)fs->fs_data, rel ? rel : "", tgt); }
+static int e4_linkop(vfs_filesystem_t *fs, const char *a, const char *b) { return e4_link_in((e4_vol_t *)fs->fs_data, a ? a : "", b ? b : ""); }
+static int e4_setattrop(vfs_filesystem_t *fs, const char *rel, int what, uint32_t mode, uint32_t uid, uint32_t gid) {
+    return e4_setattr_in((e4_vol_t *)fs->fs_data, rel ? rel : "", what, mode, uid, gid);
 }
 static int e4_syncop(vfs_filesystem_t *fs) { return e4_sync_vol((e4_vol_t *)fs->fs_data) ? -5 : 0; }
 static int e4_ro(vfs_filesystem_t *fs, const char *rel) { return -30; /* EROFS */ }
@@ -3167,6 +3352,9 @@ static int e4tx_close(vfs_filesystem_t *fs, void *hd) {
     return 0;
 }
 E4_TXOP(trunc, e4_truncop, (fs, rel, len), const char *rel, uint64_t len)
+E4_TXOP(symlink, e4_symlinkop, (fs, rel, tgt), const char *rel, const char *tgt)
+E4_TXOP(link, e4_linkop, (fs, a, b), const char *a, const char *b)
+E4_TXOP(setattr, e4_setattrop, (fs, rel, what, mode, uid, gid), const char *rel, int what, uint32_t mode, uint32_t uid, uint32_t gid)
 E4_TXOP(ftrunc, e4_ftruncop, (fs, hd, len), void *hd, uint64_t len)
 static vfs_fs_ops_t e4_ops = {
     .open = e4_open, .close = e4tx_close, .read = e4_readop, .write = e4tx_write,
@@ -3174,6 +3362,7 @@ static vfs_fs_ops_t e4_ops = {
     .create = e4tx_create, .mkdir = e4tx_mkdir, .unlink = e4tx_unlink, .exists = e4_exists,
     .rename = e4tx_rename, .rmdir = e4tx_rmdir, .truncate = e4tx_trunc, .ftruncate = e4tx_ftrunc,
     .stat = e4_stat, .sync = e4_syncop,
+    .lstat = e4_lstat, .readlink = e4_readlinkop, .symlink = e4tx_symlink, .link = e4tx_link, .setattr = e4tx_setattr,
 };
 vfs_fs_ops_t *ext4ro_get_ops(void) { return &e4_ops; }
 

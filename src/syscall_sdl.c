@@ -6,6 +6,10 @@
 #include "mouse.h"
 #include "atomic.h"
 #include "desktop.h"
+#include "kterm.h"
+#include "notepad.h"
+#include "files.h"
+#include "settings_app.h"
 #include "profiler.h"
 #include "../include/SDL.h"
 #include "../include/sdl_kernel_log.h"
@@ -24,6 +28,14 @@ static bool current_sdl_process_has_focus(void) {
     /* Allow keys unless a different Ring-3 window is focused.  Covers
      * windows created with a stale/zero pid and the no-focus case. */
     desktop_window_t *fw = desktop_get_focused();
+    /* A kernel-side app window (terminal, notepad, files, settings) has
+     * pid 0 but is a real focus owner: a background SDL app (Doom) must not
+     * see the keys/mouse typed into it (Ctrl+C in the terminal used to make
+     * an unfocused Doom quit itself). */
+    if (fw && fw->pid == 0 &&
+        (kterm_is_window(fw) || notepad_is_window(fw) ||
+         files_is_window(fw) || settings_app_is_window(fw)))
+        return false;
     if (!fw || fw->pid == 0)
         return true;
     return proc && fw->pid == proc->pid;

@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "storage.h"
 #include "fat32.h"
+#include "rtc.h"
 extern int printf(const char *fmt, ...);
 #ifndef ENOTEMPTY
 #define ENOTEMPTY 39      /* Linux value */
@@ -27,34 +28,63 @@ extern int printf(const char *fmt, ...);
 #define TMPFS_CHUNK       (64u * 1024u)
 #define TMPFS_MIN_BYTES   (64ull * 1024 * 1024)
 #define TMPFS_RESERVE     (48ull * 1024 * 1024)   /* never eat the last 48 MB of RAM */
+#define TMPFS_LINK_MAX    1023                    /* symlink target length */
 
-typedef struct tmpfs_node {
+/* Inodes hold the data and attributes; directory entries (nodes) name them.
+ * Hard links are several nodes sharing one inode; an unlinked inode stays
+ * alive while open handles reference it (read/write through the fd works). */
+typedef struct tmpfs_inode {
     int used;
-    int is_dir;
-    int parent;
-    char name[TMPFS_MAX_NAME];
+    uint32_t mode;         /* S_IFREG/S_IFDIR/S_IFLNK | permission bits */
+    uint32_t uid, gid;
+    uint32_t nlink;        /* directory entries naming it (files, links) */
+    int opens;             /* open handles */
     uint8_t **chunks;      /* nchunk_slots pointers, NULL = hole (reads as 0) */
     uint32_t nchunk_slots;
     uint32_t size;
+    char *target;          /* symlink target (kalloc'd) */
+    int64_t mtime, ctime;
+} tmpfs_inode_t;
+
+typedef struct tmpfs_node {
+    int used;
+    int parent;
+    int ino;
+    char name[TMPFS_MAX_NAME];
 } tmpfs_node_t;
 
 typedef struct tmpfs_handle {
-    int node;
+    int ino;
     uint32_t pos;
     uint32_t flags;
 } tmpfs_handle_t;
 
+#define T_IFMT  0170000u
+#define T_IFDIR 0040000u
+#define T_IFREG 0100000u
+#define T_IFLNK 0120000u
+
 static tmpfs_node_t nodes[TMPFS_MAX_NODES];
+static tmpfs_inode_t inodes[TMPFS_MAX_NODES];
 static int tmpfs_ready;
 static uint64_t tmpfs_limit_bytes;   /* size cap, set at mount from RAM */
 static uint64_t tmpfs_used_bytes;    /* chunk bytes allocated */
 
+#define NI(i) (&inodes[nodes[(i)].ino])
+static int tmpfs_isdir(int i) { return (NI(i)->mode & T_IFMT) == T_IFDIR; }
+static int tmpfs_islnk(int i) { return (NI(i)->mode & T_IFMT) == T_IFLNK; }
+static int64_t tmpfs_now(void) { return (int64_t)rtc_unix_epoch(); }
+
 static void tmpfs_init_root(void) {
     memset(nodes, 0, sizeof(nodes));
+    memset(inodes, 0, sizeof(inodes));
     nodes[0].used = 1;
-    nodes[0].is_dir = 1;
     nodes[0].parent = -1;
+    nodes[0].ino = 0;
     nodes[0].name[0] = '\0';
+    inodes[0].used = 1;
+    inodes[0].mode = T_IFDIR | 01777;                  /* /tmp: sticky, world-writable */
+    inodes[0].nlink = 1;
     tmpfs_ready = 1;
 }
 
@@ -78,14 +108,31 @@ static int tmpfs_find_child(int parent, const char *name) {
     }
     return -1;
 }
+static int tmpfs_has_children(int dir) {
+    for (int i = 1; i < TMPFS_MAX_NODES; i++)
+        if (nodes[i].used && nodes[i].parent == dir) return 1;
+    return 0;
+}
 
 static int tmpfs_alloc_node(void) {
     for (int i = 1; i < TMPFS_MAX_NODES; i++)
         if (!nodes[i].used) return i;
     return -1;
 }
+static int tmpfs_alloc_inode(uint32_t mode) {
+    for (int i = 1; i < TMPFS_MAX_NODES; i++)
+        if (!inodes[i].used) {
+            memset(&inodes[i], 0, sizeof(inodes[i]));
+            inodes[i].used = 1;
+            inodes[i].mode = mode;
+            inodes[i].nlink = 1;
+            inodes[i].mtime = inodes[i].ctime = tmpfs_now();
+            return i;
+        }
+    return -1;
+}
 
-static void tmpfs_free_data(tmpfs_node_t *n) {
+static void tmpfs_free_data(tmpfs_inode_t *n) {
     if (n->chunks) {
         for (uint32_t i = 0; i < n->nchunk_slots; i++)
             if (n->chunks[i]) { kfree(n->chunks[i]); tmpfs_used_bytes -= TMPFS_CHUNK; }
@@ -94,9 +141,37 @@ static void tmpfs_free_data(tmpfs_node_t *n) {
     n->chunks = NULL;
     n->nchunk_slots = 0;
 }
+static void tmpfs_put_inode(int ino) {
+    tmpfs_inode_t *n = &inodes[ino];
+    if (ino <= 0 || !n->used || n->nlink || n->opens) return;
+    tmpfs_free_data(n);
+    if (n->target) kfree(n->target);
+    memset(n, 0, sizeof(*n));
+}
+/* new entry @name in directory @parent for inode @ino */
+static int tmpfs_add_node(int parent, const char *name, int ino) {
+    int i = tmpfs_alloc_node();
+    if (i < 0) return -ENOSPC;
+    memset(&nodes[i], 0, sizeof(nodes[i]));
+    nodes[i].used = 1;
+    nodes[i].parent = parent;
+    nodes[i].ino = ino;
+    kstrncpy(nodes[i].name, name, TMPFS_MAX_NAME);
+    inodes[parent >= 0 ? nodes[parent].ino : 0].mtime = tmpfs_now();
+    return i;
+}
+/* drop directory entry @i; the inode goes when no entry or handle is left */
+static void tmpfs_drop_node(int i) {
+    int ino = nodes[i].ino;
+    if (nodes[i].parent >= 0) inodes[nodes[nodes[i].parent].ino].mtime = tmpfs_now();
+    memset(&nodes[i], 0, sizeof(nodes[i]));
+    if (inodes[ino].nlink) inodes[ino].nlink--;
+    inodes[ino].ctime = tmpfs_now();
+    tmpfs_put_inode(ino);
+}
 
 /* Drop chunks wholly past @len and zero the tail of the last one. */
-static void tmpfs_shrink(tmpfs_node_t *n, uint32_t len) {
+static void tmpfs_shrink(tmpfs_inode_t *n, uint32_t len) {
     uint32_t keep = (len + TMPFS_CHUNK - 1) / TMPFS_CHUNK;
     for (uint32_t i = keep; i < n->nchunk_slots; i++)
         if (n->chunks[i]) { kfree(n->chunks[i]); n->chunks[i] = NULL; tmpfs_used_bytes -= TMPFS_CHUNK; }
@@ -105,7 +180,7 @@ static void tmpfs_shrink(tmpfs_node_t *n, uint32_t len) {
 }
 
 /* Make sure chunk slot table covers @need bytes (no data allocated). */
-static int tmpfs_slots(tmpfs_node_t *n, uint64_t need) {
+static int tmpfs_slots(tmpfs_inode_t *n, uint64_t need) {
     if (need > 0xFFFFFFFFull) return -ENOSPC;
     if (need > tmpfs_limit_bytes) return -ENOSPC;
     uint32_t want = (uint32_t)((need + TMPFS_CHUNK - 1) / TMPFS_CHUNK);
@@ -124,7 +199,7 @@ static int tmpfs_slots(tmpfs_node_t *n, uint64_t need) {
     return 0;
 }
 
-static uint8_t *tmpfs_chunk(tmpfs_node_t *n, uint32_t ci) {
+static uint8_t *tmpfs_chunk(tmpfs_inode_t *n, uint32_t ci) {
     if (ci >= n->nchunk_slots) return NULL;
     if (n->chunks[ci]) return n->chunks[ci];
     if (tmpfs_used_bytes + TMPFS_CHUNK > tmpfs_limit_bytes) return NULL;
@@ -137,7 +212,9 @@ static uint8_t *tmpfs_chunk(tmpfs_node_t *n, uint32_t ci) {
     return c;
 }
 
-/* Walk rel_path from root. create_dirs/create_file make missing components. */
+/* Walk rel_path from root (symlinks are not followed: the VFS resolver has
+ * expanded them; a link in the middle of a path is ENOTDIR here).
+ * create_dirs/create_file make missing components. */
 static int tmpfs_lookup(const char *rel_path, int create_dirs, int create_file,
                         int want_dir) {
     if (!tmpfs_ready) tmpfs_init_root();
@@ -160,41 +237,63 @@ static int tmpfs_lookup(const char *rel_path, int create_dirs, int create_file,
         int is_last = (*slash == '\0');
         if (child < 0) {
             if (is_last && create_file && !want_dir) {
-                int free_i = tmpfs_alloc_node();
-                if (free_i < 0) return -ENOSPC;
-                memset(&nodes[free_i], 0, sizeof(nodes[free_i]));
-                nodes[free_i].used = 1;
-                nodes[free_i].is_dir = 0;
-                nodes[free_i].parent = cur;
-                kstrncpy(nodes[free_i].name, part, TMPFS_MAX_NAME);
-                return free_i;
+                int ino = tmpfs_alloc_inode(T_IFREG | 0644);
+                if (ino < 0) return -ENOSPC;
+                int r = tmpfs_add_node(cur, part, ino);
+                if (r < 0) { inodes[ino].nlink = 0; tmpfs_put_inode(ino); }
+                return r;
             }
             if ((!is_last && create_dirs) || (is_last && create_dirs && want_dir)) {
-                int free_i = tmpfs_alloc_node();
-                if (free_i < 0) return -ENOSPC;
-                memset(&nodes[free_i], 0, sizeof(nodes[free_i]));
-                nodes[free_i].used = 1;
-                nodes[free_i].is_dir = 1;
-                nodes[free_i].parent = cur;
-                kstrncpy(nodes[free_i].name, part, TMPFS_MAX_NAME);
-                if (is_last) return free_i;
-                child = free_i;
+                int ino = tmpfs_alloc_inode(T_IFDIR | 0755);
+                if (ino < 0) return -ENOSPC;
+                int r = tmpfs_add_node(cur, part, ino);
+                if (r < 0) { inodes[ino].nlink = 0; tmpfs_put_inode(ino); return r; }
+                if (is_last) return r;
+                child = r;
             } else {
                 return -ENOENT;
             }
         }
         if (is_last) {
-            if (want_dir && !nodes[child].is_dir) return -ENOTDIR;
-            if (!want_dir && nodes[child].is_dir && create_file) return -EISDIR;
+            if (want_dir && !tmpfs_isdir(child)) return -ENOTDIR;
+            if (!want_dir && tmpfs_isdir(child) && create_file) return -EISDIR;
             return child;
         }
-        if (!nodes[child].is_dir) return -ENOTDIR;
+        if (!tmpfs_isdir(child)) return -ENOTDIR;
         cur = child;
         p = slash + 1;
         while (*p == '/') p++;
         if (!*p)
             return want_dir ? cur : -ENOENT;
     }
+}
+/* any entry (file, dir or link) */
+static int tmpfs_lookup_any(const char *rel) {
+    if (!rel || !rel[0]) return 0;
+    int i = tmpfs_lookup(rel, 0, 0, 0);
+    if (i < 0 && i != -ENOTDIR && i != -ENAMETOOLONG) {
+        int j = tmpfs_lookup(rel, 0, 0, 1);
+        if (j >= 0) return j;
+    }
+    return i;
+}
+/* parent directory of @rel and its last component in @leaf */
+static int tmpfs_parent(const char *rel, char *leaf) {
+    char tmp[512];
+    kstrncpy(tmp, rel ? rel : "", sizeof(tmp));
+    char *t = tmp;
+    while (*t == '/') t++;
+    size_t L = strlen(t);
+    while (L && t[L - 1] == '/') t[--L] = 0;
+    if (!L) return -EEXIST;                         /* the mount root */
+    char *slash = NULL;
+    for (char *q = t; *q; q++) if (*q == '/') slash = q;
+    const char *nm = slash ? slash + 1 : t;
+    if (strlen(nm) >= TMPFS_MAX_NAME) return -ENAMETOOLONG;
+    kstrncpy(leaf, nm, TMPFS_MAX_NAME);
+    if (!slash) { if (!tmpfs_ready) tmpfs_init_root(); return 0; }
+    *slash = 0;
+    return tmpfs_lookup(t, 0, 0, 1);
 }
 
 static void *tmpfs_open(struct vfs_filesystem *fs, const char *rel_path, uint32_t flags) {
@@ -203,30 +302,46 @@ static void *tmpfs_open(struct vfs_filesystem *fs, const char *rel_path, uint32_
     if (idx < 0 && (flags & VFS_O_CREATE))
         idx = tmpfs_lookup(rel_path, 1, 1, 0);
     if (idx < 0) return NULL;
-    if (nodes[idx].is_dir) return NULL;
+    if (tmpfs_isdir(idx) || tmpfs_islnk(idx)) return NULL;
+    tmpfs_inode_t *in = NI(idx);
     if (flags & VFS_O_TRUNC) {
-        tmpfs_free_data(&nodes[idx]);
-        nodes[idx].size = 0;
+        tmpfs_free_data(in);
+        in->size = 0;
+        in->mtime = in->ctime = tmpfs_now();
     }
     tmpfs_handle_t *h = (tmpfs_handle_t *)kalloc(sizeof(*h));
     if (!h) return NULL;
-    h->node = idx;
-    h->pos = (flags & VFS_O_APPEND) ? nodes[idx].size : 0;
+    h->ino = nodes[idx].ino;
+    h->pos = (flags & VFS_O_APPEND) ? in->size : 0;
     h->flags = flags;
+    in->opens++;
     return h;
+}
+
+static tmpfs_inode_t *tmpfs_hin(void *handle) {
+    tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
+    if (!h || h->ino <= 0 || h->ino >= TMPFS_MAX_NODES || !inodes[h->ino].used) return NULL;
+    return &inodes[h->ino];
 }
 
 static int tmpfs_close(struct vfs_filesystem *fs, void *handle) {
     (void)fs;
-    if (handle) kfree(handle);
+    if (!handle) return 0;
+    tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
+    tmpfs_inode_t *in = tmpfs_hin(handle);
+    if (in) {
+        if (in->opens > 0) in->opens--;
+        tmpfs_put_inode(h->ino);
+    }
+    kfree(handle);
     return 0;
 }
 
 static int tmpfs_read(struct vfs_filesystem *fs, void *handle, void *buffer, uint32_t size) {
     (void)fs;
     tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
-    if (!h || h->node < 0 || !nodes[h->node].used) return -EBADF;
-    tmpfs_node_t *n = &nodes[h->node];
+    tmpfs_inode_t *n = tmpfs_hin(handle);
+    if (!n) return -EBADF;
     if (h->pos >= n->size) return 0;
     uint32_t avail = n->size - h->pos;
     if (size > avail) size = avail;
@@ -248,9 +363,9 @@ static int tmpfs_read(struct vfs_filesystem *fs, void *handle, void *buffer, uin
 static int tmpfs_write(struct vfs_filesystem *fs, void *handle, const void *buffer, uint32_t size) {
     (void)fs;
     tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
-    if (!h || h->node < 0 || !nodes[h->node].used) return -EBADF;
+    tmpfs_inode_t *n = tmpfs_hin(handle);
+    if (!n) return -EBADF;
     if (!(h->flags & VFS_O_WRITE)) return -EBADF;
-    tmpfs_node_t *n = &nodes[h->node];
     if (h->flags & VFS_O_APPEND) h->pos = n->size;
     if (!size) return 0;
     int rc = tmpfs_slots(n, (uint64_t)h->pos + size);
@@ -269,11 +384,12 @@ static int tmpfs_write(struct vfs_filesystem *fs, void *handle, const void *buff
     if (!done) return -ENOSPC;
     h->pos += done;
     if (h->pos > n->size) n->size = h->pos;
+    n->mtime = n->ctime = tmpfs_now();
     return (int)done;
 }
 
 /* Resize to @len: new bytes read as zero (holes), shrinking frees chunks. */
-static int tmpfs_set_len(tmpfs_node_t *n, uint64_t len) {
+static int tmpfs_set_len(tmpfs_inode_t *n, uint64_t len) {
     if (len > n->size) {
         int rc = tmpfs_slots(n, len);
         if (rc < 0) return rc;
@@ -281,45 +397,34 @@ static int tmpfs_set_len(tmpfs_node_t *n, uint64_t len) {
         tmpfs_shrink(n, (uint32_t)len);
     }
     n->size = (uint32_t)len;
+    n->mtime = n->ctime = tmpfs_now();
     return 0;
 }
 
 static int tmpfs_rename(struct vfs_filesystem *fs, const char *old_rel, const char *new_rel) {
     (void)fs;
-    int src = tmpfs_lookup(old_rel, 0, 0, 0);
-    if (src < 0) src = tmpfs_lookup(old_rel, 0, 0, 1);
+    int src = tmpfs_lookup_any(old_rel);
     if (src <= 0) return src < 0 ? src : -EBUSY;
-    /* split new path into parent dir + last name */
-    char tmp[256];
-    kstrncpy(tmp, new_rel ? new_rel : "", sizeof(tmp));
-    char *t = tmp;
-    while (*t == '/') t++;
-    size_t L = strlen(t);
-    while (L && t[L - 1] == '/') t[--L] = 0;
-    if (!L) return -EINVAL;
-    char *slash = NULL;
-    for (char *q = t; *q; q++) if (*q == '/') slash = q;
-    const char *leaf = slash ? slash + 1 : t;
-    int dparent;
-    if (slash) { *slash = 0; dparent = tmpfs_lookup(t, 0, 0, 1); }
-    else dparent = 0;
+    char leaf[TMPFS_MAX_NAME];
+    int dparent = tmpfs_parent(new_rel, leaf);
+    if (dparent == -EEXIST) return -EBUSY;
     if (dparent < 0) return dparent;
-    if (strlen(leaf) >= TMPFS_MAX_NAME) return -ENAMETOOLONG;
     for (int a = dparent; a >= 0; a = nodes[a].parent)   /* no dir into itself */
         if (a == src) return -EINVAL;
     int dst = tmpfs_find_child(dparent, leaf);
     if (dst == src) return 0;
     if (dst > 0) {
-        if (nodes[dst].is_dir != nodes[src].is_dir)
-            return nodes[dst].is_dir ? -EISDIR : -ENOTDIR;
-        if (nodes[dst].is_dir)
-            for (int i = 1; i < TMPFS_MAX_NODES; i++)
-                if (nodes[i].used && nodes[i].parent == dst) return -ENOTEMPTY;
-        tmpfs_free_data(&nodes[dst]);
-        memset(&nodes[dst], 0, sizeof(nodes[dst]));
+        if (nodes[dst].ino == nodes[src].ino) return 0;  /* hard links to one inode: no-op */
+        if (tmpfs_isdir(dst) != tmpfs_isdir(src))
+            return tmpfs_isdir(dst) ? -EISDIR : -ENOTDIR;
+        if (tmpfs_isdir(dst) && tmpfs_has_children(dst)) return -ENOTEMPTY;
+        tmpfs_drop_node(dst);
     }
+    inodes[nodes[nodes[src].parent].ino].mtime = tmpfs_now();
     nodes[src].parent = dparent;
     kstrncpy(nodes[src].name, leaf, TMPFS_MAX_NAME);
+    inodes[nodes[dparent].ino].mtime = tmpfs_now();
+    NI(src)->ctime = tmpfs_now();
     return 0;
 }
 
@@ -328,17 +433,16 @@ static int tmpfs_rmdir(struct vfs_filesystem *fs, const char *rel_path) {
     int idx = tmpfs_lookup(rel_path, 0, 0, 1);
     if (idx < 0) return idx;
     if (idx == 0) return -EBUSY;
-    for (int i = 1; i < TMPFS_MAX_NODES; i++)
-        if (nodes[i].used && nodes[i].parent == idx) return -ENOTEMPTY;
-    memset(&nodes[idx], 0, sizeof(nodes[idx]));
+    if (tmpfs_has_children(idx)) return -ENOTEMPTY;
+    tmpfs_drop_node(idx);
     return 0;
 }
 
 static int tmpfs_seek(struct vfs_filesystem *fs, void *handle, int32_t offset, int whence) {
     (void)fs;
     tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
-    if (!h || h->node < 0) return -EBADF;
-    tmpfs_node_t *n = &nodes[h->node];
+    tmpfs_inode_t *n = tmpfs_hin(handle);
+    if (!n) return -EBADF;
     int64_t np;
     if (whence == VFS_SEEK_SET) np = offset;
     else if (whence == VFS_SEEK_CUR) np = (int64_t)h->pos + offset;
@@ -351,9 +455,9 @@ static int tmpfs_seek(struct vfs_filesystem *fs, void *handle, int32_t offset, i
 
 static int tmpfs_get_size(struct vfs_filesystem *fs, void *handle) {
     (void)fs;
-    tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
-    if (!h || h->node < 0) return -EBADF;
-    return (int)nodes[h->node].size;
+    tmpfs_inode_t *n = tmpfs_hin(handle);
+    if (!n) return -EBADF;
+    return (int)n->size;
 }
 
 static int tmpfs_readdir(struct vfs_filesystem *fs, const char *rel_path,
@@ -365,9 +469,10 @@ static int tmpfs_readdir(struct vfs_filesystem *fs, const char *rel_path,
     for (int i = 1; i < TMPFS_MAX_NODES && count < max_entries; i++) {
         if (!nodes[i].used || nodes[i].parent != idx) continue;
         kstrncpy(entries[count].name, nodes[i].name, VFS_MAX_NAME);
-        entries[count].inode = (uint32_t)i;
-        entries[count].type = nodes[i].is_dir ? VFS_DIRECTORY : VFS_FILE;
-        entries[count].size = nodes[i].size;
+        entries[count].inode = (uint32_t)nodes[i].ino + 1;
+        entries[count].type = tmpfs_isdir(i) ? VFS_DIRECTORY : VFS_FILE;
+        entries[count].lnk = tmpfs_islnk(i) ? 1 : 0;
+        entries[count].size = NI(i)->size;
         count++;
     }
     return (int)count;
@@ -391,44 +496,45 @@ static int tmpfs_unlink(struct vfs_filesystem *fs, const char *rel_path) {
     if (idx < 0) {
         idx = tmpfs_lookup(rel_path, 0, 0, 1);
         if (idx < 0) return idx;
-        for (int i = 1; i < TMPFS_MAX_NODES; i++)
-            if (nodes[i].used && nodes[i].parent == idx)
-                return -EBUSY;
+        if (tmpfs_has_children(idx)) return -EBUSY;
     }
     if (idx == 0) return -EBUSY;
-    tmpfs_free_data(&nodes[idx]);
-    memset(&nodes[idx], 0, sizeof(nodes[idx]));
+    tmpfs_drop_node(idx);
     return 0;
 }
 
 static int tmpfs_exists(struct vfs_filesystem *fs, const char *rel_path) {
     (void)fs;
     if (!rel_path || !rel_path[0]) return 1;
-    if (tmpfs_lookup(rel_path, 0, 0, 0) >= 0) return 1;
-    return tmpfs_lookup(rel_path, 0, 0, 1) >= 0 ? 1 : 0;
+    return tmpfs_lookup_any(rel_path) >= 0 ? 1 : 0;
 }
 
+/* lstat semantics: a symlink reports itself (the VFS resolver follows) */
 static int tmpfs_stat(struct vfs_filesystem *fs, const char *rel_path, struct vfs_stat *st) {
     (void)fs;
     if (!st) return -EINVAL;
-    int idx;
-    if (!rel_path || !rel_path[0]) idx = 0;
-    else {
-        idx = tmpfs_lookup(rel_path, 0, 0, 0);
-        if (idx < 0) idx = tmpfs_lookup(rel_path, 0, 0, 1);
-        if (idx < 0) return idx;
-    }
+    int idx = tmpfs_lookup_any(rel_path);
+    if (idx < 0) return idx;
+    tmpfs_inode_t *in = NI(idx);
     memset(st, 0, sizeof(*st));
-    st->ino = (uint64_t)idx;
-    st->nlink = 1;
+    st->ino = (uint64_t)nodes[idx].ino + 1;
+    st->mode = in->mode;
+    st->uid = in->uid;
+    st->gid = in->gid;
     st->blksize = 512;
-    if (nodes[idx].is_dir) {
-        st->mode = 0040755;
+    st->mtime = in->mtime;
+    st->ctime = in->ctime;
+    st->atime = in->mtime;
+    if (tmpfs_isdir(idx)) {
+        uint32_t nl = 2;
+        for (int i = 1; i < TMPFS_MAX_NODES; i++)
+            if (nodes[i].used && nodes[i].parent == idx && tmpfs_isdir(i)) nl++;
+        st->nlink = nl;
         st->size = 0;
     } else {
-        st->mode = 0100644;
-        st->size = nodes[idx].size;
-        st->blocks = (nodes[idx].size + 511) / 512;
+        st->nlink = in->nlink ? in->nlink : 1;
+        st->size = in->size;
+        st->blocks = tmpfs_islnk(idx) ? 0 : ((uint64_t)in->size + 511) / 512;
     }
     return 0;
 }
@@ -437,15 +543,81 @@ static int tmpfs_truncate(struct vfs_filesystem *fs, const char *rel_path, uint6
     (void)fs;
     int idx = tmpfs_lookup(rel_path, 0, 0, 0);
     if (idx < 0) return idx;
-    if (nodes[idx].is_dir) return -EISDIR;
-    return tmpfs_set_len(&nodes[idx], len);
+    if (tmpfs_isdir(idx)) return -EISDIR;
+    if (tmpfs_islnk(idx)) return -EINVAL;
+    return tmpfs_set_len(NI(idx), len);
 }
 
 static int tmpfs_ftruncate(struct vfs_filesystem *fs, void *handle, uint64_t len) {
     (void)fs;
-    tmpfs_handle_t *h = (tmpfs_handle_t *)handle;
-    if (!h || h->node < 0) return -EBADF;
-    return tmpfs_set_len(&nodes[h->node], len);
+    tmpfs_inode_t *n = tmpfs_hin(handle);
+    if (!n) return -EBADF;
+    return tmpfs_set_len(n, len);
+}
+
+static int tmpfs_readlink(struct vfs_filesystem *fs, const char *rel_path, char *buf, uint32_t cap) {
+    (void)fs;
+    if (!rel_path || !rel_path[0]) return -EINVAL;
+    int idx = tmpfs_lookup_any(rel_path);
+    if (idx < 0) return idx;
+    if (!tmpfs_islnk(idx) || !NI(idx)->target) return -EINVAL;
+    uint32_t n = NI(idx)->size;
+    if (n > cap) n = cap;
+    memcpy(buf, NI(idx)->target, n);
+    return (int)n;
+}
+
+static int tmpfs_symlink(struct vfs_filesystem *fs, const char *rel_path, const char *target) {
+    (void)fs;
+    size_t tl = strlen(target);
+    if (!tl) return -ENOENT;
+    if (tl > TMPFS_LINK_MAX) return -ENAMETOOLONG;
+    char leaf[TMPFS_MAX_NAME];
+    int par = tmpfs_parent(rel_path, leaf);
+    if (par < 0) return par;
+    if (tmpfs_find_child(par, leaf) >= 0) return -EEXIST;
+    char *t = (char *)kalloc(tl + 1);
+    if (!t) return -ENOSPC;
+    memcpy(t, target, tl + 1);
+    int ino = tmpfs_alloc_inode(T_IFLNK | 0777);
+    if (ino < 0) { kfree(t); return -ENOSPC; }
+    inodes[ino].target = t;
+    inodes[ino].size = (uint32_t)tl;
+    int r = tmpfs_add_node(par, leaf, ino);
+    if (r < 0) { inodes[ino].nlink = 0; tmpfs_put_inode(ino); return r; }
+    return 0;
+}
+
+static int tmpfs_link(struct vfs_filesystem *fs, const char *old_rel, const char *new_rel) {
+    (void)fs;
+    int src = tmpfs_lookup_any(old_rel);
+    if (src < 0) return src;
+    if (tmpfs_isdir(src)) return -EPERM;
+    char leaf[TMPFS_MAX_NAME];
+    int par = tmpfs_parent(new_rel, leaf);
+    if (par < 0) return par;
+    if (tmpfs_find_child(par, leaf) >= 0) return -EEXIST;
+    int r = tmpfs_add_node(par, leaf, nodes[src].ino);
+    if (r < 0) return r;
+    NI(src)->nlink++;
+    NI(src)->ctime = tmpfs_now();
+    return 0;
+}
+
+static int tmpfs_setattr(struct vfs_filesystem *fs, const char *rel_path, int what,
+                         uint32_t mode, uint32_t uid, uint32_t gid) {
+    (void)fs;
+    int idx = tmpfs_lookup_any(rel_path);
+    if (idx < 0) return idx;
+    tmpfs_inode_t *in = NI(idx);
+    if ((what & VFS_SA_MODE) && !tmpfs_islnk(idx)) in->mode = (in->mode & T_IFMT) | (mode & 07777);
+    if (what & VFS_SA_OWNER) {
+        if (uid != (uint32_t)-1) in->uid = uid;
+        if (gid != (uint32_t)-1) in->gid = gid;
+        if (!tmpfs_islnk(idx) && !tmpfs_isdir(idx)) in->mode &= ~06000u;   /* chown clears setuid/setgid */
+    }
+    in->ctime = tmpfs_now();
+    return 0;
 }
 
 static vfs_fs_ops_t tmpfs_ops = {
@@ -461,10 +633,15 @@ static vfs_fs_ops_t tmpfs_ops = {
     .unlink = tmpfs_unlink,
     .exists = tmpfs_exists,
     .stat = tmpfs_stat,
+    .lstat = tmpfs_stat,
     .truncate = tmpfs_truncate,
     .ftruncate = tmpfs_ftruncate,
     .rename = tmpfs_rename,
     .rmdir = tmpfs_rmdir,
+    .readlink = tmpfs_readlink,
+    .symlink = tmpfs_symlink,
+    .link = tmpfs_link,
+    .setattr = tmpfs_setattr,
 };
 
 int tmpfs_mount_tmp(void) {

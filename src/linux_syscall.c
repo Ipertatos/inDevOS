@@ -51,6 +51,7 @@ extern void fb_console_get_size(uint32_t *cols, uint32_t *rows);
 #define LX_O_APPEND    0x400
 #define LX_O_NONBLOCK  0x800
 #define LX_O_DIRECTORY 0x10000
+#define LX_O_NOFOLLOW  0x20000
 #define LX_O_CLOEXEC   0x80000
 
 #define LX_AT_FDCWD           (-100)
@@ -657,22 +658,35 @@ static uint64_t lx_random_u64(void) {
  * Resolve a user path (optionally relative to dirfd) into a normalised
  * absolute path: no "." / ".." / empty components, no trailing slash.
  */
-static long lx_resolve_k(process_t *p, long dirfd, const char *kpath,
-                         char *out, size_t outsz);
-static long lx_resolve(process_t *p, long dirfd, const char *upath,
-                       char *out, size_t outsz, bool allow_empty)
+static long lx_resolve_kf(process_t *p, long dirfd, const char *kpath,
+                          char *out, size_t outsz, bool follow);
+/* lx_resolve_f: @follow = expand a symlink in the last component too
+ * (stat/open/chdir...); false for lstat/unlink/rename/readlink/...
+ * Symlinks in earlier components are always expanded (vfs_resolve). */
+static long lx_resolve_f(process_t *p, long dirfd, const char *upath,
+                         char *out, size_t outsz, bool allow_empty, bool follow)
 {
     char kpath[256];
     if (!upath || !strncpy_from_user(kpath, upath, sizeof(kpath)))
         return -EFAULT;
     if (kpath[0] == '\0' && !allow_empty)
         return -ENOENT;
-    return lx_resolve_k(p, dirfd, kpath, out, outsz);
+    return lx_resolve_kf(p, dirfd, kpath, out, outsz, follow);
 }
-
-/* Same as lx_resolve, for a path already in kernel memory. */
+static long lx_resolve(process_t *p, long dirfd, const char *upath,
+                       char *out, size_t outsz, bool allow_empty)
+{
+    return lx_resolve_f(p, dirfd, upath, out, outsz, allow_empty, true);
+}
 static long lx_resolve_k(process_t *p, long dirfd, const char *kpath,
                          char *out, size_t outsz)
+{
+    return lx_resolve_kf(p, dirfd, kpath, out, outsz, true);
+}
+
+/* Same as lx_resolve_f, for a path already in kernel memory. */
+static long lx_resolve_kf(process_t *p, long dirfd, const char *kpath,
+                          char *out, size_t outsz, bool follow)
 {
 
     const char *base = "";
@@ -697,7 +711,11 @@ static long lx_resolve_k(process_t *p, long dirfd, const char *kpath,
     tmp[bl] = '/';
     memcpy(tmp + bl + 1, kpath, kl + 1);
 
-    /* Normalise into out */
+    /* Normalise into out, expanding symlinks (tmpfs, ext4). */
+    {
+        int vr = vfs_resolve(tmp, out, outsz, follow);
+        if (vr != -ENOMEM) return vr;
+    }
     size_t o = 0;
     const char *s = tmp;
     while (*s) {
@@ -907,6 +925,7 @@ static bool lx_file_looks_exec(const char *abspath) {
 
 static void lx_mode_adjust(const char *abspath, stat_t *st) {
     if ((st->st_mode & 0170000) != 0100000) return;    /* regular files only */
+    if (vfs_has_inode_perms(abspath)) return;           /* tmpfs/ext4: real mode bits */
     int i = lx_mode_ovr_find(abspath);
     if (i >= 0) {
         st->st_mode = (st->st_mode & ~07777u) | lx_mode_ovr[i].mode;
@@ -929,7 +948,7 @@ static long lx_access_path(const char *abspath, long amode) {
     return 0;
 }
 
-static long lx_stat_path(const char *abspath, void *ubuf) {
+static long lx_stat_path_k(const char *abspath, lx_stat_t *out) {
     stat_t st;
     {
         uint32_t dmode = 0, rdev = lx_dev_path(abspath, &dmode);
@@ -940,9 +959,8 @@ static long lx_stat_path(const char *abspath, void *ubuf) {
             st.st_blksize = 4096;
             st.st_rdev = rdev;
             st.st_ino = 0x10000 + rdev;
-            lx_stat_t ls;
-            lx_fill_stat(&ls, &st);
-            return lx_put(ubuf, &ls, sizeof(ls));
+            lx_fill_stat(out, &st);
+            return 0;
         }
     }
     if (lx_proc_text_path(get_current_process(), abspath)) {
@@ -963,9 +981,28 @@ static long lx_stat_path(const char *abspath, void *ubuf) {
         st.st_blksize = 4096;
         st.st_ino = kstrcmp(abspath, "/dev") == 0 ? 0xD000 : 0xD001;
     }
+    lx_fill_stat(out, &st);
+    return 0;
+}
+
+static long lx_stat_path(const char *abspath, void *ubuf) {
     lx_stat_t ls;
-    lx_fill_stat(&ls, &st);
+    long r = lx_stat_path_k(abspath, &ls);
+    if (r) return r;
     return lx_put(ubuf, &ls, sizeof(ls));
+}
+
+/* Path of an fd for fchmod/fchown: 0 ok, 1 = not a file (accept), -EBADF. */
+static long lx_fd_path(process_t *p, long fd, char *out, size_t outsz) {
+    if (!lx_fd_ok(p, fd)) return -EBADF;
+    file_descriptor_t *f = &p->fds[fd];
+    if (f->fd_type == FD_TYPE_VFS_DIR && f->file_handle) {
+        kstrncpy(out, (const char *)f->file_handle, outsz);
+        return 0;
+    }
+    if (f->fd_type == FD_TYPE_VFS && vfs_fd_get_path(f->vfs_fd, out, outsz) >= 0)
+        return 0;
+    return 1;
 }
 
 static long lx_fstat(process_t *p, long fd, void *ubuf) {
@@ -1396,8 +1433,16 @@ static long lx_open_special(process_t *p, const char *path, long lflags) {
 
 static long lx_openat(process_t *p, long dirfd, const char *upath, long lflags, long mode) {
     char path[256];
-    long r = lx_resolve(p, dirfd, upath, path, sizeof(path), false);
+    /* O_NOFOLLOW / O_CREAT|O_EXCL: a symlink in the last component is
+     * ELOOP / EEXIST instead of being followed. */
+    bool nofol = (lflags & LX_O_NOFOLLOW) || ((lflags & LX_O_CREAT) && (lflags & LX_O_EXCL));
+    long r = lx_resolve_f(p, dirfd, upath, path, sizeof(path), false, !nofol);
     if (r) return r;
+    if (nofol) {
+        char lb[4];
+        if (vfs_readlink(path, lb, sizeof(lb)) >= 0)
+            return (lflags & LX_O_CREAT) && (lflags & LX_O_EXCL) ? -EEXIST : -ELOOP;
+    }
 
     r = lx_open_special(p, path, lflags);
     if (r != -ENOENT) return r;
@@ -1494,7 +1539,8 @@ static long lx_getdents64(process_t *p, long fd, void *udirp, size_t count) {
         memcpy(rec + 0, &ino, 8);
         memcpy(rec + 8, &doff, 8);
         memcpy(rec + 16, &rl, 2);
-        rec[18] = (e->type & VFS_DIRECTORY) ? LX_DT_DIR :
+        rec[18] = e->lnk ? 10 /* DT_LNK */ :
+                  (e->type & VFS_DIRECTORY) ? LX_DT_DIR :
                   (e->type & VFS_FILE) ? LX_DT_REG :
                   (e->inode >= 0xD100 && e->inode < 0xD200) ? 2 /* DT_CHR */ : LX_DT_UNKNOWN;
         memcpy(rec + 19, e->name, nl + 1);
@@ -1613,7 +1659,8 @@ static long lx_inotify_add(process_t *p, long fd, const char *upath, uint32_t ma
     void *h = lx_ino_get(p, fd, &err);
     if (!h) return err;
     char path[256];
-    long r = lx_resolve(p, LX_AT_FDCWD, upath, path, sizeof(path), false);
+    long r = lx_resolve_f(p, LX_AT_FDCWD, upath, path, sizeof(path), false,
+                          !(mask & 0x02000000u) /* IN_DONT_FOLLOW */);
     if (r) return r;
     int kind = lx_path_kind(path, NULL);
     if (!kind) return -ENOENT;
@@ -2614,7 +2661,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
 
     /* ---- metadata / paths ---- */
     case LX_stat: case LX_lstat:
-        if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false))) return r;
+        if ((r = lx_resolve_f(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false,
+                              nr == LX_stat))) return r;
         lx_exe_alias(path, sizeof(path));
         return lx_stat_path(path, (void *)a2);
     case LX_fstat:
@@ -2630,7 +2678,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
                 return lx_fstat(p, (long)(int)a1, (void *)a3);
             }
         }
-        if ((r = lx_resolve(p, (long)(int)a1, (const char *)a2, path, sizeof(path), false))) return r;
+        if ((r = lx_resolve_f(p, (long)(int)a1, (const char *)a2, path, sizeof(path), false,
+                              !(a4 & LX_AT_SYMLINK_NOFOLLOW)))) return r;
         lx_exe_alias(path, sizeof(path));
         return lx_stat_path(path, (void *)a3);
     }
@@ -2651,7 +2700,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         long dfd = nr == LX_readlink ? LX_AT_FDCWD : (long)(int)a1;
         void *ubuf = (void *)(nr == LX_readlink ? a2 : a3);
         size_t bufsiz = (size_t)(nr == LX_readlink ? a3 : a4);
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), false, false))) return r;
         /* /proc/self/exe and /proc/<pid>/exe */
         bool is_exe = false;
         if (kstrcmp(path, "/proc/self/exe") == 0)
@@ -2673,7 +2722,20 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (lx_put(ubuf, exe, n)) return -EFAULT;
             return (long)n;
         }
-        return lx_path_kind(path, NULL) ? -EINVAL : -ENOENT;   /* no real symlinks */
+        if ((long)bufsiz <= 0) return -EINVAL;
+        {
+            char *lb = (char *)kalloc(VFS_MAX_PATH);
+            if (!lb) return -ENOMEM;
+            int n = vfs_readlink(path, lb, VFS_MAX_PATH);
+            if (n >= 0) {
+                size_t c = (size_t)n < bufsiz ? (size_t)n : bufsiz;
+                long pr = lx_put(ubuf, lb, c);
+                kfree(lb);
+                return pr ? -EFAULT : (long)c;
+            }
+            kfree(lb);
+        }
+        return lx_path_kind(path, NULL) ? -EINVAL : -ENOENT;   /* not a symlink */
     }
     case LX_getcwd: {
         const char *cwd = p->cwd[0] ? p->cwd : "/";
@@ -2697,16 +2759,19 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_mkdir: case LX_mkdirat: {
         long dfd = nr == LX_mkdir ? LX_AT_FDCWD : (long)(int)a1;
         const char *up = (const char *)(nr == LX_mkdir ? a1 : a2);
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        uint32_t dmode = (uint32_t)(nr == LX_mkdir ? a2 : a3);
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), false, false))) return r;
         if (lx_path_kind(path, NULL)) return -EEXIST;
         if (!vfs_has_root_mount()) return -ENODEV;
         r = vfs_mkdir(path);
+        if (r >= 0 && vfs_has_inode_perms(path))
+            vfs_setattr(path, VFS_SA_MODE | VFS_SA_QUIET, (dmode & 07777) & ~p->file_umask, 0, 0);
         return r < 0 ? (r == -1 ? -EIO : r) : 0;
     }
     case LX_rmdir: case LX_unlink: case LX_unlinkat: {
         long dfd = nr == LX_unlinkat ? (long)(int)a1 : LX_AT_FDCWD;
         const char *up = (const char *)(nr == LX_unlinkat ? a2 : a1);
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), false, false))) return r;
         int kind = lx_path_kind(path, NULL);
         if (!kind) return -ENOENT;
         bool want_dir = nr == LX_rmdir || (nr == LX_unlinkat && (a3 & LX_AT_REMOVEDIR));
@@ -2725,8 +2790,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         const char *u1 = (const char *)(nr == LX_rename ? a1 : a2);
         long d2 = nr == LX_rename ? LX_AT_FDCWD : (long)(int)a3;
         const char *u2 = (const char *)(nr == LX_rename ? a2 : a4);
-        if ((r = lx_resolve(p, d1, u1, path, sizeof(path), false))) return r;
-        if ((r = lx_resolve(p, d2, u2, path2, sizeof(path2), false))) return r;
+        if ((r = lx_resolve_f(p, d1, u1, path, sizeof(path), false, false))) return r;
+        if ((r = lx_resolve_f(p, d2, u2, path2, sizeof(path2), false, false))) return r;
         if (!lx_path_kind(path, NULL)) return -ENOENT;
         r = vfs_rename(path, path2);
         if (r >= 0) fifo_rename(path, path2);
@@ -2749,28 +2814,60 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return r < 0 ? (r == -1 ? -EIO : r) : 0;
     }
     case LX_umask:   return sys_umask((mode_t)a1);
-    case LX_chmod: case LX_fchmodat: {
-        const char *up = (const char *)(nr == LX_chmod ? a1 : a2);
-        long dfd = nr == LX_chmod ? LX_AT_FDCWD : (long)(int)a1;
-        uint32_t mode = (uint32_t)(nr == LX_chmod ? a2 : a3);
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+    case LX_chmod: case LX_fchmodat: case LX_fchmod: {
+        uint32_t mode;
+        if (nr == LX_fchmod) {
+            mode = (uint32_t)a2;
+            r = lx_fd_path(p, (long)a1, path, sizeof(path));
+            if (r == 1) return 0;               /* pipe/socket/tty: accepted */
+            if (r < 0) return r;
+        } else {
+            const char *up = (const char *)(nr == LX_chmod ? a1 : a2);
+            long dfd = nr == LX_chmod ? LX_AT_FDCWD : (long)(int)a1;
+            mode = (uint32_t)(nr == LX_chmod ? a2 : a3);
+            bool nf = nr == LX_fchmodat && (a4 & LX_AT_SYMLINK_NOFOLLOW);
+            if (nr == LX_fchmodat && (a4 & ~(uint64_t)LX_AT_SYMLINK_NOFOLLOW)) return -EINVAL;
+            if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), false, !nf))) return r;
+            if (nf) { char lb[4]; if (vfs_readlink(path, lb, sizeof(lb)) >= 0) return -EOPNOTSUPP; }
+        }
         if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
         lx_exe_alias(path, sizeof(path));
         if (!lx_path_kind(path, NULL)) return -ENOENT;
-        return lx_mode_set(path, mode);
+        r = vfs_setattr(path, VFS_SA_MODE, mode & 07777, 0, 0);
+        if (r != -ENOSYS) return r;
+        return lx_mode_set(path, mode);         /* FAT32/exFAT: in-memory table */
     }
-    case LX_fchmod:
-        if (!lx_fd_ok(p, (long)a1)) return -EBADF;
-        return 0;                               /* no path for an fd yet */
-    case LX_chown: case LX_fchown: case LX_lchown: case LX_fchownat:
-        return 0;                               /* accepted, not enforced */
+    case LX_chown: case LX_fchown: case LX_lchown: case LX_fchownat: {
+        uint32_t uid, gid;
+        if (nr == LX_fchown) {
+            uid = (uint32_t)a2; gid = (uint32_t)a3;
+            r = lx_fd_path(p, (long)a1, path, sizeof(path));
+            if (r == 1) return 0;
+            if (r < 0) return r;
+        } else {
+            long dfd = nr == LX_fchownat ? (long)(int)a1 : LX_AT_FDCWD;
+            const char *up = (const char *)(nr == LX_fchownat ? a2 : a1);
+            uid = (uint32_t)(nr == LX_fchownat ? a3 : a2);
+            gid = (uint32_t)(nr == LX_fchownat ? a4 : a3);
+            bool nf = nr == LX_lchown || (nr == LX_fchownat && (a5 & LX_AT_SYMLINK_NOFOLLOW));
+            if (nr == LX_fchownat && (a5 & ~(uint64_t)(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH)))
+                return -EINVAL;
+            if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path),
+                                  nr == LX_fchownat && (a5 & LX_AT_EMPTY_PATH), !nf))) return r;
+        }
+        if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
+        if (!lx_path_kind(path, NULL) && !lx_synth_dir(path)) return -ENOENT;
+        r = vfs_setattr(path, VFS_SA_OWNER, 0, uid, gid);
+        return r == -ENOSYS ? 0 : r;            /* FAT32/exFAT: accepted, not stored */
+    }
     case LX_utimensat: {
         /* BusyBox touch: utimensat first; on ENOENT it open(O_CREAT).
          * Always returning 0 made touch exit success without creating. */
         long dfd = (long)(int)a1;
         const char *up = (const char *)a2;
         if (!up) return -EFAULT;
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), (a4 & 0x1000) != 0)))
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), (a4 & 0x1000) != 0,
+                              !(a4 & LX_AT_SYMLINK_NOFOLLOW))))
             return r; /* AT_EMPTY_PATH */
         if (!lx_path_kind(path, NULL)) return -ENOENT;
         return 0; /* timestamps not stored on FAT32 yet */
@@ -2786,8 +2883,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return 0;
     }
     case LX_symlink: case LX_symlinkat: {
-        /* No filesystem driver here can create symlinks (FAT32/exFAT have
-         * none; ext4 driver and tmpfs lack the op): EPERM like vfat. */
+        /* tmpfs and ext4 store symlinks; FAT32/exFAT: EPERM like vfat. */
         const char *ut = (const char *)a1;
         long dfd = nr == LX_symlinkat ? (long)(int)a2 : LX_AT_FDCWD;
         const char *up = (const char *)(nr == LX_symlinkat ? a3 : a2);
@@ -2795,7 +2891,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         char tchk[8];
         if (lx_get(tchk, ut, 1)) return -EFAULT;
         if (!tchk[0]) return -ENOENT;
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), false, false))) return r;
         if (lx_path_kind(path, NULL) || fifo_is(path)) return -EEXIST;
         {
             char par[256]; size_t n = strlen(path);
@@ -2806,7 +2902,17 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (!pk && !lx_synth_dir(par)) return -ENOENT;
             if (pk == 1) return -ENOTDIR;
         }
-        return -EPERM;
+        {
+            char *tg = (char *)kalloc(VFS_MAX_PATH);
+            if (!tg) return -ENOMEM;
+            memset(tg, 0, VFS_MAX_PATH);
+            if (!strncpy_from_user(tg, ut, VFS_MAX_PATH)) { kfree(tg); return -EFAULT; }
+            if (strlen(tg) >= VFS_MAX_PATH - 1) { kfree(tg); return -ENAMETOOLONG; }
+            r = vfs_symlink(tg, path);
+            kfree(tg);
+            /* vfs_symlink returns -errno; -1 is -EPERM (FAT32/exFAT), not EIO. */
+            return r < 0 ? r : 0;
+        }
     }
     case LX_link: case LX_linkat: {
         long d1 = nr == LX_linkat ? (long)(int)a1 : LX_AT_FDCWD;
@@ -2814,20 +2920,22 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         long d2 = nr == LX_linkat ? (long)(int)a3 : LX_AT_FDCWD;
         const char *u2 = (const char *)(nr == LX_linkat ? a4 : a2);
         if (nr == LX_linkat && (a5 & ~(uint64_t)(0x400 | 0x1000))) return -EINVAL;
-        if ((r = lx_resolve(p, d1, u1, path, sizeof(path), nr == LX_linkat && (a5 & 0x1000)))) return r;
-        if ((r = lx_resolve(p, d2, u2, path2, sizeof(path2), false))) return r;
+        if ((r = lx_resolve_f(p, d1, u1, path, sizeof(path), nr == LX_linkat && (a5 & 0x1000),
+                              nr == LX_linkat && (a5 & 0x400) /* AT_SYMLINK_FOLLOW */))) return r;
+        if ((r = lx_resolve_f(p, d2, u2, path2, sizeof(path2), false, false))) return r;
         int k = lx_path_kind(path, NULL);
         if (!k) return -ENOENT;
         if (k == 2) return -EPERM;                      /* dirs: EPERM on Linux too */
-        if (lx_path_kind(path2, NULL)) return -EEXIST;
-        return -EPERM;                                  /* no hard-link support (vfat semantics) */
+        if (lx_path_kind(path2, NULL) || fifo_is(path2)) return -EEXIST;
+        r = vfs_link(path, path2);                      /* FAT32/exFAT: EPERM (vfat) */
+        return r < 0 ? r : 0;                           /* -errno; -1 is -EPERM */
     }
     case LX_mknod: case LX_mknodat: {
         long dfd = nr == LX_mknodat ? (long)(int)a1 : LX_AT_FDCWD;
         const char *up = (const char *)(nr == LX_mknodat ? a2 : a1);
         uint32_t mode = (uint32_t)(nr == LX_mknodat ? a3 : a2);
         uint32_t fmt = mode & 0170000;
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), false, false))) return r;
         if (lx_path_kind(path, NULL) || fifo_is(path)) return -EEXIST;
         if (fmt == 0140000 || fmt == 0020000 || fmt == 0060000) return -EPERM; /* sock/chr/blk */
         if (fmt != 0 && fmt != 0100000 && fmt != LX_S_IFIFO) return -EINVAL;
@@ -3417,22 +3525,35 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         /* Soft: ignore mask/flags quirks; fill a Linux struct statx from path. */
         long dfd = (long)(int)a1;
         const char *up = (const char *)a2;
-        if ((r = lx_resolve(p, dfd, up, path, sizeof(path), (a3 & 0x1000) != 0))) /* AT_EMPTY_PATH */
+        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), (a3 & 0x1000) != 0, /* AT_EMPTY_PATH */
+                              !(a3 & LX_AT_SYMLINK_NOFOLLOW))))
             return r;
-        stat_t st;
-        if (!lx_path_kind(path, &st)) return -ENOENT;
-        /* Linux struct statx is 0x100 bytes; fill the common fields. */
+        lx_stat_t ls;
+        if ((r = lx_stat_path_k(path, &ls))) return r;
+        /* Linux struct statx (0x100 bytes) from the stat result. */
         uint8_t sx[0x100];
         memset(sx, 0, sizeof(sx));
-        /* stx_mask at 0x00 = STATX_BASIC_STATS */
-        uint32_t mask = 0x000007ffu;
+        uint32_t mask = 0x000007ffu;                    /* STATX_BASIC_STATS */
+        uint32_t bsz = (uint32_t)ls.st_blksize, nl = (uint32_t)ls.st_nlink;
+        uint32_t uid = ls.st_uid, gid = ls.st_gid;
+        uint16_t mode = (uint16_t)ls.st_mode;
+        uint64_t ino = ls.st_ino, size = (uint64_t)ls.st_size, blk = (uint64_t)ls.st_blocks;
+        int64_t at = ls.st_atime_sec, mt = ls.st_mtime_sec, ct = ls.st_ctime_sec;
         memcpy(sx + 0x00, &mask, 4);
-        if (fifo_is(path)) { st.st_mode = LX_S_IFIFO | 0644; st.st_size = 0; }
-        uint16_t mode = (uint16_t)st.st_mode;
+        memcpy(sx + 0x04, &bsz, 4);
+        memcpy(sx + 0x10, &nl, 4);
+        memcpy(sx + 0x14, &uid, 4);
+        memcpy(sx + 0x18, &gid, 4);
         memcpy(sx + 0x1c, &mode, 2);
-        uint64_t ino = st.st_ino, size = st.st_size;
-        memcpy(sx + 0x40, &ino, 8);
-        memcpy(sx + 0x48, &size, 8);
+        memcpy(sx + 0x20, &ino, 8);
+        memcpy(sx + 0x28, &size, 8);
+        memcpy(sx + 0x30, &blk, 8);
+        memcpy(sx + 0x40, &at, 8);                      /* stx_atime */
+        memcpy(sx + 0x60, &ct, 8);                      /* stx_ctime */
+        memcpy(sx + 0x70, &mt, 8);                      /* stx_mtime */
+        uint32_t rmaj = (uint32_t)(ls.st_rdev >> 8), rmin = (uint32_t)(ls.st_rdev & 0xff);
+        memcpy(sx + 0x80, &rmaj, 4);
+        memcpy(sx + 0x84, &rmin, 4);
         return lx_put((void *)a5, sx, sizeof(sx));
     }
     /* ---- sockets (AF_INET only) ---- */
