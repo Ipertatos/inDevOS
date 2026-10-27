@@ -6,6 +6,7 @@
 #include "utils.h"
 #include "string.h"
 #include "smp.h"
+#include "debug.h"     /* ktrace() */
 
 // Global scheduler instance
 scheduler_t global_scheduler = {0};
@@ -172,10 +173,19 @@ thread_t* thread_create(const char *name, void (*entry)(void*), void *arg,
     // Initialize FPU/SSE state with a clean copy
     fpu_get_default_state(thread->fxsave_area);
     
-    printf("Created thread '%s' (ID: %llu) with stack at 0x%llx, rsp=0x%llx\n", 
-           name, (unsigned long long)thread->id, 
-           (unsigned long long)stack_base,
-           (unsigned long long)thread->rsp);
+    /* One "fork-child" per fork(): ~95 polled serial bytes each, which was a
+     * visible share of fork cost (configure forks thousands of times).  Kernel
+     * and program threads keep the line; fork children only under `trace on`. */
+    if (name && strcmp(name, "fork-child") == 0)
+        ktrace("Created thread '%s' (ID: %llu) with stack at 0x%llx, rsp=0x%llx\n",
+               name, (unsigned long long)thread->id,
+               (unsigned long long)stack_base,
+               (unsigned long long)thread->rsp);
+    else
+        printf("Created thread '%s' (ID: %llu) with stack at 0x%llx, rsp=0x%llx\n",
+               name, (unsigned long long)thread->id,
+               (unsigned long long)stack_base,
+               (unsigned long long)thread->rsp);
     
     return thread;
 }

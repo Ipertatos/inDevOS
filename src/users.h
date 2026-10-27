@@ -112,6 +112,8 @@ bool     user_is_root(void);
 int      perm_set(const char *path, uint32_t uid, uint32_t gid, uint16_t mode);
 int      perm_get(const char *path, uint32_t *uid, uint32_t *gid, uint16_t *mode);
 int      perm_remove(const char *path);
+void     perm_forget_tree(const char *path);
+void     perm_rename_tree(const char *from, const char *to);
 bool     perm_check_access(const char *path, uint32_t uid, uint32_t gid, int mode);
 int      perm_chmod(const char *path, uint16_t mode);
 int      perm_chown(const char *path, uint32_t uid, uint32_t gid);

@@ -1208,7 +1208,7 @@ int fat32_list_directory(const char *path, fat32_dir_list_t *entries, uint32_t m
             uint32_t parent_cluster = 0;
             char basename[256];
             if (fat32_resolve_path(path, &parent_cluster, basename, sizeof(basename)) != 0) {
-                printf("fat32: Path '%s' not found\n", path);
+                ktrace("fat32: Path '%s' not found\n", path);   /* ENOENT is routine (stat/access probes) */
                 FS_UNLOCK(); return -1;
             }
 
@@ -1221,11 +1221,11 @@ int fat32_list_directory(const char *path, fat32_dir_list_t *entries, uint32_t m
                 uint8_t  child_attr = 0;
                 if (fat32_find_in_dir(&fat32_filesystem, parent_cluster,
                                       basename, &child_cluster, &child_attr) != 0) {
-                    printf("fat32: '%s' not found\n", path);
+                    ktrace("fat32: '%s' not found\n", path);
                     FS_UNLOCK(); return -1;
                 }
                 if (!(child_attr & FAT32_ATTR_DIRECTORY)) {
-                    printf("fat32: '%s' is not a directory\n", path);
+                    ktrace("fat32: '%s' is not a directory\n", path);
                     FS_UNLOCK(); return -1;
                 }
                 dir_cluster = child_cluster;
@@ -1257,7 +1257,7 @@ static fat32_file_t* fat32_open_impl(const char *filename, const char *mode) {
     } else {
         fat_create_hint.valid = false;
         if (fat32_resolve_path(filename, &parent_cluster, basename_uc, sizeof(basename_uc)) != 0) {
-            printf("fat32: Path resolution failed for '%s'\n", filename);
+            ktrace("fat32: Path resolution failed for '%s'\n", filename);
             FS_UNLOCK(); return NULL;
         }
         if (basename_uc[0] == '\0') {
@@ -1410,7 +1410,7 @@ static fat32_file_t* fat32_open_impl(const char *filename, const char *mode) {
     }
 
     kfree(cluster_buffer);
-    printf("fat32: File '%s' not found\n", filename);
+    ktrace("fat32: File '%s' not found\n", filename);
     FS_UNLOCK(); return NULL;
 }
 
@@ -2563,9 +2563,10 @@ static int fat32_create_file_impl(const char *filename) {
             fat_create_hint.valid = false;
         }
     }
-    /* Serial only: a console line costs a framebuffer scroll, which was a
-     * large share of the installer's per-file time. */
-    serial_printf("fat32: Created empty file '%s'\n", filename);
+    /* Trace only: a console line costs a framebuffer scroll (the installer's
+     * per-file time), and even serial-only it is ~50 polled UART bytes per
+     * create -- configure scripts create thousands of temp files. */
+    ktrace("fat32: Created empty file '%s'\n", filename);
     FS_UNLOCK(); return 0;
 }
 
@@ -2820,7 +2821,7 @@ int fat32_delete_file(const char *filename) {
     }
 
     kfree(cluster_buffer);
-    printf("fat32: File '%s' not found for deletion\n", filename);
+    ktrace("fat32: File '%s' not found for deletion\n", filename);
     FS_UNLOCK(); return -1;
 }
 
@@ -3010,7 +3011,7 @@ int fat32_rename(const char *oldpath, const char *newpath) {
     }
 
     fat32_flush_fat(&fat32_filesystem);
-    printf("fat32: Renamed '%s' -> '%s'\n", oldpath, newpath);
+    ktrace("fat32: Renamed '%s' -> '%s'\n", oldpath, newpath);   /* routine (mv, sed -i, config.status) */
     FS_UNLOCK();
     return 0;
 }

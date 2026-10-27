@@ -37,14 +37,14 @@ int clipboard_init(void) {
 int clipboard_set_text(const char *text) {
     if (!clipboard.initialized || !text) return -1;
 
-    spinlock_lock(&clipboard.lock);
+    klock(&clipboard.lock);
     size_t len = strlen(text);
     if (len >= clipboard.capacity) len = clipboard.capacity - 1;
     memcpy(clipboard.data, text, len);
     clipboard.data[len] = '\0';
     clipboard.size = len + 1;
     clipboard.type = CLIPBOARD_TEXT;
-    spinlock_unlock(&clipboard.lock);
+    kunlock(&clipboard.lock);
 
     serial_printf("clipboard: copied %d bytes of text\n", (int)len);
     return 0;
@@ -53,12 +53,12 @@ int clipboard_set_text(const char *text) {
 int clipboard_set_data(const void *data, size_t size) {
     if (!clipboard.initialized || !data || size == 0) return -1;
 
-    spinlock_lock(&clipboard.lock);
+    klock(&clipboard.lock);
     if (size > clipboard.capacity) size = clipboard.capacity;
     memcpy(clipboard.data, data, size);
     clipboard.size = size;
     clipboard.type = CLIPBOARD_BINARY;
-    spinlock_unlock(&clipboard.lock);
+    kunlock(&clipboard.lock);
 
     return 0;
 }
@@ -67,12 +67,12 @@ int clipboard_get_text(char *buf, size_t buflen) {
     if (!clipboard.initialized || !buf || buflen == 0) return -1;
     if (clipboard.type != CLIPBOARD_TEXT) return -1;
 
-    spinlock_lock(&clipboard.lock);
+    klock(&clipboard.lock);
     size_t copy_len = clipboard.size - 1;  /* exclude null terminator from count */
     if (copy_len >= buflen) copy_len = buflen - 1;
     memcpy(buf, clipboard.data, copy_len);
     buf[copy_len] = '\0';
-    spinlock_unlock(&clipboard.lock);
+    kunlock(&clipboard.lock);
 
     return (int)copy_len;
 }
@@ -81,11 +81,11 @@ int clipboard_get_data(void *buf, size_t buflen) {
     if (!clipboard.initialized || !buf || buflen == 0) return -1;
     if (clipboard.type == CLIPBOARD_EMPTY) return -1;
 
-    spinlock_lock(&clipboard.lock);
+    klock(&clipboard.lock);
     size_t copy_len = clipboard.size;
     if (copy_len > buflen) copy_len = buflen;
     memcpy(buf, clipboard.data, copy_len);
-    spinlock_unlock(&clipboard.lock);
+    kunlock(&clipboard.lock);
 
     return (int)copy_len;
 }
@@ -100,10 +100,10 @@ size_t clipboard_get_size(void) {
 
 void clipboard_clear(void) {
     if (!clipboard.initialized) return;
-    spinlock_lock(&clipboard.lock);
+    klock(&clipboard.lock);
     clipboard.type = CLIPBOARD_EMPTY;
     clipboard.size = 0;
-    spinlock_unlock(&clipboard.lock);
+    kunlock(&clipboard.lock);
 }
 
 bool clipboard_has_data(void) {

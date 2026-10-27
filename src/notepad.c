@@ -648,9 +648,9 @@ bool notepad_tick(void)
         np_need_draw = true;
     }
     if (!np_need_draw) return false;
-    spinlock_lock(&np_win->content_lock);
+    klock(&np_win->content_lock);
     np_redraw();
-    spinlock_unlock(&np_win->content_lock);
+    kunlock(&np_win->content_lock);
     return true;
 }
 

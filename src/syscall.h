@@ -376,6 +376,11 @@ typedef struct process {
      * (rt_sigreturn), or at the next syscall if no handler was invoked. */
     uint32_t sigsuspend_saved_mask;
     bool     sigsuspend_restore;
+
+    /* Set once this process loads a new image (exec_replace / spawn); never
+     * inherited by fork.  fork_child_zombie_exit() logs only exec'd or
+     * failing children - plain subshell forks are routine. */
+    bool     exec_done;
 } process_t;
 
 /** @brief Virtual memory layout for processes */

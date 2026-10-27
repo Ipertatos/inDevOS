@@ -379,13 +379,13 @@ int driver_register(const driver_registration_t *reg) {
         return -1;
     }
     
-    spinlock_lock(&global_driver_manager.lock);
+    klock(&global_driver_manager.lock);
     
     // Check if driver already exists
     driver_instance_t *existing = driver_find_by_name(reg->info.name);
     if (existing) {
         printf("Driver '%s' already registered\n", reg->info.name);
-        spinlock_unlock(&global_driver_manager.lock);
+        kunlock(&global_driver_manager.lock);
         return -1;
     }
     
@@ -393,7 +393,7 @@ int driver_register(const driver_registration_t *reg) {
     driver_instance_t *driver = kalloc(sizeof(driver_instance_t));
     if (!driver) {
         printf("Failed to allocate driver instance\n");
-        spinlock_unlock(&global_driver_manager.lock);
+        kunlock(&global_driver_manager.lock);
         return -1;
     }
     
@@ -412,7 +412,7 @@ int driver_register(const driver_registration_t *reg) {
         if (!driver->private_data) {
             printf("Failed to allocate private data for driver '%s'\n", reg->info.name);
             kfree(driver);
-            spinlock_unlock(&global_driver_manager.lock);
+            kunlock(&global_driver_manager.lock);
             return -1;
         }
         memset(driver->private_data, 0, reg->private_data_size);
@@ -423,7 +423,7 @@ int driver_register(const driver_registration_t *reg) {
     global_driver_manager.drivers = driver;
     global_driver_manager.driver_count++;
     
-    spinlock_unlock(&global_driver_manager.lock);
+    kunlock(&global_driver_manager.lock);
     
     printf("Driver '%s' registered (ID: %d)\n", reg->info.name, driver->id);
     return driver->id;
@@ -435,7 +435,7 @@ int driver_unregister(uint32_t driver_id) {
         return -1;
     }
     
-    spinlock_lock(&global_driver_manager.lock);
+    klock(&global_driver_manager.lock);
     
     driver_instance_t *prev = NULL;
     driver_instance_t *driver = global_driver_manager.drivers;
@@ -458,7 +458,7 @@ int driver_unregister(uint32_t driver_id) {
             kfree(driver);
             global_driver_manager.driver_count--;
             
-            spinlock_unlock(&global_driver_manager.lock);
+            kunlock(&global_driver_manager.lock);
             printf("Driver ID %d unregistered\n", driver_id);
             return 0;
         }
@@ -466,7 +466,7 @@ int driver_unregister(uint32_t driver_id) {
         driver = driver->next;
     }
     
-    spinlock_unlock(&global_driver_manager.lock);
+    kunlock(&global_driver_manager.lock);
     printf("Driver ID %d not found\n", driver_id);
     return -1;
 }

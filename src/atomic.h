@@ -13,12 +13,28 @@ typedef struct {
 static inline void spinlock_lock(spinlock_t *lock) __attribute__((always_inline));
 static inline void spinlock_unlock(spinlock_t *lock) __attribute__((always_inline));
 
+/* Contended-spin hook (smp.c).  While a TLB shootdown is waiting for acks
+ * (spin_tlb_pending != 0) a spinner answers it in place: a CPU spinning
+ * here with IF=0 cannot take the shootdown IPI, and the initiator's wait
+ * used to stall ~17 s whenever the lock holder was queued behind it.
+ * After a long spin the hook also records (lock, caller) per CPU so the
+ * shootdown timeout report can say who is stuck where. */
+extern volatile uint32_t spin_tlb_pending;
+void spin_slow_hook(spinlock_t *lock, void *ra, uint32_t spins);
+void spin_slow_done(void);
+
 static inline void spinlock_lock(spinlock_t *lock) {
+    uint32_t spins = 0;
     while (__sync_lock_test_and_set(&lock->lock, 1)) {
         while (lock->lock) {
             __asm__ __volatile__("pause");
+            if (__builtin_expect(spin_tlb_pending != 0, 0) ||
+                __builtin_expect((++spins & 0x3FFFFu) == 0, 0))
+                spin_slow_hook(lock, __builtin_return_address(0), spins);
         }
     }
+    if (__builtin_expect(spins >= 0x40000u, 0))
+        spin_slow_done();
 }
 
 static inline void spinlock_unlock(spinlock_t *lock) {

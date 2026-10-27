@@ -118,14 +118,14 @@ static void q_push_locked(wm_conn_t *c, const struct wm_event *ev) {
 }
 
 static void post(uint32_t desk_id, struct wm_event *ev) {
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     wm_conn_t *c = NULL;
     if (find_win_locked(desk_id, &c)) {
         ev->win = desk_id;
         ev->time_ms = (uint32_t)ktime_now_ms();
         q_push_locked(c, ev);
     }
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
 }
 
 /* Remove a surface's pages from the address space that mapped them, if that
@@ -196,11 +196,11 @@ long wm_dev_open(void **handle) {
     memset(c, 0, sizeof(*c));
     process_t *p = get_current_process();
     c->pid = p ? p->pid : 0;
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     c->serial = ++wm_conn_serial;
     c->next = wm_conns;
     wm_conns = c;
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     serial_printf("[wm] connect %u pid %u\n", c->serial, c->pid);
     *handle = c;
     return 0;
@@ -209,10 +209,10 @@ long wm_dev_open(void **handle) {
 void wm_dev_release(void *handle) {
     wm_conn_t *c = (wm_conn_t *)handle;
     if (!c) return;
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     for (wm_conn_t **pp = &wm_conns; *pp; pp = &(*pp)->next)
         if (*pp == c) { *pp = c->next; break; }
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     process_t *cur = get_current_process();
     bool owner_gone = !process_pid_alive(c->pid) ||
                       (cur && cur->pid == c->pid && !cur->pml4);
@@ -232,16 +232,16 @@ static long do_create(wm_conn_t *c, void *arg) {
     cr.title[WM_TITLE_MAX - 1] = 0;
 
     int slot = -1;
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     for (int i = 0; i < WM_MAX_WINDOWS_PER_FD; i++)
         if (!c->win[i].used) { slot = i; c->win[i].used = true; c->win[i].desk_id = 0; break; }
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     if (slot < 0) return -WM_ENOSPC;
     wm_win_t *w = &c->win[slot];
 
     wm_surf_t sf;
     if (!surf_alloc(&sf, cr.w, cr.h)) {
-        spinlock_lock(&wm_lock); w->used = false; spinlock_unlock(&wm_lock);
+        klock(&wm_lock); w->used = false; kunlock(&wm_lock);
         return -WM_ENOMEM;
     }
 
@@ -257,17 +257,17 @@ static long do_create(wm_conn_t *c, void *arg) {
                                                     (int)cr.type, cr.parent, DESKTOP_FMT_ARGB);
     if (!dw) {
         kfree(sf.mem);
-        spinlock_lock(&wm_lock); w->used = false; spinlock_unlock(&wm_lock);
+        klock(&wm_lock); w->used = false; kunlock(&wm_lock);
         return -WM_ENOMEM;
     }
     if (cr.type == WM_TYPE_NORMAL) dw->resizable = (cr.flags & WM_FLAG_RESIZABLE) != 0;
 
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     w->desk_id = dw->id;
     w->slot = (uint32_t)slot;
     w->gen = 0;
     w->cur = sf;
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
 
     cr.id = dw->id;
     cr.stride = sf.stride;
@@ -331,12 +331,12 @@ static long do_resize_ack(wm_conn_t *c, void *arg) {
     wm_surf_t nsf;
     if (!surf_alloc(&nsf, ra.w, ra.h)) return -WM_ENOMEM;
     wm_surf_t older;
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     older = w->old;
     w->old = w->cur;
     w->cur = nsf;
     w->gen++;
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     surf_free(&older, w->desk_id, false);
     ra.stride = nsf.stride;
     ra.buf_size = nsf.buf_size;
@@ -363,11 +363,11 @@ static long do_title(wm_conn_t *c, void *arg) {
 }
 
 static long do_destroy(wm_conn_t *c, uint32_t id) {
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     wm_win_t *w = conn_win(c, id);
     wm_win_t copy;
     if (w) { copy = *w; memset(w, 0, sizeof(*w)); }
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     if (!w) return -WM_EINVAL;
     serial_printf("[wm] destroy id %u pid %u\n", id, c->pid);
     win_teardown(&copy, false);
@@ -421,11 +421,11 @@ long wm_dev_read(void *handle, void *ubuf, size_t n, bool nonblock) {
     size_t done = 0;
     while (done < want) {
         struct wm_event ev;
-        spinlock_lock(&wm_lock);
-        if (c->qt == c->qh) { spinlock_unlock(&wm_lock); break; }
+        klock(&wm_lock);
+        if (c->qt == c->qh) { kunlock(&wm_lock); break; }
         ev = c->q[c->qh % WM_QLEN];
         c->qh++;
-        spinlock_unlock(&wm_lock);
+        kunlock(&wm_lock);
         if (copy_to_user((uint8_t *)ubuf + done * sizeof(ev), &ev, sizeof(ev)))
             return done ? (long)(done * sizeof(ev)) : -WM_EFAULT;
         done++;
@@ -461,19 +461,19 @@ long wm_dev_mmap(void *handle, uint64_t addr, uint64_t len, long prot, long flag
 
 bool wm_dev_pid_connected(uint32_t pid) {
     if (!wm_conns || !pid) return false;
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     bool r = false;
     for (wm_conn_t *c = wm_conns; c && !r; c = c->next) r = c->pid == pid;
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     return r;
 }
 
 /* ---- desktop.c hooks ---- */
 bool wm_dev_owns_window(uint32_t desk_id) {
     if (!wm_conns) return false;
-    spinlock_lock(&wm_lock);
+    klock(&wm_lock);
     bool r = find_win_locked(desk_id, NULL) != NULL;
-    spinlock_unlock(&wm_lock);
+    kunlock(&wm_lock);
     return r;
 }
 

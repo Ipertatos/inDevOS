@@ -863,10 +863,10 @@ static int ahci_atapi_read_512(uint8_t port, uint64_t lba, uint32_t count, void 
 
 
 int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
-    spinlock_lock(&ahci_lock);
+    klock(&ahci_lock);
     if (!ahci_ctrl.initialized || !dev || !buffer) {
         printf("AHCI: Invalid parameters for read\n");
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
     //printf("AHCI: Reading %d sectors starting at LBA %llu\n", sector_count, lba);
@@ -874,7 +874,7 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
     uint8_t port = ahci_port_of(dev);
     if (ahci_port_atapi[port] || (dev && dev->optical)) {
         int rc = ahci_atapi_read_512(port, lba, sector_count, buffer);
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return rc;
     }
 
@@ -887,7 +887,7 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
     const uint16_t MAX_SECTORS_PER_OP = 128;
     void *dma_bounce = ahci_ctrl.dma_bounce;
     if (!dma_bounce) {
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
 
@@ -896,7 +896,7 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
 
         if (ahci_port_wait_ready(port) != 0) {
             printf("AHCI: Port %d not ready for read\n", port);
-            spinlock_unlock(&ahci_lock);
+            kunlock(&ahci_lock);
             return -1;
         }
 
@@ -907,7 +907,7 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
         }
         if (slot_timeout <= 0) {
             printf("AHCI: Timeout waiting for free command slot (read)\n");
-            spinlock_unlock(&ahci_lock);
+            kunlock(&ahci_lock);
             return -1;
         }
 
@@ -966,7 +966,7 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
         // Wait for completion (interrupt-driven with polling fallback)
         if (ahci_wait_completion(port, 1000) != 0) {
             printf("AHCI: Read error/timeout – port %d\n", port);
-            spinlock_unlock(&ahci_lock);
+            kunlock(&ahci_lock);
             return -1;
         }
 
@@ -979,17 +979,17 @@ int ahci_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
         sectors_remaining -= sectors_this;
     }
 
-    spinlock_unlock(&ahci_lock);
+    kunlock(&ahci_lock);
     return 0;
 }
 
 int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer) {
     if (dev && dev->optical) return -1;
 
-    spinlock_lock(&ahci_lock);
+    klock(&ahci_lock);
     if (!ahci_ctrl.initialized || !dev || !buffer) {
         printf("AHCI: Invalid parameters for write\n");
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
 
@@ -1005,7 +1005,7 @@ int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_coun
     const uint16_t MAX_SECTORS_PER_OP = 128;
     void *dma_bounce = ahci_ctrl.dma_bounce;
     if (!dma_bounce) {
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
 
@@ -1020,13 +1020,13 @@ int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_coun
         while (slot_timeout-- && (ahci_read_port_reg32(port, AHCI_PORT_CI) & 1)) {}
         if (slot_timeout <= 0) {
             printf("AHCI: Timeout waiting for free command slot (write)\n");
-            spinlock_unlock(&ahci_lock);
+            kunlock(&ahci_lock);
             return -1;
         }
 
         if (ahci_port_wait_ready(port) != 0) {
             printf("AHCI: Port %d not ready for write\n", port);
-            spinlock_unlock(&ahci_lock);
+            kunlock(&ahci_lock);
             return -1;
         }
 
@@ -1083,7 +1083,7 @@ int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_coun
         // Wait for completion (interrupt-driven with polling fallback)
         if (ahci_wait_completion(port, 1000) != 0) {
             printf("AHCI: Write error/timeout – port %d\n", port);
-            spinlock_unlock(&ahci_lock);
+            kunlock(&ahci_lock);
             return -1;
         }
 
@@ -1093,15 +1093,15 @@ int ahci_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_coun
         sectors_remaining -= sectors_this;
     }
 
-    spinlock_unlock(&ahci_lock);
+    kunlock(&ahci_lock);
     return 0;
 }
 
 int ahci_flush(storage_device_t *dev) {
     (void)dev;
-    spinlock_lock(&ahci_lock);
+    klock(&ahci_lock);
     if (!ahci_ctrl.initialized) {
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
 
@@ -1111,12 +1111,12 @@ int ahci_flush(storage_device_t *dev) {
     while (slot_timeout-- && (ahci_read_port_reg32(port, AHCI_PORT_CI) & 1)) {}
     if (slot_timeout <= 0) {
         printf("AHCI: flush — timeout waiting for free command slot\n");
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
 
     if (ahci_port_wait_ready(port) != 0) {
-        spinlock_unlock(&ahci_lock);
+        kunlock(&ahci_lock);
         return -1;
     }
 
@@ -1146,7 +1146,7 @@ int ahci_flush(storage_device_t *dev) {
     ahci_write_port_reg32(port, AHCI_PORT_CI, 1);
 
     int wret = ahci_wait_completion(port, 5000);
-    spinlock_unlock(&ahci_lock);
+    kunlock(&ahci_lock);
     if (wret != 0) {
         printf("AHCI: flush command timeout / error on port %d\n", port);
         return -1;

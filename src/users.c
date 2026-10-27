@@ -399,7 +399,13 @@ int perm_set(const char *path, uint32_t uid, uint32_t gid, uint16_t mode) {
             return 0;
         }
     }
-    printf("perm: permission table full\n");
+    /* Say it once: configure/make create thousands of files, and a line per
+     * create was ~45 polled serial bytes each (and unlink now frees slots). */
+    static bool full_reported;
+    if (!full_reported) {
+        full_reported = true;
+        printf("perm: permission table full\n");
+    }
     return -1;
 }
 
@@ -423,6 +429,43 @@ int perm_remove(const char *path) {
     if (!e) return -1;
     e->active = false;
     return 0;
+}
+
+/* vfs_rename()/vfs_unlink()/vfs_rmdir() hooks.  Entries used to outlive
+ * their file: the 256-slot table filled after a few hundred creates (every
+ * later create logged "table full" and lost its mode), and a new file reusing
+ * a deleted path inherited the old entry.  @path and its subtree go. */
+void perm_forget_tree(const char *path) {
+    if (!path || !path[0]) return;
+    size_t n = strlen(path);
+    for (int i = 0; i < MAX_PERM_ENTRIES; i++) {
+        if (!perms[i].active) continue;
+        if (strncmp(perms[i].path, path, n) == 0 &&
+            (perms[i].path[n] == '\0' || perms[i].path[n] == '/'))
+            perms[i].active = false;
+    }
+}
+
+/* Move @from (and its subtree) to @to; whatever was at @to is replaced. */
+void perm_rename_tree(const char *from, const char *to) {
+    if (!from || !to || !from[0] || !to[0]) return;
+    perm_forget_tree(to);
+    size_t n = strlen(from), tn = strlen(to);
+    for (int i = 0; i < MAX_PERM_ENTRIES; i++) {
+        if (!perms[i].active) continue;
+        if (strncmp(perms[i].path, from, n) != 0 ||
+            (perms[i].path[n] != '\0' && perms[i].path[n] != '/'))
+            continue;
+        size_t rest = strlen(perms[i].path + n);
+        if (tn + rest >= sizeof(perms[i].path)) {      /* would truncate: drop */
+            perms[i].active = false;
+            continue;
+        }
+        char tmp[sizeof(perms[i].path)];
+        memcpy(tmp, to, tn);
+        memcpy(tmp + tn, perms[i].path + n, rest + 1);
+        memcpy(perms[i].path, tmp, tn + rest + 1);
+    }
 }
 
 bool perm_check_access(const char *path, uint32_t uid, uint32_t gid, int mode) {

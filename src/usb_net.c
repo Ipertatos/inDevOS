@@ -91,17 +91,17 @@ static inline uint32_t get32(const uint8_t *p) {
 static void ring_put(unet_t *n, const uint8_t *f, uint32_t len) {
     if (len == 0) return;                       /* zero-length packet ending a transfer */
     if (len < 14 || len > UNET_FRAME) { n->rx_err++; return; }
-    spinlock_lock(&n->ring_lk);
+    klock(&n->ring_lk);
     uint32_t h = n->head;
     if (h - n->tail >= UNET_RING) {
-        spinlock_unlock(&n->ring_lk);
+        kunlock(&n->ring_lk);
         n->rx_drop++;
         return;
     }
     memcpy(n->ring[h % UNET_RING], f, len);
     n->ring_len[h % UNET_RING] = (uint16_t)len;
     n->head = h + 1;
-    spinlock_unlock(&n->ring_lk);
+    kunlock(&n->ring_lk);
     n->rx_frames++;
 }
 
@@ -240,14 +240,14 @@ static int unet_receive(uint8_t *buffer, uint32_t max_length) {
     unet_t *n = unet;
     if (!n) return 0;
     if (n->head == n->tail) unet_pump();
-    spinlock_lock(&n->ring_lk);
-    if (n->head == n->tail) { spinlock_unlock(&n->ring_lk); return 0; }
+    klock(&n->ring_lk);
+    if (n->head == n->tail) { kunlock(&n->ring_lk); return 0; }
     uint32_t i = n->tail % UNET_RING;
     uint32_t len = n->ring_len[i];
     if (len > max_length) len = max_length;
     memcpy(buffer, n->ring[i], len);
     n->tail++;
-    spinlock_unlock(&n->ring_lk);
+    kunlock(&n->ring_lk);
     return (int)len;
 }
 
@@ -417,9 +417,9 @@ int usb_net_attach(usb_dev_t *d, usb_iface_info_t *ifc, void **data) {
     uint64_t ph;
     if (reused) {
         unet_spare = NULL;
-        spinlock_lock(&n->ring_lk);
+        klock(&n->ring_lk);
         n->head = n->tail = 0;
-        spinlock_unlock(&n->ring_lk);
+        kunlock(&n->ring_lk);
         n->online = false;
         n->rx_queued = false;
         memset(n->mac, 0, sizeof(n->mac));

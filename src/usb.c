@@ -542,7 +542,7 @@ void usb_init() {
 static void usb_keyboard_process_report_to_buffer(usb_keyboard_report_t *report) {
     if (!report) return;
     
-    spinlock_lock(&usb_keyboard_lock);
+    klock(&usb_keyboard_lock);
     
     // Check for modifier keys
     bool ctrl_pressed = (report->modifier_keys & 0x01) != 0;
@@ -589,7 +589,7 @@ static void usb_keyboard_process_report_to_buffer(usb_keyboard_report_t *report)
         }
     }
     
-    spinlock_unlock(&usb_keyboard_lock);
+    kunlock(&usb_keyboard_lock);
 }
 
 // USB Keyboard polling and integration functions
@@ -623,18 +623,18 @@ void usb_keyboard_poll_all() {
 
 // Check if USB keyboard has input
 bool usb_keyboard_has_input() {
-    spinlock_lock(&usb_keyboard_lock);
+    klock(&usb_keyboard_lock);
     bool has_input = usb_keyboard_has_data && (usb_keyboard_buffer_head != usb_keyboard_buffer_tail);
-    spinlock_unlock(&usb_keyboard_lock);
+    kunlock(&usb_keyboard_lock);
     return has_input;
 }
 
 // Get a character from USB keyboard buffer
 char usb_keyboard_get_char() {
-    spinlock_lock(&usb_keyboard_lock);
+    klock(&usb_keyboard_lock);
     
     if (!usb_keyboard_has_data || usb_keyboard_buffer_head == usb_keyboard_buffer_tail) {
-        spinlock_unlock(&usb_keyboard_lock);
+        kunlock(&usb_keyboard_lock);
         return 0; // No data available
     }
     
@@ -645,7 +645,7 @@ char usb_keyboard_get_char() {
         usb_keyboard_has_data = false;
     }
     
-    spinlock_unlock(&usb_keyboard_lock);
+    kunlock(&usb_keyboard_lock);
     return c;
 }
 

@@ -2375,6 +2375,47 @@ static int t_cx_proc(char *d, size_t n) {
     CHECK(atoi(b) == getpid(), "/proc/self/stat pid %d != %d", atoi(b), getpid());
     R(PASS, "%s", res);
 }
+/* Cheap perf sanity for configure-style workloads (batch 9): ENOENT stat
+ * probes, create+unlink churn, fork+wait.  Per-op serial logging made a
+ * missing-path stat ~45 ms and fork ~32 ms (GNU hello configure: 326 s); the
+ * limits are several times the fixed cost so host load does not flake them.
+ * Also: create/unlink churn must not exhaust the FAT permission table (a
+ * leaked slot per create lost the mode of every later file). */
+#define PERF_STAT_MISS_MAX_US 20000
+#define PERF_FORK_MAX_US      150000
+static int t_cx_perf(char *d, size_t n) {
+    struct stat st; char p[200];
+    long long t0 = now_ns(CLOCK_MONOTONIC);
+    for (int i = 0; i < 200; i++) {
+        snprintf(p, sizeof p, "/bin/ostest_nope_%d", i);
+        CHECK(stat(p, &st) != 0 && errno == ENOENT, "stat %s: expected ENOENT", p);
+    }
+    long long stat_us = (now_ns(CLOCK_MONOTONIC) - t0) / 1000 / 200;
+    int mode0 = -1, modeN = -1;
+    for (int i = 0; i < 300; i++) {
+        tpath(p, sizeof p, "perfc"); int fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        CHECKE(fd >= 0, "create"); close(fd);
+        if (i == 0 && stat(p, &st) == 0) mode0 = st.st_mode & 0777;
+        CHECKE(unlink(p) == 0, "unlink");
+    }
+    tpath(p, sizeof p, "perfm"); int fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0700);
+    CHECKE(fd >= 0, "create perfm"); close(fd);
+    if (stat(p, &st) == 0) modeN = st.st_mode & 0777;
+    unlink(p);
+    CHECK(mode0 != 0600 || modeN == 0700, "after 300 create/unlink a new 0700 file stats %o (perm table leak?)", modeN);
+    t0 = now_ns(CLOCK_MONOTONIC);
+    for (int i = 0; i < 50; i++) {
+        int ws; pid_t c = fork(); CHECKE(c >= 0, "fork");
+        if (!c) _exit(0);
+        CHECKE(waitpid(c, &ws, 0) == c, "waitpid");
+        CHECK(WIFEXITED(ws) && WEXITSTATUS(ws) == 0, "child status 0x%x", ws);
+    }
+    long long fork_us = (now_ns(CLOCK_MONOTONIC) - t0) / 1000 / 50;
+    CHECK(stat_us <= PERF_STAT_MISS_MAX_US && fork_us <= PERF_FORK_MAX_US,
+          "too slow: stat(ENOENT) %lld us (max %d), fork+wait %lld us (max %d)",
+          stat_us, PERF_STAT_MISS_MAX_US, fork_us, PERF_FORK_MAX_US);
+    R(PASS, "stat(ENOENT) %lld us, fork+_exit+wait %lld us, create/unlink x300 modes %o->%o", stat_us, fork_us, mode0, modeN);
+}
 static int t_cx_tmp_big(char *d, size_t n) {
     char p[200], q[200]; snprintf(p, sizeof(p), "/tmp/ostest_big.%d", getpid()); snprintf(q, sizeof(q), "%s.r", p);
     static uint8_t blk[65536]; int fd = open(p, O_CREAT | O_TRUNC | O_WRONLY, 0644); CHECKE(fd >= 0, "open /tmp");
@@ -2717,7 +2758,7 @@ static const struct test tests[] = {
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
-    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

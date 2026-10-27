@@ -2297,10 +2297,10 @@ static void lx_tfd_update(lx_timerfd_t *t) {
 bool lx_timerfd_ready(void *h) {
     lx_timerfd_t *t = (lx_timerfd_t *)h;
     if (!t) return false;
-    spinlock_lock(&t->lock);
+    klock(&t->lock);
     lx_tfd_update(t);
     bool r = t->exp != 0;
-    spinlock_unlock(&t->lock);
+    kunlock(&t->lock);
     return r;
 }
 static long lx_timerfd_create(process_t *p, long clockid, long flags) {
@@ -2348,7 +2348,7 @@ static long lx_timerfd_settime(process_t *p, long fd, long flags, const void *un
     uint64_t v  = (uint64_t)nv[1].tv_sec * 1000000ULL + (uint64_t)nv[1].tv_nsec / 1000;
     if (!v && (nv[1].tv_sec || nv[1].tv_nsec)) v = 1;
     if (!iv && (nv[0].tv_sec || nv[0].tv_nsec)) iv = 1;
-    spinlock_lock(&t->lock);
+    klock(&t->lock);
     lx_tfd_update(t);
     lx_timespec_t old[2];
     lx_tfd_cur(t, old);
@@ -2365,7 +2365,7 @@ static long lx_timerfd_settime(process_t *p, long fd, long flags, const void *un
     } else {
         t->next_us = lx_mono_us() + v;
     }
-    spinlock_unlock(&t->lock);
+    kunlock(&t->lock);
     if (uold && lx_put(uold, old, sizeof(old))) return -EFAULT;
     return 0;
 }
@@ -2374,10 +2374,10 @@ static long lx_timerfd_gettime(process_t *p, long fd, void *ucur) {
     lx_timerfd_t *t = lx_tfd_get(p, fd, &err);
     if (!t) return err;
     lx_timespec_t c[2];
-    spinlock_lock(&t->lock);
+    klock(&t->lock);
     lx_tfd_update(t);
     lx_tfd_cur(t, c);
-    spinlock_unlock(&t->lock);
+    kunlock(&t->lock);
     return lx_put(ucur, c, sizeof(c));
 }
 static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len) {
@@ -2385,11 +2385,11 @@ static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len) {
     lx_timerfd_t *t = (lx_timerfd_t *)p->fds[fd].file_handle;
     extern bool proc_signal_interrupts(process_t *);
     for (;;) {
-        spinlock_lock(&t->lock);
+        klock(&t->lock);
         lx_tfd_update(t);
         uint64_t v = t->exp;
         t->exp = 0;
-        spinlock_unlock(&t->lock);
+        kunlock(&t->lock);
         if (v) return lx_put(ubuf, &v, 8) ? -EFAULT : 8;
         if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
         if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;

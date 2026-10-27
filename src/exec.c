@@ -1292,6 +1292,7 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
     } else {
         proc->linux_exe_path[0] = 0;
     }
+    proc->exec_done       = true;
     proc->parent          = get_current_process();
 
     {
@@ -1614,6 +1615,7 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
     proc->linux_ti_valid = false;
     proc->linux_clear_child_tid = 0;
     kstrncpy(proc->linux_exe_path, resolved, sizeof(proc->linux_exe_path));
+    proc->exec_done      = true;
 
     /* Reset caught signal handlers to default; leave SIG_IGN alone.
      * Also clear sa_restorer — stale ash trampolines must not survive exec

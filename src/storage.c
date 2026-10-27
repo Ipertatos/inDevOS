@@ -494,10 +494,10 @@ static int storage_read_sectors_hw(storage_device_t *dev, uint8_t device_id,
 }
 
 int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, void *buffer) {
-    spinlock_lock(&storage_lock);
+    klock(&storage_lock);
     storage_device_t *dev = storage_get_device(device_id);
     if (!dev) {
-        spinlock_unlock(&storage_lock);
+        kunlock(&storage_lock);
         return -1;
     }
 
@@ -505,7 +505,7 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
      * /bin/links differed between consecutive runs). Bypass cache+readahead. */
     if (dev->optical) {
         int r = storage_read_sectors_hw(dev, device_id, lba, sector_count, buffer);
-        spinlock_unlock(&storage_lock);
+        kunlock(&storage_lock);
         return r;
     }
 
@@ -566,15 +566,15 @@ int storage_read_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count,
 
     if (!kp_hw)
         kprof_end(KP_ST_RD_CACHED, kp_t0, sector_count);
-    spinlock_unlock(&storage_lock);
+    kunlock(&storage_lock);
     return result;
 }
 
 int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count, const void *buffer) {
-    spinlock_lock(&storage_lock);
+    klock(&storage_lock);
     storage_device_t *dev = storage_get_device(device_id);
     if (!dev) {
-        spinlock_unlock(&storage_lock);
+        kunlock(&storage_lock);
         return -1;
     }
     
@@ -610,7 +610,7 @@ int storage_write_sectors(uint8_t device_id, uint64_t lba, uint32_t sector_count
         }
     }
 
-    spinlock_unlock(&storage_lock);
+    kunlock(&storage_lock);
     return result;
 }
 

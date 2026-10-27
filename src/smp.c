@@ -403,6 +403,13 @@ static volatile uint64_t tlb_sd_gen;
 static volatile uint64_t tlb_sd_acked[MAX_CPUS];
 static volatile uint32_t tlb_sd_timeouts;
 
+/* Non-zero while an initiator waits for acks (see spinlock_lock()). */
+volatile uint32_t spin_tlb_pending;
+/* Per-CPU record of a long spinlock spin, for the timeout report. */
+static void *volatile spin_wait_lock[MAX_CPUS];
+static void *volatile spin_wait_ra[MAX_CPUS];
+static volatile uint64_t spin_wait_since[MAX_CPUS];
+
 static inline void tlb_flush_local(void) {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
@@ -431,6 +438,61 @@ static inline void tlb_sd_poll(void) {
         smp_tlb_shootdown_ack();
 }
 
+/* Called from the contended path of spinlock_lock(): answer a pending
+ * shootdown (the spinner may have IF=0 and so cannot take the IPI) and,
+ * after a long spin, record what this CPU is waiting for.  No locks, no
+ * printing: this runs inside arbitrary lock waits. */
+void spin_slow_hook(spinlock_t *lock, void *ra, uint32_t spins) {
+    if (__atomic_load_n(&spin_tlb_pending, __ATOMIC_RELAXED))
+        tlb_sd_poll();
+    if (spins >= 0x40000u) {
+        uint32_t me = smp_cpu_index_fast();
+        if (me < MAX_CPUS && spin_wait_lock[me] != (void *)lock) {
+            spin_wait_ra[me] = ra;
+            spin_wait_since[me] = hpet_get_ticks();
+            spin_wait_lock[me] = (void *)lock;
+        }
+    }
+}
+
+void spin_slow_done(void) {
+    uint32_t me = smp_cpu_index_fast();
+    if (me < MAX_CPUS)
+        spin_wait_lock[me] = NULL;
+}
+
+/* Loud report for a shootdown that timed out: who asked, which CPUs did not
+ * answer, and what every CPU is running / spinning on. */
+static void tlb_sd_report(uint64_t g, uint32_t missing, uint32_t me, void *ra) {
+    extern const char *lookup_symbol(uint64_t addr);
+    uint64_t now = hpet_get_ticks();
+    thread_t *it = cpu_data[me < MAX_CPUS ? me : 0].current_thread;
+    serial_printf("smp: TLB shootdown incomplete gen=%llu missing_cpus=0x%x "
+                  "initiator cpu%u thread %llu '%s' from %p <%s>\n",
+                  (unsigned long long)g, missing, me,
+                  it ? (unsigned long long)it->id : 0ULL, it ? it->name : "-",
+                  ra, lookup_symbol((uint64_t)ra));
+    for (uint32_t c = 0; c < MAX_CPUS; c++) {
+        if (!cpu_data[c].online) continue;
+        thread_t *t = cpu_data[c].current_thread;
+        void *lk = spin_wait_lock[c];
+        void *wra = spin_wait_ra[c];
+        uint64_t since = spin_wait_since[c];
+        uint64_t acked = __atomic_load_n(&tlb_sd_acked[c], __ATOMIC_RELAXED);
+        serial_printf("smp:   cpu%u%s acked=%llu preempt=%u thread %llu '%s' state=%d kwait=%d",
+                      c, (c < 32 && (missing & (1u << c))) ? " MISSING" : "",
+                      (unsigned long long)acked,
+                      c < PREEMPT_MAX_CPUS ? preempt_count_cpu[c] : 0,
+                      t ? (unsigned long long)t->id : 0ULL, t ? t->name : "-",
+                      t ? (int)t->state : -1, t ? t->kwait : -1);
+        if (lk)
+            serial_printf(" spinning on lock %p for %llu ms from %p <%s>",
+                          lk, (unsigned long long)(now - since), wra,
+                          lookup_symbol((uint64_t)wra));
+        serial_printf("\n");
+    }
+}
+
 void smp_tlb_shootdown(void) {
     uint64_t online = cpus_online;
     if (online <= 1) {
@@ -446,6 +508,7 @@ void smp_tlb_shootdown(void) {
     }
     uint32_t me = smp_cpu_index_fast();
     uint64_t g = __atomic_add_fetch(&tlb_sd_gen, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&spin_tlb_pending, 1, __ATOMIC_SEQ_CST);
     smp_send_ipi_all_except_self(IPI_VECTOR_TLB_FLUSH);
     tlb_flush_local();
     if (me < MAX_CPUS)
@@ -463,13 +526,15 @@ void smp_tlb_shootdown(void) {
             break;
         __asm__ volatile("pause");
     }
-    __sync_lock_release(&tlb_sd_lock.lock);
-    irq_restore(flags);
+    __atomic_store_n(&spin_tlb_pending, 0, __ATOMIC_SEQ_CST);
     if (missing && tlb_sd_timeouts < 16) {
         tlb_sd_timeouts++;
-        serial_printf("smp: TLB shootdown incomplete gen=%llu missing_cpus=0x%x\n",
-                      (unsigned long long)g, missing);
+        /* Still holding tlb_sd_lock with IF=0: the report reflects the
+         * stuck state, and no other shootdown can interleave with it. */
+        tlb_sd_report(g, missing, me, __builtin_return_address(0));
     }
+    __sync_lock_release(&tlb_sd_lock.lock);
+    irq_restore(flags);
 }
 
 void smp_reschedule_cpu(uint32_t cpu_id) {

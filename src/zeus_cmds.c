@@ -436,9 +436,9 @@ static spinlock_t task_test_lock = {0};
 static void task_test_step(int idx) {
     if (task_test_progress[idx] >= task_test_iterations) return;
 
-    spinlock_lock(&task_test_lock);
+    klock(&task_test_lock);
     task_test_counter++;
-    spinlock_unlock(&task_test_lock);
+    kunlock(&task_test_lock);
 
     int i = ++task_test_progress[idx];
     if (i % 5 == 0 || i == task_test_iterations) {

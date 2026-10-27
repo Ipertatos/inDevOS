@@ -451,25 +451,25 @@ static void ide_dma_prepare(void) {
 }
 
 int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, void *buffer) {
-    spinlock_lock(&ide_lock);
+    klock(&ide_lock);
     if (dev && dev->optical) {
         int rc = ide_atapi_read(dev, lba, sector_count, buffer);
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return rc;
     }
     if (!ide_ctrl.initialized || !dev || !buffer || sector_count == 0) {
         printf("IDE: Invalid parameters for read\n");
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return -1;
     }
     if (ide_wait_ready() != 0) {
         printf("IDE: Controller not ready for read\n");
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return -1;
     }
     if (lba + sector_count > ide_ctrl.sectors) {
         printf("IDE: Read beyond drive capacity\n");
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return -1;
     }
 
@@ -489,35 +489,35 @@ int ide_read_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count,
             done += n;
         }
         if (ide_ctrl.dma_ok) {
-            spinlock_unlock(&ide_lock);
+            kunlock(&ide_lock);
             return 0;
         }
         if (done) {
             /* Partial DMA success already copied. Finish the tail with PIO. */
             int rc = ide_pio_rw(lba + done, sector_count - done, dst + (uint64_t)done * 512u, 0);
-            spinlock_unlock(&ide_lock);
+            kunlock(&ide_lock);
             return rc;
         }
     }
 
     int rc = ide_pio_rw(lba, sector_count, buffer, 0);
-    spinlock_unlock(&ide_lock);
+    kunlock(&ide_lock);
     return rc;
 }
 
 int ide_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count, const void *buffer) {
-    spinlock_lock(&ide_lock);
+    klock(&ide_lock);
     if (!ide_ctrl.initialized || !dev || !buffer || dev->optical || sector_count == 0) {
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return -1;
     }
     if (dev->device_id != ide_storage_device_id) {
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return -1;
     }
     if (lba + sector_count > ide_ctrl.sectors) {
         printf("IDE: Write beyond drive capacity\n");
-        spinlock_unlock(&ide_lock);
+        kunlock(&ide_lock);
         return -1;
     }
 
@@ -541,12 +541,12 @@ int ide_write_sectors(storage_device_t *dev, uint64_t lba, uint32_t sector_count
         if (n > IDE_PIO_MAX_SECTORS)
             n = IDE_PIO_MAX_SECTORS;
         if (ide_pio_rw(lba + done, n, (void *)(src + (uint64_t)done * 512u), 1) != 0) {
-            spinlock_unlock(&ide_lock);
+            kunlock(&ide_lock);
             return -1;
         }
         done += n;
     }
-    spinlock_unlock(&ide_lock);
+    kunlock(&ide_lock);
     return 0;
 }
 

@@ -6,6 +6,10 @@
 #include "mem.h"
 #include "atomic.h"
 #include "../include/indevos_errno.h"
+
+/* users.c permission-override table follows renames/deletes. */
+void perm_forget_tree(const char *path);
+void perm_rename_tree(const char *from, const char *to);
 #ifndef EXDEV
 #define EXDEV 18
 #endif
@@ -383,16 +387,16 @@ static int dircache_copy(vfs_dircache_t *c, uint32_t pos, vfs_dirent_t *out, uin
 int vfs_dircache_read(const void *key, const char *path, uint32_t pos, vfs_dirent_t *out, uint32_t max,
                       vfs_dir_augment_fn augment, uint32_t extra) {
     if (pos > 0) {
-        spinlock_lock(&dircache_lock);
+        klock(&dircache_lock);
         for (int i = 0; i < VFS_DIRCACHE_SLOTS; i++) {
             vfs_dircache_t *c = &dircache[i];
             if (c->key == key && c->path && strEql(c->path, path)) {
                 int r = dircache_copy(c, pos, out, max);
-                spinlock_unlock(&dircache_lock);
+                kunlock(&dircache_lock);
                 return r;
             }
         }
-        spinlock_unlock(&dircache_lock);
+        kunlock(&dircache_lock);
     }
     /* (re)build outside the lock */
     vfs_dirent_t *e = NULL;
@@ -407,7 +411,7 @@ int vfs_dircache_read(const void *key, const char *path, uint32_t pos, vfs_diren
     if (!pc) { kfree(e); return -ENOMEM; }
     memcpy(pc, path, pl + 1);
     vfs_dirent_t *old_e = NULL; char *old_p = NULL;
-    spinlock_lock(&dircache_lock);
+    klock(&dircache_lock);
     int slot = -1;
     for (int i = 0; i < VFS_DIRCACHE_SLOTS && slot < 0; i++) if (dircache[i].key == key) slot = i;
     for (int i = 0; i < VFS_DIRCACHE_SLOTS && slot < 0; i++) if (!dircache[i].key) slot = i;
@@ -419,7 +423,7 @@ int vfs_dircache_read(const void *key, const char *path, uint32_t pos, vfs_diren
     old_e = c->ents; old_p = c->path;
     c->key = key; c->path = pc; c->ents = e; c->total = n;
     int r = dircache_copy(c, pos, out, max);
-    spinlock_unlock(&dircache_lock);
+    kunlock(&dircache_lock);
     if (old_e) kfree(old_e);
     if (old_p) kfree(old_p);
     return r;
@@ -428,12 +432,12 @@ int vfs_dircache_read(const void *key, const char *path, uint32_t pos, vfs_diren
 void vfs_dircache_drop(const void *key) {
     for (int i = 0; i < VFS_DIRCACHE_SLOTS; i++) {
         vfs_dirent_t *e = NULL; char *p = NULL;
-        spinlock_lock(&dircache_lock);
+        klock(&dircache_lock);
         if (dircache[i].key == key) {
             e = dircache[i].ents; p = dircache[i].path;
             dircache[i].key = NULL; dircache[i].ents = NULL; dircache[i].path = NULL; dircache[i].total = 0;
         }
-        spinlock_unlock(&dircache_lock);
+        kunlock(&dircache_lock);
         if (e) kfree(e);
         if (p) kfree(p);
     }
@@ -613,7 +617,10 @@ int vfs_unlink(const char *path) {
     bool isdir = vfs_isdir_locked(fs, rel);
     int ret = fs->ops->unlink(fs, rel);
     VFS_UNLOCK();
-    if (ret == 0) inotify_vfs_event(path, IN_DELETE | (isdir ? IN_ISDIR : 0));
+    if (ret == 0) {
+        perm_forget_tree(path);     /* users.c: free the mode-override slot */
+        inotify_vfs_event(path, IN_DELETE | (isdir ? IN_ISDIR : 0));
+    }
     return ret;
 }
 
@@ -661,7 +668,10 @@ int vfs_rename(const char *oldpath, const char *newpath) {
         if (f1 && f1->ops && f1->ops->rename) {
             int rr = f1->ops->rename(f1, r1, r2);
             VFS_UNLOCK();
-            if (rr == 0) inotify_vfs_rename(oldpath, newpath, isdir);
+            if (rr == 0) {
+                perm_rename_tree(oldpath, newpath);
+                inotify_vfs_rename(oldpath, newpath, isdir);
+            }
             return rr;
         }
         VFS_UNLOCK();
@@ -669,7 +679,11 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     /* Same-filesystem rename only for now (single FAT32 root mount). */
     extern int fat32_rename(const char *oldpath, const char *newpath);
     int r = fat32_rename(oldpath, newpath);
-    if (r == 0) { inotify_vfs_rename(oldpath, newpath, isdir); return 0; }
+    if (r == 0) {
+        perm_rename_tree(oldpath, newpath);
+        inotify_vfs_rename(oldpath, newpath, isdir);
+        return 0;
+    }
     if (r == -ENOENT || r == -ENOTEMPTY || r == -EIO || r == -EINVAL)
         return r;
     return r < 0 ? r : -EIO;
@@ -684,13 +698,19 @@ int vfs_rmdir(const char *path) {
     if (fs && fs->ops && fs->ops->rmdir) {
         int r = fs->ops->rmdir(fs, rel);
         VFS_UNLOCK();
-        if (r == 0) inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
+        if (r == 0) {
+            perm_forget_tree(path);
+            inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
+        }
         return r;
     }
     VFS_UNLOCK();
     extern int fat32_remove_empty_directory(const char *path);
     int fr = fat32_remove_empty_directory(path);             /* FAT32: unchanged */
-    if (fr == 0) inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
+    if (fr == 0) {
+        perm_forget_tree(path);
+        inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
+    }
     return fr;
 }
 

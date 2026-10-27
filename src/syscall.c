@@ -38,6 +38,7 @@
 #include "users.h"
 #include "debug_config.h"
 #include "thread.h"
+#include "debug.h"     /* ktrace() */
 #include "profiler.h"
 #include "rtc.h"             // rtc_read() for SYS_RTC_TIME
 #include "kernel_config.h"   // MAX_PROCESSES
@@ -715,13 +716,13 @@ void process_gui_enqueue_by_pid(uint32_t pid, const gui_event_t *ev) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (processes[i].pid == pid && processes[i].is_running) {
             gui_event_queue_t *q = &processes[i].gui_queue;
-            spinlock_lock(&gui_queue_lock);
+            klock(&gui_queue_lock);
             uint32_t next = (q->tail + 1) % GUI_EVENT_QUEUE_CAP;
             if (next != q->head) {
                 q->q[q->tail] = *ev;
                 q->tail = next;
             }
-            spinlock_unlock(&gui_queue_lock);
+            kunlock(&gui_queue_lock);
             return;
         }
     }
@@ -733,15 +734,15 @@ int sys_desktop_poll_event(void *user_ev) {
     if (!desktop_is_running()) return -ENODEV;
 
     gui_event_t ev;
-    spinlock_lock(&gui_queue_lock);
+    klock(&gui_queue_lock);
     gui_event_queue_t *q = &proc->gui_queue;
     if (q->head == q->tail) {
-        spinlock_unlock(&gui_queue_lock);
+        kunlock(&gui_queue_lock);
         return 0;
     }
     ev = q->q[q->head];
     q->head = (q->head + 1) % GUI_EVENT_QUEUE_CAP;
-    spinlock_unlock(&gui_queue_lock);
+    kunlock(&gui_queue_lock);
 
     syscall_uaccess_ensure_user_cr3();
     if (copy_to_user(user_ev, &ev, sizeof(ev)) != 0)
@@ -2118,8 +2119,16 @@ void fork_child_zombie_exit(int status) {
     if (proc)
         fork_release_pending(proc);
 
-    serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
-                  proc ? (int)proc->pid : -1, status);
+    /* ~50 polled serial bytes per exit; configure-style scripts run
+     * thousands of `$(...)` / `( ... )` subshells that fork without exec and
+     * exit 0.  Those stay quiet (`trace on` shows them); every exec'd program
+     * and every non-zero exit is still logged (the desk gate keys on it). */
+    if (!proc || proc->exec_done || status != 0)
+        serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
+                      proc ? (int)proc->pid : -1, status);
+    else
+        ktrace("fork-child-exit: PID %d status=%d -> zombie\n",
+               (int)proc->pid, status);
     process_orphan_children(proc);
 
     if (proc) {

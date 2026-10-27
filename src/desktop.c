@@ -1570,7 +1570,7 @@ static void dt_draw_menubar(int scr_w, int scr_h) {
 
     int bx = 8 + DT_LOGO_W + 12;
     int tab_y = (DESKTOP_MENUBAR_H - DT_TAB_H) / 2;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (!w->visible && !w->minimized) continue;
         if (bx + DT_TAB_W > scr_w - 100) break;
@@ -1592,7 +1592,7 @@ static void dt_draw_menubar(int scr_w, int scr_h) {
                      w->focused ? DT_COL_TEXT_WHITE : DT_COL_TEXT_GRAY, scr_w, scr_h);
         bx += DT_TAB_W + 6;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 
     char clock_buf[16];
     dt_fmt_clock(clock_buf);
@@ -1794,12 +1794,12 @@ static void dt_menubar_click(int mx, int my, int scr_w, int scr_h) {
     }
     int bx = 8 + DT_LOGO_W + 12;
     int tab_y = (DESKTOP_MENUBAR_H - DT_TAB_H) / 2;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (!w->visible && !w->minimized) continue;
         if (bx + DT_TAB_W > scr_w - 100) break;
         if (dt_point_in_rect(mx, my, bx, tab_y, DT_TAB_W, DT_TAB_H)) {
-            spinlock_unlock(&desktop_lock);
+            kunlock(&desktop_lock);
             /* Unminimize first so a minimized fullscreen window comes
              * back. A visible fullscreen tab click leaves fullscreen. */
             if (w->minimized)
@@ -1811,7 +1811,7 @@ static void dt_menubar_click(int mx, int my, int scr_w, int scr_h) {
         }
         bx += DT_TAB_W + 6;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 }
 
 static void dt_dock_click(int mx, int my, int scr_w, int scr_h) {
@@ -1970,12 +1970,12 @@ static desktop_window_t *dt_window_by_id(uint32_t id) {
 }
 
 static void dt_clear_pointer_grab(void) {
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         w->dragging = false;
         w->resize_edges = 0;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     dt_grab_id = 0;
 }
 
@@ -1983,7 +1983,7 @@ static void dt_wm_apply_drag_resize(void) {
     if (!(dt_mouse_btn & 1))
         return;
 
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (w->dragging && !w->maximized) {
             dt_damage_window(w);
@@ -2037,7 +2037,7 @@ static void dt_wm_apply_drag_resize(void) {
             break;
         }
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 }
 
 /* Route pointer events to the focused window's client rect only.
@@ -2834,12 +2834,12 @@ void desktop_poll_input(void) {
 
 int desktop_count_visible_windows(void) {
     int n = 0;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (w->visible && !w->minimized)
             n++;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     return n;
 }
 
@@ -2855,7 +2855,7 @@ bool desktop_wm_needs_composite(void) {
 
     int nvis = 0;
     bool kernel_chrome = false;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (!w->visible || w->minimized)
             continue;
@@ -2863,11 +2863,11 @@ bool desktop_wm_needs_composite(void) {
         if (w->pid == 0)
             kernel_chrome = true;
         if (w->dragging || w->resize_edges) {
-            spinlock_unlock(&desktop_lock);
+            kunlock(&desktop_lock);
             return true;
         }
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 
     /* Multi-window (or none): must stack wallpaper + chrome. */
     if (nvis != 1)
@@ -2895,7 +2895,7 @@ static void dt_render_region(int dmg_x0, int dmg_y0, int dmg_x1, int dmg_y1,
                            scr_h - DESKTOP_MENUBAR_H - DESKTOP_PANEL_H))
         dt_draw_desktop_icons(scr_w, scr_h);
 
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (!w->visible || w->minimized) continue;
         if (w->fullscreen && w->pixels && dt_backbuffer) {
@@ -2919,7 +2919,7 @@ static void dt_render_region(int dmg_x0, int dmg_y0, int dmg_x1, int dmg_y1,
         if (w->visible && !w->minimized && w->fullscreen)
             any_fullscreen = true;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 
     dt_draw_menubar(scr_w, scr_h);
     if (!any_fullscreen)
@@ -3082,7 +3082,7 @@ void desktop_composite_frame(void) {
     dt_reap_orphan_windows();
 
     bool any_window_dirty = false;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (w->dirty) {
             any_window_dirty = true;
@@ -3091,7 +3091,7 @@ void desktop_composite_frame(void) {
             dt_damage_add(fx - 4, fy, fw + DESKTOP_SHADOW_PAD, fh + DESKTOP_SHADOW_PAD);
         }
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 
     bool toast_changed = dt_toast_tick(scr_w, scr_h);
     bool need_render = dt_dirty || mouse_moved || buttons_diff ||
@@ -3163,10 +3163,10 @@ void desktop_composite_frame(void) {
      * scanout never shows a half-composed frame. */
     for (int i = 0; i < nreg; i++)
         dt_render_region(regs[i].x0, regs[i].y0, regs[i].x1, regs[i].y1, scr_w, scr_h);
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next)
         w->dirty = false;
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 
     dt_dirty = false;
     dt_clip_clear();
@@ -3274,12 +3274,12 @@ static void dt_start_geom(int *x, int *y, int *w, int *h) {
 
 static int dt_collect_windows(desktop_window_t **out, int max) {
     int n = 0;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next) {
         if (w->id == 0 || w->type == DESKTOP_WIN_POPUP) continue;
         if (n < max) out[n++] = w;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     return n;
 }
 
@@ -3646,7 +3646,7 @@ void desktop_stop(void) {
     dt_wallpaper_tried = false;
 
     /* Destroy all windows */
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
         if (windows[i].id != 0) {
             /* Let kernel apps drop their window pointers (the terminal
@@ -3665,7 +3665,7 @@ void desktop_stop(void) {
     win_bottom = win_top = NULL;
     dt_focused_id = 0;
     dt_grab_id = 0;
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
 
     /* Restore normal terminal output path */
     extern void term_set_output_hook(void (*hook)(const char *, size_t));
@@ -3694,7 +3694,7 @@ desktop_window_t *desktop_create_window_ex(uint32_t pid, int x, int y,
                                            int w, int h, const char *title,
                                            int type, uint32_t parent_id,
                                            int format) {
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
 
     desktop_window_t *win = NULL;
     for (int i = 0; i < DESKTOP_MAX_WINDOWS; i++) {
@@ -3704,7 +3704,7 @@ desktop_window_t *desktop_create_window_ex(uint32_t pid, int x, int y,
         }
     }
     if (!win) {
-        spinlock_unlock(&desktop_lock);
+        kunlock(&desktop_lock);
         serial_puts("[desktop] no free window slots\n");
         return NULL;
     }
@@ -3742,7 +3742,7 @@ desktop_window_t *desktop_create_window_ex(uint32_t pid, int x, int y,
     win->pixels = (uint32_t *)kalloc(buf_sz);
     if (!win->pixels) {
         win->id = 0;  /* release slot (static windows[] entry) */
-        spinlock_unlock(&desktop_lock);
+        kunlock(&desktop_lock);
         serial_puts("[desktop] OOM allocating window pixels\n");
         return NULL;
     }
@@ -3761,7 +3761,7 @@ desktop_window_t *desktop_create_window_ex(uint32_t pid, int x, int y,
     win->focused = true;
     dt_focused_id = win->id;
 
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     dt_apply_keyboard_focus();
     dt_dirty = true;
 
@@ -3779,7 +3779,7 @@ void desktop_destroy_window(desktop_window_t *win) {
     kterm_on_window_destroyed(win);
     settings_app_on_window_destroyed(win);
 
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
 
     /* Unlink from Z-order list */
     if (win->prev) win->prev->next = win->next;
@@ -3811,7 +3811,7 @@ void desktop_destroy_window(desktop_window_t *win) {
         dt_focused_id = 0;
     }
 
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     if (was_focused)
         dt_apply_keyboard_focus();
     dt_dirty = true;
@@ -3907,7 +3907,7 @@ static void dt_reap_orphan_windows(void) {
 void desktop_raise_window(desktop_window_t *win) {
     if (!win || win == win_top) return;
 
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
 
     /* Unlink */
     if (win->prev) win->prev->next = win->next;
@@ -3921,14 +3921,14 @@ void desktop_raise_window(desktop_window_t *win) {
     win_top = win;
     if (!win_bottom) win_bottom = win;
 
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     dt_dirty = true;
 }
 
 void desktop_focus_window(desktop_window_t *win) {
     if (win && win->minimized)
         dt_restore_window(win);
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next)
         w->focused = false;
     if (win) {
@@ -3937,7 +3937,7 @@ void desktop_focus_window(desktop_window_t *win) {
     } else {
         dt_focused_id = 0;
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     if (win)
         desktop_raise_window(win); /* raise-on-focus */
     dt_apply_keyboard_focus();
@@ -3945,10 +3945,10 @@ void desktop_focus_window(desktop_window_t *win) {
 }
 
 void desktop_unfocus_all(void) {
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_bottom; w; w = w->next)
         w->focused = false;
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     dt_focused_id = 0;
     SDL_ResetInputState();
     keyboard_set_raw_mode(false);
@@ -4032,7 +4032,7 @@ desktop_window_t *desktop_get_focused(void) {
 /* Returns topmost visible window whose frame contains (x, y). */
 desktop_window_t *desktop_window_at(int x, int y) {
     desktop_window_t *hit = NULL;
-    spinlock_lock(&desktop_lock);
+    klock(&desktop_lock);
     for (desktop_window_t *w = win_top; w; w = w->prev) {
         if (!w->visible || w->minimized) continue;
         if (w->fullscreen) {
@@ -4051,7 +4051,7 @@ desktop_window_t *desktop_window_at(int x, int y) {
             break;
         }
     }
-    spinlock_unlock(&desktop_lock);
+    kunlock(&desktop_lock);
     return hit;
 }
 

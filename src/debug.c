@@ -144,7 +144,7 @@ void debug_analyze_address(uint64_t addr) {
 }
 
 void debug_track_allocation(void* ptr, size_t size, const char* file, int line) {
-    spinlock_lock(&alloc_lock);
+    klock(&alloc_lock);
     
     // Find empty slot
     for(int i = 0; i < MAX_ALLOCATIONS; i++) {
@@ -159,11 +159,11 @@ void debug_track_allocation(void* ptr, size_t size, const char* file, int line) 
     }
     
     total_allocations++;
-    spinlock_unlock(&alloc_lock);
+    kunlock(&alloc_lock);
 }
 
 void debug_track_deallocation(void* ptr, const char* file, int line) {
-    spinlock_lock(&alloc_lock);
+    klock(&alloc_lock);
     
     // Find and mark as inactive
     bool found = false;
@@ -180,11 +180,11 @@ void debug_track_deallocation(void* ptr, const char* file, int line) {
     }
     
     total_deallocations++;
-    spinlock_unlock(&alloc_lock);
+    kunlock(&alloc_lock);
 }
 
 void debug_print_allocations(void) {
-    spinlock_lock(&alloc_lock);
+    klock(&alloc_lock);
     
     printf("Active allocations:\n");
     int count = 0;
@@ -197,7 +197,7 @@ void debug_print_allocations(void) {
     }
     printf("Total: %d active allocations\n", count);
     
-    spinlock_unlock(&alloc_lock);
+    kunlock(&alloc_lock);
 }
 
 void debug_memory_poison(void* ptr, size_t size) {

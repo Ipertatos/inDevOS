@@ -201,9 +201,9 @@ void settings_app_open(void) {
     set_win = desktop_create_window(0, x, y, SET_W, SET_H, "Settings");
     if (!set_win) return;
     set_status_msg("Click a row to change it");
-    spinlock_lock(&set_win->content_lock);
+    klock(&set_win->content_lock);
     set_redraw();
-    spinlock_unlock(&set_win->content_lock);
+    kunlock(&set_win->content_lock);
     serial_puts("[settings] opened\n");
 }
 
@@ -232,8 +232,8 @@ void settings_app_on_mouse(int rx, int ry, bool down) {
 
 bool settings_app_tick(void) {
     if (!settings_app_is_open() || !set_need) return false;
-    spinlock_lock(&set_win->content_lock);
+    klock(&set_win->content_lock);
     set_redraw();
-    spinlock_unlock(&set_win->content_lock);
+    kunlock(&set_win->content_lock);
     return true;
 }

@@ -45,6 +45,7 @@ tests/fbdev/build/
 tests/forksig/build/
 tests/busybox/build/
 tests/binutils/build/
+tests/make/build/
 tests/musl/build/
 *.ko
 shot-*/

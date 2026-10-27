@@ -180,7 +180,11 @@ if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
         mcopy -o -i "$ROOTFS" "$TCC_STAGE"/home/user/*.c ::/home/user/
     fi
     # Self-hosting extras: static musl GNU make and a tiny make demo.
-    if [[ -f "$TCC_STAGE/bin/make.exe" ]]; then
+    # tests/make/build_make.sh output wins over the copy in the TCC stage.
+    if [[ -f tests/make/build/bin/make ]]; then
+        mcopy -o -i "$ROOTFS" tests/make/build/bin/make ::/bin/make.exe
+        echo "    /bin/make.exe (static musl GNU make, tests/make/build_make.sh)"
+    elif [[ -f "$TCC_STAGE/bin/make.exe" ]]; then
         mcopy -o -i "$ROOTFS" "$TCC_STAGE/bin/make.exe" ::/bin/make.exe
         echo "    /bin/make.exe (static musl GNU make)"
     fi
