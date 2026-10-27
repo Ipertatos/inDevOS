@@ -169,6 +169,7 @@ int fat32_rename(const char *oldpath, const char *newpath);
 int fat32_create_file(const char *filename);
 int fat32_truncate_file(const char *filename);
 int fat32_file_exists(const char *filename);
+int fat32_entry_times(const char *path, int set, int64_t *mtime, int64_t *atime);
 
 // Path resolution – resolve a full path to its parent directory cluster
 // and extract the basename.  Returns 0 on success, -1 if any intermediate

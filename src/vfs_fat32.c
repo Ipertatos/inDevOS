@@ -4,6 +4,7 @@
 #include "string.h"
 #include "utils.h"
 #include "mem.h"
+#include "../include/indevos_errno.h"
 
 // ---- FAT32 adapter for VFS --------------------------------------------------
 //
@@ -237,6 +238,18 @@ static int fat32_vfs_exists(vfs_filesystem_t *fs, const char *rel_path) {
 
 // ---- Static ops table -------------------------------------------------------
 
+static int fat32_vfs_times(vfs_filesystem_t *fs, const char *rel_path, int set,
+                           int64_t *mtime, int64_t *atime) {
+    (void)fs;
+    char full[VFS_MAX_PATH];
+    if (rel_path[0] == '\0') return -ENOENT;          /* root: no entry */
+    full[0] = '/';
+    size_t rlen = strlen(rel_path);
+    if (rlen >= VFS_MAX_PATH - 1) return -ENAMETOOLONG;
+    memmove(full + 1, rel_path, rlen + 1);
+    return fat32_entry_times(full, set, mtime, atime);
+}
+
 static vfs_fs_ops_t fat32_vfs_ops = {
     .open    = fat32_vfs_open,
     .close   = fat32_vfs_close,
@@ -250,6 +263,7 @@ static vfs_fs_ops_t fat32_vfs_ops = {
     .unlink  = fat32_vfs_unlink,
     .exists  = fat32_vfs_exists,
     .read_only = fat32_vfs_read_only,
+    .times   = fat32_vfs_times,
 };
 
 // ---- Public -----------------------------------------------------------------

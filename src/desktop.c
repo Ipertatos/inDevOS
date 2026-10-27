@@ -419,7 +419,7 @@ static bool dt_set_content_size(desktop_window_t *w, int nw, int nh) {
 
     int cw = nw < w->content_w ? nw : w->content_w;
     int ch = nh < w->content_h ? nh : w->content_h;
-    spinlock_lock(&w->content_lock);
+    klock(&w->content_lock);
     if (w->pixels) {
         uint32_t old_pitch = w->pixel_pitch / 4;
         for (int y = 0; y < ch; y++)
@@ -440,7 +440,7 @@ static bool dt_set_content_size(desktop_window_t *w, int nw, int nh) {
     w->content_w = nw;
     w->content_h = nh;
     w->pixel_pitch = (uint32_t)nw * 4;
-    spinlock_unlock(&w->content_lock);
+    kunlock(&w->content_lock);
 
     if (w->pid) {
         gui_event_t ev = { GUI_EVENT_RESIZE, nw, nh, 0 };
@@ -1259,7 +1259,7 @@ static void dt_scale_client_to(desktop_window_t *win,
     int sp = (int)(win->pixel_pitch / 4u);
     if (!dst || !win->pixels || sw < 1 || sh < 1 || dw < 1 || dh < 1 || sp < 1)
         return;
-    spinlock_lock(&win->content_lock);
+    klock(&win->content_lock);
     for (int y = 0; y < dh; y++) {
         int py = dy + y;
         if (py < clip_y0 || py >= clip_y1)
@@ -1277,7 +1277,7 @@ static void dt_scale_client_to(desktop_window_t *win,
             drow[px] = srow[sx] | 0xFF000000u;
         }
     }
-    spinlock_unlock(&win->content_lock);
+    kunlock(&win->content_lock);
 }
 
 static bool dt_present_window_fast(desktop_window_t *win) {
@@ -1361,7 +1361,7 @@ static bool dt_present_window_fast(desktop_window_t *win) {
     bool hal_scanout = hal && hal->pixels &&
                        hal->pixels != (uint32_t *)fb->address;
 
-    spinlock_lock(&win->content_lock);
+    klock(&win->content_lock);
     /* One copy to the active scanout buffer.  Previously this path memcpy'd
      * the same client rect into backbuffer + Limine FB + virtio FB (~19 MB for
      * a 1600x1000 doom frame) before flushing — a major FPS killer. */
@@ -1372,7 +1372,7 @@ static bool dt_present_window_fast(desktop_window_t *win) {
                src + ((uint32_t)src_y + row) * win->pixel_pitch + (uint32_t)src_x * 4,
                row_bytes);
     }
-    spinlock_unlock(&win->content_lock);
+    kunlock(&win->content_lock);
 
     gpu_hal_present_rect((uint32_t)cx, (uint32_t)cy, w, h);
     win->dirty = false;
@@ -1673,7 +1673,7 @@ static void dt_open_kernel_text_window(const char *title,
     r_target_t wt;
     r_target_init(&wt, win->pixels, w, h, w);
 
-    spinlock_lock(&win->content_lock);
+    klock(&win->content_lock);
     r_fill(&wt, 0, 0, w, h, 0xFF141824);
     r_fill(&wt, 0, 0, w, 3, DT_COL_ACCENT);
     r_fill(&wt, 24, 28, w - 48, 1, DT_COL_BORDER);
@@ -1684,7 +1684,7 @@ static void dt_open_kernel_text_window(const char *title,
         ty += 22;
         if (ty > h - 28) break;
     }
-    spinlock_unlock(&win->content_lock);
+    kunlock(&win->content_lock);
     win->dirty = true;
     dt_dirty = true;
 }
@@ -1898,7 +1898,7 @@ static void dt_blit_window(desktop_window_t *win, int scr_w, int scr_h) {
     int cy = win->y + (win->decorated ? DESKTOP_BORDER_W + DESKTOP_TITLEBAR_H : 0);
     uint32_t src_pitch_pix = win->pixel_pitch / 4;
 
-    spinlock_lock(&win->content_lock);
+    klock(&win->content_lock);
     if (dt_rt_ready && win->format == DESKTOP_FMT_ARGB) {
         r_blit_premul(&dt_rt, cx, cy, win->pixels,
                       win->content_w, win->content_h, (int)src_pitch_pix);
@@ -1945,7 +1945,7 @@ static void dt_blit_window(desktop_window_t *win, int scr_w, int scr_h) {
             }
         }
     }
-    spinlock_unlock(&win->content_lock);
+    kunlock(&win->content_lock);
 }
 
 /* ===================================================================
@@ -2276,7 +2276,7 @@ static void dt_menu_draw(void) {
     if (!w || !w->pixels) return;
     r_target_t t;
     r_target_init(&t, w->pixels, w->content_w, w->content_h, (int)(w->pixel_pitch / 4));
-    spinlock_lock(&w->content_lock);
+    klock(&w->content_lock);
     r_fill(&t, 0, 0, w->content_w, w->content_h, 0);   /* transparent corners */
     r_rrect(&t, 0, 0, w->content_w, w->content_h, 8, dt_premul(0xF0161B2A));
     r_rrect_outline(&t, 0, 0, w->content_w, w->content_h, 8, 0xFF2A3148);
@@ -2287,7 +2287,7 @@ static void dt_menu_draw(void) {
         r_text(&t, 16, y + (DT_MENU_ITEM_H - 16) / 2, dt_menu_labels[i],
                i == dt_menu_sel ? 0xFFFFFFFF : 0xFFE5E9F0);
     }
-    spinlock_unlock(&w->content_lock);
+    kunlock(&w->content_lock);
     w->dirty = true;
 }
 
@@ -2472,7 +2472,7 @@ static void dt_dlg_draw(void) {
     if (!w || !w->pixels) return;
     r_target_t t;
     r_target_init(&t, w->pixels, w->content_w, w->content_h, (int)(w->pixel_pitch / 4));
-    spinlock_lock(&w->content_lock);
+    klock(&w->content_lock);
     r_fill(&t, 0, 0, w->content_w, w->content_h, 0);
     r_rrect(&t, 0, 0, w->content_w, w->content_h, 10, dt_premul(0xF8161B2A));
     r_rrect_outline(&t, 0, 0, w->content_w, w->content_h, 10, 0xFF3A4360);
@@ -2501,7 +2501,7 @@ static void dt_dlg_draw(void) {
         int lw = (int)strlen(lab) * 8;
         r_text(&t, bx + (DT_DLG_BTN_W - lw) / 2, by + 8, lab, 0xFFFFFFFF);
     }
-    spinlock_unlock(&w->content_lock);
+    kunlock(&w->content_lock);
     w->dirty = true;
 }
 
@@ -3841,9 +3841,9 @@ static bool dt_destroy_client_window(desktop_window_t *w) {
     uint32_t *pix = w->pixels;
     bool sdl = false;
     if (pix) {
-        spinlock_lock(&w->content_lock);
+        klock(&w->content_lock);
         w->pixels = NULL;              /* compositor stops reading it */
-        spinlock_unlock(&w->content_lock);
+        kunlock(&w->content_lock);
         sdl = sdl_destroy_window_sharing_pixels(pix);
         if (!sdl)
             w->pixels = pix;           /* ours: desktop_destroy_window frees it */
@@ -4307,7 +4307,7 @@ int desktop_sys_composite(uint32_t pid, const void *user_pixels,
     int iscale = (scale_x < scale_y) ? scale_x : scale_y;
     bool scaled = (iscale >= 2) && (w * h * 4u <= 512u * 1024u);
 
-    spinlock_lock(&win->content_lock);
+    klock(&win->content_lock);
     if (scaled) {
         static uint32_t *scratch;
         static size_t scratch_bytes;
@@ -4318,7 +4318,7 @@ int desktop_sys_composite(uint32_t pid, const void *user_pixels,
             scratch_bytes = scratch ? src_bytes : 0;
         }
         if (!scratch || copy_from_user(scratch, user_pixels, src_bytes) != 0) {
-            spinlock_unlock(&win->content_lock);
+            kunlock(&win->content_lock);
             return -14;
         }
         int vw = (int)w * iscale;
@@ -4352,7 +4352,7 @@ int desktop_sys_composite(uint32_t pid, const void *user_pixels,
     } else if (win->pixel_pitch == w * 4 && copy_w == w) {
         size_t nbytes = (size_t)copy_h * (size_t)w * 4;
         if (copy_from_user(win->pixels, user_pixels, nbytes) != 0) {
-            spinlock_unlock(&win->content_lock);
+            kunlock(&win->content_lock);
             return -14; /* EFAULT */
         }
     } else {
@@ -4361,12 +4361,12 @@ int desktop_sys_composite(uint32_t pid, const void *user_pixels,
             void *dst = (uint8_t *)win->pixels + (size_t)y * win->pixel_pitch;
             const void *src = (const uint8_t *)user_pixels + (size_t)y * (size_t)w * 4;
             if (copy_from_user(dst, src, row_bytes) != 0) {
-                spinlock_unlock(&win->content_lock);
+                kunlock(&win->content_lock);
                 return -14; /* EFAULT */
             }
         }
     }
-    spinlock_unlock(&win->content_lock);
+    kunlock(&win->content_lock);
 
     /* Doom presents a 320x200 buffer. Cap that path at 35 Hz on the PM timer
      * (HLT pacing does not hold when HPET is absent). */

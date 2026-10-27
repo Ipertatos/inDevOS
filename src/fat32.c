@@ -8,6 +8,10 @@
 #include "atomic.h"
 #include "hpet.h"
 #include "ktime.h"   /* ktime_now_us() for the read diagnostic */
+#include "rtc.h"     /* rtc_unix_epoch(): FAT timestamps */
+#ifndef ENODATA
+#define ENODATA 61
+#endif
 #include "debug_config.h"
 #include "../include/indevos_errno.h"
 
@@ -29,6 +33,62 @@ static spinlock_t fat32_lock = {0};
  * 2^20 clusters (4 GiB at 4 KiB/cluster) is a generous practical cap.
  */
 #define FAT32_MAX_CHAIN_CLUSTERS (1u << 20)
+
+/*
+ * Timestamps.  Entries used to be written with all date/time fields 0
+ * (shown as 1980) and stat() reported "now" for every FAT file, so make and
+ * autoconf could not order files.  Times are stored as UTC (the RTC/CLOCK_REALTIME
+ * base), write time at 2 s resolution like every FAT driver.
+ */
+static uint64_t fat32_epoch_base_us;
+static bool     fat32_epoch_ok;
+static uint64_t fat32_now_epoch(void) {
+    if (!fat32_epoch_ok) {
+        uint64_t now = ktime_now_us();
+        fat32_epoch_base_us = rtc_unix_epoch() * 1000000ULL - now;
+        fat32_epoch_ok = true;
+    }
+    return (fat32_epoch_base_us + ktime_now_us()) / 1000000ULL;
+}
+static void fat32_epoch_to_dt(int64_t t, uint16_t *date, uint16_t *time) {
+    if (t < 315532800LL) t = 315532800LL;              /* 1980-01-01 */
+    if (t > 4354819198LL) t = 4354819198LL;            /* 2107-12-31 23:59:58 */
+    int64_t days = t / 86400, rem = t % 86400;
+    /* civil_from_days (Howard Hinnant) */
+    int64_t z = days + 719468, era = z / 146097;
+    uint32_t doe = (uint32_t)(z - era * 146097);
+    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = (int64_t)yoe + era * 400;
+    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint32_t mp = (5 * doy + 2) / 153;
+    uint32_t d = doy - (153 * mp + 2) / 5 + 1;
+    uint32_t m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
+    if (date) *date = (uint16_t)(((y - 1980) << 9) | (m << 5) | d);
+    if (time) *time = (uint16_t)(((rem / 3600) << 11) | (((rem / 60) % 60) << 5) | ((rem % 60) / 2));
+}
+static int64_t fat32_dt_to_epoch(uint16_t date, uint16_t time) {
+    if (date == 0) return -1;                          /* never stamped */
+    int64_t y = 1980 + (date >> 9);
+    uint32_t m = (date >> 5) & 15, d = date & 31;
+    if (m < 1 || m > 12 || d < 1) return -1;
+    y -= m <= 2;                                        /* days_from_civil */
+    int64_t era = y / 400;
+    uint32_t yoe = (uint32_t)(y - era * 400);
+    uint32_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + (int64_t)doe - 719468;
+    return days * 86400 + (time >> 11) * 3600 + ((time >> 5) & 63) * 60 + (time & 31) * 2;
+}
+static void fat32_stamp_write(fat32_dir_entry_t *e) {
+    uint16_t d, t;
+    fat32_epoch_to_dt((int64_t)fat32_now_epoch(), &d, &t);
+    e->write_date = d; e->write_time = t; e->last_access_date = d;
+}
+/* rename keeps the entry's times (Linux rename does not touch mtime) */
+static struct { bool use; uint8_t ctenth; uint16_t ctime, cdate, adate, wtime, wdate; } fat_keep_times;
+/* slot of the last fat32_find_in_dir() match (FS_LOCK held) */
+static uint32_t fat_last_find_cluster, fat_last_find_index;
 
 // Forward declarations for helper functions used before their definitions
 static uint32_t fat32_allocate_cluster(fat32_fs_t *fs);
@@ -770,6 +830,8 @@ static int fat32_find_in_dir_impl(fat32_fs_t *fs, uint32_t dir_cluster,
                                           e->first_cluster_lo;
                 }
                 if (out_attr) *out_attr = e->attr;
+                fat_last_find_cluster = dir_cluster;
+                fat_last_find_index = i;
                 kfree(buf);
                 return 0;
             }
@@ -1582,6 +1644,7 @@ static int fat32_update_dir_entry_impl(fat32_file_t *file, uint32_t dir_start_cl
             e->first_cluster_hi = (uint16_t)(file->first_cluster >> 16);
             e->first_cluster_lo = (uint16_t)(file->first_cluster & 0xFFFF);
             e->file_size        = file->file_size;
+            fat32_stamp_write(e);
             int ret = fat32_write_cluster(fs, file->dirent_cluster, dir_buf);
             kfree(dir_buf);
             return ret;
@@ -1667,6 +1730,7 @@ static int fat32_update_dir_entry_impl(fat32_file_t *file, uint32_t dir_start_cl
                 e->first_cluster_hi = (uint16_t)(file->first_cluster >> 16);
                 e->first_cluster_lo = (uint16_t)(file->first_cluster & 0xFFFF);
                 e->file_size        = file->file_size;
+                fat32_stamp_write(e);
                 file->dirent_cluster = dir_cluster;
                 file->dirent_index = i;
                 memcpy(file->dirent_name, e->name, 11);
@@ -2416,6 +2480,15 @@ static int fat32_dir_place_named_entry(fat32_fs_t *fs, uint32_t parent_cluster,
     entry->first_cluster_hi = (uint16_t)(first_cluster >> 16);
     entry->first_cluster_lo = (uint16_t)(first_cluster & 0xFFFF);
     entry->file_size = file_size;
+    if (fat_keep_times.use) {
+        entry->created_time_tenth = fat_keep_times.ctenth;
+        entry->created_time = fat_keep_times.ctime; entry->created_date = fat_keep_times.cdate;
+        entry->last_access_date = fat_keep_times.adate;
+        entry->write_time = fat_keep_times.wtime; entry->write_date = fat_keep_times.wdate;
+    } else {
+        fat32_stamp_write(entry);
+        entry->created_time = entry->write_time; entry->created_date = entry->write_date;
+    }
 
     if (fat32_write_cluster(fs, slot_cluster, cluster_buffer) != 0) {
         kfree(cluster_buffer);
@@ -2819,6 +2892,10 @@ static int fat32_unlink_dir_entry_keep(uint32_t parent_cluster, const char *base
                     *out_first_cluster = ((uint32_t)e->first_cluster_hi << 16) | e->first_cluster_lo;
                 if (out_size) *out_size = e->file_size;
                 if (out_attr) *out_attr = e->attr;
+                fat_keep_times.ctenth = e->created_time_tenth;
+                fat_keep_times.ctime = e->created_time; fat_keep_times.cdate = e->created_date;
+                fat_keep_times.adate = e->last_access_date;
+                fat_keep_times.wtime = e->write_time; fat_keep_times.wdate = e->write_date;
                 if (lfn_seq_valid && lfn_seq_start >= 0) {
                     for (int j = lfn_seq_start; j < (int)i; j++)
                         entries[j].name[0] = (char)0xE5;
@@ -2902,13 +2979,16 @@ int fat32_rename(const char *oldpath, const char *newpath) {
             if (*q == '/') sl = q + 1;
         if (*sl && fat32_name_eq_ci(sl, new_base)) new_leaf = sl;
     }
+    fat_keep_times.use = true;
     if (fat32_dir_place_named_entry(&fat32_filesystem, new_parent, new_leaf,
                                     attr, first_cluster, file_size) != 0) {
         /* Best-effort rollback: put the old name back. */
         (void)fat32_dir_place_named_entry(&fat32_filesystem, old_parent, old_base,
                                           attr, first_cluster, file_size);
+        fat_keep_times.use = false;
         FS_UNLOCK(); return -EIO;
     }
+    fat_keep_times.use = false;
 
     /* Cross-directory move of a directory: update ".." to the new parent. */
     if ((attr & FAT32_ATTR_DIRECTORY) && first_cluster >= 2 &&
@@ -2969,6 +3049,50 @@ int fat32_remove_empty_directory(const char *path) {
 }
 
 // Get file information – supports full paths (e.g. "/docs/readme.txt")
+/* Read (set == 0) or store (set != 0) an entry's modification/access time,
+ * epoch seconds (UTC).  0, -ENOENT, -ENODATA (entry never stamped: callers
+ * keep their old "now"), -EROFS or -EIO.  The root directory has no entry. */
+int fat32_entry_times(const char *path, int set, int64_t *mtime, int64_t *atime) {
+    FS_LOCK();
+    if (!fat32_is_mounted()) { FS_UNLOCK(); return -ENOENT; }
+    uint32_t parent = 0, fc = 0; uint8_t attr = 0;
+    char base[256];
+    if (fat32_resolve_path(path, &parent, base, sizeof(base)) != 0 || base[0] == '\0' ||
+        fat32_find_in_dir(&fat32_filesystem, parent, base, &fc, &attr) != 0) {
+        FS_UNLOCK(); return -ENOENT;
+    }
+    if (set && fat32_medium_read_only()) { FS_UNLOCK(); return -EROFS; }
+    uint32_t cl = fat_last_find_cluster, idx = fat_last_find_index;
+    uint32_t bpc = fat32_filesystem.bytes_per_cluster;
+    if (idx >= bpc / sizeof(fat32_dir_entry_t)) { FS_UNLOCK(); return -EIO; }
+    void *buf = kalloc(bpc);
+    if (!buf) { FS_UNLOCK(); return -ENOMEM; }
+    int rc = 0;
+    if (fat32_read_cluster(&fat32_filesystem, cl, buf) != 0) rc = -EIO;
+    else {
+        fat32_dir_entry_t *e = &((fat32_dir_entry_t *)buf)[idx];
+        if (!set) {
+            int64_t m = fat32_dt_to_epoch(e->write_date, e->write_time);
+            if (m < 0) rc = -ENODATA;
+            else {
+                if (mtime) *mtime = m;
+                if (atime) {
+                    int64_t a = fat32_dt_to_epoch(e->last_access_date, 0);
+                    *atime = a < 0 ? m : a;
+                }
+            }
+        } else {
+            uint16_t d, t;
+            if (mtime) { fat32_epoch_to_dt(*mtime, &d, &t); e->write_date = d; e->write_time = t; }
+            if (atime) { fat32_epoch_to_dt(*atime, &d, NULL); e->last_access_date = d; }
+            if (fat32_write_cluster(&fat32_filesystem, cl, buf) != 0) rc = -EIO;
+        }
+    }
+    kfree(buf);
+    FS_UNLOCK();
+    return rc;
+}
+
 int fat32_file_exists(const char *filename) {
     FS_LOCK();
     if (!fat32_is_mounted()) {

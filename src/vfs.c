@@ -705,6 +705,17 @@ int vfs_stat(const char *path, vfs_stat_t *st) {
     return r;
 }
 
+int vfs_times(const char *path, int set, int64_t *mtime, int64_t *atime) {
+    if (!path) return -EINVAL;
+    VFS_LOCK();
+    const char *rel = NULL;
+    vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
+    if (!fs || !fs->ops || !fs->ops->times) { VFS_UNLOCK(); return -ENOSYS; }
+    int r = fs->ops->times(fs, rel ? rel : "", set, mtime, atime);
+    VFS_UNLOCK();
+    return r;
+}
+
 /* ---- symlinks, hard links, inode attributes ---- */
 int vfs_resolve(const char *path, char *out, size_t outsz, bool follow_last) {
     if (!path || path[0] != '/' || !out || outsz < 2) return -EINVAL;

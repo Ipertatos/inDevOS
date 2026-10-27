@@ -818,7 +818,8 @@ static int lx_path_kind(const char *abspath, stat_t *st_out) {
  * found. For metadata lookups only, a missing extensionless path that has a
  * regular-file "<path>.exe" sibling resolves to it (execve already does this).
  */
-static void lx_exe_alias(char *path, size_t sz) {
+extern const char *syscall_busybox_applet_path(const char *path);
+static void lx_exe_alias2(char *path, size_t sz, bool bb_ok) {
     if (lx_path_kind(path, NULL)) return;
     size_t n = strlen(path);
     const char *slash = path;
@@ -826,8 +827,13 @@ static void lx_exe_alias(char *path, size_t sz) {
     for (const char *c = slash; *c; c++) if (*c == '.') return;
     if (!*slash || n + 5 > sz) return;
     memcpy(path + n, ".exe", 5);
-    if (lx_path_kind(path, NULL) != 1) path[n] = '\0';
+    if (lx_path_kind(path, NULL) == 1) return;
+    path[n] = '\0';
+    /* missing BusyBox applet path (/bin/sed, /usr/bin/awk): execve runs it */
+    const char *bb = bb_ok ? syscall_busybox_applet_path(path) : NULL;
+    if (bb && strlen(bb) < sz) kstrncpy(path, bb, sz);
 }
+static void lx_exe_alias(char *path, size_t sz) { lx_exe_alias2(path, sz, true); }
 
 static void lx_fill_stat(lx_stat_t *ls, const stat_t *st) {
     memset(ls, 0, sizeof(*ls));
@@ -1003,6 +1009,14 @@ static long lx_fd_path(process_t *p, long fd, char *out, size_t outsz) {
     if (f->fd_type == FD_TYPE_VFS && vfs_fd_get_path(f->vfs_fd, out, outsz) >= 0)
         return 0;
     return 1;
+}
+
+/* utime*(): store on filesystems with a times hook (FAT32); the others
+ * accept and ignore.  Only a read-only medium is an error. */
+static long lx_store_times(const char *path, bool sa, int64_t at, bool sm, int64_t mt) {
+    if (!sa && !sm) return 0;
+    int r = vfs_times(path, 1, sm ? &mt : NULL, sa ? &at : NULL);
+    return r == -EROFS ? -EROFS : 0;
 }
 
 static long lx_fstat(process_t *p, long fd, void *ubuf) {
@@ -2831,7 +2845,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (nf) { char lb[4]; if (vfs_readlink(path, lb, sizeof(lb)) >= 0) return -EOPNOTSUPP; }
         }
         if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
-        lx_exe_alias(path, sizeof(path));
+        lx_exe_alias2(path, sizeof(path), false);  /* never chmod busybox */
         if (!lx_path_kind(path, NULL)) return -ENOENT;
         r = vfs_setattr(path, VFS_SA_MODE, mode & 07777, 0, 0);
         if (r != -ENOSYS) return r;
@@ -2862,25 +2876,50 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     }
     case LX_utimensat: {
         /* BusyBox touch: utimensat first; on ENOENT it open(O_CREAT).
-         * Always returning 0 made touch exit success without creating. */
+         * Always returning 0 made touch exit success without creating.
+         * FAT32 stores the times (tar, touch -d, make); other filesystems
+         * without a set-times hook accept and ignore them. */
         long dfd = (long)(int)a1;
         const char *up = (const char *)a2;
-        if (!up) return -EFAULT;
-        if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), (a4 & 0x1000) != 0,
-                              !(a4 & LX_AT_SYMLINK_NOFOLLOW))))
-            return r; /* AT_EMPTY_PATH */
-        if (!lx_path_kind(path, NULL)) return -ENOENT;
-        return 0; /* timestamps not stored on FAT32 yet */
+        if (!up) {                                      /* futimens(fd, ...) */
+            if (!lx_fd_ok(p, dfd)) return -EBADF;
+            if (p->fds[dfd].fd_type != FD_TYPE_VFS || p->fds[dfd].vfs_fd < 0 ||
+                vfs_fd_get_path(p->fds[dfd].vfs_fd, path, sizeof(path)) != 0)
+                return 0;
+        } else {
+            if ((r = lx_resolve_f(p, dfd, up, path, sizeof(path), (a4 & 0x1000) != 0,
+                                  !(a4 & LX_AT_SYMLINK_NOFOLLOW))))
+                return r; /* AT_EMPTY_PATH */
+            if (!lx_path_kind(path, NULL)) return -ENOENT;
+        }
+        int64_t nowt = (int64_t)(lx_real_us() / 1000000ULL), tv[4] = { 0, 0, 0, 0 };
+        int64_t at = nowt, mt = nowt;
+        bool sa = true, sm = true;
+        if (a3) {
+            if (lx_get(tv, (const void *)a3, sizeof(tv))) return -EFAULT;
+            const int64_t NOW = (1L << 30) - 1, OMIT = (1L << 30) - 2;
+            if (tv[1] == OMIT) sa = false; else if (tv[1] != NOW) at = tv[0];
+            if (tv[3] == OMIT) sm = false; else if (tv[3] != NOW) mt = tv[2];
+        }
+        return lx_store_times(path, sa, at, sm, mt);
     }
     case LX_utime: case LX_utimes: case LX_futimesat: {
-        /* Accepted, not stored: the FAT32/exFAT/ext drivers have no
-         * set-times hook. Validates the path like Linux. */
+        /* FAT32 stores the times; other filesystems accept and ignore them.
+         * Validates the path like Linux. */
         long dfd = nr == LX_futimesat ? (long)(int)a1 : LX_AT_FDCWD;
         const char *up = (const char *)(nr == LX_futimesat ? a2 : a1);
+        const void *ut = (const void *)(nr == LX_futimesat ? a3 : a2);
         if (!up) return -EFAULT;
         if ((r = lx_resolve(p, dfd, up, path, sizeof(path), false))) return r;
         if (!lx_path_kind(path, NULL) && !fifo_is(path)) return -ENOENT;
-        return 0;
+        if (!lx_path_kind(path, NULL)) return 0;        /* fifo: nothing stored */
+        int64_t nowt = (int64_t)(lx_real_us() / 1000000ULL), at = nowt, mt = nowt;
+        if (ut) {
+            int64_t v[4] = { 0, 0, 0, 0 };              /* utimbuf {a, m} / timeval[2] */
+            if (lx_get(v, ut, nr == LX_utime ? 2 * sizeof(int64_t) : sizeof(v))) return -EFAULT;
+            if (nr == LX_utime) { at = v[0]; mt = v[1]; } else { at = v[0]; mt = v[2]; }
+        }
+        return lx_store_times(path, true, at, true, mt);
     }
     case LX_symlink: case LX_symlinkat: {
         /* tmpfs and ext4 store symlinks; FAT32/exFAT: EPERM like vfat. */

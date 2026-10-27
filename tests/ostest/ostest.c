@@ -2354,7 +2354,9 @@ static int t_cx_modes(char *d, size_t n) {
     CHECKE(chmod(p, 0640) == 0, "chmod 0640"); stat(p, &st); int m2 = st.st_mode & 07777, a2 = access(p, X_OK);
     CHECK(m1 == 0751 && m2 == 0640 && a1 == 0 && a2 == -1, "modes %o/%o access %d/%d", m1, m2, a1, a2);
     CHECK(stat("/bin/busybox.exe", &st) == 0 && (st.st_mode & 0111) && access("/bin/busybox.exe", X_OK) == 0, "/bin/busybox.exe not executable (mode %o)", st.st_mode & 0777);
-    R(PASS, "chmod sticks (0751/0640), X_OK honest, /bin exec bits");
+    CHECK(stat("/", &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 0111), "/ not searchable (mode %o): test -x / fails autoconf's shell check", st.st_mode & 0777);
+    CHECK(stat(tmpdir, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 0111), "%s mode %o lacks x bits", tmpdir, st.st_mode & 0777);
+    R(PASS, "chmod sticks (0751/0640), X_OK honest, /bin exec bits, dirs searchable");
 }
 static int t_cx_close_stdio(char *d, size_t n) {
     int st; pid_t c = fork(); CHECKE(c >= 0, "fork");
@@ -2547,6 +2549,128 @@ static int t_cx_binutils(char *d, size_t n) {
     R(PASS, "as + ar rcs + ld -static (archive member) runs, exit 49%s", musl);
 }
 
+/* FAT32 entry times: new files/dirs carry the RTC time (not 1980, not a
+ * synthetic "now" on every stat), utimes/utimensat/futimens store, rename
+ * keeps, writing updates mtime.  Filesystems that do not store times SKIP. */
+static int ft_near(time_t a, time_t b) { return a > b ? a - b <= 5 : b - a <= 5; }
+static int t_cx_fat_times(char *d, size_t n) {
+    char f[160], g[160], dd[160]; tpath(f, sizeof f, "ft_a"); tpath(g, sizeof g, "ft_b"); tpath(dd, sizeof dd, "ft_dir");
+    unlink(f); unlink(g); rmdir(dd);
+    time_t t0 = time(NULL); struct stat st;
+    CHECKE(put_file(f, "abc", 3) == 0, "create");
+    CHECKE(stat(f, &st) == 0, "stat new");
+    CHECK(ft_near(st.st_mtime, t0), "new file mtime %lld, now %lld", (long long)st.st_mtime, (long long)t0);
+    struct timeval tv[2] = { { 1700000000, 0 }, { 1700000000, 0 } };
+    CHECKE(utimes(f, tv) == 0, "utimes");
+    CHECKE(stat(f, &st) == 0, "stat after utimes");
+    if (st.st_mtime != 1700000000) {
+        CHECK(ft_near(st.st_mtime, time(NULL)), "utimes stored odd mtime %lld", (long long)st.st_mtime);
+        unlink(f); R(SKIP, "times not stored on %s (mtime reads as now)", tmpdir);
+    }
+    CHECKE(mkdir(dd, 0755) == 0, "mkdir");
+    CHECKE(stat(dd, &st) == 0, "stat dir");
+    CHECK(ft_near(st.st_mtime, time(NULL)), "new dir mtime %lld", (long long)st.st_mtime);
+    rmdir(dd);
+    CHECKE(rename(f, g) == 0, "rename");
+    CHECKE(stat(g, &st) == 0, "stat renamed");
+    CHECK(st.st_mtime == 1700000000, "rename lost mtime: %lld", (long long)st.st_mtime);
+    struct timespec ts[2] = { { 1600000000, 0 }, { 0, UTIME_OMIT } };
+    CHECKE(utimensat(AT_FDCWD, g, ts, 0) == 0, "utimensat OMIT");
+    CHECKE(stat(g, &st) == 0, "stat"); CHECK(st.st_mtime == 1700000000, "UTIME_OMIT changed mtime: %lld", (long long)st.st_mtime);
+    int fd = open(g, O_WRONLY | O_APPEND); CHECKE(fd >= 0, "open append");
+    CHECK(write(fd, "d", 1) == 1, "append"); close(fd);
+    CHECKE(stat(g, &st) == 0, "stat after write");
+    CHECK(ft_near(st.st_mtime, time(NULL)), "write did not update mtime: %lld", (long long)st.st_mtime);
+    fd = open(g, O_RDONLY); CHECKE(fd >= 0, "open");
+    struct timespec ts2[2] = { { 0, UTIME_NOW }, { 1700000201, 0 } };
+    CHECKE(futimens(fd, ts2) == 0, "futimens");
+    CHECKE(fstat(fd, &st) == 0 || stat(g, &st) == 0, "stat");
+    CHECKE(stat(g, &st) == 0, "stat after futimens");
+    CHECK(st.st_mtime == 1700000200 || st.st_mtime == 1700000201, "futimens mtime %lld", (long long)st.st_mtime);
+    CHECKE(futimens(fd, NULL) == 0, "futimens NULL"); close(fd);
+    CHECKE(stat(g, &st) == 0, "stat"); CHECK(ft_near(st.st_mtime, time(NULL)), "futimens NULL mtime %lld", (long long)st.st_mtime);
+    unlink(g);
+    R(PASS, "create/mkdir stamped with RTC time, utimes/utimensat(OMIT)/futimens stored, rename keeps, write updates");
+}
+/* A small autoconf-style project: ./configure (PATH search for cc, ls -t
+ * sanity check, compile probe, config.h, Makefile from Makefile.in) && make
+ * && ./prog, then a no-op make and a rebuild after the source gets newer.
+ * Needs cc + make (SKIP otherwise). */
+static int cfg_put(const char *dir, const char *name, const char *body, int mode) {
+    char p[220]; snprintf(p, sizeof p, "%s/%s", dir, name);
+    if (put_file(p, body, strlen(body))) return -1;
+    if (mode) chmod(p, mode);
+    struct timeval tv[2] = { { 1700000000, 0 }, { 1700000000, 0 } };
+    return utimes(p, tv);
+}
+/* configure/make exec /bin/<tool> directly: POSIX tools must be the BusyBox
+ * applets (native rm.exe rejects -f, native grep lacks -e), and applets with
+ * no file at all (/bin/sed) must pass "test -f && test -x". */
+static int t_cx_applets(char *d, size_t n) {
+    if (access("/bin/busybox.exe", X_OK)) R(SKIP, "/bin/busybox.exe not installed");
+    char f[160], g[160], out[512]; struct stat st; int r;
+    tpath(f, sizeof f, "ap_in.txt"); tpath(g, sizeof g, "ap_gone.txt");
+    CHECKE(put_file(f, "abc\nzz\nzz y\n", 12) == 0, "write ap_in.txt");
+    if (access("/bin/sed.exe", F_OK)) {
+        CHECKE(stat("/bin/sed", &st) == 0, "stat /bin/sed");
+        CHECK(S_ISREG(st.st_mode) && (st.st_mode & 0111), "/bin/sed mode %o", st.st_mode);
+        CHECKE(access("/bin/sed", X_OK) == 0, "access /bin/sed X_OK");
+    }
+    char *sd[] = { "/bin/sed", "s/b/B/", f, NULL }; r = run_capture(sd, out, sizeof out, 10000);
+    CHECK(r == 0 && !strncmp(out, "aBc\n", 4), "/bin/sed rc=%d out=%.60s", r, out);
+    char *gr[] = { "/bin/grep", "-c", "-e", "^zz", f, NULL }; r = run_capture(gr, out, sizeof out, 10000);
+    CHECK(r == 0 && !strncmp(out, "2", 1), "/bin/grep -c -e rc=%d out=%.60s", r, out);
+    CHECKE(put_file(g, "x", 1) == 0, "write ap_gone.txt");
+    char *rmv[] = { "/bin/rm", "-f", g, "ap_never_existed.zz", NULL }; r = run_capture(rmv, out, sizeof out, 10000);
+    CHECK(r == 0 && access(g, F_OK) != 0, "/bin/rm -f rc=%d out=%.60s", r, out);
+    unlink(f);
+    R(PASS, "sed/grep -e/rm -f via busybox applets");
+}
+static int t_cx_configure(char *d, size_t n) {
+    if (access("/bin/make", X_OK) || access("/bin/cc", X_OK) || access("/bin/busybox.exe", X_OK)) R(SKIP, "/bin/make or /bin/cc not installed");
+    char dir[160], cmd[400], out[2048]; tpath(dir, sizeof dir, "cfgproj"); mkdir(dir, 0755);
+    static const char conf[] =
+        "#!/bin/sh\n# mini autoconf-style configure (ostest compat.configure)\n"
+        "printf 'checking for a C compiler... '\nCC=\nas_save_IFS=$IFS; IFS=:\n"
+        "for as_dir in $PATH; do for ac_prog in gcc cc; do\n"
+        "  if test -f \"$as_dir/$ac_prog\" && test -x \"$as_dir/$ac_prog\"; then CC=$ac_prog; break 2; fi\ndone; done\n"
+        "IFS=$as_save_IFS\ntest -n \"$CC\" || { echo 'configure: error: no acceptable C compiler found in $PATH' >&2; exit 1; }\necho \"$CC\"\n"
+        "printf 'checking whether build environment is sane... '\necho timestamp > conftest.file\n"
+        "set X `ls -t \"$0\" conftest.file 2>/dev/null`\n"
+        "test \"$2\" = conftest.file || { echo; echo \"configure: error: newly created file is older than distributed files ($*)\" >&2; exit 1; }\n"
+        "rm -f conftest.file; echo yes\n"
+        "printf 'checking for stdio.h... '\nprintf '#include <stdio.h>\\nint main(void) { return 0; }\\n' > conftest.c\n"
+        "if $CC -o conftest conftest.c >/dev/null 2>&1 && ./conftest; then ac_stdio=1; echo yes; else ac_stdio=0; echo no; fi\n"
+        "rm -f conftest conftest.c\n"
+        "printf 'checking for a sed that does not truncate output... '\ntest \"`echo abc | sed 's/b/B/'`\" = aBc || exit 1; echo sed\n"
+        "printf '#define HAVE_STDIO_H %s\\n#define PACKAGE_STRING \"ostest-cfg 1.0\"\\n' $ac_stdio > config.h\n"
+        "sed -e \"s|@CC@|$CC|g\" Makefile.in > Makefile || exit 1\necho 'config.status: creating Makefile'\n";
+    static const char mk[] = "CC = @CC@\nprog: main.o\n\t$(CC) -o prog main.o\nmain.o: main.c config.h\n\t$(CC) -c main.c\n";
+    static const char src[] = "#include \"config.h\"\n#include <stdio.h>\nint main(void) { printf(\"CFG_OK %s %d\\n\", PACKAGE_STRING, HAVE_STDIO_H + 41); return 0; }\n";
+    CHECKE(cfg_put(dir, "configure", conf, 0755) == 0 && cfg_put(dir, "Makefile.in", mk, 0) == 0 && cfg_put(dir, "main.c", src, 0) == 0, "write project");
+    snprintf(cmd, sizeof cmd, "cd %s && ./configure && make && ./prog", dir);
+    char *a1[] = { "/bin/busybox.exe", "sh", "-c", cmd, NULL };
+    int r = run_capture(a1, out, sizeof out, 90000);
+    CHECK(r == 0 && strstr(out, "CFG_OK ostest-cfg 1.0 42"), "./configure && make && ./prog rc=%d: %.300s", r, out);
+    snprintf(cmd, sizeof cmd, "cd %s && make", dir);
+    char *a2[] = { "/bin/busybox.exe", "sh", "-c", cmd, NULL };
+    r = run_capture(a2, out, sizeof out, 30000);
+    CHECK(r == 0 && strstr(out, "up to date") && !strstr(out, "-c main.c"), "second make not a no-op rc=%d: %.300s", r, out);
+    char p[220]; struct timeval old[2] = { { 1700000100, 0 }, { 1700000100, 0 } }, nw[2] = { { 1700000200, 0 }, { 1700000200, 0 } };
+    snprintf(p, sizeof p, "%s/main.o", dir); utimes(p, old);
+    snprintf(p, sizeof p, "%s/prog", dir); utimes(p, old);
+    snprintf(p, sizeof p, "%s/config.h", dir); utimes(p, old);
+    snprintf(p, sizeof p, "%s/main.c", dir); utimes(p, nw);
+    snprintf(cmd, sizeof cmd, "cd %s && make && ./prog", dir);
+    char *a3[] = { "/bin/busybox.exe", "sh", "-c", cmd, NULL };
+    r = run_capture(a3, out, sizeof out, 60000);
+    CHECK(r == 0 && strstr(out, "-c main.c") && strstr(out, "CFG_OK"), "rebuild after newer main.c rc=%d: %.300s", r, out);
+    const char *rm[] = { "configure", "Makefile.in", "Makefile", "main.c", "main.o", "config.h", "prog", NULL };
+    for (int i = 0; rm[i]; i++) { snprintf(p, sizeof p, "%s/%s", dir, rm[i]); unlink(p); }
+    rmdir(dir);
+    R(PASS, "./configure (PATH cc, ls -t sane, probe, config.h) && make && ./prog; no-op remake; rebuild on newer source");
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -2593,7 +2717,7 @@ static const struct test tests[] = {
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
-    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

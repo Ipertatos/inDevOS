@@ -3308,31 +3308,65 @@ static int exec_shebang(const char *path, char *interp, size_t isz, char *arg, s
     kstrncpy(arg, s, asz);
     return 2;
 }
-/* Linux programs exec /usr/bin/env, /bin/sed, ... which are BusyBox applets
- * here (no symlinks on FAT32/ISO).  If such a path does not exist, run
- * /bin/busybox.exe with argv[0] = applet name. Returns the applet name or NULL. */
-static const char *exec_busybox_applet(process_t *p, const char *resolved) {
-    static const char *const applets[] = {
-        "env", "sh", "ash", "sed", "awk", "grep", "egrep", "fgrep", "cat", "ls", "cp", "mv",
-        "rm", "rmdir", "mkdir", "test", "[", "expr", "tr", "sort", "uniq", "head", "tail",
-        "wc", "find", "xargs", "basename", "dirname", "printf", "echo", "true", "false",
-        "touch", "chmod", "ln", "uname", "date", "sleep", "cut", "tee", "diff", "cmp",
-        "install", "readlink", "realpath", "mktemp", "od", "gzip", "gunzip", "tar", "patch",
-        "md5sum", "sha256sum", "stat", "id", "whoami", "pwd", "seq", "yes", "which", "kill",
-        "ps", "du", "df", "hexdump", "xxd", "strings", "nproc", "getconf", "sync", "less", "more",
-        "vi", "unzip", "bzip2", "xz", NULL };
-    if (!p || !p->linux_abi || !resolved) return NULL;
+/* POSIX tools Linux programs expect under /bin, /usr/bin, /sbin, /usr/sbin.
+ * Here they are BusyBox applets (no symlinks on FAT32/ISO). */
+static const char *const exec_bb_applets[] = {
+    "env", "sh", "ash", "sed", "awk", "grep", "egrep", "fgrep", "cat", "ls", "cp", "mv",
+    "rm", "rmdir", "mkdir", "test", "[", "expr", "tr", "sort", "uniq", "head", "tail",
+    "wc", "find", "xargs", "basename", "dirname", "printf", "echo", "true", "false",
+    "touch", "chmod", "ln", "uname", "date", "sleep", "cut", "tee", "diff", "cmp",
+    "install", "readlink", "realpath", "mktemp", "od", "gzip", "gunzip", "tar", "patch",
+    "md5sum", "sha256sum", "stat", "id", "whoami", "pwd", "seq", "yes", "which", "kill",
+    "ps", "du", "df", "hexdump", "xxd", "strings", "nproc", "getconf", "sync", "less", "more",
+    "vi", "unzip", "bzip2", "xz", NULL };
+
+/* If path is /bin|/usr/bin|/sbin|/usr/sbin/<applet> (optionally with a
+ * ".exe" suffix when allow_exe), return the applet name, else NULL. */
+static const char *bb_applet_of(const char *path, bool allow_exe) {
+    if (!path) return NULL;
     const char *bn;
-    if (!kstrncmp(resolved, "/bin/", 5)) bn = resolved + 5;
-    else if (!kstrncmp(resolved, "/usr/bin/", 9)) bn = resolved + 9;
-    else if (!kstrncmp(resolved, "/sbin/", 6)) bn = resolved + 6;
-    else if (!kstrncmp(resolved, "/usr/sbin/", 10)) bn = resolved + 10;
+    if (!kstrncmp(path, "/bin/", 5)) bn = path + 5;
+    else if (!kstrncmp(path, "/usr/bin/", 9)) bn = path + 9;
+    else if (!kstrncmp(path, "/sbin/", 6)) bn = path + 6;
+    else if (!kstrncmp(path, "/usr/sbin/", 10)) bn = path + 10;
     else return NULL;
-    for (const char *q = bn; *q; q++) if (*q == '/') return NULL;
-    if (vfs_exists(resolved) || !vfs_exists("/bin/busybox.exe")) return NULL;
-    for (int i = 0; applets[i]; i++)
-        if (kstrcmp(bn, applets[i]) == 0) return applets[i];
+    size_t n = 0;
+    for (const char *q = bn; *q; q++, n++) if (*q == '/') return NULL;
+    if (allow_exe && n > 4 && !kstrcmp(bn + n - 4, ".exe")) n -= 4;
+    for (int i = 0; exec_bb_applets[i]; i++)
+        if (strlen(exec_bb_applets[i]) == n && !kstrncmp(bn, exec_bb_applets[i], n))
+            return exec_bb_applets[i];
     return NULL;
+}
+
+/* stat()/access() helper for the Linux layer: a missing applet path with no
+ * native "<path>.exe" is reported as /bin/busybox.exe, so configure's
+ * "test -f /bin/sed && test -x /bin/sed" PATH searches find it. */
+const char *syscall_busybox_applet_path(const char *path) {
+    if (!bb_applet_of(path, false) || !vfs_exists("/bin/busybox.exe")) return NULL;
+    return "/bin/busybox.exe";
+}
+
+/* Linux programs exec /usr/bin/env, /bin/sed, ... Run /bin/busybox.exe with
+ * argv[0] = applet name when the path does not exist, or when an
+ * extensionless request (kpath) only resolved through the native ".exe"
+ * fallback: the native inDevOS rm/grep/ls/... are not POSIX ("rm -f" fails,
+ * grep lacks -e), and make/configure exec /bin/<tool> directly.
+ * Returns the applet name or NULL. */
+static const char *exec_busybox_applet(process_t *p, const char *kpath, const char *resolved) {
+    if (!p || !p->linux_abi || !resolved) return NULL;
+    if (!vfs_exists("/bin/busybox.exe")) return NULL;
+    if (!vfs_exists(resolved)) return bb_applet_of(resolved, false);
+    /* native fallback: "/bin/rm" or "rm" -> "/bin/rm.exe" */
+    if (!kpath) return NULL;
+    const char *kb = kpath;
+    for (const char *q = kpath; *q; q++) if (*q == '/') kb = q + 1;
+    for (const char *q = kb; *q; q++) if (*q == '.') return NULL;
+    size_t rl = strlen(resolved), kl = strlen(kb);
+    if (rl < kl + 5 || kstrcmp(resolved + rl - 4, ".exe")) return NULL;
+    if (kstrncmp(resolved + rl - 4 - kl, kb, kl) || resolved[rl - 5 - kl] != '/') return NULL;
+    if (kpath[0] == '/' && (strlen(kpath) != rl - 4 || kstrncmp(kpath, resolved, rl - 4))) return NULL;
+    return bb_applet_of(resolved, true);
 }
 
 int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]) {
@@ -3437,7 +3471,7 @@ int sys_exec_env(const char *pathname, char *const argv[], char *const envp[]) {
             }
         }
         {
-            const char *ap = exec_busybox_applet(p, resolved);
+            const char *ap = exec_busybox_applet(p, kpath, resolved);
             if (ap) {
                 kstrncpy(resolved, "/bin/busybox.exe", sizeof(resolved));
                 if (argc == 0) { kargv[1] = NULL; argc = 1; }
@@ -4138,6 +4172,16 @@ static void stat_fill_common(stat_t *st, uint32_t mode, uint64_t size,
     st->st_atime = st->st_mtime = st->st_ctime = sec;
 }
 
+/* FAT32 keeps write/access times in its directory entries (no stat op):
+ * use them instead of "now" when the entry has been stamped. */
+static void stat_apply_times(const char *abspath, stat_t *st) {
+    int64_t mt = 0, at = 0;
+    if (vfs_times(abspath, 0, &mt, &at) == 0 && mt > 0) {
+        st->st_mtime = st->st_ctime = (uint64_t)mt;
+        st->st_atime = (uint64_t)(at > 0 ? at : mt);
+    }
+}
+
 static int stat_vfs_path2(const char *abspath, stat_t *st, bool nofollow) {
     uint32_t uid = 0, gid = 0;
     uint16_t pm = 0644;
@@ -4158,7 +4202,7 @@ static int stat_vfs_path2(const char *abspath, stat_t *st, bool nofollow) {
         if (vr != -ENOSYS)
             return vr == -5 ? -EIO : -ENOENT;
     }
-    perm_get(abspath, &uid, &gid, &pm);
+    bool perm_set = perm_get(abspath, &uid, &gid, &pm) == 0;
 
     int vfd = vfs_open(abspath, VFS_O_READ);
     if (vfd >= 0) {
@@ -4168,12 +4212,16 @@ static int stat_vfs_path2(const char *abspath, stat_t *st, bool nofollow) {
             sz = (uint64_t)pos;
         vfs_close(vfd);
         stat_fill_common(st, S_IFREG | (uint32_t)(pm & 0777u), sz, abspath, uid, gid);
+        stat_apply_times(abspath, st);
         return 0;
     }
 
     vfs_dirent_t dent[2];
     if (vfs_readdir(abspath, dent, 2) >= 0) {
-        stat_fill_common(st, S_IFDIR | (uint32_t)(pm & 0777u), 0, abspath, uid, gid);
+        /* Directories default to 0755 (searchable): `test -x /` is part of
+         * autoconf's shell check and busybox test wants an x bit for root. */
+        stat_fill_common(st, S_IFDIR | (uint32_t)((perm_set ? pm : 0755) & 0777u), 0, abspath, uid, gid);
+        stat_apply_times(abspath, st);
         return 0;
     }
     return -ENOENT;

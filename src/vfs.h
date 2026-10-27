@@ -126,6 +126,11 @@ typedef struct vfs_fs_ops {
     int   (*lstat)(struct vfs_filesystem *fs, const char *rel_path, struct vfs_stat *st);
     int   (*setattr)(struct vfs_filesystem *fs, const char *rel_path, int what,
                      uint32_t mode, uint32_t uid, uint32_t gid);
+    /* Optional, for filesystems without a stat op (FAT32): read (set == 0)
+     * or store the modification/access time, epoch seconds; NULL pointers
+     * are skipped when storing.  0 or -errno (-ENODATA: no time recorded). */
+    int   (*times)(struct vfs_filesystem *fs, const char *rel_path, int set,
+                   int64_t *mtime, int64_t *atime);
 } vfs_fs_ops_t;
 #define VFS_SA_MODE  1
 #define VFS_SA_QUIET 0x100   /* vfs_setattr: no IN_ATTRIB (create-time mode) */
@@ -199,6 +204,7 @@ int  vfs_rmdir(const char *path);
 int  vfs_truncate(const char *path, uint64_t len);
 /* Filesystem-provided metadata; -ENOSYS when the fs has no stat op. */
 int vfs_stat(const char *path, vfs_stat_t *st);
+int vfs_times(const char *path, int set, int64_t *mtime, int64_t *atime);
 /* Symlinks (filesystems with a readlink op: tmpfs, ext2/3/4).
  * vfs_resolve: normalise absolute @path (".", "..", "//") into @out, expanding
  * every symlink on the way (and the last component too when @follow_last).

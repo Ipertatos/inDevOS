@@ -304,7 +304,7 @@ static long do_present(wm_conn_t *c, void *arg) {
     if (x1 > (int)sf->w) x1 = (int)sf->w;
     if (y1 > (int)sf->h) y1 = (int)sf->h;
     const uint8_t *src = sf->mem + (size_t)pr.buffer * sf->buf_size;
-    spinlock_lock(&dw->content_lock);
+    klock(&dw->content_lock);
     if (x1 > dw->content_w) x1 = dw->content_w;
     if (y1 > dw->content_h) y1 = dw->content_h;
     if (x1 > x0 && y1 > y0 && dw->pixels) {
@@ -312,7 +312,7 @@ static long do_present(wm_conn_t *c, void *arg) {
             memcpy((uint8_t *)dw->pixels + (size_t)yy * dw->pixel_pitch + (size_t)x0 * 4,
                    src + (size_t)yy * sf->stride + (size_t)x0 * 4, (size_t)(x1 - x0) * 4);
     }
-    spinlock_unlock(&dw->content_lock);
+    kunlock(&dw->content_lock);
     if (x1 > x0 && y1 > y0) desktop_damage_client_rect(dw, x0, y0, x1 - x0, y1 - y0);
     if (exec_current_is_sync_program()) desktop_sync_pump();   /* kmain is blocked */
     return 0;

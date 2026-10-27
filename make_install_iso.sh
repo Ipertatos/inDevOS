@@ -12,6 +12,10 @@
 #     bash ./make_install_iso.sh
 # Makefile:  make install-iso
 set -euo pipefail
+# FAT stores local time; the kernel reads the RTC as UTC and stamps new files
+# in UTC, so write the rootfs entries in UTC too (else they look 2 h ahead
+# to make).
+export TZ=UTC
 
 cd "$(dirname "$0")"
 
@@ -165,6 +169,12 @@ if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
     mmd -D s -i "$ROOTFS" ::/home 2>/dev/null </dev/null || true
     mmd -D s -i "$ROOTFS" ::/home/user 2>/dev/null </dev/null || true
     mcopy -o -i "$ROOTFS" "$TCC_STAGE/bin/tcc.exe" ::/bin/tcc.exe
+    # cc/gcc/c99 for ./configure && make: copies of tcc (FAT has no symlinks;
+    # tcc ignores argv[0]).  `cc` resolves to /bin/cc.exe like every program.
+    for cc_name in cc gcc c99; do
+        mcopy -o -i "$ROOTFS" "$TCC_STAGE/bin/tcc.exe" ::/bin/$cc_name.exe
+    done
+    echo "    /bin/{cc,gcc,c99}.exe (= tcc.exe)"
     mcopy -o -s -i "$ROOTFS" "$TCC_STAGE/usr" ::/
     if ls "$TCC_STAGE"/home/user/*.c >/dev/null 2>&1; then
         mcopy -o -i "$ROOTFS" "$TCC_STAGE"/home/user/*.c ::/home/user/
@@ -247,7 +257,7 @@ inDevOS install root
 FAT32 volume the kernel mounts as /.
 Programs: /bin/<name>.exe   (ls, sh, cat, and the other shell tools)
 Linux:    /bin/hello_musl.exe, /bin/musltest.exe, /bin/busybox.exe, /bin/tcc.exe
-Toolchain: /bin/tcc.exe, binutils /bin/as, /bin/ld, /bin/ar, ... (musl in /usr/lib)
+Toolchain: /bin/tcc.exe (also cc, gcc, c99), /bin/make.exe, binutils /bin/as, /bin/ld, /bin/ar, ... (musl in /usr/lib)
 Doom:     /bin/doom.exe
 WAD:      /doom1.wad
 Installer payload: /install/ (kernel, limine.cfg, limine-bios.sys, BOOTX64.EFI).

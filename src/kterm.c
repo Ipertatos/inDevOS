@@ -1002,9 +1002,9 @@ static bool kt_open_new(void) {
             kt_add_line("Zeus built-ins meanwhile: help, ls, pwd, cd, cat, echo, date.");
         }
     }
-    spinlock_lock(&kt_win->content_lock);
+    klock(&kt_win->content_lock);
     kt_redraw();
-    spinlock_unlock(&kt_win->content_lock);
+    kunlock(&kt_win->content_lock);
     serial_printf("[kterm] opened (instance %d, window %u, %d open)\n",
                   (int)(t - kt_pool), kt_win->id, nopen + 1);
     return true;
@@ -1236,9 +1236,9 @@ bool kterm_tick(void) {
         kt_pump_one();
         kt_ws_update();
         if (!kt_win || kt_win->id == 0 || !kt_need) continue;
-        spinlock_lock(&kt_win->content_lock);
+        klock(&kt_win->content_lock);
         kt_redraw();
-        spinlock_unlock(&kt_win->content_lock);
+        kunlock(&kt_win->content_lock);
         drew = true;
     }
     kt_leave();

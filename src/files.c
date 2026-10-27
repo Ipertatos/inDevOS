@@ -273,9 +273,9 @@ void files_open(void) {
     fb_win = desktop_create_window(0, x, y, FILES_W, FILES_H, "Files");
     if (!fb_win) return;
     fb_reload();
-    spinlock_lock(&fb_win->content_lock);
+    klock(&fb_win->content_lock);
     fb_redraw();
-    spinlock_unlock(&fb_win->content_lock);
+    kunlock(&fb_win->content_lock);
     serial_puts("[files] opened\n");
 }
 
@@ -650,8 +650,8 @@ static void fb_autorefresh(void) {
 bool files_tick(void) {
     if (files_is_open()) fb_autorefresh();
     if (!files_is_open() || !fb_need) return false;
-    spinlock_lock(&fb_win->content_lock);
+    klock(&fb_win->content_lock);
     fb_redraw();
-    spinlock_unlock(&fb_win->content_lock);
+    kunlock(&fb_win->content_lock);
     return true;
 }
