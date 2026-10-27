@@ -2470,6 +2470,83 @@ static int t_unix_scm_rights(char *d, size_t n) {
     R(PASS, "pipe write end passed with SCM_RIGHTS");
 }
 
+/* compat batch 7: lseek past EOF + write fills the gap with zeros (GNU as/ld
+ * write section data at its final offset first, the ELF header last). */
+static int t_cx_seek_hole(char *d, size_t n) {
+    char f[160]; tpath(f, sizeof f, "seekhole.bin"); unlink(f);
+    int fd = open(f, O_RDWR | O_CREAT | O_TRUNC, 0644); CHECKE(fd >= 0, "open");
+    char b[256];
+    off_t o = lseek(fd, 280, SEEK_SET); CHECK(o == 280, "lseek 280 on empty file -> %lld", (long long)o);
+    CHECK(lseek(fd, 0, SEEK_CUR) == 280, "SEEK_CUR after past-EOF seek: %lld", (long long)lseek(fd, 0, SEEK_CUR));
+    CHECK(read(fd, b, 10) == 0, "read past EOF should give 0");
+    CHECK(lseek(fd, 0, SEEK_END) == 0, "seek alone must not extend: size %lld", (long long)lseek(fd, 0, SEEK_END));
+    CHECK(lseek(fd, 280, SEEK_SET) == 280, "lseek 280 again");
+    CHECK(write(fd, "TAIL", 4) == 4, "write at 280: %s", strerror(errno));
+    CHECK(lseek(fd, 64, SEEK_SET) == 64 && write(fd, "MID", 3) == 3, "write at 64");
+    CHECK(lseek(fd, 0, SEEK_SET) == 0 && write(fd, "HEAD", 4) == 4, "write at 0");
+    CHECK(lseek(fd, 400, SEEK_SET) == 400 && lseek(fd, 16, SEEK_CUR) == 416, "SEEK_CUR from past-EOF position");
+    CHECK(write(fd, "END", 3) == 3, "write at 416");
+    CHECK(pwrite(fd, "PW", 2, 500) == 2, "pwrite past EOF: %s", strerror(errno));
+    CHECK(lseek(fd, 0, SEEK_CUR) == 419, "pwrite moved the offset: %lld", (long long)lseek(fd, 0, SEEK_CUR));
+    close(fd);
+    struct stat st; CHECKE(stat(f, &st) == 0, "stat");
+    CHECK(st.st_size == 502, "size %lld (want 502; past-EOF writes appended at EOF?)", (long long)st.st_size);
+    static char buf[502]; CHECK(get_file(f, buf, sizeof buf) == 502, "read back");
+    static const struct { int at; const char *s; } want[] = { {0, "HEAD"}, {64, "MID"}, {280, "TAIL"}, {416, "END"}, {500, "PW"} };
+    for (size_t k = 0; k < sizeof want / sizeof want[0]; k++)
+        CHECK(memcmp(buf + want[k].at, want[k].s, strlen(want[k].s)) == 0, "data at %d: '%.4s' (want %s)", want[k].at, buf + want[k].at, want[k].s);
+    for (int k = 0; k < 502; k++) {
+        int in = (k < 4) || (k >= 64 && k < 67) || (k >= 280 && k < 284) || (k >= 416 && k < 419) || k >= 500;
+        CHECK(in || buf[k] == 0, "gap byte %d = 0x%02x (want 0)", k, (unsigned char)buf[k]);
+    }
+    unlink(f);
+    R(PASS, "lseek past EOF (no extend, read 0), gap writes zero-filled, SEEK_CUR/pwrite past EOF, size 502");
+}
+/* GNU binutils on the OS (when /bin/as and /bin/ld are installed): assemble,
+ * link, ar an archive, link against it, link against musl crt1.o + libc.a. */
+static int t_cx_binutils(char *d, size_t n) {
+    if (access("/bin/as", X_OK) || access("/bin/ld", X_OK) || access("/bin/ar", X_OK)) R(SKIP, "/bin/as, /bin/ld or /bin/ar not installed");
+    char s1[160], o1[160], x1[160], s2[160], o2[160], a2[160], s3[160], o3[160], x3[160], out[512];
+    tpath(s1, sizeof s1, "bu_main.s"); tpath(o1, sizeof o1, "bu_main.o"); tpath(x1, sizeof x1, "bu_main");
+    tpath(s2, sizeof s2, "bu_sq.s"); tpath(o2, sizeof o2, "bu_sq.o"); tpath(a2, sizeof a2, "libbusq.a");
+    tpath(s3, sizeof s3, "bu_c.s"); tpath(o3, sizeof o3, "bu_c.o"); tpath(x3, sizeof x3, "bu_c");
+    static const char m[] =
+        "\t.globl _start\n\t.text\n_start:\n\tmov $1, %eax\n\tmov $1, %edi\n\tlea msg(%rip), %rsi\n"
+        "\tmov $len, %edx\n\tsyscall\n\tmov $7, %edi\n\tcall sq\n\tmov %eax, %edi\n\tmov $60, %eax\n\tsyscall\n"
+        "\t.section .rodata\nmsg:\t.ascii \"BU_OK\\n\"\n\tlen = . - msg\n\t.section .note.GNU-stack,\"\",@progbits\n";
+    static const char q[] = "\t.globl sq\n\t.text\nsq:\tmov %edi, %eax\n\timul %edi, %eax\n\tret\n"
+        "\t.section .note.GNU-stack,\"\",@progbits\n";
+    static const char c[] = "\t.globl main\n\t.text\nmain:\n\tsub $8, %rsp\n\tlea fmt(%rip), %rdi\n\tmov $42, %esi\n"
+        "\txor %eax, %eax\n\tcall printf\n\txor %eax, %eax\n\tadd $8, %rsp\n\tret\n"
+        "\t.section .rodata\nfmt:\t.asciz \"BU_MUSL %d\\n\"\n\t.section .note.GNU-stack,\"\",@progbits\n";
+    CHECKE(put_file(s1, m, sizeof m - 1) == 0 && put_file(s2, q, sizeof q - 1) == 0 && put_file(s3, c, sizeof c - 1) == 0, "write .s");
+    unlink(a2);
+    char *as1[] = { "/bin/as", "-o", o1, s1, NULL }; int r = run_capture(as1, out, sizeof out, 20000);
+    CHECK(r == 0, "as main.s -> %d: %.200s", r, out);
+    char *as2[] = { "/bin/as", "-o", o2, s2, NULL }; r = run_capture(as2, out, sizeof out, 20000);
+    CHECK(r == 0, "as sq.s -> %d: %.200s", r, out);
+    char *ar[] = { "/bin/ar", "rcs", a2, o2, NULL }; r = run_capture(ar, out, sizeof out, 20000);
+    CHECK(r == 0 && !strstr(out, "warning"), "ar rcs -> %d: %.200s", r, out);
+    char *ld1[] = { "/bin/ld", "-static", "-o", x1, o1, a2, NULL }; r = run_capture(ld1, out, sizeof out, 30000);
+    CHECK(r == 0 && !strstr(out, "warning"), "ld main.o libbusq.a -> %d: %.200s", r, out);
+    char *run1[] = { x1, NULL }; r = run_capture(run1, out, sizeof out, 10000);
+    CHECK(r == 49 && strcmp(out, "BU_OK\n") == 0, "asm program: exit %d (want 49) out '%.60s'", r, out);
+    const char *musl = "";
+    if (!access("/usr/lib/crt1.o", R_OK) && !access("/usr/lib/libc.a", R_OK)) {
+        char *as3[] = { "/bin/as", "-o", o3, s3, NULL }; r = run_capture(as3, out, sizeof out, 20000);
+        CHECK(r == 0, "as c.s -> %d: %.200s", r, out);
+        char *ld3[] = { "/bin/ld", "-static", "-o", x3, "/usr/lib/crt1.o", "/usr/lib/crti.o", o3, "-lc", "/usr/lib/crtn.o", NULL };
+        r = run_capture(ld3, out, sizeof out, 60000);
+        CHECK(r == 0, "ld crt1.o c.o -lc -> %d: %.200s", r, out);
+        char *run3[] = { x3, NULL }; r = run_capture(run3, out, sizeof out, 10000);
+        CHECK(r == 0 && strcmp(out, "BU_MUSL 42\n") == 0, "musl program: exit %d out '%.60s'", r, out);
+        musl = ", ld crt1.o + -lc (default search path) printf ok";
+        unlink(o3); unlink(x3);
+    }
+    unlink(s1); unlink(s2); unlink(s3); unlink(o1); unlink(o2); unlink(a2); unlink(x1);
+    R(PASS, "as + ar rcs + ld -static (archive member) runs, exit 49%s", musl);
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -2516,7 +2593,7 @@ static const struct test tests[] = {
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
-    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

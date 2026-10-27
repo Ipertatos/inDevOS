@@ -214,6 +214,21 @@ else
     echo "    (tests/netsurf/dhcp not built, skipping /bin/dhcp; see tests/netsurf/build/README.md)"
 fi
 
+# GNU binutils 2.43.1 (static musl): as, ld, ar, ranlib, nm, objdump, objcopy,
+# readelf, size, strings, strip.  Built by tests/binutils/build_binutils.sh into
+# tests/binutils/build/bin.  ld's default search path includes /usr/lib, where
+# the TinyCC stage puts musl's crt1.o/crti.o/crtn.o and libc.a.
+BINUTILS=(as ld ar ranlib nm objdump objcopy readelf size strings strip)
+if [[ -x tests/binutils/build/bin/ld ]]; then
+    for t in "${BINUTILS[@]}"; do
+        [[ -f tests/binutils/build/bin/$t ]] || die "tests/binutils/build/bin/$t missing (rerun tests/binutils/build_binutils.sh)"
+        mcopy -o -i "$ROOTFS" "tests/binutils/build/bin/$t" "::/bin/$t"
+    done
+    echo "    /bin/{${BINUTILS[*]}} (static musl GNU binutils)"
+else
+    echo "    (tests/binutils/build/bin not built, skipping binutils; see tests/binutils/build_binutils.sh)"
+fi
+
 echo ">>> installing Doom (one binary, one WAD)"
 mcopy -o -i "$ROOTFS" doom/doom.exe ::/bin/doom.exe
 mcopy -o -i "$ROOTFS" doom1.wad ::/doom1.wad
@@ -232,6 +247,7 @@ inDevOS install root
 FAT32 volume the kernel mounts as /.
 Programs: /bin/<name>.exe   (ls, sh, cat, and the other shell tools)
 Linux:    /bin/hello_musl.exe, /bin/musltest.exe, /bin/busybox.exe, /bin/tcc.exe
+Toolchain: /bin/tcc.exe, binutils /bin/as, /bin/ld, /bin/ar, ... (musl in /usr/lib)
 Doom:     /bin/doom.exe
 WAD:      /doom1.wad
 Installer payload: /install/ (kernel, limine.cfg, limine-bios.sys, BOOTX64.EFI).

@@ -44,6 +44,7 @@ tests/tcc/stage
 tests/fbdev/build/
 tests/forksig/build/
 tests/busybox/build/
+tests/binutils/build/
 tests/musl/build/
 *.ko
 shot-*/

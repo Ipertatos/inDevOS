@@ -10,6 +10,38 @@
 // Translates VFS calls into fat32_* calls.  The VFS handle (cookie) is
 // simply a pointer to a fat32_file_t returned by fat32_open().
 
+/* Positions past end of file.  fat32_seek() clamps to the file size, but
+ * POSIX lets lseek() go past EOF and the next write() then fills the gap
+ * with zeros.  GNU as/ld write their output that way (section data first,
+ * at its final offset, the ELF header last), so the clamp made them append
+ * every chunk at EOF and produce corrupt objects.  The adapter keeps the
+ * requested position per handle and zero-fills the gap on the next write;
+ * a read there returns 0 (EOF) like Linux. */
+static uint32_t fat32_vpos[FAT32_MAX_OPEN_FILES];
+static bool     fat32_vpend[FAT32_MAX_OPEN_FILES];
+
+static int fat32_hidx(fat32_file_t *f) {
+    if (!f || f < &open_files[0] || f >= &open_files[FAT32_MAX_OPEN_FILES]) return -1;
+    return (int)(f - &open_files[0]);
+}
+
+/* Zero-fill from EOF up to the pending position; leaves the file position
+ * at that offset.  0 or -1. */
+static int fat32_fill_gap(fat32_file_t *f, int i) {
+    static const uint8_t zeros[512];
+    uint32_t want = fat32_vpos[i];
+    fat32_vpend[i] = false;
+    if (want <= f->file_size) return fat32_seek(f, want) < 0 ? -1 : 0;
+    if (fat32_seek(f, f->file_size) < 0) return -1;
+    while (f->file_size < want) {
+        uint32_t n = want - f->file_size;
+        if (n > sizeof(zeros)) n = sizeof(zeros);
+        int w = fat32_write(f, zeros, n);
+        if (w <= 0) return -1;
+    }
+    return 0;
+}
+
 static int fat32_vfs_read_only(vfs_filesystem_t *fs) {
     (void)fs;
     return fat32_medium_read_only();
@@ -48,24 +80,37 @@ static void* fat32_vfs_open(vfs_filesystem_t *fs, const char *rel_path,
         fat32_close(f);
         return NULL;
     }
+    int i = fat32_hidx(f);
+    if (i >= 0) fat32_vpend[i] = false;
     return (void *)f;
 }
 
 static int fat32_vfs_close(vfs_filesystem_t *fs, void *handle) {
     (void)fs;
+    int i = fat32_hidx((fat32_file_t *)handle);
+    if (i >= 0) fat32_vpend[i] = false;
     return fat32_close((fat32_file_t *)handle);
 }
 
 static int fat32_vfs_read(vfs_filesystem_t *fs, void *handle,
                           void *buffer, uint32_t size) {
     (void)fs;
-    return fat32_read((fat32_file_t *)handle, buffer, size);
+    fat32_file_t *f = (fat32_file_t *)handle;
+    int i = fat32_hidx(f);
+    if (i >= 0 && fat32_vpend[i]) {
+        if (fat32_vpos[i] >= f->file_size) return 0;      /* still past EOF */
+        if (fat32_fill_gap(f, i) < 0) return -1;          /* file grew meanwhile */
+    }
+    return fat32_read(f, buffer, size);
 }
 
 static int fat32_vfs_write(vfs_filesystem_t *fs, void *handle,
                            const void *buffer, uint32_t size) {
     (void)fs;
-    return fat32_write((fat32_file_t *)handle, buffer, size);
+    fat32_file_t *f = (fat32_file_t *)handle;
+    int i = fat32_hidx(f);
+    if (i >= 0 && fat32_vpend[i] && fat32_fill_gap(f, i) < 0) return -1;
+    return fat32_write(f, buffer, size);
 }
 
 static int fat32_vfs_get_size(vfs_filesystem_t *fs, void *handle) {
@@ -81,14 +126,25 @@ static int fat32_vfs_seek(vfs_filesystem_t *fs, void *handle,
     fat32_file_t *f = (fat32_file_t *)handle;
     if (!f) return -1;
 
-    uint32_t new_pos = 0;
+    int i = fat32_hidx(f);
+    int64_t cur = (i >= 0 && fat32_vpend[i]) ? (int64_t)fat32_vpos[i] : (int64_t)f->file_position;
+    int64_t np;
     switch (whence) {
-        case VFS_SEEK_SET: new_pos = (uint32_t)offset; break;
-        case VFS_SEEK_CUR: new_pos = f->file_position + offset; break;
-        case VFS_SEEK_END: new_pos = f->file_size + offset; break;
+        case VFS_SEEK_SET: np = offset; break;
+        case VFS_SEEK_CUR: np = cur + offset; break;
+        case VFS_SEEK_END: np = (int64_t)f->file_size + offset; break;
         default: return -1;
     }
-    if (fat32_seek(f, new_pos) < 0) return -1;
+    if (np < 0 || np > 0x7fffffffLL) return -1;
+    if (i >= 0) fat32_vpend[i] = false;
+    if ((uint64_t)np > f->file_size && i >= 0) {
+        /* Past EOF: park at EOF, remember the real position. */
+        if (fat32_seek(f, f->file_size) < 0) return -1;
+        fat32_vpos[i] = (uint32_t)np;
+        fat32_vpend[i] = true;
+        return (int)np;
+    }
+    if (fat32_seek(f, (uint32_t)np) < 0) return -1;
     return (int)f->file_position;
 }
 
