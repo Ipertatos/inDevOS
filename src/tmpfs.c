@@ -644,6 +644,8 @@ static vfs_fs_ops_t tmpfs_ops = {
     .setattr = tmpfs_setattr,
 };
 
+struct vfs_fs_ops *tmpfs_get_ops(void) { return &tmpfs_ops; }
+
 int tmpfs_mount_tmp(void) {
     /* Only overlay /tmp when / is the read-only install CD (Case A). On a
      * writable disk root the real /tmp must stay visible: ostest and other

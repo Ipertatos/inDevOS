@@ -46,6 +46,9 @@ extern uint64_t vmm_nx_bit;
 #define KERNEL_VIRT_BASE    0xFFFFFFFF80000000ULL  /**< Kernel virtual base */
 #define USER_VIRT_BASE      0x0000000000000000ULL  /**< User virtual base */
 #define USER_STACK_TOP      0x00007FFFFFFFF000ULL  /**< User stack top */
+/** Max demand-paged user stack below USER_STACK_TOP (Linux default RLIMIT_STACK is 8 MiB).
+ *  exec still pre-maps only the top 1 MiB; the rest is faulted in on use. */
+#define USER_STACK_LIMIT    (8ULL * 1024ULL * 1024ULL)
 #define USER_HEAP_START     0x0000000010000000ULL  /**< User heap start (256MB) */
 #define USER_CODE_START     0x0000000000400000ULL  /**< User code start (4MB) */
 

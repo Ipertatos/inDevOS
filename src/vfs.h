@@ -232,6 +232,11 @@ int  vfs_fd_get_path(int fd, char *buf, size_t buflen);
 
 // Utility
 vfs_filesystem_t* vfs_find_mount(const char *path, const char **rel_path_out);
+/* Per-mount identity for stat()/statfs(): *dev is a Linux dev_t (8:N for
+ * disk filesystems, 0:N for memory ones, N from the mount slot), *magic the
+ * statfs f_type of the filesystem.  Returns the length of the matched mount
+ * path (1 for "/"), or -ENOENT when no mount covers @path. */
+int vfs_mount_info(const char *path, uint32_t *dev, uint32_t *magic);
 
 // Check if any filesystem is mounted at "/" (or any mount exists)
 int vfs_has_root_mount(void);

@@ -387,6 +387,15 @@ void handle_timer(registers_t *r){
     apic_eoi();
 }
 
+/* CLONE_VM threads keep brk on the thread-group leader (mm_leader): a
+ * thread's own brk_* copy is stale. Same rule as mm_leader_of(). */
+static inline process_t *pf_heap_owner(process_t *p) {
+    process_t *l = p ? p->mm_leader : NULL;
+    if (l && l != p && l->pid != 0 && l->pml4 && l->pml4 == p->pml4)
+        return l;
+    return p;
+}
+
 /*
  * Map a demand-paged heap/stack page or break a COW mapping for @proc.
  * Shared by user faults, kernel faults on user addresses and uaccess.
@@ -406,14 +415,15 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
 
             /* Check if the faulting address is in a valid demand-paged region:
              *  - heap:  [brk_start .. brk_current)
-             *  - stack: [USER_STACK_TOP - 1MB .. USER_STACK_TOP + PAGE_SIZE)
+             *  - stack: [USER_STACK_TOP - USER_STACK_LIMIT .. USER_STACK_TOP + PAGE_SIZE)
              *
              * The upper bound is inclusive of the page AT USER_STACK_TOP because
              * the Linux ABI places the initial argc/argv/envp frame exactly there.
              */
-            bool in_heap = (faulting_address >= (uint64_t)proc->brk_start &&
-                            faulting_address <  (uint64_t)proc->brk_current);
-            uint64_t stack_guard = USER_STACK_TOP - (1024 * 1024);  /* 1MB stack limit */
+            process_t *hp = pf_heap_owner(proc);
+            bool in_heap = (faulting_address >= (uint64_t)hp->brk_start &&
+                            faulting_address <  (uint64_t)hp->brk_current);
+            uint64_t stack_guard = USER_STACK_TOP - USER_STACK_LIMIT;  /* was 1MB; 8MB like Linux */
             bool in_stack = (faulting_address >= stack_guard &&
                              faulting_address <  USER_STACK_TOP + PAGE_SIZE);
 
@@ -454,11 +464,12 @@ bool user_fault_fixup(struct process *proc, uint64_t faulting_address,
         uint64_t *pml4 = active_pml4 ? active_pml4 : (proc ? proc->pml4 : NULL);
         uint64_t *pte = pml4 ? vmm_get_pte_in(pml4, page_addr) : NULL;
 
-        uint64_t stack_lo = USER_STACK_TOP - (1024ULL * 1024ULL);
+        uint64_t stack_lo = USER_STACK_TOP - USER_STACK_LIMIT;
         uint64_t stack_hi = USER_STACK_TOP + PAGE_SIZE;
         bool in_stack = (faulting_address >= stack_lo && faulting_address < stack_hi);
-        bool in_heap = proc && (faulting_address >= (uint64_t)proc->brk_start &&
-                                faulting_address < (uint64_t)proc->brk_current);
+        process_t *hp2 = pf_heap_owner(proc);
+        bool in_heap = hp2 && (faulting_address >= (uint64_t)hp2->brk_start &&
+                               faulting_address < (uint64_t)hp2->brk_current);
         bool cow_bit = pte && (*pte & VMM_PRESENT) && (*pte & VMM_COW);
         bool ro_user = pte && (*pte & VMM_PRESENT) && (*pte & VMM_USER) &&
                        !(*pte & VMM_WRITABLE);
@@ -976,7 +987,10 @@ void isr_handler(registers_t* r) {
                 }
             }
 
-            thread_t *cur = global_scheduler.current_thread;
+            /* SMP: this CPU's thread, never the global (last CPU to switch). */
+            per_cpu_t *fk_cpu = smp_get_current_cpu();
+            thread_t *cur = (fk_cpu && fk_cpu->current_thread) ? fk_cpu->current_thread
+                                                               : global_scheduler.current_thread;
             if (cur) {
                 cur->state = THREAD_TERMINATED;
                 scheduler_remove_thread(cur);

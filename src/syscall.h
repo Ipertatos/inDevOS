@@ -381,6 +381,15 @@ typedef struct process {
      * inherited by fork.  fork_child_zombie_exit() logs only exec'd or
      * failing children - plain subshell forks are routine. */
     bool     exec_done;
+    /* ktime_now_ms() at the last exec (0 = never exec'd). */
+    uint64_t exec_time_ms;
+
+    /* CLONE_VM threads are separate process_t sharing one PML4.  brk,
+     * the anon-mmap cursor and mmap_regions must exist once per address
+     * space: threads point here at the thread-group leader (NULL = self).
+     * Resolved with mm_leader_of(); never trusted if the leader's PML4
+     * no longer matches (leader exec'd / was released). */
+    struct process *mm_leader;
 } process_t;
 
 /** @brief Virtual memory layout for processes */

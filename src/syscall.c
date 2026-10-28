@@ -38,6 +38,7 @@
 #include "users.h"
 #include "debug_config.h"
 #include "thread.h"
+#include "ktime.h"
 #include "debug.h"     /* ktrace() */
 #include "profiler.h"
 #include "rtc.h"             // rtc_read() for SYS_RTC_TIME
@@ -145,6 +146,8 @@ void process_fault_kill_current(int signum);
 
 static process_t *current_process = NULL;
 static uint32_t next_pid = 1;
+/* Serialises process-slot claim (allocate_process / process_alloc) and next_pid. */
+static spinlock_t proc_slot_lock;
 
 // Track current program's memory mapping for user-space access
 static void *current_program_base = NULL;
@@ -548,6 +551,7 @@ void set_current_process(process_t *proc) {
 }
 
 process_t* process_alloc(void) {
+    klock(&proc_slot_lock);
     for (int i = 1; i < MAX_PROCESSES; i++) {
         /* A slot is free only when the process is neither running NOR a
          * zombie. Zombies stay linked in their parent's child list until
@@ -585,9 +589,11 @@ process_t* process_alloc(void) {
             processes[i].cont_tty = -1;
             processes[i].file_umask = 022;
             processes[i].mmap_anon_next = 0x20000000ULL;
+            kunlock(&proc_slot_lock);
             return &processes[i];
         }
     }
+    kunlock(&proc_slot_lock);
     return NULL;
 }
 
@@ -1587,11 +1593,35 @@ int sys_seek(int fd, off_t offset, int whence) {
  * If the heuristic disagrees with CR3, use CR3's owner (as the #PF handler
  * does).  Kernel/non-usermode callers are returned unchanged. */
 static process_t *mm_syscall_owner(process_t *proc) {
-    if (!proc || !proc->is_usermode || !proc->pml4)
-        return proc;
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     uint64_t *active = (uint64_t *)phys_to_virt(cr3 & PTE_ADDR_MASK);
+    /* The caller is the process that owns the thread running on THIS CPU.
+     * exec_user_as_process() falls back to the global exec_ring3_active_proc
+     * (written by every CPU's scheduler), so under SMP it can name a process
+     * running on another core; mapping/unmapping/freeing in that process's
+     * address space and region list from here corrupts it (its frames are
+     * freed while still mapped there -> user writes into reused kernel
+     * memory).  Use the thread owner whenever there is one. */
+    {
+        thread_t *t = scheduler_get_current_thread();
+        process_t *op = t ? (process_t *)t->owner_process : NULL;
+        if (op && op->is_usermode && op->pml4 && !op->is_zombie) {
+            static int mm_fx_logs;
+            if ((op != proc || op->pml4 != active) && mm_fx_logs < 16) {
+                mm_fx_logs++;
+                process_t *co = process_find_by_pml4(active);
+                serial_printf("mm-fx: caller PID %u (thread owner) heuristic PID %d CR3 owner PID %d%s\n",
+                              op->pid, proc ? (int)proc->pid : -1, co ? (int)co->pid : -1,
+                              op->pml4 != active ? " - CR3 MISMATCH, reloading owner AS" : "");
+            }
+            if (op->pml4 != active)
+                vmm_switch_address_space(op->pml4);
+            return op;
+        }
+    }
+    if (!proc || !proc->is_usermode || !proc->pml4)
+        return proc;
     if (proc->pml4 == active)
         return proc;
     process_t *owner = process_find_by_pml4(active);
@@ -1604,9 +1634,34 @@ static process_t *mm_syscall_owner(process_t *proc) {
     return owner ? owner : proc;
 }
 
-void* sys_brk(void *addr) {
-    process_t *proc = exec_user_as_process();
-    proc = mm_syscall_owner(proc);
+/* One lock for user address-space bookkeeping + page-table edits done by
+ * brk/mmap/munmap/mprotect.  Threads of one process run these concurrently
+ * on different CPUs against the SAME PML4: without it two threads got the
+ * same VA range from the anon cursor, and vmm_get_next_level() could
+ * install two different page tables for one slot (lost mappings). */
+static spinlock_t user_mm_lock;
+
+static process_t *mm_leader_of(process_t *p) {
+    process_t *l = p ? p->mm_leader : NULL;
+    if (l && l != p && l->pid != 0 && l->pml4 && l->pml4 == p->pml4)
+        return l;
+    return p;
+}
+
+static process_t *mm_caller(void) {
+    return mm_leader_of(mm_syscall_owner(exec_user_as_process()));
+}
+
+static void *sys_brk_impl(process_t *proc, void *addr);
+void *sys_brk(void *addr) {
+    process_t *proc = mm_caller();
+    klock(&user_mm_lock);
+    void *r = sys_brk_impl(proc, addr);
+    kunlock(&user_mm_lock);
+    return r;
+}
+
+static void *sys_brk_impl(process_t *proc, void *addr) {
 
     if (addr == NULL) {
         return proc->brk_current;
@@ -1657,21 +1712,60 @@ void* sys_brk(void *addr) {
     return addr;
 }
 
+/* proc->mmap_regions (anon mmap bookkeeping, 24-B nodes in the 32-B slab)
+ * is walked/modified by fork (copy), mmap, munmap, process release and
+ * execve.  With CLONE_VM/vfork sharers and mm_syscall_owner() redirecting a
+ * syscall to the CR3 owner, two CPUs can touch the same list at once; it
+ * had no lock (lost nodes, double kfree of a node, use-after-free of a node
+ * that another CPU is copying).  One global lock: the sections are short. */
+static spinlock_t mmreg_lock = {0};
+static inline uint64_t mmreg_lock_take(void) {
+    uint64_t f = irq_save();
+    spinlock_lock(&mmreg_lock);
+    return f;
+}
+static inline void mmreg_unlock(uint64_t f) {
+    spinlock_unlock(&mmreg_lock);
+    irq_restore(f);
+}
+/* Detach the whole list under the lock, free the nodes outside it. */
+void proc_mmap_regions_free(process_t *proc) {
+    if (!proc) return;
+    uint64_t f = mmreg_lock_take();
+    proc_mmap_region_t *r = proc->mmap_regions;
+    proc->mmap_regions = NULL;
+    mmreg_unlock(f);
+    while (r) {
+        proc_mmap_region_t *next = r->next;
+        kfree(r);
+        r = next;
+    }
+}
+
 static int mmap_region_prepend(process_t *proc, uint64_t v, size_t len) {
     proc_mmap_region_t *r = (proc_mmap_region_t *)kalloc(sizeof(proc_mmap_region_t));
     if (!r)
         return -ENOMEM;
     r->virt = v;
     r->len = len;
+    uint64_t f = mmreg_lock_take();
     r->next = proc->mmap_regions;
     proc->mmap_regions = r;
+    mmreg_unlock(f);
     return 0;
 }
 
+static void *sys_mmap_impl(process_t *proc, void *addr, size_t length, int prot, int flags);
 void *sys_mmap(void *addr, size_t length, int prot, int flags) {
+    process_t *proc = mm_caller();
+    klock(&user_mm_lock);
+    void *r = sys_mmap_impl(proc, addr, length, prot, flags);
+    kunlock(&user_mm_lock);
+    return r;
+}
+
+static void *sys_mmap_impl(process_t *proc, void *addr, size_t length, int prot, int flags) {
 #define MMAP_ERR(e) ((void *)(uintptr_t)((uint64_t)(int64_t)(-(e))))
-    process_t *proc = exec_user_as_process();
-    proc = mm_syscall_owner(proc);
     if (length == 0 || length > (256ull << 20))
         return MMAP_ERR(EINVAL);
     /* Internal: Linux MAP_SHARED|MAP_ANONYMOUS (lx_mmap) -- pages stay
@@ -1683,6 +1777,10 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
     if ((flags & MAP_SHARED))
         return MMAP_ERR(EOPNOTSUPP);
 
+    if (proc && proc->is_usermode && !proc->pml4) {
+        serial_printf("mm-fx: mmap by user PID %d with no AS - refused\n", (int)proc->pid);
+        return MMAP_ERR(ENOMEM);
+    }
     if (!proc->pml4 || !proc->is_usermode) {
         void *mem = kalloc(length);
         if (!mem)
@@ -1748,10 +1846,19 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags) {
 /* Map physical device memory (the framebuffer for /dev/fb0) into the
  * caller.  PTEs carry VMM_DEVICE so munmap/exit/fork never free or COW the
  * frames; pte_extra selects the memory type (fb_wc_pte_flags()). */
+static long sys_mmap_device_impl(process_t *proc, uint64_t addr, uint64_t length, int prot, int fixed,
+                                 uint64_t phys, uint64_t pte_extra);
 long sys_mmap_device(uint64_t addr, uint64_t length, int prot, int fixed,
                      uint64_t phys, uint64_t pte_extra) {
-    process_t *proc = exec_user_as_process();
-    proc = mm_syscall_owner(proc);
+    process_t *proc = mm_caller();
+    klock(&user_mm_lock);
+    long r = sys_mmap_device_impl(proc, addr, length, prot, fixed, phys, pte_extra);
+    kunlock(&user_mm_lock);
+    return r;
+}
+
+static long sys_mmap_device_impl(process_t *proc, uint64_t addr, uint64_t length, int prot, int fixed,
+                                 uint64_t phys, uint64_t pte_extra) {
     if (!proc || !proc->pml4 || !proc->is_usermode) return -EINVAL;
     if (length == 0 || length > (256ull << 20) || (phys & (PAGE_SIZE - 1))) return -EINVAL;
     size_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -1784,8 +1891,16 @@ long sys_mmap_device(uint64_t addr, uint64_t length, int prot, int fixed,
 }
 
 /* Change protection bits on an existing user mapping (needed by tcc -run). */
+static int sys_mprotect_impl(process_t *proc, void *addr, size_t length, int prot);
 int sys_mprotect(void *addr, size_t length, int prot) {
-    process_t *proc = exec_user_as_process();
+    process_t *proc = mm_caller();
+    klock(&user_mm_lock);
+    int r = sys_mprotect_impl(proc, addr, length, prot);
+    kunlock(&user_mm_lock);
+    return r;
+}
+
+static int sys_mprotect_impl(process_t *proc, void *addr, size_t length, int prot) {
     if (!proc || !proc->pml4 || !proc->is_usermode)
         return 0;
     if (length == 0)
@@ -1821,13 +1936,27 @@ int sys_mprotect(void *addr, size_t length, int prot) {
 }
 
 
+static int sys_munmap_impl(process_t *proc, void *addr, size_t length);
 int sys_munmap(void *addr, size_t length) {
-    process_t *proc = exec_user_as_process();
-    proc = mm_syscall_owner(proc);
+    process_t *proc = mm_caller();
+    klock(&user_mm_lock);
+    int r = sys_munmap_impl(proc, addr, length);
+    kunlock(&user_mm_lock);
+    return r;
+}
+
+static int sys_munmap_impl(process_t *proc, void *addr, size_t length) {
     if (!addr || length == 0)
         return -EINVAL;
 
-    if (!proc->pml4 || !proc->is_usermode) {
+    if (!proc || !proc->pml4 || !proc->is_usermode) {
+        /* Kernel-heap mapping handed out by sys_mmap's no-AS path.  Never
+         * kfree a user address: that fed arbitrary pointers to the slab. */
+        if (is_user_address((uint64_t)addr)) {
+            serial_printf("mm-fx: munmap(0x%llx) with no user AS (PID %d) - refused\n",
+                          (unsigned long long)(uintptr_t)addr, proc ? (int)proc->pid : -1);
+            return -EINVAL;
+        }
         kfree(addr);
         return 0;
     }
@@ -1844,16 +1973,21 @@ int sys_munmap(void *addr, size_t length) {
     shmf_range(proc->pml4, v, pages * PAGE_SIZE, true);   /* MAP_SHARED file write-back */
     vmm_unmap_range_release_in(proc->pml4, v, pages);
 
+    proc_mmap_region_t *found = NULL;
+    uint64_t lf = mmreg_lock_take();
     proc_mmap_region_t **pp = &proc->mmap_regions;
     while (*pp) {
         proc_mmap_region_t *r = *pp;
         if (r->virt == v && r->len >= pages * PAGE_SIZE) {
             *pp = r->next;
-            kfree(r);
-            return 0;
+            found = r;
+            break;
         }
         pp = &r->next;
     }
+    mmreg_unlock(lf);
+    if (found)
+        kfree(found);
     return 0;
 }
 
@@ -1863,14 +1997,24 @@ int sys_getpid(void) {
 
 // Find a free process slot
 static process_t* allocate_process(void) {
+    /* Find-and-claim under proc_slot_lock: two CPUs forking at once used to
+     * both see the same pid==0 slot, so two child threads shared one
+     * process_t (and its per-process kernel stack). The pid and is_running
+     * are set inside the lock so process_alloc() cannot take the slot either. */
+    klock(&proc_slot_lock);
     for (int i = 1; i < MAX_PROCESSES; i++) { // Skip slot 0 (kernel process)
-        if (processes[i].pid == 0) {
+        if (processes[i].pid == 0 && !processes[i].is_running &&
+            !processes[i].is_zombie) {
             /* Full clear — recycled slots must not keep stale fds/pipe credits
              * or clone_shared_vm from a prior occupant. */
             memset(&processes[i], 0, sizeof(process_t));
+            processes[i].pid = next_pid++;
+            processes[i].is_running = true;
+            kunlock(&proc_slot_lock);
             return &processes[i];
         }
     }
+    kunlock(&proc_slot_lock);
     return NULL;
 }
 
@@ -1894,13 +2038,7 @@ static void process_release(process_t *proc) {
             proc->pml4 = NULL;
         }
     }
-    proc_mmap_region_t *r = proc->mmap_regions;
-    while (r) {
-        proc_mmap_region_t *next = r->next;
-        kfree(r);
-        r = next;
-    }
-    proc->mmap_regions = NULL;
+    proc_mmap_regions_free(proc);
     if (proc->user_symtab) {
         kfree(proc->user_symtab);
         proc->user_symtab = NULL;
@@ -2046,6 +2184,9 @@ void process_fault_kill_current(int signum) {
      * Never returns — that path hlt-loops after detaching the thread.
      */
     if (thr && proc->parent && proc->parent != &processes[0]) {
+        /* A killed pthread must still release pthread_join. */
+        extern void lx_clear_child_tid(process_t *p);
+        lx_clear_child_tid(proc);
         fork_child_zombie_exit(st);
         __builtin_unreachable();
     }
@@ -2119,11 +2260,13 @@ void fork_child_zombie_exit(int status) {
     if (proc)
         fork_release_pending(proc);
 
-    /* ~50 polled serial bytes per exit; configure-style scripts run
-     * thousands of `$(...)` / `( ... )` subshells that fork without exec and
-     * exit 0.  Those stay quiet (`trace on` shows them); every exec'd program
-     * and every non-zero exit is still logged (the desk gate keys on it). */
-    if (!proc || proc->exec_done || status != 0)
+    /* ~50 polled serial bytes per exit (~10 ms: about half of a whole
+     * fork+exec+wait).  Configure-style scripts run thousands of short
+     * programs and subshells that exit 0; those stay quiet (`trace on` shows
+     * them).  Every non-zero exit and every exec'd program that ran for at
+     * least 1 s (GUI apps etc.; the desk gate keys on them) is still logged. */
+    if (!proc || status != 0 ||
+        (proc->exec_done && ktime_now_ms() - proc->exec_time_ms >= 1000))
         serial_printf("fork-child-exit: PID %d status=%d -> zombie\n",
                       proc ? (int)proc->pid : -1, status);
     else
@@ -2155,6 +2298,14 @@ void fork_child_zombie_exit(int status) {
          * the dying context.)  Interrupts stay on so TLB IPIs are answered. */
         preempt_disable();
         exit_nopreempt = true;
+        /* Leave the user address space BEFORE is_zombie is published: once
+         * it is, the parent may reap on another CPU and free these page
+         * tables and frames (vmm_destroy_address_space does no shootdown),
+         * and this CPU must not keep them loaded in CR3. */
+        {
+            extern uint64_t *vmm_get_kernel_pml4(void);
+            vmm_switch_address_space(vmm_get_kernel_pml4());
+        }
         if (thr) {
             thr->state = THREAD_TERMINATED;
             thr->owner_process = NULL;
@@ -2169,6 +2320,9 @@ void fork_child_zombie_exit(int status) {
         {
             void *ks = proc->kernel_stack;
             proc->kernel_stack = NULL;
+            /* The reaper owns (and later frees) ks: no stale top may point
+             * at it once kalloc hands that memory to a new process. */
+            proc->kernel_stack_top = 0;
             thread_mark_dead(thr, ks);
         }
         if (proc->fork_parent) {
@@ -2266,10 +2420,13 @@ static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child
     if (!child)
         return -ENOMEM;
 
-    child->pid = next_pid++;
+    /* pid assigned by allocate_process() under proc_slot_lock */
     strcpy(child->cwd, parent->cwd);
-    child->brk_start = parent->brk_start;
-    child->brk_current = parent->brk_current;
+    /* A thread's own brk / anon cursor / regions are unused copies; the
+     * address space's bookkeeping lives on the thread-group leader. */
+    process_t *mmsrc = mm_leader_of(parent);
+    child->brk_start = mmsrc->brk_start;
+    child->brk_current = mmsrc->brk_current;
     child->memory_base = parent->memory_base;
     child->memory_size = parent->memory_size;
     child->virtual_base = parent->virtual_base;
@@ -2286,7 +2443,7 @@ static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child
     child->file_umask = parent->file_umask;
     child->cont_tty = parent->cont_tty;
     child->user_stack_top = parent->user_stack_top;
-    child->mmap_anon_next = parent->mmap_anon_next;
+    child->mmap_anon_next = mmsrc->mmap_anon_next;
     child->linux_abi = parent->linux_abi;
     child->fork_pending_release = NULL;
     child->fork_release_at_exit = NULL;
@@ -2327,6 +2484,8 @@ static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child
             child->pml4 = parent->pml4;
             child->clone_shared_vm = true;
             parent->clone_shared_vm = true;
+            /* brk / mmap cursor / regions stay with the thread-group leader. */
+            child->mm_leader = mm_leader_of(parent);
         } else {
             uint64_t *newpml4 = vmm_clone_address_space(parent->pml4);
             if (!newpml4) {
@@ -2353,7 +2512,10 @@ static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child
     }
 
     if (!share_vm) {
-        for (proc_mmap_region_t *r = parent->mmap_regions; r; r = r->next) {
+        /* Copy under mmreg_lock (kalloc never sleeps; lock order
+         * mmreg_lock -> slab/pmm locks only). */
+        uint64_t lf = mmreg_lock_take();
+        for (proc_mmap_region_t *r = mmsrc->mmap_regions; r; r = r->next) {
             proc_mmap_region_t *nr = (proc_mmap_region_t *)kalloc(sizeof(proc_mmap_region_t));
             if (!nr)
                 continue;
@@ -2362,6 +2524,7 @@ static int fork_spawn_child(bool share_vm, uint64_t newsp, process_t **out_child
             nr->next = child->mmap_regions;
             child->mmap_regions = nr;
         }
+        mmreg_unlock(lf);
     } else {
         child->mmap_regions = NULL;
     }
@@ -4168,7 +4331,10 @@ static uint64_t stat_ino_hash(const char *path) {
 static void stat_fill_common(stat_t *st, uint32_t mode, uint64_t size,
                              const char *path, uint32_t uid, uint32_t gid) {
     memset(st, 0, sizeof(*st));
-    st->st_dev = 9;
+    {
+        uint32_t dv = 0;
+        st->st_dev = vfs_mount_info(path, &dv, NULL) > 0 ? dv : 9;   /* per mount */
+    }
     st->st_ino = stat_ino_hash(path);
     st->st_mode = mode;
     st->st_nlink = 1;

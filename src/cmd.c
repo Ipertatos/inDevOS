@@ -1,3 +1,4 @@
+#include "exec_cache.h"
 /*
  * cmd.c - Terminal multiplexer and shared shell utilities for inDevOS
  *
@@ -713,6 +714,7 @@ void remove_file(const char *filename) {
         printf("No filesystem mounted. Use 'mount' first.\n");
         return;
     }
+    exec_cache_invalidate(filename);
     int rc = vfs_has_root_mount() ? vfs_unlink(filename) : fat32_delete_file(filename);
     if (rc == 0)
         printf("Removed '%s'\n", filename);
@@ -750,6 +752,7 @@ void copy_file(const char *source, const char *dest) {
         printf("Failed to create '%s'\n", dest);
         return;
     }
+    exec_cache_invalidate(dest);
     fat32_file_t *out = fat32_open(dest, "w");
     if (!out) {
         fat32_close(in);
@@ -788,7 +791,7 @@ void move_file(const char *source, const char *dest) {
     if (vfs_has_root_mount()) {
         if (vfs_unlink(source) != 0)
             printf("Copied but failed to remove '%s'\n", source);
-    } else if (fat32_delete_file(source) != 0) {
+    } else if ((exec_cache_invalidate(source), fat32_delete_file(source)) != 0) {
         printf("Copied but failed to remove '%s'\n", source);
     }
 }

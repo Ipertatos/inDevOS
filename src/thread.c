@@ -120,7 +120,7 @@ thread_t* thread_create(const char *name, void (*entry)(void*), void *arg,
     
     // Initialize thread structure
     memset(thread, 0, sizeof(thread_t));
-    thread->id = global_scheduler.next_thread_id++;
+    thread->id = __atomic_fetch_add(&global_scheduler.next_thread_id, 1, __ATOMIC_RELAXED);
     kstrncpy(thread->name, name, sizeof(thread->name));
     thread->entry_point = entry;
     thread->arg = arg;

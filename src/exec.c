@@ -7,6 +7,7 @@
 #include "string.h"
 #include "serial.h"
 #include "debug.h"
+#include "exec_cache.h"
 #include "gdt.h"
 #include "term.h"
 #include "tty.h"
@@ -491,7 +492,7 @@ int exec_file(const char *filename, char *const argv[]) {
     int bytes_read = 0;
 
     if (vfs_has_root_mount()) {
-        int n = vfs_read_file_alloc(resolved, &buffer, 0);
+        int n = exec_image_load(resolved, &buffer);
         if (n <= 0 || !buffer) {
             printf("exec: failed to read '%s'\n", resolved);
             return -1;
@@ -1281,6 +1282,7 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
     proc->brk_current     = proc->brk_start;
     /* Anonymous mmap area starts EXEC_MMAP_GAP above the break so a growing
      * brk heap (musl, Doom's zone) cannot run into mmap'd pages. */
+    proc->mm_leader = NULL;   /* new address space: own brk/mmap state */
     proc->mmap_anon_next  = ((uint64_t)proc->brk_current + EXEC_MMAP_GAP + PAGE_SIZE - 1) &
                             ~(uint64_t)(PAGE_SIZE - 1);
     proc->is_usermode     = true;
@@ -1293,6 +1295,7 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
         proc->linux_exe_path[0] = 0;
     }
     proc->exec_done       = true;
+    proc->exec_time_ms    = ktime_now_ms();
     proc->parent          = get_current_process();
 
     {
@@ -1482,7 +1485,7 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
     uint32_t fsize = 0;
     int bytes_read = 0;
     if (vfs_has_root_mount()) {
-        int n = vfs_read_file_alloc(resolved, &image, 0);
+        int n = exec_image_load(resolved, &image);
         if (n <= 0 || !image) return -ENOENT;
         fsize = (uint32_t)n;
         bytes_read = n;
@@ -1596,10 +1599,9 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
             vmm_destroy_address_space(proc->pml4);
         proc->pml4 = NULL;
     }
-    while (proc->mmap_regions) {
-        proc_mmap_region_t *r = proc->mmap_regions;
-        proc->mmap_regions = r->next;
-        kfree(r);
+    {
+        extern void proc_mmap_regions_free(process_t *proc);
+        proc_mmap_regions_free(proc);
     }
     exec_free_user_symbols(proc);
 
@@ -1610,12 +1612,14 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
     proc->memory_base    = NULL;
     proc->brk_start      = (void *)((seg_end + 0xFFF) & ~0xFFFULL);
     proc->brk_current    = proc->brk_start;
+    proc->mm_leader = NULL;   /* new address space: own brk/mmap state */
     proc->mmap_anon_next = ((uint64_t)proc->brk_current + EXEC_MMAP_GAP + PAGE_SIZE - 1) &
                            ~(uint64_t)(PAGE_SIZE - 1);
     proc->linux_ti_valid = false;
     proc->linux_clear_child_tid = 0;
     kstrncpy(proc->linux_exe_path, resolved, sizeof(proc->linux_exe_path));
     proc->exec_done      = true;
+    proc->exec_time_ms   = ktime_now_ms();
 
     /* Reset caught signal handlers to default; leave SIG_IGN alone.
      * Also clear sa_restorer — stale ash trampolines must not survive exec
@@ -1716,7 +1720,7 @@ int exec_spawn(const char *filename, char *const argv[]) {
     int bytes_read = 0;
 
     if (vfs_has_root_mount()) {
-        int n = vfs_read_file_alloc(resolved, &image, 0);
+        int n = exec_image_load(resolved, &image);
         if (n <= 0 || !image) return -1;
         fsize = (uint32_t)n;
         bytes_read = n;
@@ -1875,6 +1879,7 @@ int exec_spawn(const char *filename, char *const argv[]) {
     proc->memory_size      = seg_end - seg_base;
     proc->brk_start        = (void *)((seg_end + 0xFFF) & ~0xFFFULL);
     proc->brk_current      = proc->brk_start;
+    proc->mm_leader = NULL;   /* new address space: own brk/mmap state */
     proc->mmap_anon_next   = ((uint64_t)proc->brk_current + EXEC_MMAP_GAP + PAGE_SIZE - 1)
                              & ~(uint64_t)(PAGE_SIZE - 1);
     proc->is_usermode      = true;
@@ -2028,9 +2033,12 @@ void exec_spawned_exit(int status) {
      * used to swapgs here for the SYSCALL case.) */
     exec_exit_undo_swapgs = true;
 
-    /* Free user address space (safe: we already switched to kernel PML4) */
+    /* Free user address space (safe: we already switched to kernel PML4).
+     * A CLONE_VM (vfork) child may still run on it: only drop our reference
+     * then; the last sharer frees it. */
     if (proc->pml4) {
-        vmm_destroy_address_space(proc->pml4);
+        if (!process_pml4_shared_with_others(proc->pml4, proc))
+            vmm_destroy_address_space(proc->pml4);
         proc->pml4 = NULL;
     }
 

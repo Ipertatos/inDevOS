@@ -6,6 +6,7 @@
 #include "mem.h"
 #include "atomic.h"
 #include "../include/indevos_errno.h"
+#include "exec_cache.h"   /* exec image cache invalidation hooks */
 
 /* users.c permission-override table follows renames/deletes. */
 void perm_forget_tree(const char *path);
@@ -82,6 +83,7 @@ int vfs_mount(const char *path, vfs_fs_ops_t *ops, void *fs_data) {
             mount_table[i].ops     = ops;
             mount_table[i].fs_data = fs_data;
             mount_table[i].mounted = true;
+            exec_cache_flush();   /* a new mount can shadow cached paths */
 
             int used = 0;
             for (int k = 0; k < VFS_MAX_MOUNTPOINTS; k++) if (mount_table[k].mounted) used++;
@@ -123,6 +125,7 @@ int vfs_unmount(const char *path) {
                 }
             }
             mount_table[i].mounted = false;
+            exec_cache_flush();
             printf("vfs: Unmounted '%s'\n", path);
             VFS_UNLOCK(); return 0;
         }
@@ -180,6 +183,29 @@ vfs_filesystem_t* vfs_find_mount(const char *path, const char **rel_path_out) {
     }
 
     return best;
+}
+
+#define VFS_MAGIC_MSDOS 0x4d44u
+#define VFS_MAGIC_EXFAT 0x2011BAB0u
+#define VFS_MAGIC_EXT4  0xEF53u
+#define VFS_MAGIC_TMPFS 0x01021994u
+int vfs_mount_info(const char *path, uint32_t *dev, uint32_t *magic) {
+    extern vfs_fs_ops_t *vfs_fat32_get_ops(void);
+    extern vfs_fs_ops_t *exfat_get_ops(void);
+    extern vfs_fs_ops_t *ext4ro_get_ops(void);
+    extern vfs_fs_ops_t *vfs_ext4_get_ops(void);
+    extern struct vfs_fs_ops *tmpfs_get_ops(void);
+    vfs_filesystem_t *fs = vfs_find_mount(path, NULL);
+    if (!fs) return -ENOENT;
+    uint32_t slot = (uint32_t)(fs - mount_table);
+    uint32_t mg; bool disk = true;
+    if (fs->ops == vfs_fat32_get_ops())                                  mg = VFS_MAGIC_MSDOS;
+    else if (fs->ops == exfat_get_ops())                                 mg = VFS_MAGIC_EXFAT;
+    else if (fs->ops == ext4ro_get_ops() || fs->ops == vfs_ext4_get_ops()) mg = VFS_MAGIC_EXT4;
+    else { mg = VFS_MAGIC_TMPFS; disk = false; }   /* tmpfs, /dev/dri and other memory filesystems */
+    if (dev)   *dev = disk ? ((8u << 8) | (slot + 1)) : (0x20u + slot);
+    if (magic) *magic = mg;
+    return (int)fs->mount_path_len;
 }
 
 // ---- File operations --------------------------------------------------------
@@ -257,6 +283,8 @@ int vfs_open(const char *path, uint32_t flags) {
         VFS_UNLOCK(); return -ENOENT;
     }
 
+    if (flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND))
+        exec_cache_invalidate(path);
     open_files[fd].in_use    = true;
     open_files[fd].fs        = fs;
     open_files[fd].fs_handle = handle;
@@ -313,6 +341,7 @@ int vfs_write(int fd, const void *buffer, uint32_t size) {
     if (!(vf->flags & VFS_O_WRITE)) { VFS_UNLOCK(); return -EBADF; }  // not opened for writing
     if (!vf->fs || !vf->fs->ops || !vf->fs->ops->write) { VFS_UNLOCK(); return -EINVAL; }
     int ret = vf->fs->ops->write(vf->fs, vf->fs_handle, buffer, size);
+    if (ret > 0) exec_cache_invalidate(vf->path);
     char ip[VFS_MAX_PATH];
     if (ret > 0) vfs_ino_fd(fd, ip); else ip[0] = '\0';
     VFS_UNLOCK();
@@ -618,6 +647,7 @@ int vfs_unlink(const char *path) {
     int ret = fs->ops->unlink(fs, rel);
     VFS_UNLOCK();
     if (ret == 0) {
+        exec_cache_invalidate(path);
         perm_forget_tree(path);     /* users.c: free the mode-override slot */
         inotify_vfs_event(path, IN_DELETE | (isdir ? IN_ISDIR : 0));
     }
@@ -669,6 +699,8 @@ int vfs_rename(const char *oldpath, const char *newpath) {
             int rr = f1->ops->rename(f1, r1, r2);
             VFS_UNLOCK();
             if (rr == 0) {
+                exec_cache_invalidate_tree(oldpath);
+                exec_cache_invalidate_tree(newpath);
                 perm_rename_tree(oldpath, newpath);
                 inotify_vfs_rename(oldpath, newpath, isdir);
             }
@@ -680,6 +712,8 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     extern int fat32_rename(const char *oldpath, const char *newpath);
     int r = fat32_rename(oldpath, newpath);
     if (r == 0) {
+        exec_cache_invalidate_tree(oldpath);
+        exec_cache_invalidate_tree(newpath);
         perm_rename_tree(oldpath, newpath);
         inotify_vfs_rename(oldpath, newpath, isdir);
         return 0;
@@ -699,6 +733,7 @@ int vfs_rmdir(const char *path) {
         int r = fs->ops->rmdir(fs, rel);
         VFS_UNLOCK();
         if (r == 0) {
+            exec_cache_invalidate_tree(path);
             perm_forget_tree(path);
             inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
         }
@@ -708,6 +743,7 @@ int vfs_rmdir(const char *path) {
     extern int fat32_remove_empty_directory(const char *path);
     int fr = fat32_remove_empty_directory(path);             /* FAT32: unchanged */
     if (fr == 0) {
+        exec_cache_invalidate_tree(path);
         perm_forget_tree(path);
         inotify_vfs_event(path, IN_DELETE | IN_ISDIR);
     }
@@ -845,7 +881,11 @@ int vfs_link(const char *oldpath, const char *newpath) {
     if (!f1->ops->link) { VFS_UNLOCK(); return -EPERM; }
     int r = f1->ops->link(f1, r1 ? r1 : "", r2 ? r2 : "");
     VFS_UNLOCK();
-    if (r == 0) { inotify_vfs_event(newpath, IN_CREATE); inotify_vfs_event(oldpath, IN_ATTRIB); }
+    if (r == 0) {
+        exec_cache_invalidate(oldpath);   /* nlink > 1: no longer cacheable */
+        exec_cache_invalidate(newpath);
+        inotify_vfs_event(newpath, IN_CREATE); inotify_vfs_event(oldpath, IN_ATTRIB);
+    }
     return r;
 }
 
@@ -873,6 +913,7 @@ bool vfs_has_inode_perms(const char *path) {
 
 int vfs_truncate(const char *path, uint64_t len) {
     if (!path) return -EINVAL;
+    exec_cache_invalidate(path);
     VFS_LOCK();
     const char *rel = NULL;
     vfs_filesystem_t *fs = vfs_find_mount(path, &rel);
@@ -902,6 +943,7 @@ int vfs_ftruncate(int fd, uint64_t len) {
         r = vf->fs->ops->ftruncate(vf->fs, vf->fs_handle, len);
     else if (vf->fs && vf->fs->ops == vfs_fat32_get_ops())  /* FAT32 */
         r = len > 0xFFFFFFFFull ? -EINVAL : fat32_truncate_handle_v(vf->fs_handle, (uint32_t)len);
+    exec_cache_invalidate(vf->path);
     char ip[VFS_MAX_PATH];
     if (r == 0) vfs_ino_fd(fd, ip); else ip[0] = '\0';
     VFS_UNLOCK();

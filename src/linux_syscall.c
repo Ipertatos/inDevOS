@@ -627,6 +627,24 @@ static long lx_get(void *k, const void *uptr, size_t n) {
     return copy_from_user(k, uptr, n) ? -EFAULT : 0;
 }
 
+/* CLONE_CHILD_CLEARTID on thread death: zero the tid word and futex-wake
+ * one waiter so pthread_join returns.  Called by exit/exit_group and by the
+ * fault-kill path (a thread killed by #PF/#GP used to leave pthread_join
+ * hanging forever).  Only touches user memory when CR3 is p's PML4. */
+void lx_clear_child_tid(process_t *p) {
+    if (!p || !p->linux_clear_child_tid)
+        return;
+    uint64_t a = p->linux_clear_child_tid;
+    p->linux_clear_child_tid = 0;
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    if (!p->pml4 || (uint64_t *)phys_to_virt(cr3 & PTE_ADDR_MASK) != p->pml4)
+        return;
+    uint32_t z = 0;
+    if (lx_put((void *)a, &z, 4) == 0)
+        lx_futex_wake_addr(a, 1);
+}
+
 /* Time: monotonic = microseconds since boot, realtime = RTC epoch at boot
  * plus the same counter (the CMOS clock is read once). */
 static uint64_t lx_epoch_base_us;
@@ -965,6 +983,7 @@ static long lx_stat_path_k(const char *abspath, lx_stat_t *out) {
             st.st_blksize = 4096;
             st.st_rdev = rdev;
             st.st_ino = 0x10000 + rdev;
+            st.st_dev = 5;                          /* devtmpfs 0:5 */
             lx_fill_stat(out, &st);
             return 0;
         }
@@ -975,6 +994,7 @@ static long lx_stat_path_k(const char *abspath, lx_stat_t *out) {
         st.st_nlink = 1;
         st.st_blksize = 1024;
         st.st_ino = 0xF000 + (uint64_t)strlen(abspath);
+        st.st_dev = 4;                          /* procfs 0:4 */
     } else if (lx_path_kind(abspath, &st)) {
         lx_mode_adjust(abspath, &st);
         if (fifo_is(abspath)) { st.st_mode = LX_S_IFIFO | 0644; st.st_size = 0; }
@@ -986,6 +1006,7 @@ static long lx_stat_path_k(const char *abspath, lx_stat_t *out) {
         st.st_nlink = 2;
         st.st_blksize = 4096;
         st.st_ino = kstrcmp(abspath, "/dev") == 0 ? 0xD000 : 0xD001;
+        st.st_dev = !kstrncmp(abspath, "/proc", 5) ? 4 : !kstrncmp(abspath, "/sys", 4) ? 6 : 5;
     }
     lx_fill_stat(out, &st);
     return 0;
@@ -2235,29 +2256,25 @@ static long lx_futex(process_t *p, uint64_t uaddr, long opw, uint32_t val, uint6
         kunlock(&lx_futex_lock);
         return op == 4 ? woke + moved : woke;
     }
-    case 5: /* WAKE_OP: atomic w.r.t. other futex ops (not user atomics) */ {
+    case 5: /* WAKE_OP: the *uaddr2 update is one lock cmpxchg (atomic against
+             * user-space atomics too) done under lx_futex_lock */ {
         uint64_t as2, addr2;
         if ((r = lx_futex_key(uaddr, opw, &as, &addr))) return r;
         if ((r = lx_futex_key(uaddr2, opw, &as2, &addr2))) return r;
         uint32_t fop = (val3 >> 28) & 7, cmp = (val3 >> 24) & 15;
-        uint32_t oparg = (val3 >> 12) & 0xfff, cmparg = val3 & 0xfff;
+        /* oparg / cmparg are signed 12-bit fields (Linux sign-extends them) */
+        uint32_t oparg = (uint32_t)((int32_t)(val3 << 8) >> 20);
+        int32_t cmparg = (int32_t)(val3 << 20) >> 20;
         if ((val3 >> 28) & 8) oparg = 1u << (oparg & 31);
-        uint32_t old, nv;
-        if (lx_get(&old, (void *)uaddr2, 4)) return -EFAULT;
+        if (fop > 4) return -ENOSYS;
+        uint32_t old;
+        if (user_atomic_op_u32(uaddr2, 1 /* ADD 0: fault in / break COW outside the lock */, 0, &old))
+            return -EFAULT;
         klock(&lx_futex_lock);
-        if (lx_get(&old, (void *)uaddr2, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
-        switch (fop) {
-        case 0: nv = oparg; break;
-        case 1: nv = old + oparg; break;
-        case 2: nv = old | oparg; break;
-        case 3: nv = old & ~oparg; break;
-        case 4: nv = old ^ oparg; break;
-        default: kunlock(&lx_futex_lock); return -ENOSYS;
-        }
-        if (lx_put((void *)uaddr2, &nv, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
+        if (user_atomic_op_u32(uaddr2, (int)fop, oparg, &old)) { kunlock(&lx_futex_lock); return -EFAULT; }
         int woke = lx_futex_wake_locked(as, addr, (int)val, 0xffffffffu);
         bool c;
-        int32_t so = (int32_t)old, sa = (int32_t)cmparg;
+        int32_t so = (int32_t)old, sa = cmparg;
         switch (cmp) {
         case 0: c = so == sa; break; case 1: c = so != sa; break;
         case 2: c = so < sa;  break; case 3: c = so <= sa; break;
@@ -2511,6 +2528,32 @@ static long lx_sigtimedwait(process_t *p, const void *uset, void *uinfo, const v
     }
 }
 
+/* Temporary signal mask for ppoll/pselect6/epoll_pwait(2): installed for the
+ * wait, then either restored at once or -- when the wait was interrupted by a
+ * now-deliverable signal -- after its handler ran (rt_sigreturn), exactly as
+ * rt_sigsuspend does.  Returns 0 (mask installed or none given) or -errno. */
+static long lx_sigmask_enter(process_t *p, const void *umask, size_t sz, uint32_t *old, bool *set) {
+    *set = false;
+    *old = p->blocked_signals;
+    if (!umask) return 0;
+    if (sz != 8) return -EINVAL;
+    uint64_t s = 0;
+    if (lx_get(&s, umask, 8)) return -EFAULT;
+    p->blocked_signals = (uint32_t)((s << 1) & 0xFFFFFFFEu) & ~((1u << 9) | (1u << 19));
+    *set = true;
+    return 0;
+}
+static long lx_sigmask_leave(process_t *p, long r, uint32_t old, bool set) {
+    if (!set) return r;
+    if (r == -EINTR && (p->pending_signals & ~p->blocked_signals) && !p->sigsuspend_restore) {
+        p->sigsuspend_saved_mask = old;          /* restored by rt_sigreturn / next syscall */
+        p->sigsuspend_restore = true;
+    } else {
+        p->blocked_signals = old;
+    }
+    return r;
+}
+
 static long lx_dispatch(linux_syscall_frame_t *fr) {
     process_t *p = lx_proc();
     const uint64_t nr = fr->nr;
@@ -2630,6 +2673,12 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             np++;
         }
         int pr;
+        uint32_t om = 0; bool ms_set = false;
+        if (nr == LX_pselect6 && a6) {          /* a6 -> { const sigset_t *ss; size_t ss_len } */
+            uint64_t sd[2];
+            if (lx_get(sd, (void *)a6, 16)) return -EFAULT;
+            if ((r = lx_sigmask_enter(p, (const void *)sd[0], (size_t)sd[1], &om, &ms_set))) return r;
+        }
         if (np) {
             pr = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
         } else {                    /* select(0, ..., timeout): plain sleep */
@@ -2638,12 +2687,13 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
                 fork_release_pending(p);
                 while (ktime_now_ms() < dl) {
                     extern bool proc_signal_interrupts(process_t *);
-                    if (proc_signal_interrupts(p)) return -EINTR;
+                    if (proc_signal_interrupts(p)) return lx_sigmask_leave(p, -EINTR, om, ms_set);
                     __asm__ volatile("sti; hlt" ::: "memory");
                 }
             }
             pr = 0;
         }
+        lx_sigmask_leave(p, pr < 0 ? pr : 0, om, ms_set);
         if (pr < 0) return pr;
         uint64_t rout = 0, wout = 0, eout = 0;
         int ready = 0;
@@ -2667,7 +2717,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (lx_get(&ts, (void *)a3, sizeof(ts))) return -EFAULT;
             ms = (int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
         }
-        return sys_poll((pollfd_t *)a1, (unsigned)a2, ms);
+        uint32_t om; bool ms_set;
+        if ((r = lx_sigmask_enter(p, (const void *)a4, (size_t)a5, &om, &ms_set))) return r;
+        return lx_sigmask_leave(p, sys_poll((pollfd_t *)a1, (unsigned)a2, ms), om, ms_set);
     }
     case LX_fsync: case LX_fdatasync: case LX_sync:
         vfs_sync_all();                         /* exFAT: flush + clear VolumeDirty */
@@ -3091,12 +3143,50 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         return 0;                                       /* accepted; scheduler is not pinned */
     }
     case LX_statfs: case LX_fstatfs: {
-        uint64_t sf[15];                        /* struct statfs, 120 bytes */
+        /* f_type and f_fsid of the filesystem that holds the path / fd. */
+        if (nr == LX_statfs) {
+            if ((r = lx_resolve(p, LX_AT_FDCWD, (const char *)a1, path, sizeof(path), false))) return r;
+            if (!lx_dev_path(path, NULL) && !lx_proc_text_path(p, path) && !lx_synth_dir(path)) {
+                char ap[VFS_MAX_PATH]; kstrncpy(ap, path, sizeof(ap));
+                lx_exe_alias(ap, sizeof(ap));
+                bool pseudo = !kstrcmp(path, "/proc") || !kstrncmp(path, "/proc/", 6) ||
+                              !kstrcmp(path, "/sys") || !kstrncmp(path, "/sys/", 5);
+                if (!pseudo && !lx_path_kind(ap, NULL))
+                    return -ENOENT;
+            }
+        } else {
+            if (!lx_fd_ok(p, (long)(int)a1)) return -EBADF;
+            long fr = lx_fd_path(p, (long)(int)a1, path, sizeof(path));
+            if (fr < 0) return fr;
+            if (fr == 1) {                      /* pipe/socket/tty/device fd */
+                file_descriptor_t *f = &p->fds[(int)a1];
+                bool pipe = f->fd_type == FD_TYPE_PIPE_READ || f->fd_type == FD_TYPE_PIPE_WRITE;
+                kstrncpy(path, pipe ? "pipe:" : "/dev", sizeof(path));
+            }
+        }
+        uint32_t mg = 0x4d44, dv = 9;           /* MSDOS_SUPER_MAGIC */
+        bool ro = false;
+        if (!kstrcmp(path, "pipe:"))                         { mg = 0x50495045; dv = 12; }  /* PIPEFS */
+        else if (!kstrcmp(path, "/proc") || !kstrncmp(path, "/proc/", 6)) { mg = 0x9fa0; dv = 4; }
+        else if (!kstrcmp(path, "/sys") || !kstrncmp(path, "/sys/", 5))   { mg = 0x62656572; dv = 6; }
+        else if (!kstrcmp(path, "/dev/pts") || !kstrncmp(path, "/dev/pts/", 9)) { mg = 0x1cd1; dv = 7; }
+        else {
+            int ml = vfs_mount_info(path, &dv, &mg);
+            /* /dev outside a real mount (e.g. /dev/dri) is the devtmpfs */
+            if (ml <= 1 && (!kstrcmp(path, "/dev") || !kstrncmp(path, "/dev/", 5))) { mg = 0x01021994; dv = 5; }
+            else if (ml > 0) {
+                vfs_filesystem_t *fs = vfs_find_mount(path, NULL);
+                ro = fs && fs->ops && fs->ops->read_only && fs->ops->read_only(fs);
+            }
+        }
+        uint64_t sf[15];                        /* struct statfs (x86_64), 120 bytes */
         memset(sf, 0, sizeof(sf));
-        sf[0] = 0x4d44;                         /* MSDOS_SUPER_MAGIC */
+        sf[0] = mg;                             /* f_type */
         sf[1] = 4096;                           /* f_bsize */
-        sf[11] = 255;                           /* f_namelen */
-        sf[12] = 4096;                          /* f_frsize */
+        sf[7] = dv;                             /* f_fsid (val[0] = dev, val[1] = 0) */
+        sf[8] = 255;                            /* f_namelen */
+        sf[9] = 4096;                           /* f_frsize */
+        sf[10] = 0x20 | (ro ? 1 : 0);           /* f_flags: ST_VALID | ST_RDONLY */
         return lx_put((void *)a2, sf, sizeof(sf));
     }
 
@@ -3119,14 +3209,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
 
     /* ---- process ---- */
     case LX_exit: case LX_exit_group:
-        if (p->linux_clear_child_tid) {
-            /* CLONE_CHILD_CLEARTID: zero the tid word so pthread_join's
-             * futex wait (polling) sees the thread is gone. */
-            uint32_t z = 0;
-            if (lx_put((void *)p->linux_clear_child_tid, &z, 4) == 0)
-                lx_futex_wake_addr(p->linux_clear_child_tid, 1);
-            p->linux_clear_child_tid = 0;
-        }
+        /* CLONE_CHILD_CLEARTID: zero the tid word so pthread_join's
+         * futex wait (polling) sees the thread is gone. */
+        lx_clear_child_tid(p);
         sys_exit((int)(a1 & 0xff));
         return 0;
     case LX_getpid: case LX_gettid:
@@ -3736,8 +3821,12 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_epoll_create1: return lx_epoll_create(p, (long)(int)a1);
     case LX_epoll_ctl:     return lx_epoll_ctl(p, (long)(int)a1, (long)(int)a2, (long)(int)a3, (const void *)a4);
     case LX_epoll_wait:
-    case LX_epoll_pwait:   /* sigmask ignored, as for ppoll/pselect6 */
         return lx_epoll_wait(p, (long)(int)a1, (void *)a2, (long)(int)a3, (int)a4);
+    case LX_epoll_pwait: {     /* a5 = sigmask, a6 = sigsetsize */
+        uint32_t om; bool ms_set;
+        if ((r = lx_sigmask_enter(p, (const void *)a5, (size_t)a6, &om, &ms_set))) return r;
+        return lx_sigmask_leave(p, lx_epoll_wait(p, (long)(int)a1, (void *)a2, (long)(int)a3, (int)a4), om, ms_set);
+    }
     case LX_epoll_pwait2: {
         int ms = -1;
         if (a4) {
@@ -3746,7 +3835,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
             ms = (int)(ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000);
         }
-        return lx_epoll_wait(p, (long)(int)a1, (void *)a2, (long)(int)a3, ms);
+        uint32_t om; bool ms_set;
+        if ((r = lx_sigmask_enter(p, (const void *)a5, (size_t)a6, &om, &ms_set))) return r;
+        return lx_sigmask_leave(p, lx_epoll_wait(p, (long)(int)a1, (void *)a2, (long)(int)a3, ms), om, ms_set);
     }
 
     case LX_getrandom: {
@@ -4001,7 +4092,10 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
     /* SA_RESTART: rewind to the SYSCALL insn (2 bytes) with rax=nr so the
      * call re-executes after the handler. pause/sigsuspend never restart. */
     if (r == -EINTR && p && !p->sig_in_handler &&
-        f->nr != (uint64_t)LX_pause && f->nr != (uint64_t)LX_rt_sigsuspend) {
+        f->nr != (uint64_t)LX_pause && f->nr != (uint64_t)LX_rt_sigsuspend &&
+        f->nr != (uint64_t)LX_epoll_wait && f->nr != (uint64_t)LX_epoll_pwait &&
+        f->nr != (uint64_t)LX_epoll_pwait2 && f->nr != (uint64_t)LX_ppoll &&
+        f->nr != (uint64_t)LX_pselect6) {
         for (int s = 1; s < NSIG; s++) {
             uint32_t b = 1u << s;
             if (!(p->pending_signals & b) || (p->blocked_signals & b)) continue;

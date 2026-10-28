@@ -1,3 +1,4 @@
+#include "exec_cache.h"
 #include "types.h"
 #include "zeus_internal.h"
 #include "string.h"
@@ -441,7 +442,7 @@ static const char *const zeus_command_names[] = {
     "timertest", "touch", "tui", "tuidesktop", "udpverbose",     "unmount", "unset", "udp_test",
     "usb", "usbenum", "usbkeyboard", "usbpoll", "useradd", "userdel",
     "users", "version", "wc", "whoami", "xhci", "lsusb", "usbnet", "lxtrace",
-    "uptime", "execsym", "trace", "acpidump",
+    "uptime", "execsym", "trace", "acpidump", "execcache",
     (const char *)0
 };
 
@@ -813,6 +814,15 @@ void zeus_execute_command(ZeusShell* shell, int argc, char* argv[]) {
         }
         printf("trace: program-load and filesystem tracing is %s\n",
                ktrace_enabled ? "on" : "off");
+    } else if (kstrcmp(command, "execcache") == 0) {
+        uint32_t ents = 0; uint64_t bytes = 0, hits = 0, misses = 0;
+        exec_cache_stats(&ents, &bytes, &hits, &misses);
+        printf("execcache: %u entries, %llu bytes, %llu hits, %llu misses\n",
+               (unsigned)ents, (unsigned long long)bytes,
+               (unsigned long long)hits, (unsigned long long)misses);
+        serial_printf("execcache: %u entries, %llu bytes, %llu hits, %llu misses\n",
+                      (unsigned)ents, (unsigned long long)bytes,
+                      (unsigned long long)hits, (unsigned long long)misses);
     } else if (kstrcmp(command, "execsym") == 0) {
         /* ELF symtab loading for user-mode backtraces (off by default: it costs
          * time on every program launch). */
@@ -2305,6 +2315,7 @@ static int zeus_vfs_write_redir(const char *path, const void *data, size_t n, bo
         }
         return 0;
     }
+    exec_cache_invalidate(path);
     if (!append && fat32_file_exists(path))
         fat32_truncate_file(path);
     else if (!fat32_file_exists(path))

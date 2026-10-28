@@ -2416,6 +2416,207 @@ static int t_cx_perf(char *d, size_t n) {
           stat_us, PERF_STAT_MISS_MAX_US, fork_us, PERF_FORK_MAX_US);
     R(PASS, "stat(ENOENT) %lld us, fork+_exit+wait %lld us, create/unlink x300 modes %o->%o", stat_us, fork_us, mode0, modeN);
 }
+/* compat.exec_cache (batch 10): exec reuses a cached image; every way of
+ * changing the file must be seen by the next exec, within the same second
+ * (FAT mtime has 2 s granularity, so only the VFS hooks can catch these). */
+static int xc_run(const char *path) {
+    pid_t c = fork(); if (c < 0) return -1;
+    if (!c) { execl(path, "true", (char *)NULL); _exit(errno == ENOEXEC ? 120 : errno == ENOENT ? 121 : 122); }
+    int st = 0; if (waitpid(c, &st, 0) != c) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 200;
+}
+static int xc_copy(const char *src, const char *dst) {
+    int a = open(src, O_RDONLY); if (a < 0) return -1;
+    int b = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755); if (b < 0) { close(a); return -1; }
+    static char buf[65536]; ssize_t r; int ok = 0;
+    while ((r = read(a, buf, sizeof buf)) > 0) if (writeall(b, buf, (size_t)r) != r) { ok = -1; break; }
+    close(a); close(b); return ok;
+}
+static int xc_dir(const char *dir, char *d, size_t n) {
+    char x[200], y[200]; snprintf(x, sizeof x, "%s/xc", dir); snprintf(y, sizeof y, "%s/xd", dir);
+    CHECKE(xc_copy("/bin/busybox.exe", x) == 0, "copy busybox");
+    chmod(x, 0755);
+    int r1 = xc_run(x), r2 = xc_run(x);
+    CHECK(r1 == 0 && r2 == 0, "%s: exec copy %d/%d", dir, r1, r2);
+    int fd = open(x, O_WRONLY); CHECKE(fd >= 0, "open rw");
+    CHECK(pwrite(fd, "X", 1, 0) == 1, "pwrite"); close(fd);
+    int r3 = xc_run(x);
+    CHECK(r3 == 120, "%s: exec after in-place write (bad magic) = %d, want ENOEXEC (stale image)", dir, r3);
+    fd = open(x, O_WRONLY); CHECKE(fd >= 0, "open rw2");
+    CHECK(pwrite(fd, "\x7f", 1, 0) == 1, "pwrite2"); close(fd);
+    int r4 = xc_run(x), r4b = xc_run(x);
+    CHECK(r4 == 0 && r4b == 0, "%s: exec after restore = %d/%d", dir, r4, r4b);
+    fd = open(x, O_WRONLY); CHECKE(fd >= 0, "open rw3");
+    CHECK(ftruncate(fd, 0) == 0, "ftruncate"); close(fd);
+    int r5 = xc_run(x);
+    CHECK(r5 != 0, "%s: exec of truncated file succeeded (stale image)", dir);
+    CHECKE(xc_copy("/bin/busybox.exe", x) == 0, "recopy"); chmod(x, 0755);
+    int r6 = xc_run(x); CHECK(r6 == 0, "%s: exec after rewrite = %d", dir, r6);
+    CHECKE(put_file(y, "#!/nonexistent/interp\n", 22) == 0, "put xd"); chmod(y, 0755);
+    CHECKE(rename(y, x) == 0, "rename over");
+    int r7 = xc_run(x);
+    CHECK(r7 != 0, "%s: exec after rename-over succeeded (stale image)", dir);
+    CHECKE(xc_copy("/bin/busybox.exe", x) == 0, "recopy2"); chmod(x, 0755);
+    CHECK(xc_run(x) == 0, "%s: exec after recopy2", dir);
+    CHECKE(unlink(x) == 0, "unlink");
+    int r8 = xc_run(x);
+    CHECK(r8 == 121, "%s: exec after unlink = %d, want ENOENT", dir, r8);
+    return PASS;
+}
+static int t_cx_exec_cache(char *d, size_t n) {
+    char dirs[3][160]; int nd = 0; struct stat st;
+    snprintf(dirs[nd++], 160, "%s", tmpdir);
+    snprintf(dirs[nd], 160, "/ostest_xc.%d", getpid());
+    if (mkdir(dirs[nd], 0755) == 0) nd++;
+    if (stat("/mnt/e4rw/w1.bin", &st) == 0) {
+        snprintf(dirs[nd], 160, "/mnt/e4rw/ostest_xc.%d", getpid());
+        if (mkdir(dirs[nd], 0755) == 0) nd++;
+    }
+    char res[200] = "";
+    for (int i = 0; i < nd; i++) {
+        int r = xc_dir(dirs[i], d, n);
+        if (i) rmdir(dirs[i]);
+        if (r != PASS) { for (int k = i + 1; k < nd; k++) rmdir(dirs[k]); return r; }
+        snprintf(res + strlen(res), sizeof res - strlen(res), "%s%s", i ? ", " : "", dirs[i]);
+    }
+    long long t0 = now_ns(CLOCK_MONOTONIC);
+    for (int i = 0; i < 20; i++) CHECK(xc_run("/bin/busybox.exe") == 0, "exec busybox");
+    long long us = (now_ns(CLOCK_MONOTONIC) - t0) / 1000 / 20;
+    R(PASS, "write/restore/ftruncate/rename-over/unlink seen by next exec in %s; fork+exec busybox %lld us", res, us);
+}
+/* compat.stdev_statfs (batch 10): statfs reports the real filesystem type
+ * of each mount, fstatfs agrees, st_dev differs between mounts of different
+ * filesystems and is the same within one, missing paths fail with ENOENT. */
+static const char *fs_name(long t) {
+    switch ((unsigned long)t) {
+    case 0x4d44: return "vfat"; case 0x2011BAB0: return "exfat"; case 0xEF53: return "ext4";
+    case 0x01021994: return "tmpfs"; case 0x9fa0: return "proc"; default: return "?";
+    }
+}
+static int t_cx_stdev_statfs(char *d, size_t n) {
+    struct statfs rs, sf; struct stat st0, st1, st2;
+    CHECKE(statfs("/", &rs) == 0, "statfs /");
+    CHECK(rs.f_type == 0x4d44 || rs.f_type == 0x2011BAB0 || rs.f_type == 0xEF53 || rs.f_type == 0x01021994, "statfs / f_type %#lx", (unsigned long)rs.f_type);
+    CHECK(rs.f_namelen == 255 && rs.f_bsize > 0, "f_namelen %ld f_bsize %ld", (long)rs.f_namelen, (long)rs.f_bsize);
+    errno = 0; CHECK(statfs("/nonexistent_ostest/zz", &sf) == -1 && errno == ENOENT, "statfs missing errno %d", errno);
+    CHECK(statfs("/proc", &sf) == 0 && sf.f_type == 0x9fa0, "statfs /proc f_type %#lx", (unsigned long)sf.f_type);
+    char f[200]; tpath(f, sizeof f, "dev_a");
+    CHECKE(put_file(f, "x", 1) == 0, "put");
+    CHECKE(stat(tmpdir, &st0) == 0 && stat(f, &st1) == 0, "stat tmpdir/file");
+    CHECK(st0.st_dev == st1.st_dev, "st_dev dir %#llx != file %#llx", (unsigned long long)st0.st_dev, (unsigned long long)st1.st_dev);
+    int fd = open(f, O_RDONLY); CHECKE(fd >= 0, "open");
+    CHECK(fstat(fd, &st2) == 0 && st2.st_dev == st1.st_dev, "fstat st_dev %#llx", (unsigned long long)st2.st_dev);
+    struct statfs a, b;
+    CHECK(statfs(f, &a) == 0 && fstatfs(fd, &b) == 0 && a.f_type == b.f_type, "statfs/fstatfs disagree %#lx/%#lx", (unsigned long)a.f_type, (unsigned long)b.f_type);
+    close(fd); unlink(f);
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    CHECK(fstatfs(pf[0], &b) == 0 && b.f_type == 0x50495045, "pipe fstatfs f_type %#lx", (unsigned long)b.f_type);
+    close(pf[0]); close(pf[1]);
+    struct stat rst; CHECKE(stat("/", &rst) == 0, "stat /");
+    char res[400]; int k = snprintf(res, sizeof res, "/=%s dev %#llx", fs_name(rs.f_type), (unsigned long long)rst.st_dev);
+    int other = 0;
+    DIR *D = opendir("/mnt"); struct dirent *e;
+    while (D && (e = readdir(D))) {
+        if (e->d_name[0] == '.') continue;
+        char p[128]; snprintf(p, sizeof p, "/mnt/%s", e->d_name);
+        struct stat ms; if (stat(p, &ms) != 0 || !S_ISDIR(ms.st_mode)) continue;
+        CHECK(statfs(p, &sf) == 0, "statfs %s: %s", p, strerror(errno));
+        int dfd = open(p, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { CHECK(fstatfs(dfd, &b) == 0 && b.f_type == sf.f_type, "fstatfs %s %#lx vs %#lx", p, (unsigned long)b.f_type, (unsigned long)sf.f_type); close(dfd); }
+        if (sf.f_type != rs.f_type) {
+            other++;
+            CHECK(ms.st_dev != rst.st_dev, "%s (%s) has the same st_dev %#llx as /", p, fs_name(sf.f_type), (unsigned long long)ms.st_dev);
+        }
+        if (!strcmp(e->d_name, "e4rw")) CHECK(sf.f_type == 0xEF53, "/mnt/e4rw f_type %#lx, want ext4", (unsigned long)sf.f_type);
+        if (k < (int)sizeof res - 60) k += snprintf(res + k, sizeof res - k, ", %s=%s dev %#llx", e->d_name, fs_name(sf.f_type), (unsigned long long)ms.st_dev);
+    }
+    if (D) closedir(D);
+    R(PASS, "%s (%d foreign mounts)", res, other);
+}
+/* epoll.pwait_sigmask (batch 10): epoll_pwait/ppoll install the given mask
+ * for the wait only: a pending blocked signal unblocked by the mask
+ * interrupts at once (handler runs, old mask back afterwards); a signal
+ * blocked by the mask does not interrupt the wait. */
+static volatile int pw_hits;
+static void pw_handler(int s) { (void)s; pw_hits++; }
+static int t_ep_pwait_mask(char *d, size_t n) {
+    struct sigaction sa, osa; memset(&sa, 0, sizeof sa); sa.sa_handler = pw_handler; sigemptyset(&sa.sa_mask);
+    CHECKE(sigaction(SIGUSR1, &sa, &osa) == 0, "sigaction");
+    sigset_t blk, empty, oldm, cur; sigemptyset(&blk); sigaddset(&blk, SIGUSR1); sigemptyset(&empty);
+    sigprocmask(SIG_BLOCK, &blk, &oldm);
+    int ep = epoll_create1(0); CHECKE(ep >= 0, "epoll_create1");
+    struct epoll_event out[2];
+    pw_hits = 0; raise(SIGUSR1);
+    CHECK(pw_hits == 0, "blocked signal delivered");
+    long long t0 = mono_ms(); errno = 0; int r = epoll_pwait(ep, out, 2, 2000, &empty); long long el = mono_ms() - t0;
+    int e1 = errno, h1 = pw_hits;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    CHECK(r == -1 && e1 == EINTR && el < 1000, "epoll_pwait(empty mask) with pending SIGUSR1: r=%d errno %d after %lldms", r, e1, el);
+    CHECK(h1 == 1, "handler ran %d times (want 1)", h1);
+    CHECK(sigismember(&cur, SIGUSR1) == 1, "SIGUSR1 not blocked again after epoll_pwait");
+    pw_hits = 0; raise(SIGUSR1);
+    struct pollfd pfd = { -1, 0, 0 };
+    struct timespec pto = { 2, 0 };
+    t0 = mono_ms(); errno = 0; r = ppoll(&pfd, 1, &pto, &empty); el = mono_ms() - t0; e1 = errno;
+    CHECK(r == -1 && e1 == EINTR && el < 1000 && pw_hits == 1, "ppoll(empty mask): r=%d errno %d %lldms hits %d", r, e1, el, pw_hits);
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    CHECK(sigismember(&cur, SIGUSR1) == 1, "SIGUSR1 not blocked again after ppoll");
+    /* unblocked in the thread mask, blocked by the pwait mask */
+    sigprocmask(SIG_UNBLOCK, &blk, NULL);
+    pw_hits = 0;
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (!c) { msleep(60); kill(getppid(), SIGUSR1); _exit(0); }
+    t0 = mono_ms(); errno = 0; r = epoll_pwait(ep, out, 2, 400, &blk); el = mono_ms() - t0; e1 = errno;
+    int st; waitpid(c, &st, 0);
+    for (int i = 0; i < 50 && !pw_hits; i++) msleep(10);
+    CHECK(r == 0 && el >= 300, "epoll_pwait(mask SIGUSR1) interrupted: r=%d errno %d after %lldms", r, e1, el);
+    CHECK(pw_hits == 1, "masked signal not delivered after the wait (hits %d)", pw_hits);
+    close(ep);
+    sigaction(SIGUSR1, &osa, NULL); sigprocmask(SIG_SETMASK, &oldm, NULL);
+    R(PASS, "pending signal interrupts with empty mask (epoll_pwait, ppoll), mask restored; masked signal waits %lldms", el);
+}
+/* futex.wake_op (batch 10): FUTEX_WAKE_OP ops/compare with signed 12-bit
+ * args, wakes on both words, and its update is atomic against concurrent
+ * user-space atomics on the same word. */
+#define FXOP(op, oparg, cmp, cmparg) ((((op) & 0xf) << 28) | (((cmp) & 0xf) << 24) | (((oparg) & 0xfff) << 12) | ((cmparg) & 0xfff))
+static volatile uint32_t wo_w1, wo_w2, wo_stop;
+static void *wo_adder(void *arg) { for (int i = 0; i < 200000; i++) __atomic_fetch_add(&wo_w2, 1, __ATOMIC_SEQ_CST); return NULL; }
+static int t_fx_wake_op(char *d, size_t n) {
+    wo_w1 = 0; wo_w2 = 5;
+    long r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_ADD, 3, FUTEX_OP_CMP_EQ, 5));
+    CHECK(r == 0 && wo_w2 == 8, "ADD 3: r=%ld w2=%u (want 0/8)", r, wo_w2);
+    r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_ADD, -1, FUTEX_OP_CMP_GT, -1));
+    CHECK(r == 0 && wo_w2 == 7, "ADD -1 (sign-extended): w2=%u (want 7)", wo_w2);
+    r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_OR | FUTEX_OP_OPARG_SHIFT, 4, FUTEX_OP_CMP_EQ, 0));
+    CHECK(r == 0 && wo_w2 == 23, "OR 1<<4: w2=%u (want 23)", wo_w2);
+    r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_ANDN, 16, FUTEX_OP_CMP_EQ, 0));
+    CHECK(r == 0 && wo_w2 == 7, "ANDN 16: w2=%u (want 7)", wo_w2);
+    r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_XOR, 2, FUTEX_OP_CMP_EQ, 0));
+    CHECK(r == 0 && wo_w2 == 5, "XOR 2: w2=%u (want 5)", wo_w2);
+    r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_SET, 0, FUTEX_OP_CMP_EQ, 0));
+    CHECK(r == 0 && wo_w2 == 0, "SET 0: w2=%u", wo_w2);
+    /* wake: waiter on w2 is woken only when the compare (old value) holds */
+    pthread_t a; fx_done = 0; wo_w2 = 0;
+    if (pthread_create(&a, NULL, fx_waiter, (void *)&wo_w2)) R(SKIP, "pthread_create failed");
+    msleep(100);
+    r = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_SET, 0, FUTEX_OP_CMP_NE, 0));
+    msleep(50);
+    CHECK(r == 0 && fx_done == 0, "false compare woke: r=%ld done=%u", r, fx_done);
+    long got = 0;
+    for (int i = 0; i < 200 && !got; i++) {
+        got = fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 1, (const struct timespec *)1L, &wo_w2, FXOP(FUTEX_OP_SET, 0, FUTEX_OP_CMP_EQ, 0));
+        if (!got) msleep(10);
+    }
+    pthread_join(a, NULL);
+    CHECK(got == 1 && fx_done == 1, "true compare woke %ld done=%u", got, fx_done);
+    /* atomicity against a concurrent lock-add loop */
+    wo_w2 = 0;
+    CHECK(pthread_create(&a, NULL, wo_adder, NULL) == 0, "pthread_create adder");
+    for (int i = 0; i < 3000; i++) fx(&wo_w1, FUTEX_WAKE_OP_PRIVATE, 0, (const struct timespec *)0L, &wo_w2, FXOP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_EQ, 0x7ff));
+    pthread_join(a, NULL);
+    CHECK(wo_w2 == 203000, "lost updates: w2=%u (want 203000)", wo_w2);
+    R(PASS, "SET/ADD/OR/ANDN/XOR + shift + signed args, compare-gated wake, 3000 WAKE_OPs vs 200000 user atomics exact");
+}
 static int t_cx_tmp_big(char *d, size_t n) {
     char p[200], q[200]; snprintf(p, sizeof(p), "/tmp/ostest_big.%d", getpid()); snprintf(q, sizeof(q), "%s.r", p);
     static uint8_t blk[65536]; int fd = open(p, O_CREAT | O_TRUNC | O_WRONLY, 0644); CHECKE(fd >= 0, "open /tmp");
@@ -2758,7 +2959,7 @@ static const struct test tests[] = {
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
-    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 }, { "compat", "exec_cache", t_cx_exec_cache, 120, 0 }, { "compat", "stdev_statfs", t_cx_stdev_statfs, 15, 0 }, { "epoll", "pwait_sigmask", t_ep_pwait_mask, 15, 0 }, { "futex", "wake_op", t_fx_wake_op, 30, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

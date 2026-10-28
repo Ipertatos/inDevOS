@@ -41,6 +41,15 @@ static inline void user_access_end(void) {
 }
 
 /**
+ * @brief Atomically apply a FUTEX_OP to the aligned user word @p uaddr
+ *        (lock cmpxchg, so it is atomic against user-space atomics on any
+ *        CPU).  op: 0 SET, 1 ADD, 2 OR, 3 ANDN, 4 XOR.  The page is faulted
+ *        in / COW-broken first.  Stores the previous value in *old.
+ * @return 0, -1 on a bad address, -2 on a bad op.
+ */
+int user_atomic_op_u32(uint64_t uaddr, int op, uint32_t oparg, uint32_t *old);
+
+/**
  * @brief Check if an address is in user-space range
  * @param addr Address to check
  * @return true if addr is a valid user-space address

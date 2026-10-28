@@ -103,6 +103,28 @@ int copy_to_user(void *user_dst, const void *kern_src, size_t len) {
     return 0;
 }
 
+int user_atomic_op_u32(uint64_t uaddr, int op, uint32_t oparg, uint32_t *old) {
+    if ((uaddr & 3) || !old) return -1;
+    if (op < 0 || op > 4) return -2;
+    if (!user_range_ok(uaddr, 4, true))
+        return -1;
+    volatile uint32_t *w = (volatile uint32_t *)uaddr;
+    user_access_begin();
+    uint32_t o = __atomic_load_n(w, __ATOMIC_RELAXED), n;
+    do {
+        switch (op) {
+        case 0:  n = oparg; break;
+        case 1:  n = o + oparg; break;
+        case 2:  n = o | oparg; break;
+        case 3:  n = o & ~oparg; break;
+        default: n = o ^ oparg; break;
+        }
+    } while (!__atomic_compare_exchange_n(w, &o, n, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    user_access_end();
+    *old = o;
+    return 0;
+}
+
 char *strncpy_from_user(char *kern_dst, const char *user_src, size_t max) {
     if (max == 0) return kern_dst;
     if (!kern_dst || !user_src) return NULL;
