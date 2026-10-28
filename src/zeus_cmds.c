@@ -817,16 +817,8 @@ void zeus_cmd_curl(ZeusShell* shell, int argc, char* argv[]) {
             int _n = net_receive_packet(_rx, sizeof(_rx));
             if (_n > 0) ethernet_process_frame(_rx, (uint32_t)_n);
 
-            uint32_t avail = conn->recv_buffer_used;
-            if (avail > 0) {
-                uint32_t to_copy = avail;
-                if (total_recv + to_copy > 32767)
-                    to_copy = 32767 - total_recv;
-                memcpy(resp_buf + total_recv, conn->recv_buffer, to_copy);
-                uint32_t remain = avail - to_copy;
-                if (remain > 0)
-                    memmove(conn->recv_buffer, conn->recv_buffer + to_copy, remain);
-                conn->recv_buffer_used = remain;
+            uint32_t to_copy = tcp_conn_read(conn, (uint8_t *)resp_buf + total_recv, 32767 - total_recv);
+            if (to_copy > 0) {
                 total_recv += to_copy;
                 _last_data_tick = hpet_get_ticks();
             } else {

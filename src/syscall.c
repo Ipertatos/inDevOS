@@ -3783,6 +3783,51 @@ int sys_gettimeofday(timeval_ind_t *tv, void *tz) {
     return copy_to_user(tv, &k, sizeof(k)) ? -EFAULT : 0;
 }
 
+/* c13: microsecond deadlines for poll/select/nanosleep. ms deadlines let a
+ * 10 ms wait return after 9.x ms and rounded short timeouts down to 0. */
+uint64_t sys_wait_deadline_us(uint64_t us_from_now) {
+    return ktime_now_us() + us_from_now;
+}
+bool sys_wait_expired_us(uint64_t dl_us) {
+    return ktime_now_us() >= dl_us;
+}
+/* Wait in place (no reschedule of this frame) until dl_us, or one interrupt
+ * when 'once'. HLT does not pace the PM-timer fallback clock, so spin there. */
+static void sys_wait_inplace_us(uint64_t dl_us, bool once) {
+    if (!hpet_is_hardware()) {
+        uint64_t stop = dl_us;
+        if (once) {
+            uint64_t s = ktime_now_us() + 500;
+            if (s < stop) stop = s;
+        }
+        while (ktime_now_us() < stop)
+            __asm__ volatile("sti; pause" ::: "memory");
+        return;
+    }
+    do {
+        __asm__ volatile("sti; hlt" ::: "memory");
+    } while (!once && ktime_now_us() < dl_us);
+}
+/* One wait step of a blocking readiness loop (dl_us==0: no deadline).
+ * The bulk of the wait yields the CPU via thread_sleep(1); the final
+ * <=2.5 ms is waited in place one timer IRQ at a time so the timeout lands
+ * on time instead of a scheduler sweep later. */
+void sys_wait_step_us(uint64_t dl_us) {
+    if (dl_us) {
+        uint64_t now = ktime_now_us();
+        if (now >= dl_us)
+            return;
+        if (dl_us - now <= 2500 || !global_scheduler.scheduler_running) {
+            sys_wait_inplace_us(dl_us, true);
+            return;
+        }
+    }
+    if (global_scheduler.scheduler_running)
+        thread_sleep(1);
+    else
+        __asm__ volatile("hlt");
+}
+
 int sys_select(int nfds, fd_set_t *readfds, fd_set_t *writefds, fd_set_t *exceptfds,
                void *timeout_tv) {
     (void)exceptfds;
@@ -3798,14 +3843,16 @@ int sys_select(int nfds, fd_set_t *readfds, fd_set_t *writefds, fd_set_t *except
     if (writefds && copy_from_user(&kw, writefds, sizeof(kw)) != 0)
         return -EFAULT;
 
-    extern uint64_t ktime_deadline_ms(uint64_t);
-    extern bool     ktime_expired(uint64_t);
-    uint64_t deadline = ktime_deadline_ms(5000);
+    uint64_t deadline = sys_wait_deadline_us(5000000ull);
+    bool zero_to = false;
     if (timeout_tv) {
         timeval_ind_t tv;
         if (copy_from_user(&tv, timeout_tv, sizeof(tv)) == 0) {
-            uint64_t ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
-            deadline = ktime_deadline_ms(ms);
+            if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000)
+                return -EINVAL;
+            uint64_t us = (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
+            zero_to = (us == 0);
+            deadline = sys_wait_deadline_us(us);
         }
     }
 
@@ -3814,7 +3861,7 @@ int sys_select(int nfds, fd_set_t *readfds, fd_set_t *writefds, fd_set_t *except
     memset(&outr, 0, sizeof(outr));
     memset(&outw, 0, sizeof(outw));
 
-    while (!ktime_expired(deadline)) {
+    for (;;) {
         int n = 0;
         for (int fd = 0; fd < nfds; fd++) {
             if (FD_ISSET(fd, &kr)) {
@@ -3848,13 +3895,17 @@ int sys_select(int nfds, fd_set_t *readfds, fd_set_t *writefds, fd_set_t *except
                 return -EFAULT;
             return n;
         }
+        if (zero_to || sys_wait_expired_us(deadline))
+            break;
         if (proc_kill_pending(get_current_process()))
             return -EINTR;
-        if (global_scheduler.scheduler_running)
-            thread_sleep(1);
-        else
-            __asm__ volatile("hlt");
+        sys_wait_step_us(deadline);
     }
+    /* timeout: Linux clears the sets */
+    if (readfds && copy_to_user(readfds, &outr, sizeof(outr)) != 0)
+        return -EFAULT;
+    if (writefds && copy_to_user(writefds, &outw, sizeof(outw)) != 0)
+        return -EFAULT;
     return 0;
 }
 
@@ -3871,20 +3922,20 @@ static int poll_copy_out(pollfd_t *dst, const pollfd_t *src, unsigned int nfds, 
 }
 static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool kbuf) {
     syscall_uaccess_ensure_user_cr3();
-    if (!fds || nfds == 0 || nfds > 64 ||
-        (!kbuf && !access_ok_user_range((uint64_t)fds, nfds * sizeof(pollfd_t))))
+    if (nfds > 64)
+        return -EINVAL;
+    /* poll(NULL, 0, t) is a portable t-ms sleep: only validate fds if used */
+    if (nfds > 0 && (!fds ||
+        (!kbuf && !access_ok_user_range((uint64_t)fds, nfds * sizeof(pollfd_t)))))
         return -EFAULT;
 
-    extern uint64_t ktime_deadline_ms(uint64_t);
-    extern bool     ktime_expired(uint64_t);
-    uint64_t deadline;
-    if (timeout_ms >= 0)
-        deadline = ktime_deadline_ms((uint64_t)timeout_ms);
-    else
-        deadline = ktime_deadline_ms(60000);
+    uint64_t deadline = sys_wait_deadline_us(
+        (timeout_ms >= 0 ? (uint64_t)timeout_ms : 60000ull) * 1000ull);
 
     pollfd_t kfds[64];
-    if (kbuf)
+    if (nfds == 0)
+        ;
+    else if (kbuf)
         memcpy(kfds, fds, nfds * sizeof(pollfd_t));
     else if (copy_from_user(kfds, fds, nfds * sizeof(pollfd_t)) != 0)
         return -EFAULT;
@@ -3930,7 +3981,18 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
                     tcp_socket_t *ts = ks ? (tcp_socket_t *)ks->transport : NULL;
                     tcp_connection_t *conn = ts ? ts->connection : NULL;
                     extern bool tcp_conn_at_eof(tcp_connection_t *c);
-                    if ((kfds[i].events & POLLIN) && ks && ks->listening && ts) {
+                    /* c13: a nonblocking connect completes on the state
+                     * change, whichever events the caller polls for */
+                    if (ks && !ks->listening && conn && conn->state >= TCP_STATE_ESTABLISHED)
+                        ks->connected = true;
+                    if (ks && ts && !ks->listening && !ks->connected && ks->remote_port &&
+                        (!conn || conn->state == TCP_STATE_CLOSED)) {
+                        /* connect failed (RST / refused / timed out): Linux
+                         * reports POLLERR|POLLHUP even if not requested, plus
+                         * the readable/writable bits so select() wakes */
+                        kfds[i].revents |= POLLERR | POLLHUP |
+                            (kfds[i].events & (POLLIN | POLLOUT | 0x0100));
+                    } else if ((kfds[i].events & POLLIN) && ks && ks->listening && ts) {
                         if (tcp_socket_accept_ready(ts)) kfds[i].revents |= POLLIN;
                     } else if ((kfds[i].events & POLLIN) && conn && conn->recv_buffer_used > 0) {
                         kfds[i].revents |= POLLIN;
@@ -3947,8 +4009,9 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
                             kfds[i].revents |= POLLOUT;
                             if (kfds[i].events & 0x0100) kfds[i].revents |= 0x0100;
                             ks->connected = true;
-                        } else if (ts && (!conn || conn->state == TCP_STATE_CLOSED)) {
-                            /* connect finished with failure (RST/refuse): wake like Linux */
+                        } else if (ts && (!conn || conn->state == TCP_STATE_CLOSED) &&
+                                   !(kfds[i].revents & POLLERR)) {
+                            /* closed after being connected */
                             kfds[i].revents |= POLLOUT | POLLERR | POLLHUP;
                         }
                     }
@@ -4029,7 +4092,7 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
         }
         if (timeout_ms == 0)
             break;  /* one-shot: report no ready fds */
-        if (timeout_ms > 0 && ktime_expired(deadline))
+        if (timeout_ms > 0 && sys_wait_expired_us(deadline))
             break;
         if (proc_kill_pending(get_current_process()))
             return -EINTR;
@@ -4043,14 +4106,11 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
             if (proc && exec_current_is_sync_program() && wm_dev_pid_connected(proc->pid))
                 desktop_sync_pump();
         }
-        if (global_scheduler.scheduler_running)
-            thread_sleep(1);
-        else
-            __asm__ volatile("hlt");
-        if (timeout_ms > 0 && ktime_expired(deadline))
+        sys_wait_step_us(deadline);
+        if (timeout_ms > 0 && sys_wait_expired_us(deadline))
             break;
     }
-    if (poll_copy_out(fds, kfds, nfds, kbuf) != 0)
+    if (nfds > 0 && poll_copy_out(fds, kfds, nfds, kbuf) != 0)
         return -EFAULT;
     return 0;
 }
@@ -4193,23 +4253,22 @@ int sys_nanosleep(const timespec_ind_t *req, timespec_ind_t *rem) {
     timespec_ind_t r;
     if (copy_from_user(&r, req, sizeof(r)) != 0)
         return -EFAULT;
-    uint64_t ms = (uint64_t)r.tv_sec * 1000ull + (uint64_t)r.tv_nsec / 1000000ull;
-    extern uint64_t ktime_deadline_ms(uint64_t);
-    extern void     ktime_yield_until(uint64_t);
+    if (r.tv_sec < 0 || r.tv_nsec < 0 || r.tv_nsec >= 1000000000L)
+        return -EINVAL;
+    /* c13: microsecond deadline, rounded up (a ms deadline returned early) */
+    uint64_t us = (uint64_t)r.tv_sec * 1000000ull + ((uint64_t)r.tv_nsec + 999ull) / 1000ull;
     /* Same path as SDL_Delay(): HLT until the HPET deadline. Safe from a
      * Ring-3 syscall (does not thread_sleep / reschedule this frame). */
     {
-        extern bool ktime_expired(uint64_t);
         process_t *sp_ = get_current_process();
-        uint64_t dl = ktime_deadline_ms(ms);
-        (void)ktime_yield_until;
+        uint64_t dl = sys_wait_deadline_us(us);
         /* Sleeping parent: held fork newborns must get to run meanwhile
          * (they were only released by a blocking wait). */
         fork_release_pending(sp_);
-        while (!ktime_expired(dl)) {
+        while (!sys_wait_expired_us(dl)) {
             if (proc_signal_interrupts(sp_))
                 return -EINTR;
-            __asm__ volatile("sti; hlt" ::: "memory");
+            sys_wait_inplace_us(dl, true);
         }
     }
     return 0;

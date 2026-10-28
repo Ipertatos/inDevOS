@@ -473,10 +473,11 @@ static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, i
     if (!ep) return err;
     if (maxevents <= 0 || maxevents > 0x7fffffff / (long)sizeof(lx_epoll_event_t)) return -EINVAL;
     if (!uevs) return -EFAULT;
-    extern uint64_t ktime_deadline_ms(uint64_t);
-    extern bool     ktime_expired(uint64_t);
     extern bool     proc_signal_interrupts(process_t *);
-    uint64_t dl = timeout_ms > 0 ? ktime_deadline_ms((uint64_t)timeout_ms) : 0;
+    extern uint64_t sys_wait_deadline_us(uint64_t);
+    extern bool     sys_wait_expired_us(uint64_t);
+    /* c13: us deadline so slices add up to the timeout exactly */
+    uint64_t dl = timeout_ms > 0 ? sys_wait_deadline_us((uint64_t)timeout_ms * 1000ULL) : 0;
     pollfd_t pf[LX_EPOLL_MAX];
     int map[LX_EPOLL_MAX];
     for (;;) {
@@ -519,7 +520,7 @@ static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, i
         }
         if (out) return out;
         if (timeout_ms == 0) return 0;
-        if (timeout_ms > 0 && ktime_expired(dl)) return 0;
+        if (timeout_ms > 0 && sys_wait_expired_us(dl)) return 0;
         /* sleep until something not yet reported may be ready: wait on the
          * non-suppressed entries in short slices (suppressed ET entries are
          * re-checked each slice) */
@@ -533,9 +534,9 @@ static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, i
         }
         if (!k) { pf[0].fd = -1; pf[0].events = 0; pf[0].revents = 0; k = 1; }
         if (timeout_ms > 0) {
-            extern uint64_t ktime_now_ms(void);
-            uint64_t now = ktime_now_ms();
-            int left = dl > now ? (int)(dl - now) : 0;
+            extern uint64_t ktime_now_us(void);
+            uint64_t now = ktime_now_us();
+            int left = dl > now ? (int)((dl - now + 999) / 1000) : 0;
             if (slice > left) slice = left;
         }
         r = sys_poll_kernel(pf, (unsigned)k, slice);
@@ -2647,18 +2648,16 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         (void)ein;
         int timeout_ms = -1;
         if (a5) {
-            if (nr == LX_pselect6) {
-                /* struct timespec */
-                int64_t ts[2];
-                if (lx_get(ts, (void *)a5, 16)) return -EFAULT;
-                timeout_ms = (int)(ts[0] * 1000 + ts[1] / 1000000);
-            } else {
-                /* struct timeval */
-                int64_t tv[2];
-                if (lx_get(tv, (void *)a5, 16)) return -EFAULT;
-                timeout_ms = (int)(tv[0] * 1000 + tv[1] / 1000);
-            }
-            if (timeout_ms < 0) timeout_ms = 0;
+            /* c13: round sub-ms timeouts up (truncation made a 500 us
+             * select a busy 0 ms poll and 10.9 ms a 10 ms wait) */
+            int64_t tt[2];
+            if (lx_get(tt, (void *)a5, 16)) return -EFAULT;
+            if (tt[0] < 0 || tt[1] < 0 ||
+                tt[1] >= (nr == LX_pselect6 ? 1000000000LL : 1000000LL)) return -EINVAL;
+            int64_t div = nr == LX_pselect6 ? 1000000 : 1000;      /* timespec : timeval */
+            int64_t ms64 = tt[0] > 2000000 ? 2000000000LL
+                                           : tt[0] * 1000 + (tt[1] + div - 1) / div;
+            timeout_ms = ms64 > 0x7fffffff ? 0x7fffffff : (int)ms64;
         }
         pollfd_t pf[64];
         int np = 0;
@@ -2679,30 +2678,23 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (lx_get(sd, (void *)a6, 16)) return -EFAULT;
             if ((r = lx_sigmask_enter(p, (const void *)sd[0], (size_t)sd[1], &om, &ms_set))) return r;
         }
-        if (np) {
-            pr = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
-        } else {                    /* select(0, ..., timeout): plain sleep */
-            if (timeout_ms > 0) {
-                uint64_t dl = ktime_deadline_ms((uint64_t)timeout_ms);
-                fork_release_pending(p);
-                while (ktime_now_ms() < dl) {
-                    extern bool proc_signal_interrupts(process_t *);
-                    if (proc_signal_interrupts(p)) return lx_sigmask_leave(p, -EINTR, om, ms_set);
-                    __asm__ volatile("sti; hlt" ::: "memory");
-                }
-            }
-            pr = 0;
-        }
+        /* select(0, ..., timeout) is a plain sleep; poll(NULL, 0, t) now
+         * sleeps the same way (us deadline, signal-interruptible) */
+        pr = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
         lx_sigmask_leave(p, pr < 0 ? pr : 0, om, ms_set);
         if (pr < 0) return pr;
         uint64_t rout = 0, wout = 0, eout = 0;
         int ready = 0;
         for (int i = 0; i < np; i++) {
-            if (pf[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                rout |= (1ULL << pf[i].fd); ready++;
+            uint64_t bit = 1ULL << pf[i].fd;
+            /* Linux: readable on IN/HUP/ERR, writable on OUT/ERR (a failed
+             * nonblocking connect wakes a write-select); only report sets
+             * the caller asked for */
+            if ((rin & bit) && (pf[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+                rout |= bit; ready++;
             }
-            if (pf[i].revents & POLLOUT) {
-                wout |= (1ULL << pf[i].fd); ready++;
+            if ((win & bit) && (pf[i].revents & (POLLOUT | POLLERR))) {
+                wout |= bit; ready++;
             }
         }
         if (a2 && lx_put((void *)a2, &rout, 8)) return -EFAULT;
@@ -2715,7 +2707,11 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (a3) {
             lx_timespec_t ts;
             if (lx_get(&ts, (void *)a3, sizeof(ts))) return -EFAULT;
-            ms = (int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+            if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -EINVAL;
+            /* c13: round up (truncation shortened every wait) */
+            int64_t ms64 = ts.tv_sec > 2000000 ? 2000000000LL
+                         : (int64_t)ts.tv_sec * 1000 + ((int64_t)ts.tv_nsec + 999999) / 1000000;
+            ms = ms64 > 0x7fffffff ? 0x7fffffff : (int)ms64;
         }
         uint32_t om; bool ms_set;
         if ((r = lx_sigmask_enter(p, (const void *)a4, (size_t)a5, &om, &ms_set))) return r;
@@ -3556,17 +3552,20 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
     case LX_clock_nanosleep: {
         lx_timespec_t ts;
         if (lx_get(&ts, (void *)a3, sizeof(ts))) return -EFAULT;
-        uint64_t want_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L) return -EINVAL;
+        uint64_t want_us = (uint64_t)ts.tv_sec * 1000000ULL + ((uint64_t)ts.tv_nsec + 999ULL) / 1000ULL;
         if (a2 & 1) {                           /* TIMER_ABSTIME */
             uint64_t now = (a1 == 0) ? lx_real_us() : lx_mono_us();
             want_us = want_us > now ? want_us - now : 0;
         }
         {
             extern bool proc_signal_interrupts(process_t *);
-            extern bool ktime_expired(uint64_t);
-            uint64_t dl = ktime_deadline_ms((want_us + 999) / 1000);
+            extern uint64_t sys_wait_deadline_us(uint64_t);
+            extern bool     sys_wait_expired_us(uint64_t);
+            /* c13: us deadline (a ms deadline could return up to 1 ms early) */
+            uint64_t dl = sys_wait_deadline_us(want_us);
             fork_release_pending(p);   /* sleeping parent: let held kids run */
-            while (!ktime_expired(dl)) {
+            while (!sys_wait_expired_us(dl)) {
                 if (proc_signal_interrupts(p)) return -EINTR;
                 __asm__ volatile("sti; hlt" ::: "memory");
             }

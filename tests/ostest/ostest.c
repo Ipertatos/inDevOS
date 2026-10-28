@@ -2913,6 +2913,158 @@ static int t_cx_configure(char *d, size_t n) {
     R(PASS, "./configure (PATH cc, ls -t sane, probe, config.h) && make && ./prog; no-op remake; rebuild on newer source");
 }
 
+/* ===================== compat batch 13: poll / connect / tcp ===================== */
+static void out(const char *fmt, ...);
+static long long mono_us(void) { return now_ns(CLOCK_MONOTONIC) / 1000; }
+static int c13_cmp(const void *a, const void *b) { long long x = *(const long long *)a, y = *(const long long *)b; return x < y ? -1 : x > y; }
+/* min/median/max of k samples (us), sorted in place */
+static void c13_stat(long long *v, int k, long long *mn, long long *md, long long *mx) { qsort(v, k, sizeof(*v), c13_cmp); *mn = v[0]; *md = v[k / 2]; *mx = v[k - 1]; }
+static int t_cx_poll_sleep(char *d, size_t n) {
+    long long t0 = mono_us(); errno = 0; int r = poll(NULL, 0, 100); long long e1 = (mono_us() - t0) / 1000; int er = errno;
+    CHECK(r == 0 && e1 >= 99 && e1 < 600, "poll(NULL,0,100) r=%d errno=%d after %lldms", r, r < 0 ? er : 0, e1);
+    struct pollfd dummy = { -1, 0, 0 };
+    t0 = mono_us(); r = poll(&dummy, 0, 50); long long e2 = (mono_us() - t0) / 1000;
+    CHECK(r == 0 && e2 >= 49 && e2 < 500, "poll(fds,0,50) r=%d %lldms", r, e2);
+    t0 = mono_us(); r = poll(&dummy, 1, 50); long long e3 = (mono_us() - t0) / 1000;
+    CHECK(r == 0 && e3 >= 49 && e3 < 500, "poll({-1},1,50) r=%d %lldms", r, e3);
+    struct timespec ts = { 0, 50000000 };
+    t0 = mono_us(); r = ppoll(NULL, 0, &ts, NULL); long long e4 = (mono_us() - t0) / 1000;
+    CHECK(r == 0 && e4 >= 49 && e4 < 500, "ppoll(NULL,0,50ms) r=%d errno=%d %lldms", r, r < 0 ? errno : 0, e4);
+    struct timeval tv = { 0, 50000 };
+    t0 = mono_us(); r = select(0, NULL, NULL, NULL, &tv); long long e5 = (mono_us() - t0) / 1000;
+    CHECK(r == 0 && e5 >= 49 && e5 < 500, "select(0,..,50ms) r=%d %lldms", r, e5);
+    ts.tv_sec = 0; ts.tv_nsec = 50000000;
+    t0 = mono_us(); r = pselect(0, NULL, NULL, NULL, &ts, NULL); long long e6 = (mono_us() - t0) / 1000;
+    CHECK(r == 0 && e6 >= 49 && e6 < 500, "pselect(0,..,50ms) r=%d %lldms", r, e6);
+    tv.tv_sec = 0; tv.tv_usec = 999;   /* < 1 ms: must still wait (Linux rounds up), never busy-return early */
+    t0 = mono_us(); r = select(0, NULL, NULL, NULL, &tv); long long e7 = mono_us() - t0;
+    CHECK(r == 0 && e7 >= 900 && e7 < 100000, "select(0,..,999us) r=%d %lldus", r, e7);
+    R(PASS, "poll(NULL,0,100) %lldms; nfds=0 %lld; {-1} %lld; ppoll %lld; select %lld; pselect %lld ms; select 999us -> %lldus", e1, e2, e3, e4, e5, e6, e7);
+}
+static int t_cx_poll_prec(char *d, size_t n) {
+    enum { K = 15 };
+    long long pv[K], nv[K], sv[K], ev[K], ov[K], zv[K];
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    for (int i = 0; i < K; i++) { struct pollfd p = { pf[0], POLLIN, 0 }; long long t0 = mono_us(); poll(&p, 1, 10); pv[i] = mono_us() - t0; }
+    for (int i = 0; i < K; i++) { long long t0 = mono_us(); poll(NULL, 0, 10); zv[i] = mono_us() - t0; }
+    for (int i = 0; i < K; i++) { struct pollfd p = { pf[0], POLLIN, 0 }; long long t0 = mono_us(); poll(&p, 1, 1); ov[i] = mono_us() - t0; }
+    for (int i = 0; i < K; i++) { struct timespec t = { 0, 10000000 }; long long t0 = mono_us(); nanosleep(&t, NULL); nv[i] = mono_us() - t0; }
+    for (int i = 0; i < K; i++) { fd_set rs; FD_ZERO(&rs); FD_SET(pf[0], &rs); struct timeval tv = { 0, 10000 }; long long t0 = mono_us(); select(pf[0] + 1, &rs, NULL, NULL, &tv); sv[i] = mono_us() - t0; }
+    int e = epoll_create1(0); CHECKE(e >= 0, "epoll_create1");
+    struct epoll_event ee = { .events = EPOLLIN, .data.fd = pf[0] }; epoll_ctl(e, EPOLL_CTL_ADD, pf[0], &ee);
+    for (int i = 0; i < K; i++) { struct epoll_event o; long long t0 = mono_us(); epoll_wait(e, &o, 1, 10); ev[i] = mono_us() - t0; }
+    /* same poll(10) with 4 CPU-bound sibling processes (desktop + browser-like load) */
+    long long lv[K]; pid_t sp[4]; int ns = 0;
+    for (int k = 0; k < 4; k++) { pid_t c = fork(); if (c == 0) { volatile unsigned long x = 0; for (;;) x++; } if (c > 0) sp[ns++] = c; }
+    usleep(50000);
+    for (int i = 0; i < K; i++) { struct pollfd p = { pf[0], POLLIN, 0 }; long long t0 = mono_us(); poll(&p, 1, 10); lv[i] = mono_us() - t0; }
+    for (int k = 0; k < ns; k++) kill(sp[k], SIGKILL);
+    for (int k = 0; k < ns; k++) waitpid(sp[k], NULL, 0);
+    close(e); close(pf[0]); close(pf[1]);
+    long long a[7][3]; c13_stat(pv, K, &a[0][0], &a[0][1], &a[0][2]); c13_stat(zv, K, &a[1][0], &a[1][1], &a[1][2]);
+    c13_stat(ov, K, &a[2][0], &a[2][1], &a[2][2]); c13_stat(nv, K, &a[3][0], &a[3][1], &a[3][2]);
+    c13_stat(sv, K, &a[4][0], &a[4][1], &a[4][2]); c13_stat(ev, K, &a[5][0], &a[5][1], &a[5][2]);
+    c13_stat(lv, K, &a[6][0], &a[6][1], &a[6][2]);
+    static const char *nm[7] = { "poll10", "pollnull10", "poll1", "nanosleep10", "select10", "epoll10", "poll10_4spin" };
+    char b[460]; int o = 0;
+    for (int k = 0; k < 7; k++) o += snprintf(b + o, sizeof(b) - o, "%s%s %.1f/%.1f/%.1f", k ? "; " : "", nm[k], a[k][0] / 1000.0, a[k][1] / 1000.0, a[k][2] / 1000.0);
+    if (verbose) out("POLLPREC min/med/max ms: %s\n", b);
+    /* tolerant bounds (TCG): never early by more than 0.5 ms, median within 2x, worst case 100 ms */
+    CHECK(a[0][0] >= 9500 && a[1][0] >= 9500 && a[4][0] >= 9500 && a[5][0] >= 9500, "returned early: %s", b);
+    CHECK(a[0][1] <= 20000 && a[1][1] <= 20000 && a[4][1] <= 20000 && a[5][1] <= 20000, "median too coarse: %s", b);
+    CHECK(a[2][1] <= 8000, "poll(1ms) median too coarse: %s", b);
+    CHECK(a[0][2] <= 100000 && a[1][2] <= 100000, "max too large: %s", b);
+    CHECK(a[6][1] <= 60000, "poll(10) under load: median too coarse: %s", b);
+    R(PASS, "min/med/max ms: %s", b);
+}
+/* nonblocking connect -> poll; returns elapsed ms, *rev = revents, *soerr = SO_ERROR */
+static long long c13_nbconn(const struct sockaddr_in *sa, short events, int tmo, int *pr, short *rev, int *soerr, int *cerr) {
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (s < 0) { *cerr = errno; return -1; }
+    long long t0 = mono_us();
+    int r = connect(s, (const void *)sa, sizeof(*sa)); *cerr = r == 0 ? 0 : errno;
+    struct pollfd p = { s, events, 0 };
+    *pr = 1; *rev = 0;
+    if (r != 0 && errno == EINPROGRESS) { *pr = poll(&p, 1, tmo); *rev = p.revents; }
+    long long el = (mono_us() - t0) / 1000;
+    int err = -1; socklen_t l = sizeof(err); getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &l); *soerr = err;
+    close(s);
+    return el;
+}
+static int t_cx_poll_connect(char *d, size_t n) {
+    int l = socket(AF_INET, SOCK_STREAM, 0); int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(47021), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    CHECKE(bind(l, (void *)&sa, sizeof(sa)) == 0, "bind 47021");
+    CHECKE(listen(l, 4) == 0, "listen");
+    int pr, se, ce; short rv;
+    /* 1: loopback listener -> POLLOUT, no ERR/HUP, SO_ERROR 0 */
+    long long e1 = c13_nbconn(&sa, POLLOUT, 3000, &pr, &rv, &se, &ce);
+    CHECK(ce == 0 || ce == EINPROGRESS, "connect lo: %s", strerror(ce));
+    CHECK(pr == 1 && (rv & POLLOUT) && !(rv & (POLLERR | POLLHUP)) && se == 0, "lo connect: poll %d revents 0x%x SO_ERROR %d after %lldms", pr, rv, se, e1);
+    CHECK(e1 < 1000, "lo connect POLLOUT only after %lldms", e1);
+    struct pollfd pl = { l, POLLIN, 0 }; if (poll(&pl, 1, 1000) == 1) { int a = accept(l, NULL, NULL); if (a >= 0) close(a); }
+    close(l);
+    /* 2: refused loopback port, POLLOUT -> ERR|HUP quickly, SO_ERROR ECONNREFUSED */
+    struct sockaddr_in rf = sa; rf.sin_port = htons(47022);
+    long long e2 = c13_nbconn(&rf, POLLOUT, 3000, &pr, &rv, &se, &ce);
+    CHECK(ce == ECONNREFUSED || (pr == 1 && (rv & (POLLERR | POLLHUP)) && se == ECONNREFUSED), "refused (POLLOUT): connect %s poll %d revents 0x%x SO_ERROR %d after %lldms", strerror(ce), pr, rv, se, e2);
+    CHECK(e2 < 1000, "refused (POLLOUT) took %lldms", e2);
+    short rv2 = rv;
+    /* 3: refused, events = POLLIN only: ERR/HUP are reported regardless of events */
+    long long e3 = c13_nbconn(&rf, POLLIN, 3000, &pr, &rv, &se, &ce);
+    CHECK(ce == ECONNREFUSED || (pr == 1 && (rv & (POLLERR | POLLHUP))), "refused (POLLIN only): poll %d revents 0x%x after %lldms", pr, rv, e3);
+    CHECK(e3 < 1000, "refused (POLLIN only) took %lldms", e3);
+    short rv3 = rv;
+    /* 4: select() write set on a refused connect: writable (Linux POLLOUT_SET has POLLERR) */
+    long long e4 = -1; int sr = -9;
+    {
+        int s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0); long long t0 = mono_us();
+        if (connect(s, (void *)&rf, sizeof(rf)) != 0 && errno == EINPROGRESS) {
+            fd_set ws; FD_ZERO(&ws); FD_SET(s, &ws); struct timeval tv = { 3, 0 };
+            sr = select(s + 1, NULL, &ws, NULL, &tv); if (sr == 1 && !FD_ISSET(s, &ws)) sr = -2;
+        } else sr = 1;
+        e4 = (mono_us() - t0) / 1000; close(s);
+    }
+    CHECK(sr == 1 && e4 < 1000, "select(write) on refused connect r=%d after %lldms", sr, e4);
+    /* 5: remote via slirp host 10.0.2.2: refused port 9 and (if served) the ostest http port */
+    char rem[160] = "remote skipped";
+    {
+        struct sockaddr_in h = { .sin_family = AF_INET, .sin_port = htons(9) }; inet_pton(AF_INET, "10.0.2.2", &h.sin_addr);
+        long long e5 = c13_nbconn(&h, POLLIN | POLLOUT, 4000, &pr, &rv, &se, &ce);
+        if (ce == ENETUNREACH || ce == EHOSTUNREACH) snprintf(rem, sizeof(rem), "remote: no route (%s)", strerror(ce));
+        else {
+            CHECK(ce == ECONNREFUSED || (pr == 1 && (rv & (POLLERR | POLLHUP))), "10.0.2.2:9 refused: poll %d revents 0x%x SO_ERROR %d after %lldms", pr, rv, se, e5);
+            CHECK(e5 < 2000, "10.0.2.2:9 refused took %lldms", e5);
+            h.sin_port = htons(http_port);
+            long long e6 = c13_nbconn(&h, POLLOUT, 4000, &pr, &rv, &se, &ce);
+            if (pr == 1 && (rv & POLLOUT) && !(rv & POLLERR)) snprintf(rem, sizeof(rem), "remote refused %lldms rev 0x%x, :%d POLLOUT %lldms", e5, rv, http_port, e6);
+            else snprintf(rem, sizeof(rem), "remote refused %lldms, :%d not served (rev 0x%x)", e5, http_port, rv);
+            CHECK(e6 < 2000, "10.0.2.2:%d connect poll took %lldms (rev 0x%x)", http_port, e6, rv);
+        }
+    }
+    R(PASS, "lo POLLOUT %lldms; refused POLLOUT %lldms rev 0x%x; POLLIN-only %lldms rev 0x%x; select-w %lldms; %s", e1, e2, rv2, e3, rv3, e4, rem);
+}
+/* raw HTTP/1.0 GET of /big.bin from the slirp host server (served by the ostest harness) */
+static int t_cx_tcp_download(char *d, size_t n) {
+    struct sockaddr_in h = { .sin_family = AF_INET, .sin_port = htons(http_port) }; inet_pton(AF_INET, "10.0.2.2", &h.sin_addr);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(s, (void *)&h, sizeof(h)) != 0) { int e = errno; close(s); R(SKIP, "no host server 10.0.2.2:%d (%s)", http_port, strerror(e)); }
+    const char *q = "GET /big.bin HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n"; writeall(s, q, strlen(q));
+    static char b[65536]; long long tot = 0, t0 = mono_us(); ssize_t r; char hdr[64] = ""; int hl = 0;
+    int eof = 0;   /* time-boxed (40 s): a slow stack reports its rate instead of timing out */
+    while (mono_us() - t0 < 40000000LL) {
+        struct pollfd p = { s, POLLIN, 0 };
+        if (poll(&p, 1, 1000) <= 0) continue;
+        if ((r = read(s, b, sizeof(b))) <= 0) { eof = 1; break; }
+        if (hl < 63) { int c = r < 63 - hl ? (int)r : 63 - hl; memcpy(hdr + hl, b, c); hl += c; hdr[hl] = 0; }
+        tot += r;
+    }
+    long long us = mono_us() - t0; close(s);
+    if (strncmp(hdr, "HTTP/1.", 7) || !strstr(hdr, " 200")) { for (char *c = hdr; *c; c++) if (*c == '\r' || *c == '\n') *c = ' '; R(SKIP, "no /big.bin on host server (%.30s)", hdr); }
+    if (verbose) out("TCPDL %lld bytes in %lld ms = %.0f KB/s%s\n", tot, us / 1000, tot / 1024.0 / (us / 1e6), eof ? "" : " (40s cap)");
+    CHECK(tot > 200000, "short download %lld bytes in %lldms", tot, us / 1000);
+    R(PASS, "%lld bytes in %lldms = %.0f KB/s%s", tot, us / 1000, tot / 1024.0 / (us / 1e6), eof ? "" : " (40s cap)");
+}
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -2959,7 +3111,7 @@ static const struct test tests[] = {
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
-    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 }, { "compat", "exec_cache", t_cx_exec_cache, 120, 0 }, { "compat", "stdev_statfs", t_cx_stdev_statfs, 15, 0 }, { "epoll", "pwait_sigmask", t_ep_pwait_mask, 15, 0 }, { "futex", "wake_op", t_fx_wake_op, 30, 0 },
+    { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 }, { "compat", "exec_cache", t_cx_exec_cache, 120, 0 }, { "compat", "stdev_statfs", t_cx_stdev_statfs, 15, 0 }, { "compat", "poll_sleep", t_cx_poll_sleep, 10, 0 }, { "compat", "poll_timeout_precision", t_cx_poll_prec, 30, 0 }, { "compat", "poll_connect", t_cx_poll_connect, 30, 0 }, { "compat", "tcp_download", t_cx_tcp_download, 120, 0 }, { "epoll", "pwait_sigmask", t_ep_pwait_mask, 15, 0 }, { "futex", "wake_op", t_fx_wake_op, 30, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

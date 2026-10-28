@@ -56,7 +56,9 @@ static tcp_listener_t *tcp_find_listener(uint16_t port) {
 
 // Buffer sizes
 #define TCP_DEFAULT_BUFFER_SIZE 4096
-#define TCP_RECV_BUFFER_SIZE    32768   /* advertised receive window */
+#define TCP_RECV_BUFFER_SIZE    131072  /* receive ring; window up to this with WS */
+#define TCP_RCV_WSCALE          2       /* our window-scale shift (128K / 4 fits 16 bits) */
+#define TCP_OOO_MAX             8       /* out-of-order ranges held per connection */
 #define TCP_MAX_CONNECTIONS 16
 
 // Function prototypes
@@ -75,7 +77,10 @@ static void tcp_handle_fin(tcp_connection_t *conn, const tcp_header_t *tcp_heade
 static uint32_t tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uint32_t len);
 static void tcp_retransmit_enqueue(tcp_connection_t *conn, uint32_t seq, uint8_t flags,
                                    const uint8_t *data, uint32_t data_len);
-static void tcp_retransmit_ack(tcp_connection_t *conn, uint32_t ack_num);
+static void tcp_retransmit_ack(tcp_connection_t *conn, uint32_t ack_num, bool pure_ack);
+static uint32_t tcp_syn_options(const tcp_connection_t *conn, uint8_t *opt, bool syn_ack);
+static void tcp_ooo_store(tcp_connection_t *conn, uint32_t off, const uint8_t *data, uint32_t len);
+static uint32_t tcp_ooo_merge(tcp_connection_t *conn);
 static void tcp_retransmit_flush(tcp_connection_t *conn);
 static void tcp_parse_options(tcp_connection_t *conn, const uint8_t *opts, uint32_t opts_len);
 
@@ -237,6 +242,7 @@ static tcp_connection_t* tcp_create_connection(const uint8_t *local_ip, uint16_t
     new_conn->connected = false;
     new_conn->window_size = TCP_DEFAULT_BUFFER_SIZE;
     new_conn->remote_window = TCP_DEFAULT_BUFFER_SIZE;
+    new_conn->snd_wnd = TCP_DEFAULT_BUFFER_SIZE;
 
     // Allocate buffers
     new_conn->send_buffer = kalloc(TCP_DEFAULT_BUFFER_SIZE);
@@ -297,8 +303,28 @@ static void tcp_update_activity(tcp_connection_t *conn) {
 }
 
 /* Unlink and free a connection. Caller must hold tcp_lock. */
+static void tcp_stat_report(tcp_connection_t *c, const char *why) {
+    if (!c || !c->st_rx || c->st_reported) return;
+    c->st_reported = true;
+    serial_printf("[tcpstat] %d.%d.%d.%d:%u lport %u rx %u open %llu first %llu last %llu ms (span %llu) ooo %u rexmit %u fast %u %s\n",
+                  c->remote_ip[0], c->remote_ip[1], c->remote_ip[2], c->remote_ip[3], c->remote_port,
+                  c->local_port, c->st_rx, (unsigned long long)c->st_t_open,
+                  (unsigned long long)c->st_t_first, (unsigned long long)c->st_t_last,
+                  (unsigned long long)(c->st_t_last - (c->st_t_open ? c->st_t_open : c->st_t_first)),
+                  c->st_ooo, c->st_rexmit, c->st_fast, why);
+}
+static void tcp_stat_rx(tcp_connection_t *c, uint32_t n) {
+    if (!n) return;
+    uint64_t now = tcp_now_ms();
+    if (!c->st_rx) c->st_t_first = now;
+    c->st_t_last = now;
+    c->st_rx += n;
+    c->st_reported = false;
+}
+
 static void tcp_destroy_connection_locked(tcp_connection_t *conn) {
     if (!conn) return;
+    tcp_stat_report(conn, "close");
 
     if (tcp_connections == conn) {
         tcp_connections = conn->next;
@@ -441,13 +467,16 @@ static void tcp_retransmit_enqueue(tcp_connection_t *conn, uint32_t seq, uint8_t
  * Remove entries from the retransmit queue that have been fully acknowledged.
  * Also implements TCP Reno congestion control (RFC 5681).
  */
-static void tcp_retransmit_ack(tcp_connection_t *conn, uint32_t ack_num) {
+static void tcp_retransmit_ack(tcp_connection_t *conn, uint32_t ack_num, bool pure_ack) {
     uint32_t mss = conn->remote_mss;
     if (mss == 0) mss = TCP_DEFAULT_MSS;
 
-    // Detect duplicate ACK (same ACK number, no new data acknowledged)
+    /* Duplicate ACK (RFC 5681): same ACK number, outstanding data, and a pure
+     * ACK (no payload, no SYN/FIN, window unchanged). Data segments and window
+     * updates that repeat the ACK number used to count as well. */
     if (ack_num == conn->last_ack_num && ack_num == conn->snd_una &&
         conn->retransmit_queue != NULL) {
+        if (!pure_ack) return;
         conn->dup_ack_count++;
 
         if (conn->dup_ack_count == 3 && !conn->in_fast_recovery) {
@@ -462,7 +491,13 @@ static void tcp_retransmit_ack(tcp_connection_t *conn, uint32_t ack_num) {
             // Retransmit the first unacknowledged segment immediately
             tcp_retransmit_entry_t *first = conn->retransmit_queue;
             if (first) {
+                /* Resend at the segment's own sequence number (it used to go
+                 * out at seq_num, i.e. as new data, and advanced seq_num). */
+                uint32_t saved_seq = conn->seq_num;
+                conn->seq_num = first->seq_start;
                 tcp_send_packet(conn, first->flags, first->data, first->data_len);
+                conn->seq_num = saved_seq;
+                conn->st_fast++;
                 first->sent_at = tcp_now_ms();
                 first->retries++;
             }
@@ -540,6 +575,8 @@ void tcp_retransmit_check(void) {
     tcp_connection_t *conn = tcp_connections;
 
     while (conn) {
+        if (conn->st_rx && !conn->st_reported && now - conn->st_t_last >= 1500)
+            tcp_stat_report(conn, "idle");
         tcp_retransmit_entry_t *entry = conn->retransmit_queue;
         while (entry) {
             tcp_retransmit_entry_t *next = entry->next;
@@ -575,8 +612,15 @@ void tcp_retransmit_check(void) {
                 // Save and restore seq_num to resend with the original sequence
                 uint32_t saved_seq = conn->seq_num;
                 conn->seq_num = entry->seq_start;
-                tcp_send_packet(conn, entry->flags, entry->data, entry->data_len);
+                if (entry->flags & TCP_FLAG_SYN) {
+                    /* same MSS/WS options as the original SYN or SYN-ACK */
+                    uint8_t so[8];
+                    uint32_t sl = tcp_syn_options(conn, so, (entry->flags & TCP_FLAG_ACK) != 0);
+                    tcp_send_packet_with_options(conn, entry->flags, entry->data, entry->data_len, so, sl);
+                } else
+                    tcp_send_packet(conn, entry->flags, entry->data, entry->data_len);
                 conn->seq_num = saved_seq;  // Don't advance seq_num for retransmits
+                conn->st_rexmit++;
 
                 // Exponential backoff
                 entry->retries++;
@@ -614,10 +658,25 @@ static void tcp_parse_options(tcp_connection_t *conn, const uint8_t *opts, uint3
                 conn->remote_mss = mss;
                 NET_RX_LOG("TCP: Peer MSS = %u\n", mss);
             }
+        } else if (kind == 3 && len == 3) {
+            // Window scale option (RFC 7323): shift capped at 14
+            uint8_t sh = opts[i + 2];
+            conn->ws_peer = true;
+            conn->snd_wscale = sh > 14 ? 14 : sh;
         }
 
         i += len;
     }
+}
+
+/* Options for our SYN / SYN-ACK: MSS, plus window scale (NOP, WS) on a SYN,
+ * or on a SYN-ACK when the peer's SYN offered it. Returns the length. */
+static uint32_t tcp_syn_options(const tcp_connection_t *conn, uint8_t *opt, bool syn_ack) {
+    uint16_t mss = conn->local_mss ? conn->local_mss : TCP_DEFAULT_MSS;
+    opt[0] = 2; opt[1] = 4; opt[2] = (uint8_t)(mss >> 8); opt[3] = (uint8_t)(mss & 0xFF);
+    if (syn_ack && !conn->ws_peer) return 4;
+    opt[4] = 1; opt[5] = 3; opt[6] = 3; opt[7] = TCP_RCV_WSCALE;
+    return 8;
 }
 
 // ---- Packet sending with options --------------------------------------------
@@ -648,10 +707,20 @@ static int tcp_send_packet_with_options(tcp_connection_t *conn, uint8_t flags,
     tcp_header->data_offset = (header_size / 4) << 4;
     tcp_header->flags = flags;
 
-    // Flow control: advertise our available receive window
+    // Flow control: advertise our available receive window (scaled once WS
+    // is agreed; SYN segments are never scaled, RFC 7323)
     uint32_t avail_window = conn->recv_buffer_size - conn->recv_buffer_used;
-    if (avail_window > 0xFFFF) avail_window = 0xFFFF;
-    tcp_header->window = (uint16_t)avail_window;
+    uint32_t wfield;
+    if (flags & TCP_FLAG_SYN) {
+        wfield = avail_window > 0xFFFF ? 0xFFFF : avail_window;
+        conn->last_wnd_adv = wfield;
+    } else {
+        uint8_t sh = conn->ws_ok ? conn->rcv_wscale : 0;
+        wfield = avail_window >> sh;
+        if (wfield > 0xFFFF) wfield = 0xFFFF;
+        conn->last_wnd_adv = wfield << sh;
+    }
+    tcp_header->window = (uint16_t)wfield;
     tcp_header->checksum = 0;
     tcp_header->urgent_ptr = 0;
 
@@ -761,23 +830,22 @@ tcp_connection_t* tcp_connect(const uint8_t *remote_ip, uint16_t remote_port,
     conn->seq_num = tcp_new_isn();
     conn->initial_seq = conn->seq_num;
     conn->snd_una = conn->seq_num;
+    conn->st_t_open = tcp_now_ms();
 
+    serial_printf("[tcpstat] open %llu ms\n", (unsigned long long)conn->st_t_open);
     serial_printf("TCP: Connecting to %d.%d.%d.%d:%u from port %u\n",
            remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port, local_port);
 
-    // Build MSS option for SYN: kind=2, len=4, MSS value (big-endian)
-    uint8_t mss_opt[4];
-    mss_opt[0] = 2;   // Kind: MSS
-    mss_opt[1] = 4;   // Length
-    mss_opt[2] = (uint8_t)(conn->local_mss >> 8);
-    mss_opt[3] = (uint8_t)(conn->local_mss & 0xFF);
+    // SYN options: MSS + window scale
+    uint8_t syn_opt[8];
+    uint32_t syn_opt_len = tcp_syn_options(conn, syn_opt, false);
 
     // Enqueue SYN for retransmission before sending
     uint32_t syn_seq = conn->seq_num;
     tcp_retransmit_enqueue(conn, syn_seq, TCP_FLAG_SYN, NULL, 0);
 
     // Send SYN packet with MSS option
-    if (tcp_send_packet_with_options(conn, TCP_FLAG_SYN, NULL, 0, mss_opt, 4) != 0) {
+    if (tcp_send_packet_with_options(conn, TCP_FLAG_SYN, NULL, 0, syn_opt, syn_opt_len) != 0) {
         printf("TCP: Failed to send SYN packet\n");
         tcp_retransmit_flush(conn);
         tcp_destroy_connection_locked(conn);
@@ -800,10 +868,10 @@ int tcp_send(tcp_connection_t *conn, const uint8_t *data, uint32_t len) {
         return -ENOTCONN;
     }
 
-    // Flow control: effective window = min(cwnd, remote_window)
+    // Flow control: effective window = min(cwnd, peer window)
     uint32_t effective_window = conn->cwnd;
-    if (conn->remote_window < effective_window)
-        effective_window = conn->remote_window;
+    if (conn->snd_wnd < effective_window)
+        effective_window = conn->snd_wnd;
 
     // Calculate bytes already in-flight (sent but not yet ACKed)
     uint32_t in_flight = (uint32_t)(conn->seq_num - conn->snd_una);
@@ -1047,12 +1115,19 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
         return;
     }
 
-    // Update remote window from every incoming segment (flow control)
+    // Update remote window from every incoming segment (flow control);
+    // windows in SYN segments are never scaled
+    uint32_t old_snd_wnd = conn->snd_wnd;
     conn->remote_window = tcp_header.window;
+    conn->snd_wnd = (tcp_header.flags & TCP_FLAG_SYN) ? tcp_header.window
+                  : ((uint32_t)tcp_header.window << (conn->ws_ok ? conn->snd_wscale : 0));
 
     // Process ACK: remove acknowledged segments from retransmit queue
     if (tcp_header.flags & TCP_FLAG_ACK) {
-        tcp_retransmit_ack(conn, tcp_header.ack_num);
+        bool pure = tcp_payload_len == 0 &&
+                    !(tcp_header.flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) &&
+                    conn->snd_wnd == old_snd_wnd;
+        tcp_retransmit_ack(conn, tcp_header.ack_num, pure);
     }
 
     // Parse TCP options (for MSS in SYN/SYN-ACK)
@@ -1078,9 +1153,13 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
             if ((tcp_header.flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
                 // Received SYN-ACK, send ACK
                 serial_printf("TCP: Received SYN-ACK, sending ACK\n");
+                /* we always offer WS in our SYN: scaling is on iff the peer answered with it */
+                conn->ws_ok = conn->ws_peer;
+                conn->rcv_wscale = conn->ws_ok ? TCP_RCV_WSCALE : 0;
+                if (!conn->ws_ok) conn->snd_wscale = 0;
                 conn->ack_num = tcp_header.seq_num + 1;
                 conn->snd_una = tcp_header.ack_num;
-                tcp_retransmit_ack(conn, tcp_header.ack_num);  // ACK our SYN
+                tcp_retransmit_ack(conn, tcp_header.ack_num, false);  // ACK our SYN
                 tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                 conn->state = TCP_STATE_ESTABLISHED;
                 conn->connected = true;
@@ -1110,9 +1189,9 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
                 serial_printf("TCP: Re-sending SYN-ACK (retransmitted SYN)\n");
                 uint32_t saved_seq = conn->seq_num;
                 conn->seq_num = conn->initial_seq;
-                uint16_t mss = conn->local_mss ? conn->local_mss : TCP_DEFAULT_MSS;
-                uint8_t mss_opt[4] = { 2, 4, (uint8_t)(mss >> 8), (uint8_t)(mss & 0xFF) };
-                tcp_send_packet_with_options(conn, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0, mss_opt, 4);
+                uint8_t so[8];
+                uint32_t sl = tcp_syn_options(conn, so, true);
+                tcp_send_packet_with_options(conn, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0, so, sl);
                 conn->seq_num = saved_seq;
                 break;
             }
@@ -1142,10 +1221,27 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
             /* RFC 793: process the segment text first, then the FIN. A server
              * that closes right after its last write often sends data+FIN in a
              * single segment; handling FIN first used to drop that data. */
-            bool in_order = (tcp_header.seq_num == conn->ack_num);
             if (tcp_payload_len > 0) {
-                if (!in_order) {
-                    /* Old retransmit or out-of-order: re-ACK what we have. */
+                int32_t off = (int32_t)(tcp_header.seq_num - conn->ack_num);
+                if (off < 0 && ((uint32_t)(-off) < tcp_payload_len ||
+                                ((uint32_t)(-off) == tcp_payload_len && (tcp_header.flags & TCP_FLAG_FIN)))) {
+                    /* partly old (retransmit overlapping what we have): trim.
+                     * A FIN whose data we already hold (e.g. merged from the
+                     * out-of-order queue) is trimmed to the bare FIN. */
+                    payload_ptr += (uint32_t)(-off);
+                    tcp_payload_len -= (uint32_t)(-off);
+                    tcp_header.seq_num = conn->ack_num;
+                    off = 0;
+                }
+                if (off != 0) {
+                    /* Old retransmit, or out of order: hold data past rcv_nxt in
+                     * the ring (socket conns only; callback conns get payloads
+                     * directly) and send a duplicate ACK for the gap. */
+                    if (off > 0) {
+                        conn->st_ooo++;
+                        if (!conn->data_callback)
+                            tcp_ooo_store(conn, (uint32_t)off, payload_ptr, tcp_payload_len);
+                    }
                     tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                     break;
                 }
@@ -1157,9 +1253,17 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
                 /* Only ACK what fit in the buffer; the peer retransmits the rest
                  * once our advertised window opens again. */
                 conn->ack_num = tcp_header.seq_num + taken;
+                /* the gap is filled: held segments that now follow become in-order */
+                uint32_t merged = conn->ooo_n ? tcp_ooo_merge(conn) : 0;
+                tcp_stat_rx(conn, taken + merged);
                 if (taken < tcp_payload_len) {
                     tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
                     break;  /* FIN (if any) sits after unaccepted data */
+                }
+                if (merged) {
+                    /* ACK the merged data; a FIN on this segment is not at rcv_nxt any more */
+                    tcp_send_packet(conn, TCP_FLAG_ACK, NULL, 0);
+                    break;
                 }
             }
             if (tcp_header.flags & TCP_FLAG_FIN) {
@@ -1188,6 +1292,7 @@ void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
             /* Peer may still send data after our FIN (half-close). */
             if (tcp_payload_len > 0 && tcp_header.seq_num == conn->ack_num) {
                 uint32_t taken = tcp_handle_data(conn, payload_ptr, tcp_payload_len);
+                tcp_stat_rx(conn, taken);
                 if (taken > 0) { deferred_data_cb = true; deliver_len = taken; }
                 conn->ack_num += taken;
                 if (taken < tcp_payload_len || !(tcp_header.flags & TCP_FLAG_FIN)) {
@@ -1268,10 +1373,128 @@ static uint32_t tcp_handle_data(tcp_connection_t *conn, const uint8_t *data, uin
         serial_printf("TCP: recv buffer full, dropping %u bytes\n", len - to_copy);
     }
     if (to_copy > 0) {
-        memcpy(conn->recv_buffer + conn->recv_buffer_used, data, to_copy);
+        uint32_t size = conn->recv_buffer_size;
+        uint32_t pos = (conn->recv_head + conn->recv_buffer_used) % size;
+        uint32_t first = size - pos;
+        if (first > to_copy) first = to_copy;
+        memcpy(conn->recv_buffer + pos, data, first);
+        if (to_copy > first) memcpy(conn->recv_buffer, data + first, to_copy - first);
         conn->recv_buffer_used += to_copy;
     }
     return to_copy;
+}
+
+/* Out-of-order receive queue. Data for seq S (S past ack_num) lives in the ring
+ * at (recv_head + recv_buffer_used + (S - ack_num)) % size: that position is
+ * invariant while in-order appends (ack_num and used grow together) and reads
+ * (head grows, used shrinks) happen. Only bytes inside the advertised window
+ * (free ring space) are held, so memory stays bounded by the ring. Caller holds
+ * tcp_lock. */
+static void tcp_ooo_store(tcp_connection_t *conn, uint32_t off, const uint8_t *data, uint32_t len) {
+    if (!conn->recv_buffer || !len) return;
+    uint32_t size = conn->recv_buffer_size;
+    uint32_t free_sp = size - conn->recv_buffer_used;
+    if (off >= free_sp) return;
+    if (len > free_sp - off) len = free_sp - off;
+    uint32_t s0 = conn->ack_num + off, e0 = s0 + len;
+
+    /* new range list: existing ones + [s0,e0), sorted by offset, coalesced */
+    uint32_t st[TCP_OOO_MAX + 1], en[TCP_OOO_MAX + 1];
+    uint32_t n = 0;
+    bool placed = false;
+    for (uint32_t i = 0; i <= conn->ooo_n; i++) {
+        uint32_t s, e;
+        if (i < conn->ooo_n) {
+            s = conn->ooo[i].start; e = conn->ooo[i].end;
+            if (!placed && (int32_t)(s0 - s) < 0) { st[n] = s0; en[n] = e0; n++; placed = true; }
+        } else {
+            if (placed) break;
+            s = s0; e = e0; placed = true;
+        }
+        if (n && (int32_t)(s - en[n - 1]) <= 0) {          /* overlaps / touches previous */
+            if ((int32_t)(e - en[n - 1]) > 0) en[n - 1] = e;
+        } else {
+            st[n] = s; en[n] = e; n++;
+        }
+    }
+    /* coalesce once more (an inserted range may bridge two old ones) */
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (m && (int32_t)(st[i] - en[m - 1]) <= 0) {
+            if ((int32_t)(en[i] - en[m - 1]) > 0) en[m - 1] = en[i];
+        } else { st[m] = st[i]; en[m] = en[i]; m++; }
+    }
+    if (m > TCP_OOO_MAX) return;              /* too fragmented: drop this one */
+
+    uint32_t pos = (conn->recv_head + conn->recv_buffer_used + off) % size;
+    uint32_t first = size - pos;
+    if (first > len) first = len;
+    memcpy(conn->recv_buffer + pos, data, first);
+    if (len > first) memcpy(conn->recv_buffer, data + first, len - first);
+    for (uint32_t i = 0; i < m; i++) { conn->ooo[i].start = st[i]; conn->ooo[i].end = en[i]; }
+    conn->ooo_n = (uint8_t)m;
+}
+
+/* After rcv_nxt advanced: absorb held ranges that are now contiguous, drop
+ * ones already covered. Returns the bytes made readable. Caller holds tcp_lock. */
+static uint32_t tcp_ooo_merge(tcp_connection_t *conn) {
+    uint32_t gained = 0;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < conn->ooo_n; i++) {
+        uint32_t s = conn->ooo[i].start, e = conn->ooo[i].end;
+        if ((int32_t)(e - conn->ack_num) <= 0) continue;            /* fully covered */
+        if ((int32_t)(s - conn->ack_num) <= 0) {                    /* touches rcv_nxt */
+            uint32_t add = e - conn->ack_num;
+            uint32_t room = conn->recv_buffer_size - conn->recv_buffer_used;
+            if (add > room) add = room;
+            conn->recv_buffer_used += add;
+            conn->ack_num += add;
+            gained += add;
+            if ((int32_t)(e - conn->ack_num) > 0) { conn->ooo[k].start = conn->ack_num; conn->ooo[k].end = e; k++; }
+            continue;
+        }
+        conn->ooo[k].start = s; conn->ooo[k].end = e; k++;
+    }
+    conn->ooo_n = (uint8_t)k;
+    return gained;
+}
+
+/* Copy up to len in-order bytes out of the receive ring. Caller holds tcp_lock. */
+static uint32_t tcp_ring_read_locked(tcp_connection_t *conn, uint8_t *buf, uint32_t len) {
+    uint32_t avail = conn->recv_buffer_used;
+    uint32_t n = avail < len ? avail : len;
+    if (!n) return 0;
+    uint32_t size = conn->recv_buffer_size;
+    uint32_t first = size - conn->recv_head;
+    if (first > n) first = n;
+    memcpy(buf, conn->recv_buffer + conn->recv_head, first);
+    if (n > first) memcpy(buf + first, conn->recv_buffer, n - first);
+    conn->recv_head = (conn->recv_head + n) % size;
+    conn->recv_buffer_used -= n;
+    if (!conn->recv_buffer_used && !conn->ooo_n) conn->recv_head = 0;
+    return n;
+}
+
+/* Window update after the application read: when the window we last
+ * advertised was small and at least two segments' worth opened up, tell the
+ * peer (without it a full buffer stalls until the peer's persist timer).
+ * Caller holds tcp_lock. */
+static void tcp_rx_window_update(tcp_connection_t *c) {
+    uint32_t mss = c->local_mss ? c->local_mss : TCP_MAX_MSS;
+    uint32_t now = c->recv_buffer_size - c->recv_buffer_used;
+    if (c->last_wnd_adv < c->recv_buffer_size / 2 && now >= c->last_wnd_adv + 2 * mss &&
+        (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_FIN_WAIT_1 ||
+         c->state == TCP_STATE_FIN_WAIT_2))
+        tcp_send_packet(c, TCP_FLAG_ACK, NULL, 0);
+}
+
+uint32_t tcp_conn_read(tcp_connection_t *conn, uint8_t *buf, uint32_t len) {
+    if (!conn || !conn->recv_buffer || !buf) return 0;
+    TCP_LOCK();
+    uint32_t n = tcp_ring_read_locked(conn, buf, len);
+    if (n) tcp_rx_window_update(conn);
+    TCP_UNLOCK();
+    return n;
 }
 
 static void tcp_handle_ack(tcp_connection_t *conn, const tcp_header_t *tcp_header) {
@@ -1290,10 +1513,13 @@ static void tcp_handle_syn(tcp_connection_t *conn, const tcp_header_t *tcp_heade
         conn->seq_num = tcp_new_isn();
         conn->initial_seq = conn->seq_num;
 
-        uint16_t mss = conn->local_mss;
-        if (mss == 0) mss = TCP_DEFAULT_MSS;
-        uint8_t mss_opt[4] = { 2, 4, (uint8_t)(mss >> 8), (uint8_t)(mss & 0xFF) };
-        tcp_send_packet_with_options(conn, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0, mss_opt, 4);
+        /* scaling is on iff the client's SYN offered it (we then answer with ours) */
+        conn->ws_ok = conn->ws_peer;
+        conn->rcv_wscale = conn->ws_ok ? TCP_RCV_WSCALE : 0;
+        if (!conn->ws_ok) conn->snd_wscale = 0;
+        uint8_t so[8];
+        uint32_t sl = tcp_syn_options(conn, so, true);
+        tcp_send_packet_with_options(conn, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0, so, sl);
         conn->state = TCP_STATE_SYN_RECEIVED;
     }
 }
@@ -1405,36 +1631,11 @@ int tcp_socket_recv(tcp_socket_t *sock, uint8_t *buffer, uint32_t max_len) {
     if (!sock || !sock->connection || !sock->connection->recv_buffer) return -ENOTCONN;
 
     TCP_LOCK();
-    uint32_t available = sock->connection->recv_buffer_used;
-    if (available == 0) {
-        TCP_UNLOCK();
-        return 0;
-    }
-
-    uint32_t to_copy = (available < max_len) ? available : max_len;
-    memcpy(buffer, sock->connection->recv_buffer, to_copy);
-
-    // Remove copied data from buffer
-    uint32_t remaining = available - to_copy;
-    if (remaining > 0) {
-        memmove(sock->connection->recv_buffer,
-                sock->connection->recv_buffer + to_copy, remaining);
-    }
-    sock->connection->recv_buffer_used = remaining;
-    /* Window update: if the window we last advertised was nearly closed
-     * (less than one MSS), tell the peer that space opened up. Without it a
-     * full buffer stalls the transfer until the peer's persist timer fires. */
-    {
-        tcp_connection_t *c = sock->connection;
-        uint32_t before = c->recv_buffer_size - available;
-        uint32_t now = c->recv_buffer_size - remaining;
-        if (before < 1460 && now >= 1460 &&
-            (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_FIN_WAIT_1))
-            tcp_send_packet(c, TCP_FLAG_ACK, NULL, 0);
-    }
+    uint32_t to_copy = tcp_ring_read_locked(sock->connection, buffer, max_len);
+    if (to_copy) tcp_rx_window_update(sock->connection);
     TCP_UNLOCK();
 
-    return to_copy;
+    return (int)to_copy;
 }
 
 int tcp_socket_close(tcp_socket_t *sock) {

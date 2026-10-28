@@ -128,6 +128,27 @@ typedef struct tcp_connection {
     bool accepted;     // already handed out by accept()
     bool user_child;   // created by a SYN to a socket-layer listener
     bool disowned;     // socket closed it: free as soon as the close handshake ends
+
+    // Passive statistics ([tcpstat] serial line once a receive burst goes idle)
+    uint64_t st_t_open;       // ms: connect()/SYN seen
+    uint64_t st_t_first;      // ms: first payload byte received
+    uint64_t st_t_last;       // ms: last payload byte received
+    uint32_t st_rx;           // payload bytes accepted
+    uint32_t st_ooo;          // out-of-order segments seen
+    uint32_t st_rexmit;       // RTO retransmissions
+    uint32_t st_fast;         // fast retransmissions
+    bool     st_reported;     // current burst already reported
+
+    // Receive ring + out-of-order queue + window scaling (batch 13)
+    uint32_t recv_head;       // read offset into recv_buffer (ring); recv_buffer_used = in-order bytes
+    uint32_t snd_wnd;         // peer's receive window in bytes (scaled)
+    uint32_t last_wnd_adv;    // window (bytes) we last advertised
+    uint8_t  rcv_wscale;      // shift applied to windows we advertise (0 unless WS agreed)
+    uint8_t  snd_wscale;      // shift the peer applies to its windows
+    bool     ws_peer;         // peer's SYN carried the window-scale option
+    bool     ws_ok;           // window scaling in effect (both SYNs carried it)
+    uint8_t  ooo_n;           // number of held out-of-order ranges
+    struct { uint32_t start, end; } ooo[8];   // absolute seq ranges held in the ring past rcv_nxt
 } tcp_connection_t;
 
 // TCP Socket Structure (for user applications)
@@ -153,6 +174,8 @@ tcp_socket_t* tcp_socket_accept(tcp_socket_t *sock);
 int tcp_socket_connect(tcp_socket_t *sock, const uint8_t *remote_ip, uint16_t remote_port);
 int tcp_socket_send(tcp_socket_t *sock, const uint8_t *data, uint32_t len);
 int tcp_socket_recv(tcp_socket_t *sock, uint8_t *buffer, uint32_t max_len);
+/* Copy up to len in-order received bytes out of conn's receive ring (takes tcp_lock). */
+uint32_t tcp_conn_read(tcp_connection_t *conn, uint8_t *buf, uint32_t len);
 int tcp_socket_close(tcp_socket_t *sock);
 int tcp_socket_accept_ready(tcp_socket_t *sock);
 int tcp_socket_shutdown_wr(tcp_socket_t *sock);
