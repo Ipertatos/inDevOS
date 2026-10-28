@@ -1,6 +1,12 @@
 114bb9c5f5b57328b15cf2c7352954df  ./Choices
 7f887a07dc3b5378edf4b743f984607e  ./NetSurf.desktop
 a82d09f35deb4cb07f1d4dc6f22b9423  ./dhcp.c
+8fa78d2221201107e6494d67d83123c2  ./res/DejaVuSans-Bold.ttf
+18756952572508cb0948b3a884128a0f  ./res/DejaVuSans.ttf
+33df9c0888683eb0c10e75127ac97c08  ./res/DejaVuSansMono-Bold.ttf
+ab568aa9f5870ff068649f5f3c00b4d2  ./res/DejaVuSansMono.ttf
+534d1be3d06c3721e1bef45267641fd4  ./res/DejaVuSerif-Bold.ttf
+e622f18dbedb05d596d261827bc12afc  ./res/DejaVuSerif.ttf
 e4fcea37a9c25d28d166ba269ff25e2d  ./res/Messages
 93258c552517a8ed17ca075c705e98f9  ./res/adblock.css
 b0750aa0a75c6912482362cb9fdb00c3  ./res/credits.html

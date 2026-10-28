@@ -1,0 +1,17 @@
+<html><head><title>orphan controls</title></head><body>
+<h1 id="h">Orphan controls</h1>
+<input id="a" type="text" value="outside form">
+<textarea id="t">ta outside</textarea>
+<button id="b">btn</button>
+<form><input name="q" value="in form"></form>
+<div id="board"></div>
+<script>
+var n=0;
+var iv=setInterval(function(){
+  n++;
+  var d=document.createElement('div'); d.textContent='ROW'+n;
+  document.getElementById('board').appendChild(d);
+  if(n==3){var x=document.getElementById('b'); x.parentNode.removeChild(x);}
+  if(n>=6){clearInterval(iv); setTimeout(function(){location.href='nojs.html';},600);}
+}, 250);
+</script></body></html>

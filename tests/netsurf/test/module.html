@@ -1,0 +1,19 @@
+<!doctype html><html><head><title>modules</title>
+<script type="importmap">{"imports":{"lib-b":"./mod/b.js","mods/":"./mod/"}}</script>
+<script type="module" src="mod/a.js"></script>
+<script nomodule>document.title='NOMODULE RAN';</script>
+</head><body>
+<p id="r0">inline module: FAIL</p>
+<p id="r1">static import: FAIL</p>
+<p id="r2">dynamic import: FAIL</p>
+<p id="r3">defer order: FAIL</p>
+<script type="module">
+document.getElementById('r0').textContent = 'inline module: OK this=' + (typeof this);
+import('./mod/b.js').then(m => { document.getElementById('r2').textContent = 'dynamic import: ' + m.default; });
+</script>
+<script>window.__classic = document.getElementById('r1').textContent;</script>
+<script type="module">document.getElementById('r3').textContent = 'defer order: classic saw "' + window.__classic + '"';</script>
+<p id="r4">import map: FAIL</p>
+<script type="module">import d from "lib-b"; import {twice} from "mods/b.js"; document.getElementById("r4").textContent = "import map: " + d + " " + twice(5);</script>
+<p id="end">end</p>
+</body></html>

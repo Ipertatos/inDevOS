@@ -1,0 +1,333 @@
+--- a/netsurf/content/handlers/css/utils.h
++++ b/netsurf/content/handlers/css/utils.h
+@@ -36,11 +36,11 @@
+ 	uint8_t value = css_computed_display(style, root);
+ 
+ 	switch (value) {
+-	case CSS_DISPLAY_GRID:
+-		return CSS_DISPLAY_BLOCK;
++	case CSS_DISPLAY_GRID: /* layout_grid */
++		return CSS_DISPLAY_FLEX;
+ 
+ 	case CSS_DISPLAY_INLINE_GRID:
+-		return CSS_DISPLAY_INLINE_BLOCK;
++		return CSS_DISPLAY_INLINE_FLEX;
+ 
+ 	default:
+ 		break;
+@@ -59,11 +59,11 @@
+ 	uint8_t value = css_computed_display_static(style);
+ 
+ 	switch (value) {
+-	case CSS_DISPLAY_GRID:
+-		return CSS_DISPLAY_BLOCK;
++	case CSS_DISPLAY_GRID: /* layout_grid */
++		return CSS_DISPLAY_FLEX;
+ 
+ 	case CSS_DISPLAY_INLINE_GRID:
+-		return CSS_DISPLAY_INLINE_BLOCK;
++		return CSS_DISPLAY_INLINE_FLEX;
+ 
+ 	default:
+ 		break;
+--- a/netsurf/content/handlers/html/Makefile
++++ b/netsurf/content/handlers/html/Makefile
+@@ -17,6 +17,7 @@
+ 	interaction.c		\
+ 	layout.c		\
+ 	layout_flex.c		\
++	layout_grid.c		\
+ 	object.c		\
+ 	redraw.c		\
+ 	redraw_border.c		\
+--- a/netsurf/content/handlers/html/box_construct.c
++++ b/netsurf/content/handlers/html/box_construct.c
+@@ -108,8 +108,8 @@
+ 	BOX_NONE,            /* CSS_DISPLAY_NONE */
+ 	BOX_FLEX,            /* CSS_DISPLAY_FLEX */
+ 	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_FLEX */
+-	BOX_BLOCK,           /* CSS_DISPLAY_GRID */
+-	BOX_INLINE_BLOCK,    /* CSS_DISPLAY_INLINE_GRID */
++	BOX_FLEX,            /* CSS_DISPLAY_GRID (layout_grid) */
++	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_GRID */
+ };
+ 
+ 
+@@ -604,6 +604,9 @@
+ 			case BOX_INLINE_BLOCK:
+ 				box->type = BOX_BLOCK;
+ 				break;
++			case BOX_INLINE:
++				box->type = BOX_BLOCK;
++				break;
+ 			default:
+ 				break;
+ 			}
+--- a/netsurf/content/handlers/html/box_inspect.c
++++ b/netsurf/content/handlers/html/box_inspect.c
+@@ -550,8 +550,7 @@
+ 	*x = box->x;
+ 	*y = box->y;
+ 	while (box->parent) {
+-		if (box_is_float(box)) {
+-			assert(box->float_container);
++		if (box_is_float(box) && box->float_container != NULL) {
+ 			box = box->float_container;
+ 		} else {
+ 			box = box->parent;
+--- a/netsurf/content/handlers/html/layout.c
++++ b/netsurf/content/handlers/html/layout.c
+@@ -1037,13 +1037,34 @@
+ 		}
+ 	}
+ 
++	/* layout_grid */
++	if (lh__box_is_grid(block) && block->object == NULL &&
++	    !(block->flags & IFRAME)) {
++		layout_grid_minmax(block, (html_content *) content, &min, &max);
++	} else if (lh__box_is_flex_container(block) &&
++		   lh__flex_main_is_horizontal(block) && block->style != NULL) {
++		int gap = layout_grid_gap(&content->unit_len_ctx, block->style,
++				true, 0);
++		int n = 0;
++		for (child = block->children; child; child = child->next)
++			if (!lh__box_is_absolute(child))
++				n++;
++		if (gap > 0 && n > 1) {
++			max += gap * (n - 1);
++			if (css_computed_flex_wrap(block->style) ==
++					CSS_FLEX_WRAP_NOWRAP)
++				min += gap * (n - 1);
++		}
++	}
++
+ 	if (max < min) {
+ 		box_dump(stderr, block, 0, true);
+ 		assert(0);
+ 	}
+ 
+ 	/* fixed width takes priority */
+-	if (block->type != BOX_TABLE_CELL && !lh__box_is_flex_item(block)) {
++	if (block->type != BOX_TABLE_CELL && (!lh__box_is_flex_item(block) ||
++			lh__box_is_grid(block->parent))) {
+ 		bool border_box = bs == CSS_BOX_SIZING_BORDER_BOX;
+ 		enum css_max_width_e max_type;
+ 		enum css_min_width_e min_type;
+@@ -3389,7 +3410,8 @@
+ 				used_height = d->height;
+ 			}
+ 		} else if ((d->type == BOX_INLINE) ||
+-				d->type == BOX_INLINE_BLOCK) {
++				d->type == BOX_INLINE_BLOCK ||
++				d->type == BOX_INLINE_FLEX) {
+ 			/* replaced inlines and inline-blocks */
+ 			d->x += x0;
+ 			d->y = *y + d->border[TOP].width + d->margin[TOP];
+--- a/netsurf/content/handlers/html/layout_flex.c
++++ b/netsurf/content/handlers/html/layout_flex.c
+@@ -84,6 +84,7 @@
+ 	size_t first;
+ 	size_t count;
+ 	size_t frozen;
++	int gaps; /* layout_grid: total main gaps */
+ };
+ 
+ /**
+@@ -103,6 +104,8 @@
+ 	bool horizontal;
+ 	bool main_reversed;
+ 	enum css_flex_wrap_e wrap;
++	int main_gap; /* layout_grid: flex gap */
++	int cross_gap;
+ 
+ 	struct flex_items {
+ 		size_t count;
+@@ -417,6 +420,7 @@
+ 	enum box_side end_side = layout_flex__main_end_side(ctx);
+ 	struct flex_line_data *line;
+ 	int used_main = 0;
++	int in_flow = 0; /* layout_grid */
+ 
+ 	if (!layout_flex_ctx__ensure_line(ctx)) {
+ 		return NULL;
+@@ -437,15 +441,19 @@
+ 				item->main_size :
+ 				b->height + lh__delta_outer_main(ctx->flex, b);
+ 
++		int gap = (in_flow > 0) ? ctx->main_gap : 0;
++
+ 		if (ctx->wrap == CSS_FLEX_WRAP_NOWRAP ||
+-		    pos_main + used_main <= ctx->available_main ||
++		    pos_main + used_main + gap <= ctx->available_main ||
+ 		    lh__box_is_absolute(item->box) ||
+ 		    ctx->available_main == AUTO ||
+ 		    line->count == 0 ||
+ 		    pos_main == 0) {
+ 			if (lh__box_is_absolute(item->box) == false) {
+-				line->main_size += item->main_size;
+-				used_main += pos_main;
++				line->main_size += item->main_size + gap;
++				used_main += pos_main + gap;
++				line->gaps += gap;
++				in_flow++;
+ 
+ 				if (b->margin[start_side] == AUTO) {
+ 					line->main_auto_margin_count++;
+@@ -714,9 +722,11 @@
+ 
+ 	if (available_main == AUTO) {
+ 		available_main = INT_MAX;
++	} else {
++		available_main -= line->gaps; /* layout_grid */
+ 	}
+ 
+-	grow = (line->main_size < available_main);
++	grow = (line->main_size - line->gaps < available_main);
+ 	initial_free_main = available_main;
+ 
+ 	NSLOG(flex, DEEPDEBUG, "box %p: line %zu: first: %zu, count: %zu",
+@@ -812,12 +822,52 @@
+ 	size_t item_count = line->first + line->count;
+ 	int extra_remainder = 0;
+ 	int extra = 0;
++	int dir = ctx->main_reversed ? -1 : 1; /* layout_grid */
++	int between = 0, between_rem = 0, in_flow = 0, n_in_flow = 0;
+ 
+ 	if (ctx->main_reversed) {
+ 		main_pos = lh__box_size_main(ctx->horizontal, ctx->flex) -
+ 				main_pos;
+ 	}
+ 
++	for (size_t i = line->first; i < item_count; i++)
++		if (!lh__box_is_absolute(ctx->item.data[i].box))
++			n_in_flow++;
++	if (ctx->available_main != AUTO &&
++	    ctx->available_main != UNKNOWN_WIDTH &&
++	    line->main_auto_margin_count == 0 && n_in_flow > 0) {
++		int free_main = ctx->available_main - line->used_main_size -
++				line->gaps;
++		int lead = 0;
++		if (free_main > 0) {
++			switch (css_computed_justify_content(ctx->flex->style)) {
++			case CSS_JUSTIFY_CONTENT_FLEX_END:
++				lead = free_main;
++				break;
++			case CSS_JUSTIFY_CONTENT_CENTER:
++				lead = free_main / 2;
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_BETWEEN:
++				if (n_in_flow > 1) {
++					between = free_main / (n_in_flow - 1);
++					between_rem = free_main % (n_in_flow - 1);
++				}
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_AROUND:
++				between = free_main / n_in_flow;
++				lead = between / 2;
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_EVENLY:
++				between = free_main / (n_in_flow + 1);
++				lead = between;
++				break;
++			default:
++				break;
++			}
++		}
++		main_pos += dir * lead;
++	}
++
+ 	if (ctx->available_main != AUTO &&
+ 	    ctx->available_main != UNKNOWN_WIDTH &&
+ 	    ctx->available_main > line->used_main_size) {
+@@ -852,6 +902,14 @@
+ 		box_size_main = lh__box_size_main(ctx->horizontal, b);
+ 		box_pos_main = ctx->horizontal ? &b->x : &b->y;
+ 
++		if (!lh__box_is_absolute(b) && in_flow++ > 0) { /* layout_grid */
++			main_pos += dir * (ctx->main_gap + between);
++			if (between_rem > 0) {
++				main_pos += dir;
++				between_rem--;
++			}
++		}
++
+ 		if (!lh__box_is_absolute(b)) {
+ 			if (b->margin[main_start] == AUTO) {
+ 				extra_pre = extra + extra_remainder;
+@@ -923,6 +981,8 @@
+ 			return false;
+ 		}
+ 
++		if (ctx->line.count > 1) /* layout_grid */
++			ctx->cross_size += ctx->cross_gap;
+ 		ctx->cross_size += line->cross_size;
+ 		if (ctx->main_size < line->main_size) {
+ 			ctx->main_size = line->main_size;
+@@ -1023,6 +1083,8 @@
+ 	for (size_t i = 0; i < ctx->line.count; i++) {
+ 		struct flex_line_data *line = &ctx->line.data[i];
+ 
++		if (i > 0) /* layout_grid */
++			line_pos += (reversed ? -1 : 1) * ctx->cross_gap;
+ 		line_pos += pre_multiplier * line->cross_size;
+ 		line->pos = line_pos;
+ 		line_pos += post_multiplier * line->cross_size +
+@@ -1052,6 +1114,9 @@
+ 	struct flex_ctx *ctx;
+ 	bool success = false;
+ 
++	if (lh__box_is_grid(flex)) /* layout_grid */
++		return layout_grid(flex, available_width, content);
++
+ 	ctx = layout_flex_ctx__create(content, flex);
+ 	if (ctx == NULL) {
+ 		return false;
+@@ -1077,6 +1142,14 @@
+ 		ctx->available_cross = available_width;
+ 	}
+ 
++	/* layout_grid: flex gap */
++	ctx->main_gap = layout_grid_gap(ctx->unit_len_ctx, flex->style,
++			ctx->horizontal, ctx->horizontal ? available_width :
++			(flex->height != AUTO ? flex->height : -1));
++	ctx->cross_gap = layout_grid_gap(ctx->unit_len_ctx, flex->style,
++			!ctx->horizontal, ctx->horizontal ?
++			(flex->height != AUTO ? flex->height : -1) : available_width);
++
+ 	NSLOG(flex, DEEPDEBUG, "box %p: available_main: %i",
+ 			flex, ctx->available_main);
+ 	NSLOG(flex, DEEPDEBUG, "box %p: available_cross: %i",
+--- a/netsurf/content/handlers/html/layout_internal.h
++++ b/netsurf/content/handlers/html/layout_internal.h
+@@ -71,6 +71,14 @@
+ 		int available_width,
+ 		html_content *content);
+ 
++/* layout_grid */
++bool layout_grid(struct box *grid, int available_width,
++		html_content *content);
++void layout_grid_minmax(struct box *grid, html_content *content,
++		int *min, int *max);
++int layout_grid_gap(const css_unit_ctx *uctx,
++		const css_computed_style *style, bool column, int pct_base);
++
+ typedef uint8_t (*css_len_func)(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+@@ -125,6 +133,16 @@
+ 	return (b->parent != NULL) && lh__box_is_flex_container(b->parent);
+ }
+ 
++/** Layout helper: Check whether box is a grid container (layout_grid). */
++static inline bool lh__box_is_grid(const struct box *b)
++{
++	uint8_t d;
++	if (b == NULL || b->style == NULL || !lh__box_is_flex_container(b))
++		return false;
++	d = css_computed_display_static(b->style);
++	return d == CSS_DISPLAY_GRID || d == CSS_DISPLAY_INLINE_GRID;
++}
++
+ /** Layout helper: Check whether box is inline level. (Includes BR.) */
+ static inline bool lh__box_is_inline_level(const struct box *b)
+ {

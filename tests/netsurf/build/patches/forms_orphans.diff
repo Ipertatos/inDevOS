@@ -1,0 +1,128 @@
+--- a/netsurf/content/handlers/html/forms.c
++++ b/netsurf/content/handlers/html/forms.c
+@@ -540,6 +540,61 @@
+ 	return ctl;
+ }
+ 
++/* forms_orphans: controls outside any form hang off their node */
++#include "html/box.h"
++#include "html/box_construct.h"
++static dom_string *orphan_key;
++
++static struct form_control *orphan_get(dom_node *node)
++{
++	void *data = NULL;
++	if (orphan_key == NULL && dom_string_create(
++			(const uint8_t *) "__ns_orphan_ctl", 15,
++			&orphan_key) != DOM_NO_ERR)
++		return NULL;
++	if (dom_node_get_user_data(node, orphan_key, &data) != DOM_NO_ERR)
++		return NULL;
++	return data;
++}
++
++static void orphan_set(dom_node *node, struct form_control *ctl)
++{
++	void *old = NULL;
++	if (orphan_key == NULL)
++		return;
++	dom_node_set_user_data(node, orphan_key, ctl, NULL, &old);
++}
++
++void html_forms_free_orphans(struct box *root, bool unused_only)
++{
++	struct box *b = root;
++	while (b != NULL) {
++		struct form_control *g = b->gadget;
++		/* identify orphans by node data only: form-owned controls
++		 * may already be freed (html_destroy frees forms first) */
++		if (g != NULL && b->node != NULL &&
++		    orphan_get(b->node) == g) {
++			struct box *nb = box_for_node(b->node);
++			if (!unused_only || nb == NULL || nb->gadget != g) {
++				orphan_set(b->node, NULL);
++				if (g->box == b || (nb != NULL && nb->gadget != g))
++					g->box = NULL;
++				form_free_control(g);
++			}
++		}
++		/* pre-order walk */
++		if (b->children != NULL) {
++			b = b->children;
++			continue;
++		}
++		while (b != NULL && b != root && b->next == NULL)
++			b = b->parent;
++		if (b == NULL || b == root)
++			break;
++		b = b->next;
++	}
++}
++
+ /* documented in html_internal.h */
+ struct form_control *
+ html_forms_get_control_for_node(struct form *forms, dom_node *node)
+@@ -557,6 +612,11 @@
+ 		}
+ 	}
+ 
++	/* forms_orphans: a control outside any form made earlier */
++	ctl = orphan_get(node);
++	if (ctl != NULL)
++		return ctl;
++
+ 	/* Step two, extract the node's name so we can construct a gadget. */
+ 	err = dom_element_get_tag_name(node, &ds_name);
+ 	if (err == DOM_NO_ERR && ds_name != NULL) {
+@@ -585,6 +645,10 @@
+ 	if (ctl == NULL)
+ 		ctl = invent_fake_gadget(node);
+ 
++	/* forms_orphans: remember controls no form owns */
++	if (ctl != NULL && ctl->form == NULL)
++		orphan_set(node, ctl);
++
+ 	if (ds_name != NULL)
+ 		dom_string_unref(ds_name);
+ 
+--- a/netsurf/content/handlers/html/box_textarea.c
++++ b/netsurf/content/handlers/html/box_textarea.c
+@@ -354,6 +354,14 @@
+ 	ta_setup.selected_bg = fstyle.foreground;
+ 	ta_setup.selected_text = colour_to_bw_furthest(ta_setup.selected_bg);
+ 
++	/* forms_orphans: a reused control already has a textarea */
++	if (gadget->data.text.ta != NULL) {
++		textarea_destroy(gadget->data.text.ta);
++		gadget->data.text.ta = NULL;
++	}
++	if (gadget->data.text.initial != NULL)
++		dom_string_unref(gadget->data.text.initial);
++
+ 	/* Hand reference to dom text over to gadget */
+ 	gadget->data.text.initial = dom_text;
+ 
+--- a/netsurf/content/handlers/html/private.h
++++ b/netsurf/content/handlers/html/private.h
+@@ -318,6 +318,10 @@
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+ struct form_control *html_forms_get_control_for_node(struct form *forms,
+ 		dom_node *node);
++/* forms_orphans: free controls outside any form found in a box tree;
++ * unused_only: only those whose node no longer has a box using them */
++struct box;
++void html_forms_free_orphans(struct box *root, bool unused_only);
+ 
+ 
+ /* in html/css_fetcher.c */
+--- a/netsurf/content/handlers/html/html.c
++++ b/netsurf/content/handlers/html/html.c
+@@ -1309,6 +1323,8 @@
+ 	html_object_free_objects(html);
+ 
+ 	/* free layout */
++	if (html->layout != NULL) /* forms_orphans */
++		html_forms_free_orphans(html->layout, false);
+ 	html_free_layout(html);
+ }
+ 

@@ -1,0 +1,77 @@
+--- a/netsurf/Makefile
++++ b/netsurf/Makefile
+@@ -140,6 +140,7 @@
+ $(eval $(call feature_switch,HARU_PDF,PDF export (haru),-DWITH_PDF_EXPORT,-lhpdf -lpng,-UWITH_PDF_EXPORT,))
+ $(eval $(call feature_switch,LIBICONV_PLUG,glibc internal iconv,-DLIBICONV_PLUG,,-ULIBICONV_PLUG,-liconv))
+ $(eval $(call feature_switch,DUKTAPE,Javascript (Duktape),,,,,))
++$(eval $(call feature_switch,QUICKJS,Javascript (QuickJS),,-lquickjs -lm,,))
+ 
+ # Common libraries with pkgconfig
+ $(eval $(call pkg_config_find_and_add,libcss,CSS))
+--- a/netsurf/Makefile.defaults
++++ b/netsurf/Makefile.defaults
+@@ -71,6 +71,10 @@
+ # Valid options: YES, NO
+ NETSURF_USE_DUKTAPE := YES
+ 
++# Enable the QuickJS javascript engine instead of Duktape
++# Valid options: YES, NO
++NETSURF_USE_QUICKJS := NO
++
+ # Enable NetSurf's use of libharu for PDF export and GTK printing support.
+ # There is no auto-detection available for this, as it does not have a
+ # pkg-config file.
+--- a/netsurf/content/handlers/javascript/Makefile
++++ b/netsurf/content/handlers/javascript/Makefile
+@@ -6,7 +6,10 @@
+ 
+ S_JAVASCRIPT_BINDING:=
+ 
+-ifeq ($(NETSURF_USE_DUKTAPE),YES)
++ifeq ($(NETSURF_USE_QUICKJS),YES)
++# QuickJS
++include content/handlers/javascript/quickjs/Makefile
++else ifeq ($(NETSURF_USE_DUKTAPE),YES)
+ # Duktape
+ include content/handlers/javascript/duktape/Makefile
+ else
+--- a/netsurf/content/handlers/html/html.c
++++ b/netsurf/content/handlers/html/html.c
+@@ -168,6 +168,20 @@
+ 		case NS_KEY_TEXT_END:
+ 			dom_key = dom_string_ref(corestring_dom_End);
+ 			break;
++		/* js_quickjs: more named keys */
++		case NS_KEY_NL:
++		case NS_KEY_CR:
++			dom_string_create((const uint8_t *)"Enter", 5, &dom_key);
++			break;
++		case NS_KEY_DELETE_LEFT:
++			dom_string_create((const uint8_t *)"Backspace", 9, &dom_key);
++			break;
++		case NS_KEY_TAB:
++			dom_string_create((const uint8_t *)"Tab", 3, &dom_key);
++			break;
++		case NS_KEY_DELETE_RIGHT:
++			dom_string_create((const uint8_t *)"Delete", 6, &dom_key);
++			break;
+ 		default:
+ 			dom_key = NULL;
+ 			break;
+--- a/netsurf/content/handlers/html/interaction.c
++++ b/netsurf/content/handlers/html/interaction.c
+@@ -1552,7 +1552,13 @@
+ 	 * `event.preventDefault()` then we won't handle the event when
+ 	 * we're not supposed to.
+ 	 */
+-	if (html->layout != NULL && html->layout->node != NULL) {
++	if (html->focus_type == HTML_FOCUS_TEXTAREA &&
++	    html->focus_owner.textarea != NULL &&
++	    html->focus_owner.textarea->node != NULL) {
++		/* js_quickjs: keydown targets the focused control */
++		fire_dom_keyboard_event(corestring_dom_keydown,
++				html->focus_owner.textarea->node, true, true, key);
++	} else if (html->layout != NULL && html->layout->node != NULL) {
+ 		fire_dom_keyboard_event(corestring_dom_keydown,
+ 				html->layout->node, true, true, key);
+ 	}

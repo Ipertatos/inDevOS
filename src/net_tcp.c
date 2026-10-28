@@ -84,6 +84,44 @@ static uint64_t tcp_now_ms(void) {
     return ktime_now_ms();
 }
 
+/* RFC 6528-style ISN: a 4 us clock plus a per-boot random offset, so a new
+ * connection on a reused 4-tuple starts above the old one's sequence space
+ * (the old "counter++" ISN was below it and peers in TIME_WAIT dropped the SYN). */
+static uint32_t tcp_isn_secret;
+static uint16_t tcp_next_port;
+static inline uint64_t tcp_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint32_t tcp_new_isn(void) {
+    if (!tcp_isn_secret) {
+        uint64_t t = tcp_rdtsc();
+        tcp_isn_secret = (uint32_t)(t ^ (t >> 31) ^ 0x9E3779B9u) | 1u;
+    }
+    return (uint32_t)(ktime_now_us() >> 2) + tcp_isn_secret;
+}
+/* Ephemeral port: rotate through 49152-65535 starting at a random point and
+ * skip any port still used by a connection (any state) on that local IP.
+ * Always starting at 49152 reused the same 4-tuple for back-to-back
+ * connections to one server, which peers still holding the old one ignore. */
+static uint16_t tcp_pick_ephemeral(const uint8_t *local_ip) {
+    if (!tcp_next_port)
+        tcp_next_port = (uint16_t)(49152 + (uint32_t)(tcp_rdtsc() >> 4) % 16384);
+    for (uint32_t tries = 0; tries < 16384; tries++) {
+        uint16_t p = tcp_next_port;
+        tcp_next_port = (tcp_next_port >= 65535) ? 49152 : (uint16_t)(tcp_next_port + 1);
+        bool used = false;
+        TCP_LOCK();
+        for (tcp_connection_t *c = tcp_connections; c; c = c->next) {
+            if (c->local_port == p && memcmp(c->local_ip, local_ip, 4) == 0) { used = true; break; }
+        }
+        TCP_UNLOCK();
+        if (!used) return p;
+    }
+    return 0;
+}
+
 void tcp_init(void) {
     printf("TCP: Initialized\n");
     tcp_isn_counter = 0x12345678; // Simple ISN initialization
@@ -704,14 +742,11 @@ tcp_connection_t* tcp_connect(const uint8_t *remote_ip, uint16_t remote_port,
     uint8_t local_ip[4];
     ip_select_src(remote_ip, local_ip);   /* 127.x talks from 127.x */
 
-    // Find an available local port (49152-65535)
-    uint16_t local_port = 49152;
-    while (tcp_find_connection(local_ip, local_port, remote_ip, remote_port) != NULL) {
-        local_port++;
-        if (local_port == 0) {
-            printf("TCP: No available local ports\n");
-            return NULL;
-        }
+    // Pick an ephemeral local port (49152-65535, rotating)
+    uint16_t local_port = tcp_pick_ephemeral(local_ip);
+    if (local_port == 0) {
+        printf("TCP: No available local ports\n");
+        return NULL;
     }
 
     // Create connection
@@ -723,7 +758,7 @@ tcp_connection_t* tcp_connect(const uint8_t *remote_ip, uint16_t remote_port,
     TCP_LOCK();
     conn->connect_callback = connect_callback;
     conn->state = TCP_STATE_SYN_SENT;
-    conn->seq_num = tcp_isn_counter++;
+    conn->seq_num = tcp_new_isn();
     conn->initial_seq = conn->seq_num;
     conn->snd_una = conn->seq_num;
 
@@ -1252,7 +1287,7 @@ static void tcp_handle_syn(tcp_connection_t *conn, const tcp_header_t *tcp_heade
     if (conn->state == TCP_STATE_LISTEN) {
         // Send SYN-ACK with MSS option (many clients expect it; improves interoperability)
         conn->ack_num = tcp_header->seq_num + 1;
-        conn->seq_num = tcp_isn_counter++;
+        conn->seq_num = tcp_new_isn();
         conn->initial_seq = conn->seq_num;
 
         uint16_t mss = conn->local_mss;

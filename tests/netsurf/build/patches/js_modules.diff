@@ -1,0 +1,107 @@
+--- a/netsurf/content/handlers/javascript/js.h
++++ b/netsurf/content/handlers/javascript/js.h
+@@ -127,6 +127,10 @@
+  * execute some javascript in a context
+  */
+ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name);
++/** install a <script type="importmap"> */
++bool js_importmap(jsthread *thread, const uint8_t *txt, size_t txtlen);
++/** execute source as an ES module (type="module") */
++bool js_exec_module(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name);
+ 
+ /**
+  * fire an event at a dom node
+--- a/netsurf/content/handlers/html/script.c
++++ b/netsurf/content/handlers/html/script.c
+@@ -46,6 +46,19 @@
+ typedef bool (script_handler_t)(struct jsthread *jsthread, const uint8_t *data, size_t size, const char *name);
+ 
+ 
++/* type="module" (case-insensitive, surrounding space ignored) */
++static bool html_script_is_module(struct dom_string *mt)
++{
++	const char *d;
++	size_t l;
++	if (mt == NULL) return false;
++	d = dom_string_data(mt);
++	l = dom_string_byte_length(mt);
++	while (l > 0 && (*d == ' ' || *d == '\t')) { d++; l--; }
++	while (l > 0 && (d[l-1] == ' ' || d[l-1] == '\t')) l--;
++	return l == 6 && strncasecmp(d, "module", 6) == 0;
++}
++
+ static script_handler_t *select_script_handler(content_type ctype)
+ {
+ 	if (ctype == CONTENT_JS) {
+@@ -96,6 +109,8 @@
+ 				size_t size;
+ 				data = content_get_source_data(
+ 						s->data.handle, &size );
++				if (html_script_is_module(s->mimetype))
++					script_handler = js_exec_module;
+ 				script_handler(c->jsthread, data, size,
+ 					       nsurl_access(hlcache_handle_get_url(s->data.handle)));
+ 				have_run_something = true;
+@@ -323,6 +338,8 @@
+ 			const uint8_t *data;
+ 			size_t size;
+ 			data = content_get_source_data(s->data.handle, &size );
++			if (html_script_is_module(s->mimetype))
++				script_handler = js_exec_module;
+ 			script_handler(parent->jsthread, data, size,
+ 				       nsurl_access(hlcache_handle_get_url(s->data.handle)));
+ 		}
+@@ -445,6 +462,8 @@
+ 			return DOM_HUBBUB_OK; /* dom error */
+ 		}
+ 
++		if (html_script_is_module(mimetype))
++			defer = true;
+ 		if (defer) {
+ 			/* defered script */
+ 			script_type = HTML_SCRIPT_DEFER;
+@@ -537,6 +556,14 @@
+ 	nscript->data.string = script;
+ 	nscript->already_started = true;
+ 
++	if (dom_string_byte_length(mimetype) == 9 &&
++	    strncasecmp(dom_string_data(mimetype), "importmap", 9) == 0) {
++		js_importmap(c->jsthread,
++			     (const uint8_t *)dom_string_data(script),
++			     dom_string_byte_length(script));
++		return DOM_HUBBUB_OK;
++	}
++
+ 	/* ensure script handler for content type */
+ 	exc = dom_string_intern(mimetype, &lwcmimetype);
+ 	if (exc != DOM_NO_ERR) {
+@@ -545,6 +572,8 @@
+ 
+ 	script_handler = select_script_handler(content_factory_type_from_mime_type(lwcmimetype));
+ 	lwc_string_unref(lwcmimetype);
++	if (html_script_is_module(mimetype))
++		script_handler = js_exec_module;
+ 
+ 	if (script_handler != NULL) {
+ 		script_handler(c->jsthread,
+@@ -593,6 +622,20 @@
+ 		mimetype = dom_string_ref(corestring_dom_text_javascript);
+ 	}
+ 
++	{
++		dom_string *nm = NULL;
++		bool has_nm = false;
++		if (dom_string_create((const uint8_t *)"nomodule", 8, &nm) == DOM_NO_ERR) {
++			if (dom_element_has_attribute(node, nm, &has_nm) != DOM_NO_ERR)
++				has_nm = false;
++			dom_string_unref(nm);
++		}
++		if (has_nm) {
++			dom_string_unref(mimetype);
++			return DOM_HUBBUB_OK;
++		}
++	}
++
+ 	exc = dom_element_get_attribute(node, corestring_dom_src, &src);
+ 	if (exc != DOM_NO_ERR || src == NULL) {
+ 		err = exec_inline_script(c, node, mimetype);

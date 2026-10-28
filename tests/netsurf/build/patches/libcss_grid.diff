@@ -1,0 +1,613 @@
+--- a/libcss/include/libcss/computed.h
++++ b/libcss/include/libcss/computed.h
+@@ -377,6 +377,47 @@
+ uint8_t css_computed_column_fill(
+ 		const css_computed_style *style);
+ 
++/* libcss_grid */
++uint8_t css_computed_row_gap(
++		const css_computed_style *style,
++		css_fixed *length, css_unit *unit);
++uint8_t css_computed_grid_template_columns(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_template_rows(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_template_areas(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_auto_columns(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_auto_rows(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_auto_flow(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_column_start(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_column_end(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_row_start(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_grid_row_end(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_justify_items(
++		const css_computed_style *style,
++		lwc_string **string);
++uint8_t css_computed_justify_self(
++		const css_computed_style *style,
++		lwc_string **string);
++
+ uint8_t css_computed_column_gap(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+--- a/libcss/include/libcss/properties.h
++++ b/libcss/include/libcss/properties.h
+@@ -140,6 +140,19 @@
+ 	CSS_PROP_ORDER				= 0x07b,
+ 	CSS_PROP_FILL_OPACITY			= 0x07c,
+ 	CSS_PROP_STROKE_OPACITY			= 0x07d,
++	CSS_PROP_ROW_GAP		= 0x07e, /* libcss_grid */
++	CSS_PROP_GRID_TEMPLATE_COLUMNS		= 0x07f, /* libcss_grid */
++	CSS_PROP_GRID_TEMPLATE_ROWS		= 0x080, /* libcss_grid */
++	CSS_PROP_GRID_TEMPLATE_AREAS		= 0x081, /* libcss_grid */
++	CSS_PROP_GRID_AUTO_COLUMNS		= 0x082, /* libcss_grid */
++	CSS_PROP_GRID_AUTO_ROWS		= 0x083, /* libcss_grid */
++	CSS_PROP_GRID_AUTO_FLOW		= 0x084, /* libcss_grid */
++	CSS_PROP_GRID_COLUMN_START		= 0x085, /* libcss_grid */
++	CSS_PROP_GRID_COLUMN_END		= 0x086, /* libcss_grid */
++	CSS_PROP_GRID_ROW_START		= 0x087, /* libcss_grid */
++	CSS_PROP_GRID_ROW_END		= 0x088, /* libcss_grid */
++	CSS_PROP_JUSTIFY_ITEMS		= 0x089, /* libcss_grid */
++	CSS_PROP_JUSTIFY_SELF		= 0x08a, /* libcss_grid */
+ 
+ 	CSS_N_PROPERTIES
+ };
+@@ -328,6 +341,19 @@
+ 	CSS_COLUMN_FILL_AUTO			= 0x2
+ };
+ 
++/* libcss_grid */
++enum css_row_gap_e {
++	CSS_ROW_GAP_INHERIT			= 0x0,
++	CSS_ROW_GAP_SET				= 0x1,
++	CSS_ROW_GAP_NORMAL			= 0x2
++};
++
++/* grid longhands stored as text; NULL string means none/initial */
++enum css_grid_string_e {
++	CSS_GRID_STRING_INHERIT			= 0x0,
++	CSS_GRID_STRING_SET			= 0x1
++};
++
+ enum css_column_gap_e {
+ 	CSS_COLUMN_GAP_INHERIT			= 0x0,
+ 	CSS_COLUMN_GAP_SET			= 0x1,
+--- a/libcss/src/bytecode/opcodes.h
++++ b/libcss/src/bytecode/opcodes.h
+@@ -206,6 +206,17 @@
+ 	COLUMN_FILL_AUTO		= 0x0001
+ };
+ 
++/* libcss_grid */
++enum op_row_gap {
++	ROW_GAP_NORMAL			= 0x0000,
++	ROW_GAP_SET			= 0x0080
++};
++
++enum op_grid_string {
++	GRID_STRING_NONE		= 0x0000,
++	GRID_STRING_SET			= 0x0080
++};
++
+ enum op_column_gap {
+ 	COLUMN_GAP_NORMAL		= 0x0000,
+ 	COLUMN_GAP_SET			= 0x0080
+--- a/libcss/src/parse/important.c
++++ b/libcss/src/parse/important.c
+@@ -109,6 +109,19 @@
+ 					offset++; /* colour */
+ 				break;
+ 
++			/* libcss_grid: GRID_STRING_SET == BACKGROUND_IMAGE_URI */
++			case CSS_PROP_GRID_TEMPLATE_COLUMNS:
++			case CSS_PROP_GRID_TEMPLATE_ROWS:
++			case CSS_PROP_GRID_TEMPLATE_AREAS:
++			case CSS_PROP_GRID_AUTO_COLUMNS:
++			case CSS_PROP_GRID_AUTO_ROWS:
++			case CSS_PROP_GRID_AUTO_FLOW:
++			case CSS_PROP_GRID_COLUMN_START:
++			case CSS_PROP_GRID_COLUMN_END:
++			case CSS_PROP_GRID_ROW_START:
++			case CSS_PROP_GRID_ROW_END:
++			case CSS_PROP_JUSTIFY_ITEMS:
++			case CSS_PROP_JUSTIFY_SELF:
+ 			case CSS_PROP_BACKGROUND_IMAGE:
+ 			case CSS_PROP_CUE_AFTER:
+ 			case CSS_PROP_CUE_BEFORE:
+@@ -164,6 +177,7 @@
+ 			case CSS_PROP_WIDTH:
+ 			case CSS_PROP_COLUMN_WIDTH:
+ 			case CSS_PROP_COLUMN_GAP:
++			case CSS_PROP_ROW_GAP: /* libcss_grid */
+ 				assert(BOTTOM_SET == (enum op_bottom)LEFT_SET);
+ 				assert(BOTTOM_SET == (enum op_bottom)RIGHT_SET);
+ 				assert(BOTTOM_SET == (enum op_bottom)TOP_SET);
+--- a/libcss/src/parse/properties/Makefile
++++ b/libcss/src/parse/properties/Makefile
+@@ -48,6 +48,7 @@
+ 	fill_opacity.c			\
+ 	flex.c				\
+ 	flex_flow.c			\
++	grid.c				\
+ 	font.c				\
+ 	font_family.c			\
+ 	font_weight.c			\
+--- a/libcss/src/parse/properties/properties.c
++++ b/libcss/src/parse/properties/properties.c
+@@ -158,7 +158,27 @@
+ 	css__parse_width,
+ 	css__parse_word_spacing,
+ 	css__parse_writing_mode,
+-	css__parse_z_index
++	css__parse_z_index,
++	/* libcss_grid */
++	css__parse_gap,
++	css__parse_grid_area,
++	css__parse_grid_auto_columns,
++	css__parse_grid_auto_flow,
++	css__parse_grid_auto_rows,
++	css__parse_grid_column,
++	css__parse_grid_column_end,
++	css__parse_grid_column_start,
++	css__parse_grid_row,
++	css__parse_grid_row_end,
++	css__parse_grid_row_start,
++	css__parse_grid_template,
++	css__parse_grid_template_areas,
++	css__parse_grid_template_columns,
++	css__parse_grid_template_rows,
++	css__parse_justify_items,
++	css__parse_justify_self,
++	css__parse_row_gap,
++	css__parse_grid
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+@@ -289,4 +309,5 @@
+ 	[CSS_PROP_FLEX_WRAP]             = UNIT_MASK_FLEX_WRAP,
+ 	[CSS_PROP_JUSTIFY_CONTENT]       = UNIT_MASK_JUSTIFY_CONTENT,
+ 	[CSS_PROP_ORDER]                 = UNIT_MASK_ORDER,
++	[CSS_PROP_ROW_GAP]               = UNIT_MASK_ROW_GAP, /* libcss_grid */
+ };
+--- a/libcss/src/parse/properties/properties.gen
++++ b/libcss/src/parse/properties/properties.gen
+@@ -202,6 +202,9 @@
+ 
+ column_fill:CSS_PROP_COLUMN_FILL IDENT:( INHERIT: INITIAL: REVERT: UNSET: BALANCE:0,COLUMN_FILL_BALANCE AUTO:0,COLUMN_FILL_AUTO IDENT:)
+ 
++# libcss_grid
++row_gap:CSS_PROP_ROW_GAP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NORMAL:0,ROW_GAP_NORMAL IDENT:) LENGTH_UNIT:( UNIT_PX:ROW_GAP_SET RANGE:<0 MASK:UNIT_MASK_ROW_GAP LENGTH_UNIT:)
++
+ column_gap:CSS_PROP_COLUMN_GAP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NORMAL:0,COLUMN_GAP_NORMAL IDENT:) LENGTH_UNIT:( UNIT_PX:COLUMN_GAP_SET RANGE:<0 MASK:UNIT_MASK_COLUMN_GAP LENGTH_UNIT:)
+ 
+ column_rule_color:CSS_PROP_COLUMN_RULE_COLOR IDENT:( INHERIT: INITIAL: REVERT: UNSET: IDENT:) COLOR:COLUMN_RULE_COLOR_SET
+@@ -218,11 +221,11 @@
+ 
+ box_sizing:CSS_PROP_BOX_SIZING IDENT:( INHERIT: INITIAL: REVERT: UNSET: CONTENT_BOX:0,BOX_SIZING_CONTENT_BOX BORDER_BOX:0,BOX_SIZING_BORDER_BOX IDENT:)
+ 
+-align_content:CSS_PROP_ALIGN_CONTENT IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_CONTENT_STRETCH FLEX_START:0,ALIGN_CONTENT_FLEX_START FLEX_END:0,ALIGN_CONTENT_FLEX_END CENTER:0,ALIGN_CONTENT_CENTER SPACE_BETWEEN:0,ALIGN_CONTENT_SPACE_BETWEEN SPACE_AROUND:0,ALIGN_CONTENT_SPACE_AROUND SPACE_EVENLY:0,ALIGN_CONTENT_SPACE_EVENLY IDENT:)
++align_content:CSS_PROP_ALIGN_CONTENT IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_CONTENT_STRETCH FLEX_START:0,ALIGN_CONTENT_FLEX_START FLEX_END:0,ALIGN_CONTENT_FLEX_END CENTER:0,ALIGN_CONTENT_CENTER SPACE_BETWEEN:0,ALIGN_CONTENT_SPACE_BETWEEN SPACE_AROUND:0,ALIGN_CONTENT_SPACE_AROUND SPACE_EVENLY:0,ALIGN_CONTENT_SPACE_EVENLY START:0,ALIGN_CONTENT_FLEX_START END:0,ALIGN_CONTENT_FLEX_END SELF_START:0,ALIGN_CONTENT_FLEX_START SELF_END:0,ALIGN_CONTENT_FLEX_END NORMAL:0,ALIGN_CONTENT_STRETCH IDENT:)
+ 
+-align_items:CSS_PROP_ALIGN_ITEMS IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_ITEMS_STRETCH FLEX_START:0,ALIGN_ITEMS_FLEX_START FLEX_END:0,ALIGN_ITEMS_FLEX_END CENTER:0,ALIGN_ITEMS_CENTER BASELINE:0,ALIGN_ITEMS_BASELINE IDENT:)
++align_items:CSS_PROP_ALIGN_ITEMS IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_ITEMS_STRETCH FLEX_START:0,ALIGN_ITEMS_FLEX_START FLEX_END:0,ALIGN_ITEMS_FLEX_END CENTER:0,ALIGN_ITEMS_CENTER BASELINE:0,ALIGN_ITEMS_BASELINE START:0,ALIGN_ITEMS_FLEX_START END:0,ALIGN_ITEMS_FLEX_END SELF_START:0,ALIGN_ITEMS_FLEX_START SELF_END:0,ALIGN_ITEMS_FLEX_END NORMAL:0,ALIGN_ITEMS_STRETCH IDENT:)
+ 
+-align_self:CSS_PROP_ALIGN_SELF IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_SELF_STRETCH FLEX_START:0,ALIGN_SELF_FLEX_START FLEX_END:0,ALIGN_SELF_FLEX_END CENTER:0,ALIGN_SELF_CENTER BASELINE:0,ALIGN_SELF_BASELINE AUTO:0,ALIGN_SELF_AUTO IDENT:)
++align_self:CSS_PROP_ALIGN_SELF IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_SELF_STRETCH FLEX_START:0,ALIGN_SELF_FLEX_START FLEX_END:0,ALIGN_SELF_FLEX_END CENTER:0,ALIGN_SELF_CENTER BASELINE:0,ALIGN_SELF_BASELINE AUTO:0,ALIGN_SELF_AUTO START:0,ALIGN_SELF_FLEX_START END:0,ALIGN_SELF_FLEX_END SELF_START:0,ALIGN_SELF_FLEX_START SELF_END:0,ALIGN_SELF_FLEX_END NORMAL:0,ALIGN_SELF_STRETCH IDENT:)
+ 
+ flex_basis:CSS_PROP_FLEX_BASIS IDENT:( INHERIT: INITIAL: REVERT: UNSET: AUTO:0,FLEX_BASIS_AUTO CONTENT:0,FLEX_BASIS_CONTENT IDENT:) LENGTH_UNIT:( UNIT_PX:FLEX_BASIS_SET MASK:UNIT_MASK_FLEX_BASIS RANGE:<0 LENGTH_UNIT:)
+ 
+@@ -234,6 +237,6 @@
+ 
+ flex_wrap:CSS_PROP_FLEX_WRAP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NOWRAP:0,FLEX_WRAP_NOWRAP WRAP_STRING:0,FLEX_WRAP_WRAP WRAP_REVERSE:0,FLEX_WRAP_WRAP_REVERSE IDENT:)
+ 
+-justify_content:CSS_PROP_JUSTIFY_CONTENT IDENT:( INHERIT: INITIAL: REVERT: UNSET: FLEX_START:0,JUSTIFY_CONTENT_FLEX_START FLEX_END:0,JUSTIFY_CONTENT_FLEX_END CENTER:0,JUSTIFY_CONTENT_CENTER SPACE_BETWEEN:0,JUSTIFY_CONTENT_SPACE_BETWEEN SPACE_AROUND:0,JUSTIFY_CONTENT_SPACE_AROUND SPACE_EVENLY:0,JUSTIFY_CONTENT_SPACE_EVENLY IDENT:)
++justify_content:CSS_PROP_JUSTIFY_CONTENT IDENT:( INHERIT: INITIAL: REVERT: UNSET: FLEX_START:0,JUSTIFY_CONTENT_FLEX_START FLEX_END:0,JUSTIFY_CONTENT_FLEX_END CENTER:0,JUSTIFY_CONTENT_CENTER SPACE_BETWEEN:0,JUSTIFY_CONTENT_SPACE_BETWEEN SPACE_AROUND:0,JUSTIFY_CONTENT_SPACE_AROUND SPACE_EVENLY:0,JUSTIFY_CONTENT_SPACE_EVENLY START:0,JUSTIFY_CONTENT_FLEX_START END:0,JUSTIFY_CONTENT_FLEX_END SELF_START:0,JUSTIFY_CONTENT_FLEX_START SELF_END:0,JUSTIFY_CONTENT_FLEX_END NORMAL:0,JUSTIFY_CONTENT_FLEX_START STRETCH:0,JUSTIFY_CONTENT_FLEX_START LEFT:0,JUSTIFY_CONTENT_FLEX_START RIGHT:0,JUSTIFY_CONTENT_FLEX_END IDENT:)
+ 
+ order:CSS_PROP_ORDER IDENT:( INHERIT: INITIAL: REVERT: UNSET: IDENT:) NUMBER:( true:ORDER_SET NUMBER:)
+--- a/libcss/src/parse/properties/properties.h
++++ b/libcss/src/parse/properties/properties.h
+@@ -460,6 +460,64 @@
+ css_error css__parse_writing_mode(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
++/* libcss_grid */
++css_error css__parse_gap(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_area(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_auto_columns(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_auto_flow(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_auto_rows(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_column(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_column_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_column_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_row(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_row_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_row_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_template(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_template_areas(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_template_columns(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_template_rows(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_justify_items(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_justify_self(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_row_gap(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
+ css_error css__parse_z_index(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+@@ -560,6 +618,7 @@
+ #define UNIT_MASK_COLUMN_COUNT          (0)
+ #define UNIT_MASK_COLUMN_FILL           (0)
+ #define UNIT_MASK_COLUMN_GAP            (UNIT_LENGTH)
++#define UNIT_MASK_ROW_GAP               (UNIT_LENGTH) /* libcss_grid */
+ #define UNIT_MASK_COLUMN_RULE_COLOR     (0)
+ #define UNIT_MASK_COLUMN_RULE_STYLE     (0)
+ #define UNIT_MASK_COLUMN_RULE_WIDTH     (UNIT_LENGTH)
+--- a/libcss/src/parse/propstrings.c
++++ b/libcss/src/parse/propstrings.c
+@@ -233,6 +233,26 @@
+ 	SMAP("word-spacing"),
+ 	SMAP("writing-mode"),
+ 	SMAP("z-index"),
++	/* libcss_grid */
++	SMAP("gap"),
++	SMAP("grid-area"),
++	SMAP("grid-auto-columns"),
++	SMAP("grid-auto-flow"),
++	SMAP("grid-auto-rows"),
++	SMAP("grid-column"),
++	SMAP("grid-column-end"),
++	SMAP("grid-column-start"),
++	SMAP("grid-row"),
++	SMAP("grid-row-end"),
++	SMAP("grid-row-start"),
++	SMAP("grid-template"),
++	SMAP("grid-template-areas"),
++	SMAP("grid-template-columns"),
++	SMAP("grid-template-rows"),
++	SMAP("justify-items"),
++	SMAP("justify-self"),
++	SMAP("row-gap"),
++	SMAP("grid"),
+ 
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+@@ -491,6 +511,11 @@
+ 	SMAP("grid"),
+ 	SMAP("inline-grid"),
+ 	SMAP("sticky"),
++	/* libcss_grid align */
++	SMAP("start"),
++	SMAP("end"),
++	SMAP("self-start"),
++	SMAP("self-end"),
+ 
+ 	SMAP("aliceblue"),
+ 	SMAP("antiquewhite"),
+--- a/libcss/src/parse/propstrings.h
++++ b/libcss/src/parse/propstrings.h
+@@ -68,8 +68,10 @@
+ 	TEXT_DECORATION, TEXT_INDENT, TEXT_TRANSFORM, TOP, UNICODE_BIDI,
+ 	VERTICAL_ALIGN, VISIBILITY, VOICE_FAMILY, VOLUME, WHITE_SPACE, WIDOWS,
+ 	WIDTH, WORD_SPACING, WRITING_MODE, Z_INDEX,
++	/* libcss_grid */
++	GAP, GRID_AREA, GRID_AUTO_COLUMNS, GRID_AUTO_FLOW, GRID_AUTO_ROWS, GRID_COLUMN, GRID_COLUMN_END, GRID_COLUMN_START, GRID_ROW, GRID_ROW_END, GRID_ROW_START, GRID_TEMPLATE, GRID_TEMPLATE_AREAS, GRID_TEMPLATE_COLUMNS, GRID_TEMPLATE_ROWS, JUSTIFY_ITEMS, JUSTIFY_SELF, ROW_GAP, LIBCSS_GRID,
+ 
+-	LAST_PROP = Z_INDEX,
++	LAST_PROP = LIBCSS_GRID,
+ 
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+@@ -111,6 +113,7 @@
+ 	FLEX_END, SPACE_BETWEEN, SPACE_AROUND, SPACE_EVENLY, ROW, ROW_REVERSE,
+ 	COLUMN_REVERSE, WRAP_STRING, WRAP_REVERSE, AND, OR, ONLY, INFINITE,
+ 	GRID, INLINE_GRID, STICKY,
++	/* libcss_grid align */ START, END, SELF_START, SELF_END,
+ 
+ 	/* Named colours */
+ 	FIRST_COLOUR,
+--- a/libcss/src/select/computed.c
++++ b/libcss/src/select/computed.c
+@@ -188,6 +188,31 @@
+ 
+ 	if (style->i.background_image != NULL)
+ 		lwc_string_unref(style->i.background_image);
++	/* libcss_grid */
++	if (style->i.grid_template_columns != NULL)
++		lwc_string_unref(style->i.grid_template_columns);
++	if (style->i.grid_template_rows != NULL)
++		lwc_string_unref(style->i.grid_template_rows);
++	if (style->i.grid_template_areas != NULL)
++		lwc_string_unref(style->i.grid_template_areas);
++	if (style->i.grid_auto_columns != NULL)
++		lwc_string_unref(style->i.grid_auto_columns);
++	if (style->i.grid_auto_rows != NULL)
++		lwc_string_unref(style->i.grid_auto_rows);
++	if (style->i.grid_auto_flow != NULL)
++		lwc_string_unref(style->i.grid_auto_flow);
++	if (style->i.grid_column_start != NULL)
++		lwc_string_unref(style->i.grid_column_start);
++	if (style->i.grid_column_end != NULL)
++		lwc_string_unref(style->i.grid_column_end);
++	if (style->i.grid_row_start != NULL)
++		lwc_string_unref(style->i.grid_row_start);
++	if (style->i.grid_row_end != NULL)
++		lwc_string_unref(style->i.grid_row_end);
++	if (style->i.justify_items != NULL)
++		lwc_string_unref(style->i.justify_items);
++	if (style->i.justify_self != NULL)
++		lwc_string_unref(style->i.justify_self);
+ 
+ 	free(style);
+ 
+@@ -871,6 +896,85 @@
+ 	return get_column_fill(style);
+ }
+ 
++/* libcss_grid */
++uint8_t css_computed_row_gap(const css_computed_style *style,
++		css_fixed *length, css_unit *unit)
++{
++	return get_row_gap(style, length, unit);
++}
++
++uint8_t css_computed_grid_template_columns(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_template_columns(style, string);
++}
++
++uint8_t css_computed_grid_template_rows(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_template_rows(style, string);
++}
++
++uint8_t css_computed_grid_template_areas(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_template_areas(style, string);
++}
++
++uint8_t css_computed_grid_auto_columns(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_auto_columns(style, string);
++}
++
++uint8_t css_computed_grid_auto_rows(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_auto_rows(style, string);
++}
++
++uint8_t css_computed_grid_auto_flow(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_auto_flow(style, string);
++}
++
++uint8_t css_computed_grid_column_start(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_column_start(style, string);
++}
++
++uint8_t css_computed_grid_column_end(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_column_end(style, string);
++}
++
++uint8_t css_computed_grid_row_start(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_row_start(style, string);
++}
++
++uint8_t css_computed_grid_row_end(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_grid_row_end(style, string);
++}
++
++uint8_t css_computed_justify_items(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_justify_items(style, string);
++}
++
++uint8_t css_computed_justify_self(const css_computed_style *style,
++		lwc_string **string)
++{
++	return get_justify_self(style, string);
++}
++
+ uint8_t css_computed_column_gap(const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit)
+ {
+@@ -1347,6 +1451,14 @@
+ 	if (error != CSS_OK)
+ 			return error;
+ 
++	/* Fix up row-gap (libcss_grid) */
++	error = compute_absolute_length(style,
++			&ex_size.data.length,
++			get_row_gap,
++			set_row_gap);
++	if (error != CSS_OK)
++		return error;
++
+ 	/* Fix up column-gap */
+ 	error = compute_absolute_length(style,
+ 			&ex_size.data.length,
+--- a/libcss/src/select/dispatch.c
++++ b/libcss/src/select/dispatch.c
+@@ -522,5 +522,58 @@
+ 	{
+ 		PROPERTY_FUNCS(stroke_opacity),
+ 		1,
++	},
++	/* libcss_grid */
++	{
++		PROPERTY_FUNCS(row_gap),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_template_columns),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_template_rows),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_template_areas),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_auto_columns),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_auto_rows),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_auto_flow),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_column_start),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_column_end),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_row_start),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(grid_row_end),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(justify_items),
++		0,
++	},
++	{
++		PROPERTY_FUNCS(justify_self),
++		0,
+ 	}
+ };
+--- a/libcss/src/select/properties/Makefile
++++ b/libcss/src/select/properties/Makefile
+@@ -1,5 +1,6 @@
+ # Sources
+ DIR_SOURCES := helpers.c \
++grid.c \
+ align_content.c \
+ align_items.c \
+ align_self.c \
+--- a/libcss/src/select/properties/properties.h
++++ b/libcss/src/select/properties/properties.h
+@@ -57,6 +57,20 @@
+ PROPERTY_FUNCS(column_count);
+ PROPERTY_FUNCS(column_fill);
+ PROPERTY_FUNCS(column_gap);
++/* libcss_grid */
++PROPERTY_FUNCS(row_gap);
++PROPERTY_FUNCS(grid_template_columns);
++PROPERTY_FUNCS(grid_template_rows);
++PROPERTY_FUNCS(grid_template_areas);
++PROPERTY_FUNCS(grid_auto_columns);
++PROPERTY_FUNCS(grid_auto_rows);
++PROPERTY_FUNCS(grid_auto_flow);
++PROPERTY_FUNCS(grid_column_start);
++PROPERTY_FUNCS(grid_column_end);
++PROPERTY_FUNCS(grid_row_start);
++PROPERTY_FUNCS(grid_row_end);
++PROPERTY_FUNCS(justify_items);
++PROPERTY_FUNCS(justify_self);
+ PROPERTY_FUNCS(column_rule_color);
+ PROPERTY_FUNCS(column_rule_style);
+ PROPERTY_FUNCS(column_rule_width);
+--- a/libcss/src/select/select_config.py
++++ b/libcss/src/select/select_config.py
+@@ -106,6 +106,20 @@
+     ('vertical_align', 4, 'length', 'CSS_VERTICAL_ALIGN_SET'),
+     ('width', 2, 'length', 'CSS_WIDTH_SET'),
+     ('z_index', 2, 'integer'),
++    # libcss_grid
++    ('row_gap', 2, 'length', 'CSS_ROW_GAP_SET', 'CSS_ROW_GAP_NORMAL'),
++    ('grid_template_columns', 1, 'string'),
++    ('grid_template_rows', 1, 'string'),
++    ('grid_template_areas', 1, 'string'),
++    ('grid_auto_columns', 1, 'string'),
++    ('grid_auto_rows', 1, 'string'),
++    ('grid_auto_flow', 1, 'string'),
++    ('grid_column_start', 1, 'string'),
++    ('grid_column_end', 1, 'string'),
++    ('grid_row_start', 1, 'string'),
++    ('grid_row_end', 1, 'string'),
++    ('justify_items', 1, 'string'),
++    ('justify_self', 1, 'string'),
+     # Style group, arrays
+     ('font_family', 3, 'string_arr', None, None,
+         'Encode font family as an array of string objects, terminated with a '

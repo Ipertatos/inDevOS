@@ -64,6 +64,7 @@
 #define RTL8139_RCR_MXDMA_UNL   (7 << 8)
 // RBLEN (bits 11-12): Receive Buffer Length base (00=8K, 01=16K, 10=32K, 11=64K)
 #define RTL8139_RCR_RBLEN_8K    (0 << 11)
+#define RTL8139_RCR_RBLEN_32K   (2 << 11)
 
 // Interrupt Status Register Bits
 #define RTL8139_ISR_ROK      0x0001  // Receive OK
@@ -100,7 +101,7 @@
 #define RTL8139_RXSTAT_MAR   0x8000  // Multicast address received
 
 // Buffer sizes (OSDev wiki recommendations)
-#define RTL8139_RX_BUFFER_SIZE 8192  // Use 8K buffer WITH WRAP mode (total allocation: 8K+16+1500)
+#define RTL8139_RX_BUFFER_SIZE 32768 // 32K ring WITH WRAP mode (allocation: 32K+16+2048 slack); 8K overflowed on one 32K TCP window
 #define RTL8139_TX_BUFFER_SIZE 1518
 #define RTL8139_NUM_TX_BUFFERS 4  // Use all 4 transmit buffers like TwistedOS
 

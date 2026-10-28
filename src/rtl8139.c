@@ -91,7 +91,7 @@ static void rtl8139_reset(rtl8139_device_t *dev) {
 static void rtl8139_setup_rx_buffer(rtl8139_device_t *dev) {
     // CRITICAL DMA FIX: Allocate in low memory for guaranteed RTL8139 access
     // RTL8139 might have issues with addresses above certain ranges
-    size_t buffer_size = RTL8139_RX_BUFFER_SIZE + 16 + 1500;
+    size_t buffer_size = RTL8139_RX_BUFFER_SIZE + 16 + 2048;  /* WRAP slack: a max frame + header may run past the ring end */
     
     // Try to allocate in very low memory first (below 16MB)
     dev->rx_buffer = NULL;
@@ -231,14 +231,14 @@ static void rtl8139_configure_rx_buffer(rtl8139_device_t *dev) {
         RTL8139_RCR_AAP |
         RTL8139_RCR_WRAP |
         RTL8139_RCR_MXDMA_UNL |
-        RTL8139_RCR_RBLEN_8K;
+        RTL8139_RCR_RBLEN_32K;
 
     // RCR is at 0x44 and is 32-bit wide
     rtl8139_write_reg32(dev, RTL8139_CONFIG4, rcr_value);
 
     // Verify the register was set correctly
     uint32_t read_rcr = rtl8139_read_reg32(dev, RTL8139_CONFIG4);
-    printf("RTL8139: RCR configured - wrote 0x%08x, read 0x%08x (WRAP, MXDMA=unl, RBLEN=8K)\n", rcr_value, read_rcr);
+    printf("RTL8139: RCR configured - wrote 0x%08x, read 0x%08x (WRAP, MXDMA=unl, RBLEN=32K)\n", rcr_value, read_rcr);
 }
 
 // Setup transmit buffers
@@ -779,17 +779,12 @@ int rtl8139_receive_packet(uint8_t *buffer, uint32_t max_length) {
         return 0;
     }
     
-    // Copy packet data (skip the 4-byte header) with at most two memcpy
-    // calls (split at the ring wrap point) instead of a per-byte loop.
-    {
-        uint32_t data_start = (packet_ptr + 4) % RTL8139_RX_BUFFER_SIZE;
-        uint32_t first = RTL8139_RX_BUFFER_SIZE - data_start;
-        if (first > length) first = length;
-        memcpy(buffer, (const void *)(rb + data_start), first);
-        if (first < length) {
-            memcpy(buffer + first, (const void *)rb, length - first);
-        }
-    }
+    // Copy packet data (skip the 4-byte header). RCR.WRAP is set, so the
+    // NIC does NOT wrap a frame at the ring end: it keeps writing into the
+    // slack past RTL8139_RX_BUFFER_SIZE and the frame is contiguous from
+    // packet_ptr + 4. (Copying the tail from rb[0] read stale bytes and every
+    // large frame that straddled the ring end failed the TCP checksum.)
+    memcpy(buffer, (const void *)(rb + packet_ptr + 4), length);
     
     // Update packet pointer - FIXED: Proper CAPR calculation
     rtl8139_dev.current_packet_ptr = (packet_ptr + length + 4 + 3) & ~3;

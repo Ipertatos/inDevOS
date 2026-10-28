@@ -3,20 +3,25 @@
 #
 # Installs into tests/netsurf/ (the parent of this directory):
 #   netsurf   static, stripped NetSurf (draws through /dev/wm)  -> /bin/netsurf
-#   res/      runtime resources (internal font, so fonts/ is dropped) -> /usr/share/netsurf
+#   res/      runtime resources + DejaVu TTFs (freetype fonts)       -> /usr/share/netsurf
 #   dhcp      static musl build of dhcp.c                          -> /bin/dhcp
 # make_install_iso.sh then puts them into the install rootfs.
 #
 # Host prerequisites (Debian/Ubuntu): musl-tools musl-dev make gcc flex bison gperf
-#   pkg-config zlib1g-dev libpng-dev perl python3 curl xz-utils linux-libc-dev
+#   pkg-config zlib1g-dev libpng-dev perl python3 curl xz-utils linux-libc-dev fonts-dejavu-core patch
 # Work tree (sources, sysroot, logs; ~1.5 GB): $NETSURF_WORK, default ~/netsurf-build.
 # Tarballs are downloaded there on first run and checked against SHA-256 below.
-# Env: J=<jobs> (default nproc), NETSURF_WORK=<dir>, ONLY_DHCP=1 (just rebuild dhcp).
+# Env: J=<jobs> (default nproc), NETSURF_WORK=<dir>, ONLY_DHCP=1 (just rebuild dhcp),
+#   NETSURF_JS=quickjs (default: QuickJS 2025-04-26 + quickjs/ bindings, CSS Grid, ES modules)
+#   or NETSURF_JS=duktape (NetSurf's stock Duktape bindings).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$(cd "$HERE/.." && pwd)                       # tests/netsurf
 NS=${NETSURF_WORK:-$HOME/netsurf-build}
+FONTDIR=${FONTDIR:-/usr/share/fonts/truetype/dejavu}
 SRC=$NS/src; SR=$NS/sysroot; J=${J:-$(nproc)}
+JSENG=${NETSURF_JS:-quickjs}
+case "$JSENG" in quickjs|duktape) ;; *) echo "NETSURF_JS must be quickjs or duktape" >&2; exit 1;; esac
 step() { echo "=== $1 $(date +%T)"; }
 
 step dhcp
@@ -37,10 +42,13 @@ fetch libpng-1.6.44.tar.xz  60c4da1d5b7f0aa8d158da48e8f8afa9773c1c8baa5d21974df6
 fetch jpegsrc.v9f.tar.gz    04705c110cb2469caa79fb71fba3d7bf834914706e9641a4589485c1f832565b https://www.ijg.org/files/jpegsrc.v9f.tar.gz
 fetch expat-2.6.3.tar.xz    274db254a6979bde5aad404763a704956940e465843f2a9bd9ed7af22e2c0efc https://github.com/libexpat/libexpat/releases/download/R_2_6_3/expat-2.6.3.tar.xz
 fetch curl-8.10.1.tar.xz    73a4b0e99596a09fa5924a4fb7e4b995a85fda0d18a2c02ab9cf134bebce04ee https://curl.se/download/curl-8.10.1.tar.xz
+fetch freetype-2.13.3.tar.xz 0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289 https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz
+fetch quickjs-2025-04-26.tar.xz 2f20074c25166ef6f781f381c50d57b502cb85d470d639abccebbef7954c83bf https://bellard.org/quickjs/quickjs-2025-04-26.tar.xz
 fetch netsurf-all-3.11.tar.gz 4dea880ff3c2f698bfd62c982b259340f9abcd7f67e6c8eb2b32c61f71644b7b https://download.netsurf-browser.org/netsurf/releases/source-full/netsurf-all-3.11.tar.gz
 unpack openssl-3.0.15.tar.gz openssl-3.0.15; unpack zlib-1.3.1.tar.gz zlib-1.3.1; unpack libpng-1.6.44.tar.xz libpng-1.6.44
 unpack jpegsrc.v9f.tar.gz jpeg-9f; unpack expat-2.6.3.tar.xz expat-2.6.3; unpack curl-8.10.1.tar.xz curl-8.10.1
-unpack netsurf-all-3.11.tar.gz netsurf-all-3.11
+unpack freetype-2.13.3.tar.xz freetype-2.13.3; unpack netsurf-all-3.11.tar.gz netsurf-all-3.11
+unpack quickjs-2025-04-26.tar.xz quickjs-2025-04-26
 
 cd "$SRC"
 # musl has no kernel headers: expose the host's linux/asm headers after musl's own
@@ -63,21 +71,46 @@ export PKG_CONFIG_LIBDIR=$SR/lib/pkgconfig PKG_CONFIG_PATH= PKG_CONFIG="pkg-conf
    --without-libssh2 --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
    --disable-smtp --disable-gopher --disable-mqtt --disable-smb --disable-manual --disable-docs --disable-ntlm --enable-ipv6 \
    --with-ca-bundle=/etc/ssl/cert.pem && make -j$J && make install) >"$NS/log_curl.txt" 2>&1; }
+[ -f "$SR/lib/libfreetype.a" ] || { step freetype; (cd freetype-2.13.3 && ./configure --prefix="$SR" --disable-shared --enable-static \
+   --with-zlib=yes --with-png=no --with-bzip2=no --with-brotli=no --with-harfbuzz=no && make -j$J && make install) >"$NS/log_freetype.txt" 2>&1; }
+# QuickJS engine only (no quickjs-libc): flags as its Makefile, minus -Werror/LTO
+[ -f "$SR/lib/libquickjs.a" ] || { step quickjs; (cd quickjs-2025-04-26 && for f in quickjs libregexp libunicode cutils dtoa; do
+     musl-gcc -O2 -fwrapv -D_GNU_SOURCE -DCONFIG_VERSION=\"2025-04-26\" -idirafter "$NS/kh" -c $f.c -o $f.o || exit 1; done &&
+   ar rcs "$SR/lib/libquickjs.a" quickjs.o libregexp.o libunicode.o cutils.o dtoa.o && cp quickjs.h "$SR/include/") >"$NS/log_quickjs.txt" 2>&1; }
 
 step netsurf
+python3 "$HERE/patches/html_preload_css.py" "$SRC/netsurf-all-3.11/netsurf/content/handlers/html/css.c"
+python3 "$HERE/patches/js_events.py" "$SRC/netsurf-all-3.11/netsurf"
+python3 "$HERE/patches/libdom_class_cache.py" "$SRC/netsurf-all-3.11/libdom/src/core/element.c"
+# QuickJS backend + CSS Grid + ES modules + orphan form-control leak fix (patches/*.diff)
+python3 "$HERE/patches/js_quickjs.py" "$SRC/netsurf-all-3.11"
+python3 "$HERE/patches/libcss_grid.py" "$SRC/netsurf-all-3.11"
+python3 "$HERE/patches/layout_grid.py" "$SRC/netsurf-all-3.11"
+python3 "$HERE/patches/forms_orphans.py" "$SRC/netsurf-all-3.11"
+# ES modules need js_exec_module/js_importmap from the QuickJS bindings
+[ "$JSENG" = quickjs ] && python3 "$HERE/patches/js_modules.py" "$SRC/netsurf-all-3.11"
+python3 "$HERE/patches/libdom_event_target.py" "$SRC/netsurf-all-3.11/libdom/src/core/node.c"
 bash "$HERE/patches/apply_wm_surface.sh" "$SRC/netsurf-all-3.11/libnsfb"
 export CFLAGS="$CFLAGS $CPPFLAGS"   # env (not make args) so component CFLAGS still append
 cd "$SRC/netsurf-all-3.11"
+if [ "$JSENG" = quickjs ]; then JSFLAGS="NETSURF_USE_QUICKJS=YES NETSURF_USE_DUKTAPE=NO"
+else JSFLAGS="NETSURF_USE_QUICKJS=NO NETSURF_USE_DUKTAPE=YES"; fi
 # top Makefile's build-stamp otherwise skips everything; force libnsfb + gui to pick up patches
-rm -f inst-framebuffer/build-stamp netsurf/build/Linux-framebuffer/frontends_framebuffer_gui.o
+rm -f inst-framebuffer/build-stamp netsurf/build/Linux-framebuffer/frontends_framebuffer_*.o
+# engine switch: drop objects built for the other backend
+[ -f netsurf/.js_engine ] && [ "$(cat netsurf/.js_engine)" != "$JSENG" ] && rm -rf netsurf/build/Linux-framebuffer
+echo "$JSENG" > netsurf/.js_engine
 # host tools (nsgenbind, split-messages, font converter) use the host gcc (zlib1g-dev, libpng-dev)
 make -j$J TARGET=framebuffer CC=musl-gcc HOST_CC=gcc BUILD_CC=gcc \
-  NETSURF_FB_FRONTEND=linux NETSURF_FB_FONTLIB=internal \
+  NETSURF_FB_FRONTEND=linux NETSURF_FB_FONTLIB=freetype \
   NETSURF_FB_RESPATH='$${HOME}/.netsurf/:$${NETSURFRES}:/etc/netsurf/:/cdrom/etc/netsurf/:/usr/share/netsurf/:/cdrom/usr/share/netsurf/:./frontends/framebuffer/res' \
-  NETSURF_USE_DUKTAPE=YES NETSURF_USE_WEBP=NO NETSURF_USE_VIDEO=NO NETSURF_USE_HARU_PDF=NO \
+  $JSFLAGS NETSURF_USE_WEBP=NO NETSURF_USE_VIDEO=NO NETSURF_USE_HARU_PDF=NO \
   >"$NS/log_netsurf.txt" 2>&1 || { tail -40 "$NS/log_netsurf.txt"; exit 1; }
 B=$(find . -maxdepth 2 -name nsfb -type f | head -1)
 strip -o "$OUT/netsurf" "$B"
 rm -rf "$OUT/res.new"; cp -rL netsurf/frontends/framebuffer/res "$OUT/res.new"; rm -rf "$OUT/res.new/fonts"
+# freetype: DejaVu faces (Greek/Cyrillic/etc. coverage) next to the resources; found via the resource path
+for f in DejaVuSans DejaVuSans-Bold DejaVuSerif DejaVuSerif-Bold DejaVuSansMono DejaVuSansMono-Bold; do
+  cp "$FONTDIR/$f.ttf" "$OUT/res.new/"; done
 rm -rf "$OUT/res"; mv "$OUT/res.new" "$OUT/res"
 ls -l "$OUT/netsurf" "$OUT/dhcp"; echo "res: $(du -sh "$OUT/res" | cut -f1)"

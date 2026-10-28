@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html><head><title>grid tests</title>
+<style>
+body{font-family:sans-serif;margin:10px;background:#fff}
+h3{margin:10px 0 4px 0;font-size:14px}
+.g{display:grid;background:#eee;border:1px solid #888;margin-bottom:6px}
+.g>div{background:#7ab;color:#fff;border:1px solid #246;padding:2px;font-size:12px}
+.fixed{grid-template-columns:repeat(5,60px);gap:8px}
+.fixed>div{height:40px}
+.fr{grid-template-columns:1fr 2fr 1fr;column-gap:10px;row-gap:4px}
+.fill{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.fit{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px}
+.span{grid-template-columns:repeat(4,1fr);gap:5px}
+.span .a{grid-column:span 2}
+.span .b{grid-column:1 / -1;background:#c55}
+.span .c{grid-row:span 2;background:#5a5}
+.areas{grid-template-areas:"hd hd hd" "sd main main" "ft ft ft";grid-template-columns:120px 1fr 1fr;gap:4px}
+.areas .h{grid-area:hd;background:#a5a}.areas .s{grid-area:sd}.areas .m{grid-area:main;height:60px}.areas .f{grid-area:ft;background:#555}
+.cflow{grid-auto-flow:column;grid-template-rows:repeat(2,30px);grid-auto-columns:80px;gap:3px}
+.center{grid-template-columns:repeat(3,50px);justify-content:center;gap:2px;justify-items:center;align-items:center}
+.center>div{width:20px;height:20px}
+.inl{display:inline-grid;grid-template-columns:30px 30px;gap:2px}
+</style></head><body>
+<h3>1 fixed repeat(5,60px) gap 8</h3>
+<div class="g fixed"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div><div>8</div><div>9</div><div>10</div></div>
+<h3>2 fr 1fr 2fr 1fr</h3>
+<div class="g fr"><div>a</div><div>b longer text here</div><div>c</div><div>d</div><div>e</div></div>
+<h3>3 auto-fill minmax(150px,1fr) (3 items)</h3>
+<div class="g fill"><div>1</div><div>2</div><div>3</div></div>
+<h3>4 auto-fit minmax(150px,1fr) (3 items)</h3>
+<div class="g fit"><div>1</div><div>2</div><div>3</div></div>
+<h3>5 spans</h3>
+<div class="g span"><div class="a">span2</div><div>x</div><div class="c">row span 2</div><div class="b">1 / -1</div><div>y</div><div>z</div><div>w</div></div>
+<h3>6 areas</h3>
+<div class="g areas"><div class="h">header</div><div class="s">side</div><div class="m">main</div><div class="f">footer</div></div>
+<h3>7 column flow</h3>
+<div class="g cflow"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
+<h3>8 justify-content center, items centred</h3>
+<div class="g center"><div></div><div></div><div></div><div></div></div>
+<h3>9 inline-grid</h3>
+text <div class="g inl"><div>a</div><div>b</div><div>c</div></div> after
+<h3>10 flex gap + justify center</h3>
+<div style="display:flex;gap:6px;justify-content:center;background:#ddd"><div style="width:45px;height:30px;background:#99c"></div><div style="width:45px;height:30px;background:#99c"></div><div style="width:45px;height:30px;background:#99c"></div></div>
+</body></html>
