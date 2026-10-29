@@ -481,20 +481,23 @@ NP.getRootNode = function () { let n = this, p; while ((p = N.parent(n))) n = p;
 NP.isSameNode = function (o) { return o === this; };
 NP.isEqualNode = function (o) { return isNode(o) && o.nodeType === this.nodeType && serialize(o) === serialize(this); };
 NP.normalize = function () {};
+/* Ancestor chains + one sibling scan under the common ancestor: was two
+ * whole-tree walks per call (jQuery's uniqueSort made that quadratic). */
 NP.compareDocumentPosition = function (o) {
 	if (o === this) return 0;
-	if (this.contains(o)) return 20;
-	if (o.contains(this)) return 10;
-	const a = docOrderIndex(this), b = docOrderIndex(o);
-	if (a < 0 || b < 0) return 1;
-	return a < b ? 4 : 2;
+	if (!isNode(o)) throw new TypeError('compareDocumentPosition: not a Node');
+	const pa = [], pb = [];
+	for (let n = this; n; n = N.parent(n)) pa.push(n);
+	for (let n = o; n; n = N.parent(n)) pb.push(n);
+	let i = pa.length - 1, j = pb.length - 1;
+	if (pa[i] !== pb[j]) return 1;
+	while (i >= 0 && j >= 0 && pa[i] === pb[j]) { i--; j--; }
+	if (i < 0) return 20;
+	if (j < 0) return 10;
+	const b = pb[j];
+	for (let x = N.next(pa[i]); x; x = N.next(x)) if (x === b) return 4;
+	return 2;
 };
-function docOrderIndex(n) {
-	const root = n.getRootNode();
-	let i = 0, found = -1;
-	walk(root, (x) => { if (x === n) { found = i; return true; } i++; return false; }, false);
-	return found;
-}
 /* ChildNode / ParentNode mixins */
 const CNM = {
 	remove() { const p = N.parent(this); if (p) N.remove(p, this); },
@@ -517,21 +520,11 @@ const PNM = {
 	querySelectorAll(sel) { return makeList(qsa(this, sel, false)); },
 	getElementsByTagName(tag) {
 		tag = String(tag).toLowerCase();
-		const out = [];
-		walk(this, (n) => { if (N.nodeType(n) === 1 && (tag === '*' || lname(n) === tag)) out.push(n); return false; }, true);
-		return makeList(out);
+		return makeList(N.collect(this, tag === '*' ? null : tag, null, null, false));
 	},
 	getElementsByClassName(cls) {
 		const want = String(cls).trim().split(/\s+/).filter(Boolean);
-		const out = [];
-		walk(this, (n) => {
-			if (N.nodeType(n) === 1) {
-				const c = classesOf(n);
-				if (want.every((w) => c.includes(w))) out.push(n);
-			}
-			return false;
-		}, true);
-		return makeList(out);
+		return makeList(want.length ? N.collect(this, null, null, want, false) : []);
 	},
 };
 const PNG = {
@@ -1332,11 +1325,63 @@ function qsa(root, sel, first) {
 			if (root === d) return [];
 		}
 	}
+	/* Candidates come from a native walk filtered by each group's rightmost
+	 * compound (tag / id / classes); a bare compound needs no JS match, and a
+	 * chain that starts with #id only searches under that element. */
+	const filtered = (c) => c.tag !== null || c.id !== null || c.cls.length > 0;
+	if (groups.length === 1 || groups.every((g) => filtered(g[g.length - 1]))) {
+		const res = [];
+		for (const g of groups) res.push(groupMatches(root, g, first && groups.length === 1));
+		if (res.length === 1) return res[0];
+		const seen = new Set();
+		for (const r of res) for (const n of r) seen.add(n);
+		if (!seen.size) return [];
+		let out;
+		if (seen.size > 64) out = N.collect(root, null, null, null, false).filter((n) => seen.has(n));
+		else out = [...seen].sort(docOrderCmp);
+		return first ? out.slice(0, 1) : out;
+	}
 	const out = [];
-	walk(root, (n) => {
-		if (N.nodeType(n) === 1 && matchesSel(n, groups)) { out.push(n); if (first) return true; }
-		return false;
-	}, true);
+	for (const n of N.collect(root, null, null, null, false))
+		if (matchesSel(n, groups)) { out.push(n); if (first) break; }
+	return out;
+}
+function docOrderCmp(a, b) {
+	return a === b ? 0 : (NP.compareDocumentPosition.call(a, b) & 4) ? -1 : 1;
+}
+function groupMatches(root, g, first) {
+	const c = g[g.length - 1];
+	const simple = g.length === 1 && !c.attrs.length && !c.pseudo.length;
+	const cls = c.cls.length ? c.cls : null;
+	if (simple) return N.collect(root, c.tag, c.id, cls, first);
+	let scopes = [root];
+	const a = g[0];
+	if (g.length > 2 && (a.tag !== null || a.id !== null || a.cls.length) && (g[1] === ' ' || g[1] === '>')) {
+		/* A ... X: X must lie inside an element matching A, so only the
+		 * subtrees of such anchors are searched. */
+		let top = root;
+		for (let p = N.parent(top); p; p = N.parent(p)) top = p;
+		const anchors = N.collect(top, a.tag, a.id, a.cls.length ? a.cls : null, false);
+		if (anchors.length <= 200) {
+			scopes = [];
+			for (const e of anchors) {
+				if (!matchCompound(e, a)) continue;
+				if (e === root || NP.contains.call(e, root)) { scopes = [root]; break; }
+				if (NP.contains.call(root, e)) scopes.push(e);
+			}
+		}
+	}
+	if (scopes.length > 1) {
+		/* anchors are in document order: drop ones nested in the last kept */
+		const keep = [];
+		for (const e of scopes) if (!keep.length || !NP.contains.call(keep[keep.length - 1], e)) keep.push(e);
+		scopes = keep;
+	}
+	const out = [];
+	for (const sc of scopes) {
+		for (const n of N.collect(sc, c.tag, c.id, cls, false))
+			if (matchChain(n, g, g.length - 1)) { out.push(n); if (first) return out; }
+	}
 	return out;
 }
 
@@ -2216,6 +2261,7 @@ if (typeof G.Intl === 'undefined') {
 	String.prototype.localeCompare = function (b) { return new Collator().compare(this, b); };
 	void nf;
 }
+
 
 /* ---------------- hooks for the C side ---------------- */
 function proto(type, tag) {

@@ -1,0 +1,127 @@
+--- a/netsurf/content/handlers/html/html.c
++++ b/netsurf/content/handlers/html/html.c
+@@ -1225,6 +1225,8 @@
+ 
+ 	NSLOG(netsurf, INFO, "content %p", c);
+ 
++	html_object_cancel_reformat(html);
++
+ 	/* If we're still converting a layout, cancel it */
+ 	if (html->box_conversion_context != NULL) {
+ 		if (cancel_dom_to_box(html->box_conversion_context) != NSERROR_OK) {
+--- a/netsurf/content/handlers/html/object.c
++++ b/netsurf/content/handlers/html/object.c
+@@ -151,6 +151,47 @@
+ }
+ 
+ 
++/* Object arrivals reformat the whole page.  A page with many objects
++ * (Wikipedia: hundreds of SVG images, each READY with a reformattable
++ * content) laid itself out once per object, seconds of layout per burst.
++ * Throttle like the incremental reflow (next reformat no sooner than 3x the
++ * cost of the last one) and run one deferred reformat for those skipped. */
++static void html_object_deferred_reformat(void *p)
++{
++	html_content *c = p;
++
++	c->reformat_pending = false;
++	if (c->layout != NULL && !c->reflowing &&
++	    (c->base.status == CONTENT_STATUS_READY ||
++	     c->base.status == CONTENT_STATUS_DONE))
++		content__reformat(&c->base, false, c->base.available_width,
++				  c->base.available_height);
++}
++
++static void html_object_reformat(html_content *c)
++{
++	uint64_t ms_now;
++
++	nsu_getmonotonic_ms(&ms_now);
++	if (ms_now > c->base.reformat_time) {
++		html_object_cancel_reformat(c);
++		content__reformat(&c->base, false, c->base.available_width,
++				  c->base.available_height);
++	} else if (!c->reformat_pending) {
++		c->reformat_pending = true;
++		guit->misc->schedule((int)(c->base.reformat_time - ms_now) + 1,
++				     html_object_deferred_reformat, c);
++	}
++}
++
++void html_object_cancel_reformat(html_content *c)
++{
++	if (c->reformat_pending) {
++		guit->misc->schedule(-1, html_object_deferred_reformat, c);
++		c->reformat_pending = false;
++	}
++}
++
+ /**
+  * Callback for hlcache_handle_retrieve() for objects with a box.
+  */
+@@ -187,9 +228,7 @@
+ 			html_object_done(box, object, o->background);
+ 			if (c->base.status == CONTENT_STATUS_READY ||
+ 					c->base.status == CONTENT_STATUS_DONE)
+-				content__reformat(&c->base, false,
+-						c->base.available_width,
+-						c->base.available_height);
++				html_object_reformat(c);
+ 		}
+ 		break;
+ 
+@@ -479,6 +518,7 @@
+ 	     event->type == CONTENT_MSG_DONE ||
+ 	     event->type == CONTENT_MSG_ERROR)) {
+ 		/* all objects have arrived */
++		html_object_cancel_reformat(c);
+ 		content__reformat(&c->base, false, c->base.available_width,
+ 				c->base.available_height);
+ 		content_set_done(&c->base);
+@@ -494,19 +534,9 @@
+ 		 * 3) the box's dimensions need to change due to being replaced
+ 		 * 4) the object's parent HTML is ready for reformat,
+ 		 */
+-		uint64_t ms_now;
+-		nsu_getmonotonic_ms(&ms_now);
+-		if (ms_now > c->base.reformat_time) {
+-			/* The time since the previous reformat is
+-			 *  more than the configured minimum time
+-			 *  between reformats so reformat the page to
+-			 *  display newly fetched objects
+-			 */
+-			content__reformat(&c->base,
+-					  false,
+-					  c->base.available_width,
+-					  c->base.available_height);
+-		}
++		/* reformat now if the minimum time since the previous
++		 * reformat has passed, otherwise once it has */
++		html_object_reformat(c);
+ 	}
+ 
+ 	return NSERROR_OK;
+--- a/netsurf/content/handlers/html/object.h
++++ b/netsurf/content/handlers/html/object.h
+@@ -83,4 +83,9 @@
+  */
+ nserror html_object_abort_objects(struct html_content *html);
+ 
++/**
++ * Cancel a pending throttled reformat (content is being destroyed).
++ */
++void html_object_cancel_reformat(struct html_content *html);
++
+ #endif
+--- a/netsurf/content/handlers/html/private.h
++++ b/netsurf/content/handlers/html/private.h
+@@ -124,6 +124,9 @@
+ 	/** Whether an initial layout has been done */
+ 	bool had_initial_layout;
+ 
++	/** Whether a throttled object reformat is scheduled */
++	bool reformat_pending;
++
+ 	/** Whether scripts are enabled for this content */
+ 	bool enable_scripting;
+ 

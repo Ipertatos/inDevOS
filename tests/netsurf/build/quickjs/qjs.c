@@ -1097,6 +1097,164 @@ static JSValue n_attr(JSContext *ctx, JSValueConst this_val, int argc,
 	return r;
 }
 
+
+/* N.collect(root, tag, id, classes, first): element descendants of root in
+ * document order whose (lower-case) tag, id attribute and class list match
+ * (null = any).  The tree walk and the filtering stay in C: the JS walk()
+ * paid three native calls plus a wrapper per node, which made
+ * querySelectorAll / getElementsBy* on big pages (Wikipedia) cost seconds. */
+static bool qjs_has_classes(const char *cv, size_t cl, char **want, size_t *wl, int nw)
+{
+	int i;
+	for (i = 0; i < nw; i++) {
+		size_t p = 0;
+		bool found = false;
+		while (p < cl && !found) {
+			size_t q;
+			while (p < cl && (cv[p] == ' ' || cv[p] == '\t' || cv[p] == '\n' || cv[p] == '\r' || cv[p] == '\f'))
+				p++;
+			q = p;
+			while (q < cl && !(cv[q] == ' ' || cv[q] == '\t' || cv[q] == '\n' || cv[q] == '\r' || cv[q] == '\f'))
+				q++;
+			if (q - p == wl[i] && memcmp(cv + p, want[i], wl[i]) == 0)
+				found = true;
+			p = q;
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+static JSValue n_collect(JSContext *ctx, JSValueConst this_val, int argc,
+			 JSValueConst *argv)
+{
+	jsthread *t = T(ctx);
+	JSValue out, v;
+	dom_string *tag = NULL, *id = NULL, *s_class = NULL, *s_id = NULL;
+	char *want[16];
+	size_t wl[16];
+	const char *wc[16];
+	int nw = 0, i;
+	uint32_t cnt = 0;
+	bool first;
+	dom_node *n, *next;
+	NODE_ARG(root, 0);
+	if (argc > 1 && JS_IsString(argv[1])) {
+		tag = qjs_todstr(ctx, argv[1]);
+		if (tag == NULL)
+			return JS_EXCEPTION;
+	}
+	if (argc > 2 && JS_IsString(argv[2])) {
+		id = qjs_todstr(ctx, argv[2]);
+		if (id == NULL) {
+			if (tag != NULL)
+				dom_string_unref(tag);
+			return JS_EXCEPTION;
+		}
+	}
+	if (argc > 3 && JS_IsArray(ctx, argv[3])) {
+		int64_t len = 0;
+		JSValue lv = JS_GetPropertyStr(ctx, argv[3], "length");
+		JS_ToInt64(ctx, &len, lv);
+		JS_FreeValue(ctx, lv);
+		for (i = 0; i < len && nw < 16; i++) {
+			JSValue e = JS_GetPropertyUint32(ctx, argv[3], i);
+			size_t l;
+			wc[nw] = JS_ToCStringLen(ctx, &l, e);
+			JS_FreeValue(ctx, e);
+			if (wc[nw] == NULL)
+				continue;
+			want[nw] = (char *)wc[nw];
+			wl[nw] = l;
+			nw++;
+		}
+	}
+	first = argc > 4 && JS_ToBool(ctx, argv[4]);
+	dom_string_create((const uint8_t *)"class", 5, &s_class);
+	dom_string_create((const uint8_t *)"id", 2, &s_id);
+	out = JS_NewArray(ctx);
+
+	n = NULL;
+	dom_node_get_first_child(root, &n);
+	while (n != NULL) {
+		dom_node_type type = 0;
+		dom_node_get_node_type(n, &type);
+		if (type == DOM_ELEMENT_NODE) {
+			bool ok = true;
+			if (tag != NULL) {
+				dom_string *name = NULL;
+				if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
+					ok = false;
+				else {
+					ok = dom_string_caseless_isequal(name, tag);
+					dom_string_unref(name);
+				}
+			}
+			if (ok && id != NULL) {
+				dom_string *a = NULL;
+				dom_element_get_attribute(n, s_id, &a);
+				ok = (a != NULL && dom_string_isequal(a, id));
+				if (a != NULL)
+					dom_string_unref(a);
+			}
+			if (ok && nw > 0) {
+				dom_string *a = NULL;
+				dom_element_get_attribute(n, s_class, &a);
+				ok = (a != NULL && qjs_has_classes(dom_string_data(a),
+						dom_string_byte_length(a), want, wl, nw));
+				if (a != NULL)
+					dom_string_unref(a);
+			}
+			if (ok) {
+				v = qjs_wrap_node(t, n);
+				if (JS_IsException(v)) {
+					dom_node_unref(n);
+					JS_FreeValue(ctx, out);
+					out = JS_EXCEPTION;
+					break;
+				}
+				JS_SetPropertyUint32(ctx, out, cnt++, v);
+				if (first) {
+					dom_node_unref(n);
+					break;
+				}
+			}
+		}
+		/* advance in document order, staying below root */
+		next = NULL;
+		dom_node_get_first_child(n, &next);
+		if (next == NULL) {
+			dom_node *cur = n;
+			dom_node_ref(cur);
+			for (;;) {
+				dom_node *p = NULL;
+				if (cur == root)
+					break;
+				dom_node_get_next_sibling(cur, &next);
+				if (next != NULL)
+					break;
+				dom_node_get_parent_node(cur, &p);
+				dom_node_unref(cur);
+				cur = p;
+				if (cur == NULL || cur == root)
+					break;
+			}
+			if (cur != NULL)
+				dom_node_unref(cur);
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	for (i = 0; i < nw; i++)
+		JS_FreeCString(ctx, wc[i]);
+	if (tag != NULL) dom_string_unref(tag);
+	if (id != NULL) dom_string_unref(id);
+	if (s_class != NULL) dom_string_unref(s_class);
+	if (s_id != NULL) dom_string_unref(s_id);
+	return out;
+}
+
 static JSValue n_attrs(JSContext *ctx, JSValueConst this_val, int argc,
 		       JSValueConst *argv)
 {
@@ -1621,6 +1779,7 @@ static JSValue n_dims(JSContext *ctx, JSValueConst this_val, int argc,
 	return a;
 }
 
+
 static JSValue n_now(JSContext *ctx, JSValueConst this_val, int argc,
 		     JSValueConst *argv)
 {
@@ -1888,6 +2047,7 @@ static const JSCFunctionListEntry qjs_natives[] = {
 	FM("removeAttr", 2, n_attr, 2),
 	FM("hasAttr", 2, n_attr, 3),
 	JS_CFUNC_DEF("attrs", 1, n_attrs),
+	JS_CFUNC_DEF("collect", 5, n_collect),
 	FM("append", 2, n_mutate, 0),
 	FM("insertBefore", 3, n_mutate, 1),
 	FM("remove", 2, n_mutate, 2),
@@ -1950,6 +2110,7 @@ static void qjs_run_jobs(jsthread *t)
 
 /* ------------------------------------------------------------------ */
 /* js.h interface                                                       */
+
 
 void js_initialise(void)
 {
