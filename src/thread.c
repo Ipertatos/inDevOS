@@ -7,6 +7,7 @@
 #include "string.h"
 #include "smp.h"
 #include "debug.h"     /* ktrace() */
+#include "kpoll.h"
 
 // Global scheduler instance
 scheduler_t global_scheduler = {0};
@@ -1056,6 +1057,82 @@ void thread_sleep(uint64_t milliseconds) {
 
     // Switch to next thread
     thread_yield();
+}
+
+/* ---- c18: kpoll event wakeups (see kpoll.h) ---- */
+volatile uint32_t kpoll_seq;
+static volatile int kpoll_nwait;
+
+void kpoll_wake(void) {
+    __atomic_add_fetch(&kpoll_seq, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&kpoll_nwait, __ATOMIC_SEQ_CST) <= 0 ||
+        !global_scheduler.scheduler_running)
+        return;
+    uint32_t woke_mask = 0;
+    uint64_t flags = irq_save();
+    spinlock_lock(&global_scheduler.scheduler_lock);
+    thread_t *t = global_scheduler.sleeping_queue;
+    while (t) {
+        thread_t *nx = t->next;
+        if (t->kpoll_waiting && t->state == THREAD_SLEEPING) {
+            t->kpoll_waiting = 0;
+            thread_wake_blocked_unlocked(t);
+            woke_mask |= (t->home_cpu < 32) ? (1u << t->home_cpu) : 0;
+        }
+        t = nx;
+    }
+    spinlock_unlock(&global_scheduler.scheduler_lock);
+    irq_restore(flags);
+    if (!woke_mask) return;
+    per_cpu_t *me = smp_get_current_cpu();
+    uint32_t my_id = me ? me->cpu_id : 0;
+    for (uint32_t c = 0; c < 32 && c < MAX_CPUS; c++) {
+        if (c == my_id) continue;
+        if ((woke_mask & (1u << c)) && cpu_data[c].online)
+            smp_reschedule_cpu(c);
+    }
+}
+
+/* thread_sleep() that does not start when kpoll_seq moved past snap: the
+ * check runs under the scheduler lock that kpoll_wake() takes, and the
+ * waiter count is raised first, so a wake between the caller's readiness
+ * check and this sleep is never lost. */
+void kpoll_sleep_ms(uint32_t snap, uint64_t ms) {
+    if (!global_scheduler.scheduler_running) return;
+    thread_t *current = scheduler_get_current_thread();
+    if (!current) return;
+    if (!ms) ms = 1;
+    __atomic_add_fetch(&kpoll_nwait, 1, __ATOMIC_SEQ_CST);
+    uint64_t wakeup_time = hpet_get_ticks() + ms;
+    uint64_t flags = irq_save();
+    spinlock_lock(&global_scheduler.scheduler_lock);
+    if (__atomic_load_n(&kpoll_seq, __ATOMIC_SEQ_CST) != snap) {
+        spinlock_unlock(&global_scheduler.scheduler_lock);
+        irq_restore(flags);
+        __atomic_sub_fetch(&kpoll_nwait, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+    _scheduler_remove_thread_unlocked(current);
+    current->state = THREAD_SLEEPING;
+    current->sleep_until = wakeup_time;
+    current->prev = NULL;
+    thread_t **pp = &global_scheduler.sleeping_queue;
+    thread_t *prev_node = NULL;
+    while (*pp && (*pp)->sleep_until <= wakeup_time) {
+        prev_node = *pp;
+        pp = &(*pp)->next;
+    }
+    current->next = *pp;
+    if (*pp)
+        (*pp)->prev = current;
+    *pp = current;
+    current->prev = prev_node;
+    current->kpoll_waiting = 1;
+    spinlock_unlock(&global_scheduler.scheduler_lock);
+    irq_restore(flags);
+    thread_yield();
+    current->kpoll_waiting = 0;
+    __atomic_sub_fetch(&kpoll_nwait, 1, __ATOMIC_SEQ_CST);
 }
 
 // Wake up a thread (front-of-queue: explicit wakeups are latency-sensitive)

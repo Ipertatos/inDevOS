@@ -12,6 +12,7 @@
 #include "utils.h"
 #include "string.h"
 #include "../include/indevos_errno.h"
+#include "kpoll.h"
 
 /** @brief Global pipe table */
 static pipe_t pipe_table[MAX_PIPES];
@@ -124,6 +125,7 @@ int pipe_read(pipe_t *pipe, void *buf, size_t count) {
     pipe->waiting_writer = NULL;
     kunlock(&pipe->lock);
     if (ww) { extern void thread_wake(void *); thread_wake(ww); }
+    if (to_read) kpoll_wake();          /* c18: pollers waiting for room */
     return (int)to_read;
 }
 
@@ -160,6 +162,7 @@ int pipe_write(pipe_t *pipe, const void *buf, size_t count) {
     pipe->waiting_reader = NULL;
     kunlock(&pipe->lock);
     if (wr) { extern void thread_wake(void *); thread_wake(wr); }
+    if (to_write) kpoll_wake();         /* c18: pollers waiting for data */
     return (int)to_write;
 }
 
@@ -180,6 +183,7 @@ void pipe_close_read(pipe_t *pipe) {
     if (ww) { extern void thread_wake(void *); thread_wake(ww); }
     if (wr) { extern void thread_wake(void *); thread_wake(wr); }
 
+    kpoll_wake();                       /* c18: POLLHUP / POLLERR */
     if (should_destroy) {
         pipe_destroy(pipe);
     }
@@ -202,6 +206,7 @@ void pipe_close_write(pipe_t *pipe) {
     if (wr) { extern void thread_wake(void *); thread_wake(wr); }
     if (ww) { extern void thread_wake(void *); thread_wake(ww); }
 
+    kpoll_wake();                       /* c18: POLLHUP / POLLERR */
     if (should_destroy) {
         pipe_destroy(pipe);
     }
@@ -275,11 +280,13 @@ int pipe_try_read(pipe_t *pipe, void *buf, size_t count) {
         dst[i] = pipe->buffer[pipe->read_pos];
         pipe->read_pos = (pipe->read_pos + 1) % pipe->buf_size;
     }
+    if (to_read && pipe->count == pipe->buf_size) pipe->out_gen++;   /* c18 */
     pipe->count -= to_read;
     void *ww = pipe->waiting_writer;
     pipe->waiting_writer = NULL;
     kunlock(&pipe->lock);
     if (ww) { extern void thread_wake(void *); thread_wake(ww); }
+    if (to_read) kpoll_wake();          /* c18: pollers waiting for room */
     return (int)to_read;
 }
 
@@ -302,9 +309,11 @@ int pipe_try_write(pipe_t *pipe, const void *buf, size_t count) {
         pipe->write_pos = (pipe->write_pos + 1) % pipe->buf_size;
     }
     pipe->count += to_write;
+    if (to_write) pipe->in_gen++;       /* c18: EPOLLET edge (pty input) */
     void *wr = pipe->waiting_reader;
     pipe->waiting_reader = NULL;
     kunlock(&pipe->lock);
     if (wr) { extern void thread_wake(void *); thread_wake(wr); }
+    if (to_write) kpoll_wake();         /* c18: pollers waiting for data */
     return (int)to_write;
 }

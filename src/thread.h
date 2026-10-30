@@ -74,6 +74,8 @@ typedef struct thread {
     /* 1 = user thread parked in-kernel (wait/sleep) — preemptible with a
      * ring-0 frame; 2 = BSP boot thread (ash) parked in sys_wait. */
     volatile int kwait;
+    /* c18: 1 while sleeping in kpoll_sleep_ms(): kpoll_wake() wakes it */
+    volatile int kpoll_waiting;
 } thread_t;
 
 /* FS base is per thread: Linux/musl programs point it at their TLS block with

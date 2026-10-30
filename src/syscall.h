@@ -390,6 +390,13 @@ typedef struct process {
      * Resolved with mm_leader_of(); never trusted if the leader's PML4
      * no longer matches (leader exec'd / was released). */
     struct process *mm_leader;
+
+    /* c18: sender info of each pending standard signal (signalfd_siginfo /
+     * rt_sigtimedwait siginfo): pid, uid, si_code, si_status. */
+    uint32_t sig_src_pid[33];
+    uint32_t sig_src_uid[33];
+    int32_t  sig_src_code[33];
+    int32_t  sig_src_status[33];
 } process_t;
 
 /** @brief Virtual memory layout for processes */

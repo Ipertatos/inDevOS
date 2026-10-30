@@ -34,6 +34,7 @@
 #include "thread.h"
 #include "ktime.h"
 #include "rtc.h"
+#include "kpoll.h"
 
 bool linux_syscall_trace = false;
 bool linux_stdout_mirror = false;  /* console output already reaches serial */
@@ -306,42 +307,74 @@ int sys_accept(int fd, sockaddr_in_t *addr, uint32_t *addrlen);
 int sys_connect(int fd, sockaddr_in_t *addr, uint32_t addrlen);
 
 
-/* eventfd: 64-bit counter object (curl uses it as its multi wakeup fd) */
+/* eventfd: 64-bit counter object (curl uses it as its multi wakeup fd).
+ * c18: EFD_SEMAPHORE, overflow (write blocks / EAGAIN), POLLOUT only while
+ * a write of 1 fits, kpoll wakeups instead of 1-tick polling. */
 #define FD_TYPE_EVENTFD 8
 extern int lx_strace;
 static long lx_put(void *uptr, const void *k, size_t n);
 static long lx_get(void *k, const void *uptr, size_t n);
+typedef struct {
+    volatile uint64_t ctr;      /* counter */
+    volatile uint64_t gens;     /* EPOLLET edge generations: lo32 in, hi32 out */
+    spinlock_t lock;
+    bool sem;                   /* EFD_SEMAPHORE */
+} lx_eventfd_t;
 static long lx_eventfd_create(process_t *p, uint64_t initval, long flags) {
+    if (flags & ~(long)(1 | 04000 | 02000000)) return -EINVAL;   /* SEMAPHORE|NONBLOCK|CLOEXEC */
     int fd = allocate_fd(p);
     if (fd < 0) return -EMFILE;
-    /* ctr[0] = counter, ctr[1] = EPOLLET edge generations (lo32 in, hi32 out) */
-    uint64_t *ctr = (uint64_t *)kalloc(2 * sizeof(uint64_t));
-    if (!ctr) { p->fds[fd].in_use = false; return -ENOMEM; }
-    ctr[0] = initval;
-    ctr[1] = 0;
+    lx_eventfd_t *e = (lx_eventfd_t *)kalloc(sizeof(*e));
+    if (!e) { p->fds[fd].in_use = false; return -ENOMEM; }
+    memset(e, 0, sizeof(*e));
+    e->ctr = initval;
+    e->sem = (flags & 1) != 0;
     p->fds[fd].ref_count = fd_refcount_create();
-    if (!p->fds[fd].ref_count) { kfree(ctr); p->fds[fd].in_use = false; return -ENOMEM; }
+    if (!p->fds[fd].ref_count) { kfree(e); p->fds[fd].in_use = false; return -ENOMEM; }
     p->fds[fd].fd_type = FD_TYPE_EVENTFD;
-    p->fds[fd].file_handle = ctr;
+    p->fds[fd].file_handle = e;
     p->fds[fd].flags = (flags & 04000) ? O_NONBLOCK : 0;   /* EFD_NONBLOCK */
     p->fds[fd].position = 0;
     p->fds[fd].cloexec = (flags & 02000000) != 0;          /* EFD_CLOEXEC */
     p->fds[fd].in_use = true;
     return fd;
 }
+short lx_eventfd_poll(void *h, short events) {
+    lx_eventfd_t *e = (lx_eventfd_t *)h;
+    if (!e) return 0;
+    uint64_t v = e->ctr;
+    short rev = 0;
+    if (v) rev |= POLLIN;
+    if (v < 0xfffffffffffffffeULL) rev |= POLLOUT;          /* a write of 1 fits */
+    return rev & events;
+}
 
-/* epoll: interest list over sys_poll_kernel.
+/* epoll (c18 rewrite).
+ * Interest items are keyed by (fd, object).  Items on objects that are
+ * released through fd_close_entry() (pipes, sockets, eventfd, timerfd,
+ * signalfd, inotify, epoll, evdev, /dev/wm) are evaluated on the object
+ * itself, so they work from every thread of a process (threads here have
+ * copied fd tables) and survive close() of one of several descriptors of
+ * the object, as on Linux; the last close removes them from every set
+ * (lx_epoll_forget).  Other items (ttys, fbdev, /dev/null) are evaluated
+ * through the caller's fd table and dropped once that fd is closed or reused.
  * Level-triggered by default.  EPOLLET reports an entry only on a new
- * readiness edge, as Linux does: when it becomes ready (or gains new bits
- * such as HUP), or when a new wakeup arrives for a reported bit -- data
- * added (EPOLLIN) / room freed (EPOLLOUT).  Pipes, AF_UNIX sockets and
- * eventfds keep exact edge generations; other objects use a per-object I/O
+ * readiness edge: when it becomes ready (or gains new bits such as HUP), or
+ * when a new wakeup arrives for a reported bit -- data added (EPOLLIN) /
+ * room freed (EPOLLOUT).  Pipes, AF_UNIX sockets, eventfds, inotify and
+ * timerfds keep exact edge generations; other objects use a per-object I/O
  * counter (any data-moving syscall on that object), which can only add a
  * spurious wakeup, never lose one.  EPOLLONESHOT disarms the entry after it
- * is reported (re-arm with EPOLL_CTL_MOD).  Entries whose fd was closed or
- * reused for another object are dropped silently. */
+ * is reported (re-arm with EPOLL_CTL_MOD).  Ready items are reported round
+ * robin when maxevents is smaller than the ready set.  epoll fds nest (poll,
+ * select and epoll on an epoll fd), with loops and deep chains -> ELOOP.
+ * Waits sleep until kpoll_wake() (no polling) unless an item has no wakeup
+ * source (TCP/UDP, ttys, evdev, /dev/wm): those keep per-tick stepping. */
 #define FD_TYPE_EPOLL 13
-#define LX_EPOLL_MAX  64
+#define LX_EPOLL_CAP    1024
+#define LX_EP_MAX_NEST  4
+#define LX_EPOLLEXCLUSIVE (1u << 28)
+#define LX_EPOLLWAKEUP    (1u << 29)
 #define LX_EPOLLONESHOT (1u << 30)
 #define LX_EPOLLET      (1u << 31)
 typedef struct __attribute__((packed)) { uint32_t events; uint64_t data; } lx_epoll_event_t;
@@ -349,24 +382,51 @@ typedef struct {
     int      fd;
     uint32_t events;
     uint64_t data;
-    void    *key;        /* file_handle at ADD time: detects fd reuse */
+    void    *key;        /* object (file_handle at ADD time) */
     uint8_t  type;
     bool     armed;
+    bool     byh;        /* evaluated on the object, not the fd table */
     uint32_t et_rev;        /* EPOLLET: bits reported and still ready since */
     uint32_t et_in, et_out; /* edge generations at the last report */
 } lx_epitem_t;
-typedef struct { int n; lx_epitem_t it[LX_EPOLL_MAX]; } lx_epoll_t;
+typedef struct lx_epoll {
+    volatile int lock;          /* lx_ep_mx: holders may sleep/be preempted */
+    int n, cap, rr;
+    lx_epitem_t *it;
+    struct lx_epoll *all_next;
+} lx_epoll_t;
+static volatile int lx_ep_all_lock;
+/* Item evaluation calls into socket/tty/evdev code whose locks are not all
+ * preempt-safe, so epoll locks are yielding mutexes, never spinlocks with
+ * preemption off (thread context only). */
+static void lx_ep_mx(volatile int *m) {
+    while (__atomic_exchange_n(m, 1, __ATOMIC_ACQUIRE)) {
+        extern void thread_yield(void);
+        thread_yield();
+    }
+}
+static void lx_ep_unmx(volatile int *m) { __atomic_store_n(m, 0, __ATOMIC_RELEASE); }
+static lx_epoll_t  *lx_ep_all;
+static volatile int lx_ep_count;
 
+static bool lx_ep_byh_type(uint8_t ty) {
+    /* pipes, sockets, eventfd, evdev/uinput/wm (10-12), epoll, timerfd,
+     * signalfd, inotify (13-16) */
+    return ty == FD_TYPE_PIPE_READ || ty == FD_TYPE_PIPE_WRITE || ty == FD_TYPE_SOCKET ||
+           ty == FD_TYPE_EVENTFD || (ty >= 10 && ty <= 16);
+}
+/* fd-table items: still the same object in p's table? */
 static bool lx_ep_valid(process_t *p, const lx_epitem_t *e) {
     if (e->fd < 0 || e->fd >= MAX_OPEN_FILES_SYSCALL) return false;
     const file_descriptor_t *f = &p->fds[e->fd];
     return f->in_use && f->file_handle == e->key && f->fd_type == e->type;
 }
-static void lx_ep_gc(process_t *p, lx_epoll_t *ep) {
-    int w = 0;
-    for (int i = 0; i < ep->n; i++)
-        if (lx_ep_valid(p, &ep->it[i])) ep->it[w++] = ep->it[i];
-    ep->n = w;
+static bool lx_ep_gone(process_t *p, const lx_epitem_t *e) {
+    if (!e->byh) return !lx_ep_valid(p, e);
+    if ((e->type == FD_TYPE_PIPE_READ || e->type == FD_TYPE_PIPE_WRITE) &&
+        (!e->key || !((pipe_t *)e->key)->active))
+        return true;                    /* refcount-less pipe fd freed it */
+    return e->key == NULL;
 }
 static long lx_epoll_create(process_t *p, long flags) {
     if (flags & ~02000000L) return -EINVAL;               /* only EPOLL_CLOEXEC */
@@ -377,6 +437,11 @@ static long lx_epoll_create(process_t *p, long flags) {
     memset(ep, 0, sizeof(*ep));
     p->fds[fd].ref_count = fd_refcount_create();
     if (!p->fds[fd].ref_count) { kfree(ep); p->fds[fd].in_use = false; return -ENOMEM; }
+    lx_ep_mx(&lx_ep_all_lock);
+    ep->all_next = lx_ep_all;
+    lx_ep_all = ep;
+    lx_ep_count++;
+    lx_ep_unmx(&lx_ep_all_lock);
     p->fds[fd].fd_type = FD_TYPE_EPOLL;
     p->fds[fd].file_handle = ep;
     p->fds[fd].flags = 0;
@@ -385,55 +450,168 @@ static long lx_epoll_create(process_t *p, long flags) {
     p->fds[fd].in_use = true;
     return fd;
 }
+/* fd_close_entry: last reference to (h, type) is gone. */
+void lx_epoll_forget(void *h, uint8_t type) {
+    if (!h || !__atomic_load_n(&lx_ep_count, __ATOMIC_ACQUIRE)) return;
+    lx_ep_mx(&lx_ep_all_lock);
+    for (lx_epoll_t *ep = lx_ep_all; ep; ep = ep->all_next) {
+        if (ep == h) continue;
+        lx_ep_mx(&ep->lock);
+        int w = 0;
+        for (int i = 0; i < ep->n; i++)
+            if (!(ep->it[i].key == h && ep->it[i].type == type)) ep->it[w++] = ep->it[i];
+        ep->n = w;
+        if (ep->rr >= ep->n) ep->rr = 0;
+        lx_ep_unmx(&ep->lock);
+    }
+    lx_ep_unmx(&lx_ep_all_lock);
+}
+void lx_epoll_free(void *h) {
+    lx_epoll_t *ep = (lx_epoll_t *)h;
+    if (!ep) return;
+    lx_ep_mx(&lx_ep_all_lock);
+    lx_epoll_t **pp = &lx_ep_all;
+    while (*pp) {
+        if (*pp == ep) { *pp = ep->all_next; lx_ep_count--; break; }
+        pp = &(*pp)->all_next;
+    }
+    lx_ep_unmx(&lx_ep_all_lock);
+    if (ep->it) kfree(ep->it);
+    kfree(ep);
+}
 static lx_epoll_t *lx_ep_get(process_t *p, long epfd, long *err) {
     if (epfd < 0 || epfd >= MAX_OPEN_FILES_SYSCALL || !p->fds[epfd].in_use) { *err = -EBADF; return NULL; }
     if (p->fds[epfd].fd_type != FD_TYPE_EPOLL) { *err = -EINVAL; return NULL; }
     return (lx_epoll_t *)p->fds[epfd].file_handle;
+}
+/* Longest chain of epoll sets reachable from ep (ep itself = 1); returns
+ * a big value when target is reachable.  Caller holds lx_ep_all_lock. */
+static int lx_ep_chain(lx_epoll_t *ep, lx_epoll_t *target, int depth) {
+    if (ep == target) return 1000;
+    if (depth > LX_EP_MAX_NEST + 1) return 1000;
+    int best = 1;
+    lx_ep_mx(&ep->lock);
+    int n = ep->n;
+    lx_epoll_t *kids[16];
+    int nk = 0;
+    for (int i = 0; i < n; i++) {
+        if (ep->it[i].type != FD_TYPE_EPOLL) continue;
+        if (nk == 16) { best = 1000; break; }
+        kids[nk++] = (lx_epoll_t *)ep->it[i].key;
+    }
+    lx_ep_unmx(&ep->lock);
+    for (int k = 0; k < nk && best < 1000; k++) {
+        int d = 1 + lx_ep_chain(kids[k], target, depth + 1);
+        if (d > best) best = d;
+    }
+    return best;
+}
+/* Does ep appear (directly or nested) under any other set?  Depth above. */
+static int lx_ep_up(lx_epoll_t *ep, int depth) {
+    if (depth > LX_EP_MAX_NEST + 1) return 1000;
+    int best = 0;
+    for (lx_epoll_t *x = lx_ep_all; x && best < 1000; x = x->all_next) {
+        if (x == ep) continue;
+        bool has = false;
+        lx_ep_mx(&x->lock);
+        for (int i = 0; i < x->n; i++)
+            if (x->it[i].type == FD_TYPE_EPOLL && x->it[i].key == ep) { has = true; break; }
+        lx_ep_unmx(&x->lock);
+        if (has) {
+            int d = 1 + lx_ep_up(x, depth + 1);
+            if (d > best) best = d;
+        }
+    }
+    return best;
+}
+static int lx_ep_find(lx_epoll_t *ep, long fd, void *key, uint8_t ty) {
+    for (int i = 0; i < ep->n; i++)
+        if (ep->it[i].fd == fd && ep->it[i].key == key && ep->it[i].type == ty) return i;
+    return -1;
 }
 static long lx_epoll_ctl(process_t *p, long epfd, long op, long fd, const void *uev) {
     long err = 0;
     lx_epoll_t *ep = lx_ep_get(p, epfd, &err);
     if (!ep) return err;
     if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use) return -EBADF;
-    if (fd == epfd) return -EINVAL;
     uint8_t ty = p->fds[fd].fd_type;
-    if (ty == FD_TYPE_EPOLL) return -EINVAL;              /* nested epoll: not supported */
-    if (ty == FD_TYPE_VFS || ty == FD_TYPE_FILE || ty == FD_TYPE_VFS_DIR)
+    void *key = p->fds[fd].file_handle;
+    if (ty == FD_TYPE_VFS || ty == FD_TYPE_VFS_DIR ||
+        (ty == FD_TYPE_FILE && !(fd <= 2 && key == NULL)))
         return -EPERM;                                    /* Linux: regular files/dirs */
     lx_epoll_event_t ev = {0, 0};
-    if (op != 2 /* DEL */) {
+    if (op == 1 || op == 3) {
         if (!uev) return -EFAULT;
         if (lx_get(&ev, uev, sizeof(ev))) return -EFAULT;
+    } else if (op != 2) {
+        return -EINVAL;
     }
-    lx_ep_gc(p, ep);
-    int idx = -1;
-    for (int i = 0; i < ep->n; i++) if (ep->it[i].fd == fd) { idx = i; break; }
+    if (fd == epfd) return -EINVAL;
+    if (op != 2 && (ev.events & LX_EPOLLEXCLUSIVE)) {
+        /* Linux: EXCLUSIVE only on ADD, never with ONESHOT or on an epoll fd */
+        const uint32_t ok = 0x1 | 0x4 | 0x8 | 0x10 | LX_EPOLLWAKEUP | LX_EPOLLET | LX_EPOLLEXCLUSIVE;
+        if (op == 3 || ty == FD_TYPE_EPOLL || (ev.events & ~ok)) return -EINVAL;
+    }
+    bool nested = (ty == FD_TYPE_EPOLL && op == 1);
+    if (nested) {
+        /* loops and chains deeper than EP_MAX_NESTS: ELOOP (global lock
+         * serialises nested ADDs, like Linux's epnested_mutex) */
+        lx_ep_mx(&lx_ep_all_lock);
+        lx_epoll_t *tgt = (lx_epoll_t *)key;
+        int down = lx_ep_chain(tgt, ep, 0);
+        int up = down >= 1000 ? 0 : lx_ep_up(ep, 0);
+        if (down >= 1000 || down + up > LX_EP_MAX_NEST) {
+            lx_ep_unmx(&lx_ep_all_lock);
+            return -ELOOP;
+        }
+    }
+    long r = 0;
+    lx_ep_mx(&ep->lock);
+    int idx = lx_ep_find(ep, fd, key, ty);
     switch (op) {
     case 1: /* EPOLL_CTL_ADD */
-        if (idx >= 0) return -EEXIST;
-        if (ep->n >= LX_EPOLL_MAX) return -ENOSPC;
+        if (idx >= 0) { r = -EEXIST; break; }
+        if (ep->n >= ep->cap) {
+            if (ep->cap >= LX_EPOLL_CAP) { r = -ENOSPC; break; }
+            int nc = ep->cap ? ep->cap * 2 : 16;
+            lx_epitem_t *ni = (lx_epitem_t *)kalloc((size_t)nc * sizeof(lx_epitem_t));
+            if (!ni) { r = -ENOMEM; break; }
+            if (ep->n) memcpy(ni, ep->it, (size_t)ep->n * sizeof(lx_epitem_t));
+            if (ep->it) kfree(ep->it);
+            ep->it = ni;
+            ep->cap = nc;
+        }
         idx = ep->n++;
+        memset(&ep->it[idx], 0, sizeof(ep->it[idx]));
         ep->it[idx].fd = (int)fd;
-        ep->it[idx].key = p->fds[fd].file_handle;
+        ep->it[idx].key = key;
         ep->it[idx].type = ty;
-        /* fallthrough */
+        ep->it[idx].byh = lx_ep_byh_type(ty);
+        ep->it[idx].events = ev.events;
+        ep->it[idx].data = ev.data;
+        ep->it[idx].armed = true;
+        break;
     case 3: /* EPOLL_CTL_MOD */
-        if (idx < 0) return -ENOENT;
+        if (idx < 0) { r = -ENOENT; break; }
+        if (ep->it[idx].events & LX_EPOLLEXCLUSIVE) { r = -EINVAL; break; }
         ep->it[idx].events = ev.events;
         ep->it[idx].data = ev.data;
         ep->it[idx].armed = true;
         ep->it[idx].et_rev = 0;          /* ADD/MOD on a ready fd reports it */
-        return 0;
+        break;
     case 2: /* EPOLL_CTL_DEL */
-        if (idx < 0) return -ENOENT;
+        if (idx < 0) { r = -ENOENT; break; }
         ep->it[idx] = ep->it[--ep->n];
-        return 0;
-    default:
-        return -EINVAL;
+        if (ep->rr >= ep->n) ep->rr = 0;
+        break;
     }
+    lx_ep_unmx(&ep->lock);
+    if (nested) lx_ep_unmx(&lx_ep_all_lock);
+    if (r == 0 && op != 2) kpoll_wake();   /* another thread may wait on ep */
+    return r;
 }
 /* Per-object I/O counters for EPOLLET on objects without exact edge
- * generations (TCP/UDP sockets, ttys, timerfd, ...): bumped by every
+ * generations (TCP/UDP sockets, ttys, signalfd, ...): bumped by every
  * data-moving syscall on an fd of that object.  A hash slot collision only
  * causes an extra (harmless) edge. */
 #define LX_IOTAB 256
@@ -448,101 +626,136 @@ static void lx_io_bump(process_t *p, long fd) {
     __atomic_add_fetch(&lx_io_tab[lx_io_slot(p->fds[fd].file_handle)], 1, __ATOMIC_RELEASE);
 }
 bool ux_fd_gens(void *file_handle, uint32_t *in_gen, uint32_t *out_gen);
+uint32_t lx_timerfd_gen(void *h);
 /* Edge generations of an epoll entry's object. */
-static void lx_ep_gens(process_t *p, const lx_epitem_t *it, uint32_t *gi, uint32_t *go) {
-    const file_descriptor_t *f = &p->fds[it->fd];
-    void *h = f->file_handle;
-    if ((f->fd_type == FD_TYPE_PIPE_READ || f->fd_type == FD_TYPE_PIPE_WRITE) && h) {
+static void lx_ep_gens(const lx_epitem_t *it, uint32_t *gi, uint32_t *go) {
+    void *h = it->key;
+    uint8_t ty = it->type;
+    if ((ty == FD_TYPE_PIPE_READ || ty == FD_TYPE_PIPE_WRITE) && h) {
         pipe_t *pp = (pipe_t *)h;
         *gi = __atomic_load_n(&pp->in_gen, __ATOMIC_ACQUIRE);
         *go = __atomic_load_n(&pp->out_gen, __ATOMIC_ACQUIRE);
         return;
     }
-    if (f->fd_type == FD_TYPE_EVENTFD && h) {
-        uint64_t g = __atomic_load_n(&((volatile uint64_t *)h)[1], __ATOMIC_ACQUIRE);
+    if (ty == FD_TYPE_EVENTFD && h) {
+        uint64_t g = __atomic_load_n(&((lx_eventfd_t *)h)->gens, __ATOMIC_ACQUIRE);
         *gi = (uint32_t)g; *go = (uint32_t)(g >> 32);
         return;
     }
-    if (f->fd_type == FD_TYPE_SOCKET && ux_fd_gens(h, gi, go)) return;
-    if (f->fd_type == FD_TYPE_INOTIFY && h) { *gi = inotify_gen(h); *go = 0; return; }
+    if (ty == FD_TYPE_SOCKET && ux_fd_gens(h, gi, go)) return;
+    if (ty == FD_TYPE_INOTIFY && h) { *gi = inotify_gen(h); *go = 0; return; }
+    if (ty == 14 /* TIMERFD */ && h) { *gi = lx_timerfd_gen(h); *go = 0; return; }
     *gi = *go = __atomic_load_n(&lx_io_tab[lx_io_slot(h)], __ATOMIC_ACQUIRE);
+}
+short poll_eval_obj(process_t *proc, int fd, uint8_t type, void *h, short events,
+                    kpoll_hint_t *hint);
+static int lx_ep_scan(process_t *p, lx_epoll_t *ep, lx_epoll_event_t *out, int cap,
+                      kpoll_hint_t *hint, int depth, bool commit);
+/* Readiness of one item (ERR/HUP always reported, like poll). */
+static uint32_t lx_ep_eval(process_t *p, const lx_epitem_t *it, kpoll_hint_t *hint, int depth) {
+    uint32_t want = it->events & 0x23ff;
+    if (it->type == FD_TYPE_EPOLL) {
+        if (!(want & 0x1)) return 0;
+        return lx_ep_scan(p, (lx_epoll_t *)it->key, NULL, 0, hint, depth + 1, false) ? 0x1 : 0;
+    }
+    short rev = poll_eval_obj(p, it->byh ? -1 : it->fd, it->type, it->key, (short)want, hint);
+    return (uint16_t)rev & (want | 0x18);
+}
+/* Collect up to cap events (commit: update ET/ONESHOT state, drop dead
+ * items, rotate).  !commit: return 1 if anything would be reported. */
+static int lx_ep_scan(process_t *p, lx_epoll_t *ep, lx_epoll_event_t *out, int cap,
+                      kpoll_hint_t *hint, int depth, bool commit) {
+    if (!ep || depth > LX_EP_MAX_NEST + 1) return 0;
+    int got = 0;
+    lx_ep_mx(&ep->lock);
+    if (commit) {
+        int w = 0;
+        for (int i = 0; i < ep->n; i++)
+            if (!lx_ep_gone(p, &ep->it[i])) ep->it[w++] = ep->it[i];
+        ep->n = w;
+        if (ep->rr >= ep->n) ep->rr = 0;
+    }
+    int n = ep->n, start = commit ? ep->rr : 0, last = -1;
+    for (int k = 0; k < n; k++) {
+        int i = (start + k) % n;
+        lx_epitem_t *it = &ep->it[i];
+        if (!it->armed || (!commit && lx_ep_gone(p, it))) continue;
+        uint32_t rev = lx_ep_eval(p, it, hint, depth);
+        uint32_t gi = 0, go = 0;
+        if (it->events & LX_EPOLLET) {
+            lx_ep_gens(it, &gi, &go);
+            /* bits that went un-ready since the last report re-arm */
+            uint32_t etr = it->et_rev & rev;
+            if (!rev) {
+                if (commit) { it->et_rev = 0; it->et_in = gi; it->et_out = go; }
+                continue;
+            }
+            bool edge = (rev & ~etr) != 0 ||
+                        ((rev & 0x41) && gi != it->et_in) ||      /* IN|RDNORM: new data */
+                        ((rev & 0x104) && go != it->et_out);      /* OUT|WRNORM: new room */
+            if (commit) it->et_rev = etr;
+            if (!edge) continue;
+        }
+        if (!rev) continue;
+        if (!commit) { got = 1; break; }
+        if (got >= cap) break;
+        out[got].events = rev;
+        out[got].data = it->data;
+        got++;
+        last = i;
+        if (it->events & LX_EPOLLONESHOT) it->armed = false;
+        if (it->events & LX_EPOLLET) { it->et_rev = rev; it->et_in = gi; it->et_out = go; }
+    }
+    if (commit && last >= 0 && got >= cap)
+        ep->rr = (last + 1) % (n ? n : 1);   /* LT fairness: next scan starts after */
+    lx_ep_unmx(&ep->lock);
+    return got;
+}
+/* poll/select/nested epoll on an epoll fd: readable while it has events. */
+short lx_epoll_poll(void *h, process_t *proc, short events, kpoll_hint_t *hint) {
+    if (!(events & POLLIN)) return 0;
+    return lx_ep_scan(proc, (lx_epoll_t *)h, NULL, 0, hint, 1, false) ? POLLIN : 0;
 }
 static long lx_epoll_wait(process_t *p, long epfd, void *uevs, long maxevents, int timeout_ms) {
     long err = 0;
     lx_epoll_t *ep = lx_ep_get(p, epfd, &err);
     if (!ep) return err;
     if (maxevents <= 0 || maxevents > 0x7fffffff / (long)sizeof(lx_epoll_event_t)) return -EINVAL;
-    if (!uevs) return -EFAULT;
+    if (!uevs || !access_ok_user_range((uint64_t)uevs, (uint64_t)maxevents * sizeof(lx_epoll_event_t)))
+        return -EFAULT;
     extern bool     proc_signal_interrupts(process_t *);
     extern uint64_t sys_wait_deadline_us(uint64_t);
     extern bool     sys_wait_expired_us(uint64_t);
-    /* c13: us deadline so slices add up to the timeout exactly */
+    extern void     sys_wait_step_us(uint64_t);
+    extern void     poll_network_once(void);
+    /* c13: us deadline so waits add up to the timeout exactly */
     uint64_t dl = timeout_ms > 0 ? sys_wait_deadline_us((uint64_t)timeout_ms * 1000ULL) : 0;
-    pollfd_t pf[LX_EPOLL_MAX];
-    int map[LX_EPOLL_MAX];
-    for (;;) {
-        lx_ep_gc(p, ep);
-        int np = 0;
-        for (int i = 0; i < ep->n; i++) {
-            if (!ep->it[i].armed) continue;
-            pf[np].fd = ep->it[i].fd;
-            /* poll bit values match EPOLLIN/PRI/OUT/ERR/HUP/RDNORM/WRNORM/RDHUP */
-            pf[np].events = (short)(ep->it[i].events & 0x23ff);
-            pf[np].revents = 0;
-            map[np++] = i;
-        }
-        long r = 0;
-        if (np) r = sys_poll_kernel(pf, (unsigned)np, 0);
-        if (r < 0) return r;
-        long out = 0;
-        bool suppressed = false;
-        for (int j = 0; j < np; j++) {
-            lx_epitem_t *it = &ep->it[map[j]];
-            /* ERR/HUP are always reported, like poll */
-            uint32_t rev = (uint16_t)pf[j].revents & ((it->events & 0x23ff) | 0x18);
-            uint32_t gi = 0, go = 0;
-            if (it->events & LX_EPOLLET) {
-                lx_ep_gens(p, it, &gi, &go);
-                /* bits that went un-ready since the last report re-arm */
-                it->et_rev &= rev;
-                if (!rev) { it->et_in = gi; it->et_out = go; continue; }
-                bool edge = (rev & ~it->et_rev) != 0 ||
-                            ((rev & 0x41) && gi != it->et_in) ||      /* IN|RDNORM: new data */
-                            ((rev & 0x104) && go != it->et_out);      /* OUT|WRNORM: new room */
-                if (!edge) { suppressed = true; continue; }
-            }
-            if (!rev || out >= maxevents) continue;
-            lx_epoll_event_t e = { rev, it->data };
-            if (lx_put((char *)uevs + out * sizeof(e), &e, sizeof(e))) return out ? out : -EFAULT;
-            if (it->events & LX_EPOLLONESHOT) it->armed = false;
-            if (it->events & LX_EPOLLET) { it->et_rev = rev; it->et_in = gi; it->et_out = go; }
-            out++;
-        }
-        if (out) return out;
-        if (timeout_ms == 0) return 0;
-        if (timeout_ms > 0 && sys_wait_expired_us(dl)) return 0;
-        /* sleep until something not yet reported may be ready: wait on the
-         * non-suppressed entries in short slices (suppressed ET entries are
-         * re-checked each slice) */
-        int slice = 10;
-        if (!suppressed) slice = timeout_ms < 0 ? 50 : timeout_ms;
-        int k = 0;
-        for (int j = 0; j < np; j++) {
-            lx_epitem_t *it = &ep->it[map[j]];
-            if ((it->events & LX_EPOLLET) && it->et_rev && pf[j].revents) continue;
-            pf[k].fd = pf[j].fd; pf[k].events = (short)(it->events & 0x23ff); pf[k].revents = 0; k++;
-        }
-        if (!k) { pf[0].fd = -1; pf[0].events = 0; pf[0].revents = 0; k = 1; }
-        if (timeout_ms > 0) {
-            extern uint64_t ktime_now_us(void);
-            uint64_t now = ktime_now_us();
-            int left = dl > now ? (int)((dl - now + 999) / 1000) : 0;
-            if (slice > left) slice = left;
-        }
-        r = sys_poll_kernel(pf, (unsigned)k, slice);
-        if (r < 0) return r;
-        if (proc_signal_interrupts(p)) return -EINTR;
+    int cap = maxevents < 128 ? (int)maxevents : 128;
+    lx_epoll_event_t kst[32];
+    lx_epoll_event_t *kev = kst;
+    if (cap > 32) {
+        kev = (lx_epoll_event_t *)kalloc((size_t)cap * sizeof(lx_epoll_event_t));
+        if (!kev) { kev = kst; cap = 32; }
     }
+    long ret;
+    for (;;) {
+        poll_network_once();
+        uint32_t snap = kpoll_snapshot();      /* before any readiness check */
+        kpoll_hint_t hint = { false, 0 };
+        int out = lx_ep_scan(p, ep, kev, cap, &hint, 0, true);
+        if (out) {
+            ret = lx_put(uevs, kev, (size_t)out * sizeof(lx_epoll_event_t)) ? -EFAULT : out;
+            break;
+        }
+        if (timeout_ms == 0) { ret = 0; break; }
+        if (timeout_ms > 0 && sys_wait_expired_us(dl)) { ret = 0; break; }
+        if (proc_kill_pending(p) || proc_signal_interrupts(p)) { ret = -EINTR; break; }
+        fork_release_pending(p);
+        if (hint.nonevent) sys_wait_step_us(dl);
+        else kpoll_wait_us(snap, dl, hint.next_us);
+    }
+    if (kev != kst) kfree(kev);
+    return ret;
 }
 
 #define FD_TYPE_TIMERFD  14
@@ -551,27 +764,48 @@ static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len);
 static long lx_signalfd_read(process_t *p, long fd, void *ubuf, size_t len);
 static long lx_inotify_read(process_t *p, long fd, void *ubuf, size_t len);
 static void lx_futex_wake_addr(uint64_t uaddr, int n);
+/* c18: common blocking step for event-fd reads/writes: -EINTR or 0 */
+static long lx_evwait(process_t *p, uint32_t snap, uint64_t tmr_us) {
+    extern bool proc_signal_interrupts(process_t *);
+    if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
+    fork_release_pending(p);
+    kpoll_wait_us(snap, 0, tmr_us);
+    return 0;
+}
 static long lx_eventfd_rw(process_t *p, long fd, void *ubuf, size_t len, bool wr) {
     if (len < 8) return -EINVAL;
-    volatile uint64_t *ctr = (volatile uint64_t *)p->fds[fd].file_handle;
-    uint64_t v;
+    lx_eventfd_t *e = (lx_eventfd_t *)p->fds[fd].file_handle;
+    uint64_t v = 0;
     if (lx_strace)
         serial_printf("lxt:  eventfd %s pid %u fd %ld ctr@%p=%llu\n", wr ? "write" : "read",
-                      p->pid, fd, (void *)ctr, (unsigned long long)*ctr);
+                      p->pid, fd, (void *)e, (unsigned long long)e->ctr);
     if (wr) {
         if (lx_get(&v, ubuf, 8)) return -EFAULT;
         if (v == ~0ULL) return -EINVAL;
-        *ctr += v;
-        ctr[1] = (ctr[1] & ~0xffffffffULL) | (uint32_t)(ctr[1] + 1);   /* in edge */
-        return 8;
     }
     for (;;) {
-        v = *ctr;
-        if (v) { *ctr = 0; ctr[1] += 1ULL << 32;   /* out edge */
-                 return lx_put(ubuf, &v, 8) ? -EFAULT : 8; }
+        uint32_t snap = kpoll_snapshot();
+        klock(&e->lock);
+        if (wr) {
+            if (0xffffffffffffffffULL - e->ctr > v) {
+                e->ctr += v;
+                e->gens = (e->gens & ~0xffffffffULL) | (uint32_t)(e->gens + 1);   /* in edge */
+                kunlock(&e->lock);
+                kpoll_wake();
+                return 8;
+            }
+        } else if (e->ctr) {
+            uint64_t r = e->sem ? 1 : e->ctr;
+            e->ctr -= r;
+            e->gens += 1ULL << 32;                                           /* out edge */
+            kunlock(&e->lock);
+            kpoll_wake();
+            return lx_put(ubuf, &r, 8) ? -EFAULT : 8;
+        }
+        kunlock(&e->lock);
         if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
-        if (proc_kill_pending(p)) return -EINTR;
-        thread_sleep(1);
+        long r = lx_evwait(p, snap, 0);
+        if (r) return r;
     }
 }
 
@@ -1712,7 +1946,9 @@ static long lx_inotify_read(process_t *p, long fd, void *ubuf, size_t len) {
     void *h = p->fds[fd].file_handle;
     extern bool proc_signal_interrupts(process_t *);
     char kb[512];
+    (void)proc_signal_interrupts;
     for (;;) {
+        uint32_t snap = kpoll_snapshot();
         if (inotify_ready(h)) {
             size_t n = len < sizeof(kb) ? len : sizeof(kb);
             long got = inotify_take(h, kb, n);
@@ -1721,9 +1957,8 @@ static long lx_inotify_read(process_t *p, long fd, void *ubuf, size_t len) {
             if (got > 0) return lx_put(ubuf, kb, (size_t)got) ? -EFAULT : got;
         }
         if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
-        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
-        fork_release_pending(p);
-        thread_sleep(1);
+        long w = lx_evwait(p, snap, 0);
+        if (w) return w;
     }
 }
 
@@ -2298,6 +2533,7 @@ typedef struct {
     uint64_t next_us;       /* monotonic deadline, 0 = disarmed */
     uint64_t interval_us;
     uint64_t exp;           /* expirations not yet read */
+    volatile uint32_t gen;  /* c18: expirations ever (EPOLLET edges) */
 } lx_timerfd_t;
 static void lx_tfd_update(lx_timerfd_t *t) {
     if (!t->next_us) return;
@@ -2311,6 +2547,29 @@ static void lx_tfd_update(lx_timerfd_t *t) {
         t->exp++;
         t->next_us = 0;
     }
+    t->gen++;
+}
+uint32_t lx_timerfd_gen(void *h) {
+    lx_timerfd_t *t = (lx_timerfd_t *)h;
+    if (!t) return 0;
+    klock(&t->lock);
+    lx_tfd_update(t);
+    uint32_t g = t->gen;
+    kunlock(&t->lock);
+    return g;
+}
+/* c18: ready?  Else *next_us = the next expiry (ktime us; 0 = disarmed) so
+ * pollers sleep exactly until it. */
+bool lx_timerfd_ready_hint(void *h, uint64_t *next_us) {
+    lx_timerfd_t *t = (lx_timerfd_t *)h;
+    if (next_us) *next_us = 0;
+    if (!t) return false;
+    klock(&t->lock);
+    lx_tfd_update(t);
+    bool r = t->exp != 0;
+    if (next_us) *next_us = t->next_us;   /* next expiry even when ready (EPOLLET) */
+    kunlock(&t->lock);
+    return r;
 }
 bool lx_timerfd_ready(void *h) {
     lx_timerfd_t *t = (lx_timerfd_t *)h;
@@ -2378,12 +2637,16 @@ static long lx_timerfd_settime(process_t *p, long fd, long flags, const void *un
         bool rt = t->clock == 0 || t->clock == 8;
         uint64_t now_c = rt ? lx_real_us() : lx_mono_us(), mono = lx_mono_us();
         uint64_t abs = (uint64_t)nv[1].tv_sec * 1000000ULL + (uint64_t)nv[1].tv_nsec / 1000;
-        t->next_us = abs > now_c ? mono + (abs - now_c) : mono;
+        /* c18: a past absolute time with an interval counts the overruns
+         * since then (Linux), not just one expiry */
+        if (abs > now_c) t->next_us = mono + (abs - now_c);
+        else t->next_us = (now_c - abs) < mono ? mono - (now_c - abs) : 1;
         if (!t->next_us) t->next_us = 1;
     } else {
         t->next_us = lx_mono_us() + v;
     }
     kunlock(&t->lock);
+    kpoll_wake();                       /* pollers re-read the deadline */
     if (uold && lx_put(uold, old, sizeof(old))) return -EFAULT;
     return 0;
 }
@@ -2402,17 +2665,19 @@ static long lx_timerfd_read(process_t *p, long fd, void *ubuf, size_t len) {
     if (len < 8) return -EINVAL;
     lx_timerfd_t *t = (lx_timerfd_t *)p->fds[fd].file_handle;
     extern bool proc_signal_interrupts(process_t *);
+    (void)proc_signal_interrupts;
     for (;;) {
+        uint32_t snap = kpoll_snapshot();
         klock(&t->lock);
         lx_tfd_update(t);
         uint64_t v = t->exp;
+        uint64_t nx = t->next_us;
         t->exp = 0;
         kunlock(&t->lock);
         if (v) return lx_put(ubuf, &v, 8) ? -EFAULT : 8;
         if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
-        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
-        fork_release_pending(p);
-        thread_sleep(1);
+        long w = lx_evwait(p, snap, nx);
+        if (w) return w;
     }
 }
 
@@ -2435,6 +2700,7 @@ static long lx_signalfd(process_t *p, long fd, const void *umask, size_t sz, lon
         if (fd < 0 || fd >= MAX_OPEN_FILES_SYSCALL || !p->fds[fd].in_use) return -EBADF;
         if (p->fds[fd].fd_type != FD_TYPE_SIGNALFD) return -EINVAL;
         ((lx_signalfd_t *)p->fds[fd].file_handle)->mask = lx_sigmask_from_user(m);
+        kpoll_wake();
         return fd;
     }
     int nfd = allocate_fd(p);
@@ -2452,16 +2718,35 @@ static long lx_signalfd(process_t *p, long fd, const void *umask, size_t sz, lon
     p->fds[nfd].in_use = true;
     return nfd;
 }
-/* take the lowest pending signal in mask; 0 if none */
-static int lx_sig_dequeue(process_t *p, uint32_t mask) {
+/* take the lowest pending signal in mask; 0 if none.  c18: *inf gets the
+ * sender record (pid, uid, si_code, si_status) kept by process_sig_info. */
+typedef struct { uint32_t pid, uid; int32_t code, status; } lx_sigsrc_t;
+static int lx_sig_dequeue_info(process_t *p, uint32_t mask, lx_sigsrc_t *inf) {
     for (;;) {
         uint32_t pend = __atomic_load_n(&p->pending_signals, __ATOMIC_ACQUIRE) & mask;
         if (!pend) return 0;
         int s = __builtin_ctz(pend);
         uint32_t bit = 1u << s;
+        lx_sigsrc_t si = { 0, 0, 0, 0 };
+        if (s >= 1 && s <= 32) {
+            si.pid = p->sig_src_pid[s];
+            si.uid = p->sig_src_uid[s];
+            si.code = p->sig_src_code[s];
+            si.status = p->sig_src_status[s];
+        }
         uint32_t prev = __atomic_fetch_and(&p->pending_signals, ~bit, __ATOMIC_SEQ_CST);
-        if (prev & bit) return s;
+        if (prev & bit) {
+            if (s >= 1 && s <= 32) {
+                p->sig_src_pid[s] = 0; p->sig_src_uid[s] = 0;
+                p->sig_src_code[s] = 0; p->sig_src_status[s] = 0;
+            }
+            if (inf) *inf = si;
+            return s;
+        }
     }
+}
+static inline int lx_sig_dequeue(process_t *p, uint32_t mask) {
+    return lx_sig_dequeue_info(p, mask, NULL);
 }
 typedef struct {
     uint32_t ssi_signo; int32_t ssi_errno; int32_t ssi_code; uint32_t ssi_pid;
@@ -2476,22 +2761,27 @@ static long lx_signalfd_read(process_t *p, long fd, void *ubuf, size_t len) {
     lx_signalfd_t *s = (lx_signalfd_t *)p->fds[fd].file_handle;
     extern bool proc_signal_interrupts(process_t *);
     size_t got = 0;
+    (void)proc_signal_interrupts;
     for (;;) {
+        uint32_t snap = kpoll_snapshot();
         while (got + sizeof(lx_sfd_siginfo_t) <= len) {
-            int sig = lx_sig_dequeue(p, s->mask);
+            lx_sigsrc_t src;
+            int sig = lx_sig_dequeue_info(p, s->mask, &src);
             if (!sig) break;
             lx_sfd_siginfo_t si;
             memset(&si, 0, sizeof(si));
             si.ssi_signo = (uint32_t)sig;
-            si.ssi_code = 0;                              /* SI_USER */
+            si.ssi_code = src.code;                       /* SI_USER / SI_KERNEL / CLD_* */
+            si.ssi_pid = src.pid;
+            si.ssi_uid = src.uid;
+            si.ssi_status = src.status;
             if (lx_put((char *)ubuf + got, &si, sizeof(si))) return got ? (long)got : -EFAULT;
             got += sizeof(si);
         }
         if (got) return (long)got;
         if (p->fds[fd].flags & O_NONBLOCK) return -EAGAIN;
-        if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
-        fork_release_pending(p);
-        thread_sleep(1);
+        long w = lx_evwait(p, snap, 0);
+        if (w) return w;
     }
 }
 /* rt_sigtimedwait(set, info, timeout, sigsetsize): same dequeue */
@@ -2500,8 +2790,8 @@ static long lx_sigtimedwait(process_t *p, const void *uset, void *uinfo, const v
     uint64_t m = 0;
     if (lx_get(&m, uset, 8)) return -EFAULT;
     uint32_t mask = lx_sigmask_from_user(m);
-    extern uint64_t ktime_deadline_ms(uint64_t);
-    extern bool     ktime_expired(uint64_t);
+    extern uint64_t sys_wait_deadline_us(uint64_t);
+    extern bool     sys_wait_expired_us(uint64_t);
     extern bool     proc_signal_interrupts(process_t *);
     bool has_to = uts != NULL;
     uint64_t dl = 0;
@@ -2509,23 +2799,31 @@ static long lx_sigtimedwait(process_t *p, const void *uset, void *uinfo, const v
         lx_timespec_t ts;
         if (lx_get(&ts, uts, sizeof(ts))) return -EFAULT;
         if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -EINVAL;
-        dl = ktime_deadline_ms((uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000);
+        /* c18: us deadline (ms rounding + 1-tick polling before) */
+        uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ((uint64_t)ts.tv_nsec + 999) / 1000;
+        dl = sys_wait_deadline_us(us);
     }
     for (;;) {
-        int sig = lx_sig_dequeue(p, mask);
+        uint32_t snap = kpoll_snapshot();
+        lx_sigsrc_t src;
+        int sig = lx_sig_dequeue_info(p, mask, &src);
         if (sig) {
             if (uinfo) {
                 uint8_t si[128];
                 memset(si, 0, sizeof(si));
-                *(int32_t *)si = sig;                     /* si_signo; errno/code 0 */
+                *(int32_t *)si = sig;                     /* si_signo */
+                memcpy(si + 8, &src.code, 4);             /* si_code */
+                memcpy(si + 16, &src.pid, 4);             /* si_pid */
+                memcpy(si + 20, &src.uid, 4);             /* si_uid */
+                if (sig == 17) memcpy(si + 24, &src.status, 4);   /* SIGCHLD si_status */
                 if (lx_put(uinfo, si, sizeof(si))) return -EFAULT;
             }
             return sig;
         }
-        if (has_to && ktime_expired(dl)) return -EAGAIN;
+        if (has_to && sys_wait_expired_us(dl)) return -EAGAIN;
         if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) return -EINTR;
         fork_release_pending(p);
-        thread_sleep(1);
+        kpoll_wait_us(snap, has_to ? dl : 0, 0);
     }
 }
 
@@ -2683,6 +2981,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         pr = sys_poll_kernel(pf, (unsigned)np, timeout_ms);
         lx_sigmask_leave(p, pr < 0 ? pr : 0, om, ms_set);
         if (pr < 0) return pr;
+        for (int i = 0; i < np; i++)
+            if (pf[i].revents & POLLNVAL) return -EBADF;   /* c18: Linux select */
         uint64_t rout = 0, wout = 0, eout = 0;
         int ready = 0;
         for (int i = 0; i < np; i++) {
@@ -2897,7 +3197,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (!lx_path_kind(path, NULL)) return -ENOENT;
         r = vfs_setattr(path, VFS_SA_MODE, mode & 07777, 0, 0);
         if (r != -ENOSYS) return r;
-        return lx_mode_set(path, mode);         /* FAT32/exFAT: in-memory table */
+        r = lx_mode_set(path, mode);            /* FAT32/exFAT: in-memory table */
+        if (r == 0) inotify_vfs_event(path, IN_ATTRIB);   /* Linux: any chmod */
+        return r;
     }
     case LX_chown: case LX_fchown: case LX_lchown: case LX_fchownat: {
         uint32_t uid, gid;
@@ -2920,7 +3222,11 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         if (lx_dev_path(path, NULL) || lx_proc_text_path(p, path)) return 0;
         if (!lx_path_kind(path, NULL) && !lx_synth_dir(path)) return -ENOENT;
         r = vfs_setattr(path, VFS_SA_OWNER, 0, uid, gid);
-        return r == -ENOSYS ? 0 : r;            /* FAT32/exFAT: accepted, not stored */
+        if (r == -ENOSYS) {                     /* FAT32/exFAT: accepted, not stored */
+            inotify_vfs_event(path, IN_ATTRIB);
+            r = 0;
+        }
+        return r;
     }
     case LX_utimensat: {
         /* BusyBox touch: utimensat first; on ENOENT it open(O_CREAT).
@@ -2949,7 +3255,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (tv[1] == OMIT) sa = false; else if (tv[1] != NOW) at = tv[0];
             if (tv[3] == OMIT) sm = false; else if (tv[3] != NOW) mt = tv[2];
         }
-        return lx_store_times(path, sa, at, sm, mt);
+        r = lx_store_times(path, sa, at, sm, mt);
+        if (r == 0 && (sa || sm)) inotify_vfs_event(path, IN_ATTRIB);
+        return r;
     }
     case LX_utime: case LX_utimes: case LX_futimesat: {
         /* FAT32 stores the times; other filesystems accept and ignore them.
@@ -2967,7 +3275,9 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (lx_get(v, ut, nr == LX_utime ? 2 * sizeof(int64_t) : sizeof(v))) return -EFAULT;
             if (nr == LX_utime) { at = v[0]; mt = v[1]; } else { at = v[0]; mt = v[2]; }
         }
-        return lx_store_times(path, true, at, true, mt);
+        r = lx_store_times(path, true, at, true, mt);
+        if (r == 0) inotify_vfs_event(path, IN_ATTRIB);
+        return r;
     }
     case LX_symlink: case LX_symlinkat: {
         /* tmpfs and ext4 store symlinks; FAT32/exFAT: EPERM like vfat. */

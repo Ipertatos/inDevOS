@@ -43,6 +43,7 @@
 #include "profiler.h"
 #include "rtc.h"             // rtc_read() for SYS_RTC_TIME
 #include "kernel_config.h"   // MAX_PROCESSES
+#include "kpoll.h"
 
 // External assembly functions
 extern void syscall_asm_handler(void);
@@ -335,6 +336,11 @@ static void handle_pending_signals(process_t *proc);
 static void process_orphan_children(process_t *proc);
 bool proc_signal_interrupts(process_t *p);
 void process_post_signal(process_t *t, int signum);
+void process_post_signal_info(process_t *t, int signum, uint32_t pid, uint32_t uid,
+                              int32_t code, int32_t status);
+void process_sig_info(process_t *t, int signum, uint32_t pid, uint32_t uid,
+                      int32_t code, int32_t status);
+void process_sigchld_post(process_t *child);
 int sys_getchar_intr(process_t *p);
 
 int process_deliver_signals(process_t *proc, void *linux_frame) {
@@ -479,8 +485,21 @@ static int fd_close_entry(process_t *proc, int fd) {
     }
     fde->ref_count = NULL;
 
+    if (should_free_object &&
+        (last_rc_key || (ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE))) {
+        /* c18: last reference to the object: drop it from every epoll set
+         * (Linux removes an epoll item when its file is released).  A pipe
+         * end without a refcount may still be open through another fd
+         * lineage; its items go once the pipe itself is freed (!active). */
+        extern void lx_epoll_forget(void *h, uint8_t type);
+        lx_epoll_forget(fde->file_handle, ty);
+    }
     if (should_free_object && ty != FD_TYPE_PIPE_READ && ty != FD_TYPE_PIPE_WRITE) {
-        if (ty == 8 /* FD_TYPE_EVENTFD */ || ty == 13 /* FD_TYPE_EPOLL */ ||
+        if (ty == 13 /* FD_TYPE_EPOLL */) {
+            extern void lx_epoll_free(void *h);
+            lx_epoll_free(fde->file_handle);
+            fde->file_handle = NULL;
+        } else if (ty == 8 /* FD_TYPE_EVENTFD */ ||
             ty == 14 /* FD_TYPE_TIMERFD */ || ty == 15 /* FD_TYPE_SIGNALFD */) {
             if (fde->file_handle) kfree(fde->file_handle);
         } else if (ty == 16 /* FD_TYPE_INOTIFY */) {
@@ -518,6 +537,8 @@ static int fd_close_entry(process_t *proc, int fd) {
     }
 
     free_fd(proc, fd);
+    if (should_free_object)
+        kpoll_wake();                   /* c18: hangups / removed epoll items */
     return 0;
 }
 
@@ -2202,7 +2223,7 @@ void process_fault_kill_current(int signum) {
     if (proc->parent && proc->parent->sched_thread)
         thread_wake((thread_t *)proc->parent->sched_thread);
     if (proc->parent)
-        proc->parent->pending_signals |= (1u << SIGCHLD);
+        process_sigchld_post(proc);
 }
 
 /* Exit-time child cleanup.  Zombie children of an exiting process were never
@@ -2349,7 +2370,7 @@ void fork_child_zombie_exit(int status) {
             }
         }
         if (proc->parent)
-            proc->parent->pending_signals |= (1u << SIGCHLD);
+            process_sigchld_post(proc);
     }
 
     /* This CPU hlt-loops — never SYSRET. Do NOT set_current_process(parent):
@@ -2924,10 +2945,13 @@ int sys_kill(pid_t pid, int signum) {
     }
     
     if (target == sender) {
+        process_sig_info(target, signum, sender->pid, sender->uid, 0 /* SI_USER */, 0);
         target->pending_signals |= (1 << signum);
+        kpoll_wake();
         handle_pending_signals(target);
     } else {
-        process_post_signal(target, signum);
+        process_post_signal_info(target, signum, sender ? sender->pid : 0,
+                                 sender ? sender->uid : 0, 0 /* SI_USER */, 0);
     }
     
     return 0;
@@ -3058,10 +3082,38 @@ static void process_kick_thread(thread_t *thr) {
     }
 }
 
-void process_post_signal(process_t *t, int signum) {
+/* c18: record who sent a standard signal (first sender wins while it is
+ * pending, like Linux's non-queued signals). */
+void process_sig_info(process_t *t, int signum, uint32_t pid, uint32_t uid,
+                      int32_t code, int32_t status) {
+    if (!t || signum < 1 || signum > 32) return;
+    if (__atomic_load_n(&t->pending_signals, __ATOMIC_ACQUIRE) & (1u << signum)) return;
+    t->sig_src_pid[signum] = pid;
+    t->sig_src_uid[signum] = uid;
+    t->sig_src_code[signum] = code;
+    t->sig_src_status[signum] = status;
+}
+void process_post_signal_info(process_t *t, int signum, uint32_t pid, uint32_t uid,
+                              int32_t code, int32_t status) {
     if (!t || signum < 1 || signum >= NSIG) return;
+    process_sig_info(t, signum, pid, uid, code, status);
     __atomic_or_fetch(&t->pending_signals, 1u << signum, __ATOMIC_SEQ_CST);
+    kpoll_wake();                       /* signalfd / sigtimedwait / EINTR */
     process_kick_thread(process_exec_thread(t));
+}
+void process_post_signal(process_t *t, int signum) {
+    process_post_signal_info(t, signum, 0, 0, 0x80 /* SI_KERNEL */, 0);
+}
+/* SIGCHLD for an exiting child: CLD_EXITED / CLD_KILLED + status + pid */
+void process_sigchld_post(process_t *child) {
+    process_t *par = child ? child->parent : NULL;
+    if (!par) return;
+    int raw = child->exit_status;
+    int32_t code = 1, st = raw & 0xff;               /* CLD_EXITED */
+    if (raw > 128 && raw < 128 + 32) { code = 2; st = raw - 128; }   /* CLD_KILLED */
+    process_sig_info(par, SIGCHLD, child->pid, child->uid, code, st);
+    __atomic_or_fetch(&par->pending_signals, 1u << SIGCHLD, __ATOMIC_SEQ_CST);
+    kpoll_wake();
 }
 
 /* ---- alarm()/setitimer(ITIMER_REAL) ----
@@ -3148,6 +3200,7 @@ void process_request_kill(process_t *t, int signum) {
     __atomic_compare_exchange_n(&t->kill_sig, &zero, signum, false,
                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     __atomic_or_fetch(&t->pending_signals, 1u << SIGKILL, __ATOMIC_SEQ_CST);
+    kpoll_wake();                       /* c18: kpoll waiters re-check kills */
     thread_t *thr = process_exec_thread(t);
     if (!thr)
         serial_printf("signal: kill PID %u (sig %d) has no thread yet; "
@@ -3920,9 +3973,198 @@ static int poll_copy_out(pollfd_t *dst, const pollfd_t *src, unsigned int nfds, 
     if (kbuf) { memcpy(dst, src, nfds * sizeof(pollfd_t)); return 0; }
     return copy_to_user(dst, src, nfds * sizeof(pollfd_t));
 }
+/* c18: readiness of one open object (poll, select and epoll share it).
+ * fd is the caller's fd number (stdin/stdout special cases) or -1.  Marks
+ * hint->nonevent for objects whose readiness changes without kpoll_wake()
+ * and records timerfd deadlines in hint->next_us. */
+short poll_eval_obj(process_t *proc, int fd, uint8_t type, void *h, short events,
+                    kpoll_hint_t *hint) {
+    short rev = 0;
+    kpoll_hint_t dummy;
+    if (!hint) hint = &dummy;
+    if (fd == STDIN_FILENO && (events & POLLIN) &&
+        (type == FD_TYPE_FILE || type == FD_TYPE_DEV_TTY))
+        hint->nonevent = true;                  /* console keyboard */
+    if ((events & POLLIN) && fd == STDIN_FILENO &&
+        keyboard_get_buffer_length() > 0) {
+        rev |= POLLIN;
+    } else if (type == FD_TYPE_PIPE_READ) {
+        pipe_t *rp = (pipe_t *)h;
+        if ((events & POLLIN) && rp && pipe_available(rp) > 0)
+            rev |= POLLIN;
+        /* Linux: all writers gone -> POLLHUP (reported even if not requested) */
+        if (rp && rp->writers == 0)
+            rev |= POLLHUP;
+    } else if (type == FD_TYPE_SOCKET) {
+        kernel_socket_t *ks = (kernel_socket_t *)h;
+        if (ks && ks->domain == 1 /* AF_UNIX */) {
+            extern int ux_poll(kernel_socket_t *s, int events);
+            rev |= (short)ux_poll(ks, events | 0x2000);
+            if (!(events & 0x2000)) rev &= ~0x2000;
+        } else if (ks && ks->type == SOCK_DGRAM) {
+            hint->nonevent = true;
+            udp_pcb_t *pcb = (udp_pcb_t *)ks->transport;
+            if ((events & POLLIN) && pcb && udp_pcb_rx_ready(pcb) > 0)
+                rev |= POLLIN;
+            if (events & (POLLOUT | 0x0100)) {
+                rev |= POLLOUT;
+                if (events & 0x0100) rev |= 0x0100;
+            }
+        } else {
+            hint->nonevent = true;
+            tcp_socket_t *ts = ks ? (tcp_socket_t *)ks->transport : NULL;
+            tcp_connection_t *conn = ts ? ts->connection : NULL;
+            extern bool tcp_conn_at_eof(tcp_connection_t *c);
+            /* c13: a nonblocking connect completes on the state
+             * change, whichever events the caller polls for */
+            if (ks && !ks->listening && conn && conn->state >= TCP_STATE_ESTABLISHED)
+                ks->connected = true;
+            if (ks && ts && !ks->listening && !ks->connected && ks->remote_port &&
+                (!conn || conn->state == TCP_STATE_CLOSED)) {
+                /* connect failed (RST / refused / timed out): Linux
+                 * reports POLLERR|POLLHUP even if not requested, plus
+                 * the readable/writable bits so select() wakes */
+                rev |= POLLERR | POLLHUP | (events & (POLLIN | POLLOUT | 0x0100));
+            } else if ((events & POLLIN) && ks && ks->listening && ts) {
+                if (tcp_socket_accept_ready(ts)) rev |= POLLIN;
+            } else if ((events & POLLIN) && conn && conn->recv_buffer_used > 0) {
+                rev |= POLLIN;
+                /* c18: EOF behind the data still reports RDHUP */
+                if ((events & 0x2000) && ks->connected && tcp_conn_at_eof(conn))
+                    rev |= 0x2000;
+            } else if (conn && ks->connected && tcp_conn_at_eof(conn)) {
+                /* peer closed: readable (read returns 0); hung up unless
+                 * only the peer's half is closed (we may still write) */
+                rev |= POLLIN | (events & 0x2000 /* POLLRDHUP */);
+                if (conn->state != TCP_STATE_CLOSE_WAIT) rev |= POLLHUP;
+            }
+            if (events & (POLLOUT | 0x0100 /* POLLWRNORM */)) {
+                if (conn && (conn->state == TCP_STATE_ESTABLISHED ||
+                             conn->state == TCP_STATE_CLOSE_WAIT) && !ks->listening) {
+                    rev |= POLLOUT;
+                    if (events & 0x0100) rev |= 0x0100;
+                    ks->connected = true;
+                } else if (ts && (!conn || conn->state == TCP_STATE_CLOSED) &&
+                           !(rev & POLLERR)) {
+                    /* closed after being connected */
+                    rev |= POLLOUT | POLLERR | POLLHUP;
+                }
+            }
+        }
+    }
+    switch (type) {
+    case 8: {   /* FD_TYPE_EVENTFD */
+        extern short lx_eventfd_poll(void *h, short events);
+        rev |= lx_eventfd_poll(h, events);
+        break;
+    }
+    case 13: {  /* FD_TYPE_EPOLL: readable while it has events to report */
+        extern short lx_epoll_poll(void *h, process_t *proc, short events, kpoll_hint_t *hint);
+        rev |= lx_epoll_poll(h, proc, events, hint);
+        break;
+    }
+    case 16: {  /* FD_TYPE_INOTIFY */
+        extern bool inotify_ready(void *h);
+        if ((events & (POLLIN | 0x0040)) && inotify_ready(h))
+            rev |= events & (POLLIN | 0x0040);
+        break;
+    }
+    case 14: {  /* FD_TYPE_TIMERFD */
+        extern bool lx_timerfd_ready_hint(void *h, uint64_t *next_us);
+        uint64_t nx = 0;
+        if (lx_timerfd_ready_hint(h, &nx)) rev |= events & (POLLIN | 0x0040);
+        kpoll_hint_timer(hint, nx);     /* also when ready: EPOLLET waits for the next */
+        break;
+    }
+    case 15: {  /* FD_TYPE_SIGNALFD */
+        extern bool lx_signalfd_ready(void *h, process_t *proc);
+        if ((events & (POLLIN | 0x0040)) && lx_signalfd_ready(h, proc))
+            rev |= events & (POLLIN | 0x0040);
+        break;
+    }
+    case 10: {  /* FD_TYPE_DEV_INPUT */
+        extern bool evdev_poll_ready(void *handle, bool *hup);
+        bool hup = false;
+        hint->nonevent = true;
+        if (evdev_poll_ready(h, &hup)) {
+            if (events & POLLIN) rev |= POLLIN;
+            if (hup) rev |= POLLHUP | POLLERR;
+        }
+        break;
+    }
+    case 11:    /* FD_TYPE_DEV_UINPUT: writable */
+        rev |= events & POLLOUT;
+        hint->nonevent = true;
+        break;
+    case 9:     /* FD_TYPE_DEV_FB: always ready */
+        rev |= events & (POLLIN | POLLOUT);
+        break;
+    case 12: {  /* FD_TYPE_DEV_WM */
+        extern bool wm_dev_poll_ready(void *handle);
+        hint->nonevent = true;
+        if ((events & POLLIN) && wm_dev_poll_ready(h))
+            rev |= POLLIN;
+        rev |= events & POLLOUT;
+        break;
+    }
+    case FD_TYPE_PIPE_WRITE: {
+        pipe_t *wp = (pipe_t *)h;
+        if (wp && wp->readers == 0)
+            rev |= POLLERR;
+        else if (!wp || wp->count < wp->buf_size)
+            rev |= events & (POLLOUT | 0x0100);
+        break;
+    }
+    case FD_TYPE_VFS:
+    case FD_TYPE_DEV_NULL:
+        /* c18: regular files and /dev/null-like nodes never block (Linux) */
+        rev |= events & (POLLIN | POLLOUT | 0x0040 | 0x0100);
+        break;
+    case FD_TYPE_PIPE_READ:
+    case FD_TYPE_SOCKET:
+        break;
+    case FD_TYPE_DEV_TTY:
+        rev |= events & (POLLOUT | 0x0100);     /* console output never blocks */
+        hint->nonevent = true;
+        break;
+    default:
+        hint->nonevent = true;                  /* ttys / unknown objects */
+        break;
+    }
+    if ((events & POLLOUT) && fd >= 1 && fd <= 2)
+        rev |= POLLOUT;
+    return rev;
+}
+
+/* c18: one event wait step (see kpoll.h).  Sleeps until kpoll_wake() after
+ * snap, capped so a missed wakeup source costs latency, never a hang. */
+#define KPOLL_CAP_MS 200
+void kpoll_wait_us(uint32_t snap, uint64_t dl_us, uint64_t tmr_us) {
+    uint64_t dl = dl_us;
+    if (tmr_us && (!dl || tmr_us < dl)) dl = tmr_us;
+    if (!global_scheduler.scheduler_running) {
+        sys_wait_step_us(dl);
+        return;
+    }
+    uint64_t ms = KPOLL_CAP_MS;
+    if (dl) {
+        uint64_t now = ktime_now_us();
+        if (now >= dl) return;
+        uint64_t left = dl - now;
+        if (left <= 2500) {
+            sys_wait_inplace_us(dl, true);
+            return;
+        }
+        /* the sleep sweep runs every few ms: wake early, finish in place */
+        uint64_t m = left >= 6000 ? left / 1000 - 4 : 1;
+        if (m < ms) ms = m;
+    }
+    kpoll_sleep_ms(snap, ms);
+}
+
 static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool kbuf) {
     syscall_uaccess_ensure_user_cr3();
-    if (nfds > 64)
+    if (nfds > 1024)                    /* c18: RLIMIT_NOFILE default (was 64) */
         return -EINVAL;
     /* poll(NULL, 0, t) is a portable t-ms sleep: only validate fds if used */
     if (nfds > 0 && (!fds ||
@@ -3932,147 +4174,48 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
     uint64_t deadline = sys_wait_deadline_us(
         (timeout_ms >= 0 ? (uint64_t)timeout_ms : 60000ull) * 1000ull);
 
-    pollfd_t kfds[64];
+    pollfd_t kfds_stack[64];
+    pollfd_t *kfds = kfds_stack;
+    if (nfds > 64) {
+        kfds = (pollfd_t *)kalloc(nfds * sizeof(pollfd_t));
+        if (!kfds) return -ENOMEM;
+    }
+    int ret = 0;
     if (nfds == 0)
         ;
     else if (kbuf)
         memcpy(kfds, fds, nfds * sizeof(pollfd_t));
-    else if (copy_from_user(kfds, fds, nfds * sizeof(pollfd_t)) != 0)
-        return -EFAULT;
+    else if (copy_from_user(kfds, fds, nfds * sizeof(pollfd_t)) != 0) {
+        ret = -EFAULT;
+        goto out;
+    }
 
     process_t *proc = get_current_process();
     /* Always evaluate readiness at least once. timeout==0 must not skip the
      * check (ktime_deadline_ms(0)==now makes while(!expired) never enter). */
     for (;;) {
         poll_network_once();  /* advance TCP handshakes before checking readiness */
+        uint32_t snap = kpoll_snapshot();      /* before any readiness check */
+        kpoll_hint_t hint = { false, 0 };
         int cnt = 0;
         for (unsigned i = 0; i < nfds; i++) {
             kfds[i].revents = 0;
             int fd = kfds[i].fd;
             if (fd < 0)
                 continue;
-            if ((kfds[i].events & POLLIN) && fd == STDIN_FILENO &&
-                keyboard_get_buffer_length() > 0) {
-                kfds[i].revents |= POLLIN;
-            } else if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
-                       proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_PIPE_READ) {
-                pipe_t *rp = (pipe_t *)proc->fds[fd].file_handle;
-                if ((kfds[i].events & POLLIN) && rp && pipe_available(rp) > 0)
-                    kfds[i].revents |= POLLIN;
-                /* Linux: all writers gone -> POLLHUP (reported even if not requested) */
-                if (rp && rp->writers == 0)
-                    kfds[i].revents |= POLLHUP;
-            } else if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL &&
-                       proc->fds[fd].in_use && proc->fds[fd].fd_type == FD_TYPE_SOCKET) {
-                kernel_socket_t *ks = (kernel_socket_t *)proc->fds[fd].file_handle;
-                if (ks && ks->domain == 1 /* AF_UNIX */) {
-                    extern int ux_poll(kernel_socket_t *s, int events);
-                    kfds[i].revents |= (short)ux_poll(ks, kfds[i].events | 0x2000);
-                    if (!(kfds[i].events & 0x2000)) kfds[i].revents &= ~0x2000;
-                } else if (ks && ks->type == SOCK_DGRAM) {
-                    udp_pcb_t *pcb = (udp_pcb_t *)ks->transport;
-                    if ((kfds[i].events & POLLIN) && pcb && udp_pcb_rx_ready(pcb) > 0)
-                        kfds[i].revents |= POLLIN;
-                    if (kfds[i].events & (POLLOUT | 0x0100)) {
-                        kfds[i].revents |= POLLOUT;
-                        if (kfds[i].events & 0x0100) kfds[i].revents |= 0x0100;
-                    }
-                } else {
-                    tcp_socket_t *ts = ks ? (tcp_socket_t *)ks->transport : NULL;
-                    tcp_connection_t *conn = ts ? ts->connection : NULL;
-                    extern bool tcp_conn_at_eof(tcp_connection_t *c);
-                    /* c13: a nonblocking connect completes on the state
-                     * change, whichever events the caller polls for */
-                    if (ks && !ks->listening && conn && conn->state >= TCP_STATE_ESTABLISHED)
-                        ks->connected = true;
-                    if (ks && ts && !ks->listening && !ks->connected && ks->remote_port &&
-                        (!conn || conn->state == TCP_STATE_CLOSED)) {
-                        /* connect failed (RST / refused / timed out): Linux
-                         * reports POLLERR|POLLHUP even if not requested, plus
-                         * the readable/writable bits so select() wakes */
-                        kfds[i].revents |= POLLERR | POLLHUP |
-                            (kfds[i].events & (POLLIN | POLLOUT | 0x0100));
-                    } else if ((kfds[i].events & POLLIN) && ks && ks->listening && ts) {
-                        if (tcp_socket_accept_ready(ts)) kfds[i].revents |= POLLIN;
-                    } else if ((kfds[i].events & POLLIN) && conn && conn->recv_buffer_used > 0) {
-                        kfds[i].revents |= POLLIN;
-                    } else if (conn && ks->connected && tcp_conn_at_eof(conn)) {
-                        /* peer closed: readable (read returns 0); hung up unless
-                         * only the peer's half is closed (we may still write) */
-                        kfds[i].revents |= POLLIN;
-                        if (conn->state != TCP_STATE_CLOSE_WAIT) kfds[i].revents |= POLLHUP;
-                        else kfds[i].revents |= kfds[i].events & 0x2000 /* POLLRDHUP */;
-                    }
-                    if (kfds[i].events & (POLLOUT | 0x0100 /* POLLWRNORM */)) {
-                        if (conn && (conn->state == TCP_STATE_ESTABLISHED ||
-                                     conn->state == TCP_STATE_CLOSE_WAIT) && !ks->listening) {
-                            kfds[i].revents |= POLLOUT;
-                            if (kfds[i].events & 0x0100) kfds[i].revents |= 0x0100;
-                            ks->connected = true;
-                        } else if (ts && (!conn || conn->state == TCP_STATE_CLOSED) &&
-                                   !(kfds[i].revents & POLLERR)) {
-                            /* closed after being connected */
-                            kfds[i].revents |= POLLOUT | POLLERR | POLLHUP;
-                        }
-                    }
-                }
+            bool open = fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use;
+            if (!open && fd > 2) {
+                kfds[i].revents = POLLNVAL;    /* c18: Linux reports closed fds */
+                cnt++;
+                continue;
             }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 8 /* FD_TYPE_EVENTFD */) {
-                uint64_t v = *(volatile uint64_t *)proc->fds[fd].file_handle;
-                if ((kfds[i].events & POLLIN) && v) kfds[i].revents |= POLLIN;
-                if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
-            }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 16 /* FD_TYPE_INOTIFY */) {
-                extern bool inotify_ready(void *h);
-                if ((kfds[i].events & (POLLIN | 0x0040)) && inotify_ready(proc->fds[fd].file_handle))
-                    kfds[i].revents |= kfds[i].events & (POLLIN | 0x0040);
-            }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 14 /* FD_TYPE_TIMERFD */) {
-                extern bool lx_timerfd_ready(void *h);
-                if ((kfds[i].events & POLLIN) && lx_timerfd_ready(proc->fds[fd].file_handle))
-                    kfds[i].revents |= POLLIN;
-            }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 15 /* FD_TYPE_SIGNALFD */) {
-                extern bool lx_signalfd_ready(void *h, process_t *proc);
-                if ((kfds[i].events & POLLIN) && lx_signalfd_ready(proc->fds[fd].file_handle, proc))
-                    kfds[i].revents |= POLLIN;
-            }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 10 /* FD_TYPE_DEV_INPUT */) {
-                extern bool evdev_poll_ready(void *handle, bool *hup);
-                bool hup = false;
-                if (evdev_poll_ready(proc->fds[fd].file_handle, &hup)) {
-                    if (kfds[i].events & POLLIN) kfds[i].revents |= POLLIN;
-                    if (hup) kfds[i].revents |= POLLHUP | POLLERR;
-                }
-            }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 11 /* FD_TYPE_DEV_UINPUT: writable */)
-                kfds[i].revents |= kfds[i].events & POLLOUT;
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 9 /* FD_TYPE_DEV_FB: always ready */)
-                kfds[i].revents |= kfds[i].events & (POLLIN | POLLOUT);
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == 12 /* FD_TYPE_DEV_WM */) {
-                extern bool wm_dev_poll_ready(void *handle);
-                if ((kfds[i].events & POLLIN) && wm_dev_poll_ready(proc->fds[fd].file_handle))
-                    kfds[i].revents |= POLLIN;
-                kfds[i].revents |= kfds[i].events & POLLOUT;
-            }
-            if (fd >= 0 && fd < MAX_OPEN_FILES_SYSCALL && proc->fds[fd].in_use &&
-                proc->fds[fd].fd_type == FD_TYPE_PIPE_WRITE) {
-                pipe_t *wp = (pipe_t *)proc->fds[fd].file_handle;
-                if (wp && wp->readers == 0)
-                    kfds[i].revents |= POLLERR;
-                else if (!wp || wp->count < wp->buf_size)
-                    kfds[i].revents |= kfds[i].events & POLLOUT;
-            }
-            if ((kfds[i].events & POLLOUT) && fd >= 1 && fd <= 2)
-                kfds[i].revents |= POLLOUT;
+            if (open)
+                kfds[i].revents = poll_eval_obj(proc, fd, proc->fds[fd].fd_type,
+                                                proc->fds[fd].file_handle,
+                                                kfds[i].events, &hint);
+            else
+                kfds[i].revents = poll_eval_obj(proc, fd, FD_TYPE_FILE, NULL,
+                                                kfds[i].events, &hint);
             /* POSIX: return value is the number of fds with nonzero revents */
             if (kfds[i].revents)
                 cnt++;
@@ -4087,32 +4230,46 @@ static int sys_poll_impl(pollfd_t *fds, unsigned int nfds, int timeout_ms, bool 
         }
         if (cnt > 0) {
             if (poll_copy_out(fds, kfds, nfds, kbuf) != 0)
-                return -EFAULT;
-            return cnt;
+                ret = -EFAULT;
+            else
+                ret = cnt;
+            goto out;
         }
         if (timeout_ms == 0)
             break;  /* one-shot: report no ready fds */
         if (timeout_ms > 0 && sys_wait_expired_us(deadline))
             break;
-        if (proc_kill_pending(get_current_process()))
-            return -EINTR;
-        if (proc && proc->linux_abi && proc_signal_interrupts(proc))
-            return -EINTR;            /* SIGALRM / handled signal: EINTR */
+        if (proc_kill_pending(get_current_process())) {
+            ret = -EINTR;
+            goto out;
+        }
+        if (proc && proc->linux_abi && proc_signal_interrupts(proc)) {
+            ret = -EINTR;             /* SIGALRM / handled signal: EINTR */
+            goto out;
+        }
         fork_release_pending(proc);   /* about to sleep: let held kids run */
         {   /* sync /dev/wm client waiting: kmain is blocked, pump for it */
             extern bool exec_current_is_sync_program(void);
             extern bool wm_dev_pid_connected(uint32_t pid);
             extern void desktop_sync_pump(void);
-            if (proc && exec_current_is_sync_program() && wm_dev_pid_connected(proc->pid))
+            if (proc && exec_current_is_sync_program() && wm_dev_pid_connected(proc->pid)) {
                 desktop_sync_pump();
+                hint.nonevent = true;
+            }
         }
-        sys_wait_step_us(deadline);
+        if (hint.nonevent)
+            sys_wait_step_us(timeout_ms > 0 ? deadline : 0);
+        else
+            kpoll_wait_us(snap, timeout_ms > 0 ? deadline : 0, hint.next_us);
         if (timeout_ms > 0 && sys_wait_expired_us(deadline))
             break;
     }
     if (nfds > 0 && poll_copy_out(fds, kfds, nfds, kbuf) != 0)
-        return -EFAULT;
-    return 0;
+        ret = -EFAULT;
+out:
+    if (kfds != kfds_stack)
+        kfree(kfds);
+    return ret;
 }
 
 int sys_getppid(void) {

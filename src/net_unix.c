@@ -90,6 +90,7 @@ extern bool proc_kill_pending(process_t *p);
 extern long lx_unix_parse_addr(process_t *p, const void *uaddr, uint32_t alen,
                                char *out, int *outlen);
 
+#include "kpoll.h"
 static inline ux_ep_t *UX(kernel_socket_t *s) { return (ux_ep_t *)s->transport; }
 /* lock held: name to report to user space */
 static int ux_dn(const ux_ep_t *e, char *out) {
@@ -160,6 +161,7 @@ static void ux_destroy(ux_ep_t *e) {
     klock(&ux_lock);
     ux_detach_locked(e, &msgs, pend, &npend);
     kunlock(&ux_lock);
+    kpoll_wake();                       /* c18: peers see HUP/EOF */
     while (msgs) { ux_msg_t *n = msgs->next; ux_msg_free(msgs); msgs = n; }
     for (int i = 0; i < npend; i++) ux_destroy(pend[i]);
     kfree(e);
@@ -378,6 +380,7 @@ long ux_connect(process_t *p, int fd, kernel_socket_t *s, const void *uaddr, uin
             t->bl[t->nbl++] = srv;
             t->in_gen++;
             kunlock(&ux_lock);
+            kpoll_wake();                   /* c18: listener readable */
             s->connected = true;
             return 0;
         }
@@ -463,6 +466,7 @@ long ux_shutdown(kernel_socket_t *s, int how) {
         if (e->peer && e->type != UX_DGRAM) e->peer->rd_eof = true;
     }
     kunlock(&ux_lock);
+    kpoll_wake();                       /* c18: RDHUP / HUP */
     return 0;
 }
 
@@ -673,6 +677,7 @@ long ux_sendmsg(process_t *p, int fd, kernel_socket_t *s, const ux_iov_t *iov, i
                 t->rx_count++;
                 t->in_gen++;
                 kunlock(&ux_lock);
+                kpoll_wake();               /* c18: peer readable */
                 break;
             }
             kunlock(&ux_lock);
@@ -777,6 +782,7 @@ long ux_recvmsg(process_t *p, int fd, kernel_socket_t *s, const ux_iov_t *iov, i
             }
             if (!peek && got && e->peer) e->peer->out_gen++;   /* room for the sender */
             kunlock(&ux_lock);
+            if (!peek && got) kpoll_wake();   /* c18: sender writable */
             r = msgmode ? (long)got : (long)got;
             break;
         }

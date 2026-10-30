@@ -3242,6 +3242,411 @@ static int t_fs_sendfile_cfr(char *d, size_t n) {
     CHECK(g == SZ - 1000 && !memcmp(a + 1000, b, SZ - 1000), "copy_file_range data mismatch (read %ld)", (long)g);
     R(PASS, "sendfile %d B + copy_file_range %d B (off_in ptr) byte-exact", SZ, SZ - 1000);
 }
+/* ===================== c18: event-loop primitives ===================== */
+/* eventfd.semantics: EFD_SEMAPHORE, flag validation, overflow (EAGAIN /
+ * POLLOUT), ~0 rejected, blocking read woken by another process. */
+static int t_efd_sem(char *d, size_t n) {
+    extern int eventfd(unsigned int, int);
+    errno = 0; CHECK(eventfd(0, 0x40) < 0 && errno == EINVAL, "bad flags errno %d", errno);
+    int e = eventfd(3, EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC); CHECKE(e >= 0, "eventfd sem");
+    CHECK(fcntl(e, F_GETFD) & FD_CLOEXEC, "EFD_CLOEXEC not set");
+    uint64_t v = 0; int k = 0;
+    while (read(e, &v, 8) == 8) { CHECK(v == 1, "semaphore read %llu", (unsigned long long)v); k++; }
+    CHECK(k == 3 && errno == EAGAIN, "semaphore reads %d errno %d", k, errno);
+    close(e);
+    e = eventfd(0, EFD_NONBLOCK); CHECKE(e >= 0, "eventfd");
+    v = ~0ULL; errno = 0; CHECK(write(e, &v, 8) < 0 && errno == EINVAL, "write ~0 errno %d", errno);
+    v = 0xfffffffffffffffeULL; CHECK(write(e, &v, 8) == 8, "write max");
+    struct pollfd pf = { e, POLLIN | POLLOUT, 0 };
+    CHECK(poll(&pf, 1, 0) == 1 && pf.revents == POLLIN, "poll at max revents 0x%x", pf.revents);
+    v = 1; errno = 0; CHECK(write(e, &v, 8) < 0 && errno == EAGAIN, "overflow errno %d", errno);
+    v = 0; CHECK(write(e, &v, 8) == 8, "write 0 at max");
+    CHECK(read(e, &v, 8) == 8 && v == 0xfffffffffffffffeULL, "read max %llx", (unsigned long long)v);
+    CHECK(poll(&pf, 1, 0) == 1 && pf.revents == POLLOUT, "poll empty revents 0x%x", pf.revents);
+    errno = 0; CHECK(read(e, &v, 4) < 0 && errno == EINVAL, "short read errno %d", errno);
+    close(e);
+    /* blocking read + blocking write (overflow) woken by another process */
+    e = eventfd(0, 0); CHECKE(e >= 0, "eventfd blocking");
+    pid_t c = fork(); if (c == 0) { msleep(80); uint64_t w = 9; write(e, &w, 8); _exit(0); }
+    long long t0 = mono_ms(); v = 0; ssize_t r = read(e, &v, 8); long long el = mono_ms() - t0;
+    waitpid(c, NULL, 0);
+    CHECK(r == 8 && v == 9 && el >= 40 && el < 1500, "blocking read %zd v=%llu %lldms", r, (unsigned long long)v, el);
+    v = 0xfffffffffffffffeULL; write(e, &v, 8);
+    c = fork(); if (c == 0) { msleep(80); uint64_t w; read(e, &w, 8); _exit(0); }
+    t0 = mono_ms(); v = 5; r = write(e, &v, 8); long long el2 = mono_ms() - t0;
+    waitpid(c, NULL, 0);
+    CHECK(r == 8 && el2 >= 40 && el2 < 1500, "blocking overflow write %zd %lldms", r, el2);
+    CHECK(read(e, &v, 8) == 8 && v == 5, "after overflow wait %llu", (unsigned long long)v);
+    close(e);
+    R(PASS, "semaphore, EINVAL, overflow EAGAIN/POLLOUT, blocking read %lldms / write %lldms", el, el2);
+}
+/* epoll.nested: an epoll fd inside another epoll set, poll() on an epoll
+ * fd, loops and too-deep chains -> ELOOP, EPOLLEXCLUSIVE errno rules. */
+static int t_ep_nested(char *d, size_t n) {
+    int in = epoll_create1(0), out = epoll_create1(0); if (in < 0 || out < 0) R(SKIP, "epoll_create1");
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = 1 }, o[4];
+    CHECKE(epoll_ctl(in, EPOLL_CTL_ADD, pf[0], &ev) == 0, "inner ADD pipe");
+    ev.data.u32 = 2;
+    CHECKE(epoll_ctl(out, EPOLL_CTL_ADD, in, &ev) == 0, "outer ADD inner epoll");
+    struct pollfd pp = { in, POLLIN, 0 };
+    CHECK(poll(&pp, 1, 0) == 0 && epoll_wait(out, o, 4, 0) == 0, "nested ready with no data");
+    pid_t c = fork(); if (c == 0) { msleep(80); write(pf[1], "x", 1); _exit(0); }
+    long long t0 = mono_ms(); int r = epoll_wait(out, o, 4, 2000); long long el = mono_ms() - t0;
+    waitpid(c, NULL, 0);
+    CHECK(r == 1 && o[0].data.u32 == 2 && (o[0].events & EPOLLIN) && el >= 40 && el < 1500, "outer wake r=%d %lldms", r, el);
+    CHECK(poll(&pp, 1, 0) == 1 && (pp.revents & POLLIN), "poll(inner epoll) 0x%x", pp.revents);
+    fd_set rs; FD_ZERO(&rs); FD_SET(in, &rs); struct timeval tv = { 0, 0 };
+    CHECK(select(in + 1, &rs, NULL, NULL, &tv) == 1, "select(inner epoll)");
+    r = epoll_wait(in, o, 4, 0); CHECK(r == 1 && o[0].data.u32 == 1, "inner still reports r=%d", r);
+    char b[4]; read(pf[0], b, sizeof b);
+    CHECK(epoll_wait(out, o, 4, 0) == 0, "outer ready after drain");
+    /* loop: in watching out */
+    errno = 0; CHECK(epoll_ctl(in, EPOLL_CTL_ADD, out, &ev) < 0 && errno == ELOOP, "loop ADD errno %d", errno);
+    /* chain e[0] <- e[1] <- ... : Linux allows 5 levels (EP_MAX_NESTS 4) */
+    int e[8], depth_ok = 0, er = 0; for (int i = 0; i < 8; i++) e[i] = epoll_create1(0);
+    for (int i = 1; i < 8; i++) {
+        errno = 0;
+        if (epoll_ctl(e[i], EPOLL_CTL_ADD, e[i - 1], &ev) == 0) depth_ok = i; else { er = errno; break; }
+    }
+    for (int i = 0; i < 8; i++) close(e[i]);
+    CHECK(depth_ok == 4 && er == ELOOP, "chain depth %d errno %d (want 4/ELOOP)", depth_ok, er);
+    /* EPOLLEXCLUSIVE */
+    int x = epoll_create1(0);
+    struct epoll_event xe = { .events = EPOLLIN | EPOLLEXCLUSIVE, .data.u32 = 5 };
+    CHECKE(epoll_ctl(x, EPOLL_CTL_ADD, pf[0], &xe) == 0, "ADD EXCLUSIVE");
+    errno = 0; CHECK(epoll_ctl(x, EPOLL_CTL_MOD, pf[0], &xe) < 0 && errno == EINVAL, "MOD with EXCLUSIVE errno %d", errno);
+    struct epoll_event me = { .events = EPOLLIN };
+    errno = 0; CHECK(epoll_ctl(x, EPOLL_CTL_MOD, pf[0], &me) < 0 && errno == EINVAL, "MOD of EXCLUSIVE item errno %d", errno);
+    struct epoll_event oe = { .events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLONESHOT };
+    errno = 0; CHECK(epoll_ctl(x, EPOLL_CTL_ADD, pf[1], &oe) < 0 && errno == EINVAL, "EXCLUSIVE|ONESHOT errno %d", errno);
+    errno = 0; CHECK(epoll_ctl(x, EPOLL_CTL_ADD, in, &xe) < 0 && errno == EINVAL, "EXCLUSIVE on epoll fd errno %d", errno);
+    write(pf[1], "y", 1);
+    CHECK(epoll_wait(x, o, 4, 0) == 1 && o[0].data.u32 == 5, "EXCLUSIVE item reports");
+    CHECKE(epoll_ctl(x, EPOLL_CTL_DEL, pf[0], NULL) == 0, "DEL EXCLUSIVE");
+    close(x); close(pf[0]); close(pf[1]);
+    /* closing the inner epoll removes it from the outer set */
+    close(in);
+    CHECK(epoll_wait(out, o, 4, 0) == 0, "closed inner epoll still reported");
+    close(out);
+    R(PASS, "nested wake %lldms, poll/select on epfd, ELOOP loop + depth 4, EXCLUSIVE rules", el);
+}
+/* epoll.lifetime: an item lives as long as its file (dup keeps it), goes on
+ * the last close; HUP / RDHUP / ERR reporting on pipes and socketpairs. */
+static int t_ep_life(char *d, size_t n) {
+    int ep = epoll_create1(0); if (ep < 0) R(SKIP, "epoll_create1");
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe");
+    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = 11 }, o[4];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) == 0, "ADD");
+    int dd = dup(pf[0]); CHECKE(dd >= 0, "dup");
+    close(pf[0]);
+    write(pf[1], "a", 1);
+    int r = epoll_wait(ep, o, 4, 0);
+    CHECK(r == 1 && o[0].data.u32 == 11, "item gone while dup open r=%d", r);
+    errno = 0; CHECK(epoll_ctl(ep, EPOLL_CTL_DEL, pf[0], NULL) < 0 && errno == EBADF, "DEL closed fd errno %d", errno);
+    close(dd);
+    CHECK(epoll_wait(ep, o, 4, 0) == 0, "item survived last close");
+    /* same fd number reused by a new pipe: new item, no EEXIST */
+    int p2[2]; CHECKE(pipe(p2) == 0, "pipe2");
+    ev.data.u32 = 12;
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, p2[0], &ev) == 0, "ADD reused fd number");
+    /* writer closes -> EPOLLHUP on the read end (always reported) */
+    close(pf[1]);
+    write(p2[1], "b", 1); close(p2[1]);
+    r = epoll_wait(ep, o, 4, 0);
+    CHECK(r == 1 && o[0].data.u32 == 12 && (o[0].events & EPOLLIN) && (o[0].events & EPOLLHUP), "HUP r=%d ev 0x%x", r, r > 0 ? o[0].events : 0);
+    close(p2[0]);
+    /* reader closed -> EPOLLERR on the write end */
+    int p3[2]; CHECKE(pipe(p3) == 0, "pipe3");
+    struct epoll_event we = { .events = EPOLLOUT, .data.u32 = 13 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, p3[1], &we) == 0, "ADD write end");
+    close(p3[0]);
+    r = epoll_wait(ep, o, 4, 0);
+    CHECK(r == 1 && (o[0].events & EPOLLERR), "ERR r=%d ev 0x%x", r, r > 0 ? o[0].events : 0);
+    close(p3[1]);
+    /* socketpair: peer shutdown(SHUT_WR) -> EPOLLRDHUP | EPOLLIN */
+    int sv[2]; CHECKE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    struct epoll_event se = { .events = EPOLLIN | EPOLLRDHUP | EPOLLET, .data.u32 = 14 };
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &se) == 0, "ADD sock");
+    CHECK(epoll_wait(ep, o, 4, 0) == 0, "sock ready early");
+    pid_t c = fork(); if (c == 0) { msleep(60); shutdown(sv[1], SHUT_WR); _exit(0); }
+    long long t0 = mono_ms(); r = epoll_wait(ep, o, 4, 2000); long long el = mono_ms() - t0;
+    waitpid(c, NULL, 0);
+    CHECK(r == 1 && (o[0].events & EPOLLRDHUP) && (o[0].events & EPOLLIN), "RDHUP r=%d ev 0x%x %lldms", r, r > 0 ? o[0].events : 0, el);
+    CHECK(epoll_wait(ep, o, 4, 0) == 0, "ET RDHUP repeated");
+    close(sv[1]);
+    r = epoll_wait(ep, o, 4, 0);
+    CHECK(r == 1 && (o[0].events & EPOLLHUP), "HUP after peer close r=%d ev 0x%x", r, r > 0 ? o[0].events : 0);
+    close(sv[0]); close(ep);
+    R(PASS, "dup keeps item, last close drops it, fd reuse, HUP/ERR, RDHUP %lldms", el);
+}
+/* epoll.threads: a pthread blocked in epoll_wait is woken by an eventfd
+ * write, by EPOLL_CTL_ADD of an already-ready fd from another thread, and
+ * by EPOLL_CTL_MOD re-arming a ONESHOT item. */
+static int ept_ep, ept_res[3]; static long long ept_ms[3];
+static void *ept_waiter(void *a) {
+    struct epoll_event o[4];
+    for (int i = 0; i < 3; i++) {
+        long long t0 = mono_ms();
+        int r = epoll_wait(ept_ep, o, 4, 3000);
+        ept_ms[i] = mono_ms() - t0;
+        ept_res[i] = r == 1 ? (int)o[0].data.u32 : -100 - r;
+        if (r == 1 && o[0].data.u32 == 1) { uint64_t v; read((int)(o[0].data.u64 >> 32), &v, 8); }
+    }
+    return NULL;
+}
+static int t_ep_threads(char *d, size_t n) {
+    extern int eventfd(unsigned int, int);
+    ept_ep = epoll_create1(0); if (ept_ep < 0) R(SKIP, "epoll_create1");
+    int e = eventfd(0, EFD_NONBLOCK); CHECKE(e >= 0, "eventfd");
+    struct epoll_event ev = { .events = EPOLLIN }; ev.data.u64 = ((uint64_t)e << 32) | 1;
+    CHECKE(epoll_ctl(ept_ep, EPOLL_CTL_ADD, e, &ev) == 0, "ADD eventfd");
+    int pf[2]; CHECKE(pipe(pf) == 0, "pipe"); write(pf[1], "z", 1);     /* ready */
+    pthread_t th; if (pthread_create(&th, NULL, ept_waiter, NULL)) R(SKIP, "pthread_create failed");
+    msleep(80); uint64_t one = 1; write(e, &one, 8);
+    msleep(80);
+    struct epoll_event pe = { .events = EPOLLIN | EPOLLONESHOT, .data.u32 = 2 };
+    CHECKE(epoll_ctl(ept_ep, EPOLL_CTL_ADD, pf[0], &pe) == 0, "ADD ready pipe while waiting");
+    msleep(80);
+    pe.data.u32 = 3;
+    CHECKE(epoll_ctl(ept_ep, EPOLL_CTL_MOD, pf[0], &pe) == 0, "MOD re-arm while waiting");
+    pthread_join(th, NULL);
+    close(pf[0]); close(pf[1]); close(e); close(ept_ep);
+    for (int i = 0; i < 3; i++)
+        CHECK(ept_res[i] == i + 1 && ept_ms[i] < 1000, "wait %d got %d after %lldms", i, ept_res[i], ept_ms[i]);
+    R(PASS, "thread woken by write %lldms, ADD %lldms, MOD %lldms", ept_ms[0], ept_ms[1], ept_ms[2]);
+}
+/* epoll.latency: eventfd ping-pong between two processes through blocking
+ * epoll_wait (no tick polling: many round trips per ms budget). */
+static int t_ep_latency(char *d, size_t n) {
+    extern int eventfd(unsigned int, int);
+    int a = eventfd(0, EFD_NONBLOCK), b = eventfd(0, EFD_NONBLOCK); if (a < 0 || b < 0) R(SKIP, "eventfd");
+    const int N = 2000;
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) {
+        int ep = epoll_create1(0); struct epoll_event ev = { .events = EPOLLIN }, o;
+        epoll_ctl(ep, EPOLL_CTL_ADD, a, &ev);
+        for (int i = 0; i < N; i++) {
+            if (epoll_wait(ep, &o, 1, 5000) != 1) _exit(2);
+            uint64_t v; read(a, &v, 8); v = 1; write(b, &v, 8);
+        }
+        _exit(0);
+    }
+    int ep = epoll_create1(0); struct epoll_event ev = { .events = EPOLLIN }, o;
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, b, &ev) == 0, "ADD");
+    long long t0 = mono_ms(); int i;
+    for (i = 0; i < N; i++) {
+        uint64_t v = 1; write(a, &v, 8);
+        if (epoll_wait(ep, &o, 1, 5000) != 1) break;
+        read(b, &v, 8);
+    }
+    long long el = mono_ms() - t0;
+    int st = 0; waitpid(c, &st, 0); close(ep); close(a); close(b);
+    CHECK(i == N && WIFEXITED(st) && WEXITSTATUS(st) == 0, "round trips %d/%d child st 0x%x", i, N, st);
+    long long us = el * 1000 / N;
+    CHECK(el < 8000, "%d round trips took %lldms", N, el);
+    R(PASS, "%d round trips in %lldms (%lld us each)", N, el, us);
+}
+/* epoll.stress: 20 pipes + 10 eventfds in one set mixing LT / ET /
+ * ONESHOT, a writer process feeding them in a scrambled order, maxevents
+ * smaller than the ready set, then the writer closes every pipe while the
+ * parent waits (HUP on each, all bytes accounted). */
+static int t_ep_stress(char *d, size_t n) {
+    extern int eventfd(unsigned int, int);
+    enum { NP = 20, NE = 10, ROUNDS = 60 };
+    int ep = epoll_create1(0); if (ep < 0) R(SKIP, "epoll_create1");
+    int rp[NP], wp[NP], ef[NE];
+    for (int i = 0; i < NP; i++) {
+        int p[2]; CHECKE(pipe(p) == 0, "pipe");
+        rp[i] = p[0]; wp[i] = p[1];
+        fcntl(rp[i], F_SETFL, O_NONBLOCK);
+        uint32_t mode = i % 3 == 0 ? 0 : i % 3 == 1 ? EPOLLET : EPOLLONESHOT;
+        struct epoll_event ev = { .events = EPOLLIN | mode, .data.u32 = (uint32_t)i };
+        CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, rp[i], &ev) == 0, "ADD pipe");
+    }
+    for (int i = 0; i < NE; i++) {
+        ef[i] = eventfd(0, EFD_NONBLOCK); CHECKE(ef[i] >= 0, "eventfd");
+        struct epoll_event ev = { .events = EPOLLIN | (i & 1 ? EPOLLET : 0), .data.u32 = 100 + i };
+        CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, ef[i], &ev) == 0, "ADD eventfd");
+    }
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) {
+        for (int i = 0; i < NP; i++) close(rp[i]);
+        unsigned x = 12345;
+        for (int r = 0; r < ROUNDS; r++) {
+            for (int k = 0; k < NP + NE; k++) {
+                x = x * 1103515245u + 12345u;
+                int j = (int)((x >> 16) % (NP + NE));
+                if (j < NP) write(wp[j], "s", 1);
+                else { uint64_t v = 1; write(ef[j - NP], &v, 8); }
+            }
+            if (r % 10 == 0) msleep(5);
+        }
+        for (int i = 0; i < NP; i++) { msleep(2); close(wp[i]); }
+        _exit(0);
+    }
+    for (int i = 0; i < NP; i++) close(wp[i]);
+    long long total = 0, wakes = 0; int hups = 0; char hup[NP] = { 0 };
+    long long t0 = mono_ms(); const long long expect = (long long)ROUNDS * (NP + NE);
+    while ((total < expect || hups < NP) && mono_ms() - t0 < 15000) {
+        struct epoll_event o[8];
+        int r = epoll_wait(ep, o, 8, 2000);
+        if (r < 0) { if (errno == EINTR) continue; R(FAIL, "epoll_wait: %s", strerror(errno)); }
+        if (r == 0) break;
+        wakes++;
+        for (int k = 0; k < r; k++) {
+            uint32_t id = o[k].data.u32;
+            if (id >= 100) {
+                uint64_t v; if (read(ef[id - 100], &v, 8) == 8) total += (long long)v;
+                continue;
+            }
+            char b[64]; ssize_t g;
+            uint32_t mode = id % 3;
+            if (mode == 0) { g = read(rp[id], b, 1); if (g > 0) total += g; }   /* LT: one byte per event */
+            else { while ((g = read(rp[id], b, sizeof b)) > 0) total += g; }   /* ET / ONESHOT: drain */
+            if ((o[k].events & EPOLLHUP) && !hup[id]) {
+                /* HUP: drain any rest, drop the item */
+                while ((g = read(rp[id], b, sizeof b)) > 0) total += g;
+                hup[id] = 1; hups++;
+                epoll_ctl(ep, EPOLL_CTL_DEL, rp[id], NULL);
+                continue;
+            }
+            if (mode == 2) {
+                struct epoll_event ev = { .events = EPOLLIN | EPOLLONESHOT, .data.u32 = id };
+                epoll_ctl(ep, EPOLL_CTL_MOD, rp[id], &ev);
+            }
+        }
+    }
+    long long el = mono_ms() - t0;
+    int st = 0; waitpid(c, &st, 0);
+    for (int i = 0; i < NP; i++) close(rp[i]);
+    for (int i = 0; i < NE; i++) close(ef[i]);
+    close(ep);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "writer status 0x%x", st);
+    CHECK(total == expect && hups == NP, "got %lld/%lld units, %d/%d HUPs in %lldms", total, expect, hups, NP, el);
+    R(PASS, "%lld units over 30 fds, %d HUPs, %lld wakeups, %lldms", total, hups, wakes, el);
+}
+/* timerfd.overrun: absolute start in the past with an interval counts every
+ * missed period; periodic timer drives epoll (LT and ET). */
+static int t_tfd_overrun(char *d, size_t n) {
+    int t = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK); if (t < 0) R(SKIP, "timerfd_create");
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    struct itimerspec its = { { 0, 100 * 1000000L }, { now.tv_sec - 1, now.tv_nsec } };
+    CHECKE(timerfd_settime(t, TFD_TIMER_ABSTIME, &its, NULL) == 0, "settime past abs");
+    uint64_t v = 0;
+    CHECK(read(t, &v, 8) == 8 && v >= 10 && v <= 12, "past abs expirations %llu (want 11)", (unsigned long long)v);
+    struct itimerspec per = { { 0, 20 * 1000000L }, { 0, 20 * 1000000L } };
+    CHECKE(timerfd_settime(t, 0, &per, NULL) == 0, "settime periodic");
+    int ep = epoll_create1(0); CHECKE(ep >= 0, "epoll_create1");
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.u32 = 1 }, o[2];
+    CHECKE(epoll_ctl(ep, EPOLL_CTL_ADD, t, &ev) == 0, "ADD ET");
+    int wakes = 0; long long t0 = mono_ms();
+    while (mono_ms() - t0 < 210) if (epoll_wait(ep, o, 2, 100) == 1) wakes++;   /* ET: no read needed */
+    uint64_t tot = 0; read(t, &tot, 8);
+    CHECK(wakes >= 6 && wakes <= 12, "ET periodic wakeups %d in 210ms (want ~10)", wakes);
+    CHECK(tot >= 8 && tot <= 13, "expirations %llu", (unsigned long long)tot);
+    close(ep); close(t);
+    R(PASS, "past-abs overruns %llu, ET periodic %d wakes / %llu exp", (unsigned long long)v, wakes, (unsigned long long)tot);
+}
+/* signalfd.siginfo: ssi_pid / ssi_uid / ssi_code for kill() from self and a
+ * child, SIGCHLD CLD_EXITED / CLD_KILLED with status through epoll, and
+ * sigtimedwait si_pid. */
+static int t_sfd_info(char *d, size_t n) {
+    sigset_t m, om; sigemptyset(&m); sigaddset(&m, SIGUSR1); sigaddset(&m, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &m, &om);
+    int s = signalfd(-1, &m, SFD_NONBLOCK); if (s < 0) { sigprocmask(SIG_SETMASK, &om, NULL); R(SKIP, "signalfd"); }
+    struct signalfd_siginfo si; int ok = 1; char why[160] = "";
+    kill(getpid(), SIGUSR1);
+    memset(&si, 0, sizeof si);
+    if (read(s, &si, sizeof si) != sizeof si || si.ssi_signo != SIGUSR1 || si.ssi_pid != (uint32_t)getpid() ||
+        si.ssi_uid != getuid() || si.ssi_code != SI_USER) {
+        ok = 0; snprintf(why, sizeof why, "self kill signo %u pid %u uid %u code %d", si.ssi_signo, si.ssi_pid, si.ssi_uid, si.ssi_code);
+    }
+    int ep = epoll_create1(0);
+    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = 9 }, o[2];
+    epoll_ctl(ep, EPOLL_CTL_ADD, s, &ev);
+    pid_t par = getpid(), c = fork();
+    if (c == 0) { msleep(50); kill(par, SIGUSR1); _exit(7); }
+    int got_usr = 0, got_chld = 0; uint32_t upid = 0; int ccode = 0, cst = 0; uint32_t cpid = 0;
+    long long t0 = mono_ms();
+    while ((!got_usr || !got_chld) && mono_ms() - t0 < 3000) {
+        if (epoll_wait(ep, o, 2, 1000) != 1) continue;
+        while (read(s, &si, sizeof si) == sizeof si) {
+            if (si.ssi_signo == SIGUSR1) { got_usr = 1; upid = si.ssi_pid; }
+            if (si.ssi_signo == SIGCHLD) { got_chld = 1; cpid = si.ssi_pid; ccode = si.ssi_code; cst = si.ssi_status; }
+        }
+    }
+    waitpid(c, NULL, 0);
+    if (ok && (!got_usr || upid != (uint32_t)c)) { ok = 0; snprintf(why, sizeof why, "child kill got %d pid %u want %d", got_usr, upid, c); }
+    if (ok && (!got_chld || cpid != (uint32_t)c || ccode != CLD_EXITED || cst != 7)) {
+        ok = 0; snprintf(why, sizeof why, "SIGCHLD got %d pid %u code %d status %d (want %d/%d/7)", got_chld, cpid, ccode, cst, c, CLD_EXITED);
+    }
+    /* killed child */
+    c = fork(); if (c == 0) { for (;;) pause(); }
+    msleep(30); kill(c, SIGKILL);
+    got_chld = 0; t0 = mono_ms();
+    while (!got_chld && mono_ms() - t0 < 3000) {
+        if (epoll_wait(ep, o, 2, 1000) != 1) continue;
+        while (read(s, &si, sizeof si) == sizeof si)
+            if (si.ssi_signo == SIGCHLD) { got_chld = 1; cpid = si.ssi_pid; ccode = si.ssi_code; cst = si.ssi_status; }
+    }
+    waitpid(c, NULL, 0);
+    if (ok && (!got_chld || cpid != (uint32_t)c || ccode != CLD_KILLED || cst != SIGKILL)) {
+        ok = 0; snprintf(why, sizeof why, "killed SIGCHLD got %d pid %u code %d status %d", got_chld, cpid, ccode, cst);
+    }
+    close(ep); close(s);
+    /* sigtimedwait si_pid */
+    kill(getpid(), SIGUSR1);
+    siginfo_t inf; memset(&inf, 0, sizeof inf); struct timespec z = { 1, 0 };
+    int g = sigtimedwait(&m, &inf, &z);
+    if (ok && (g != SIGUSR1 || inf.si_pid != getpid() || inf.si_code != SI_USER)) {
+        ok = 0; snprintf(why, sizeof why, "sigtimedwait %d pid %d code %d", g, inf.si_pid, inf.si_code);
+    }
+    sigprocmask(SIG_SETMASK, &om, NULL);
+    CHECK(ok, "%s", why);
+    R(PASS, "ssi_pid/uid/code self+child, SIGCHLD exited/killed status, sigtimedwait si_pid");
+}
+/* inotify.flags: IN_ATTRIB, IN_ONESHOT, IN_MASK_ADD, IN_ONLYDIR, FIONREAD,
+ * and a blocking read woken by another process. */
+static int t_ino_flags(char *d, size_t n) {
+    char dir[64], f1[96]; snprintf(dir, sizeof dir, "/tmp/ostest_inf.%d", getpid());
+    if (mkdir(dir, 0755) != 0) R(FAIL, "mkdir: %s", strerror(errno));
+    snprintf(f1, sizeof f1, "%s/f", dir);
+    int fd = inotify_init1(IN_NONBLOCK); CHECKE(fd >= 0, "inotify_init1");
+    int g = open(f1, O_CREAT | O_WRONLY, 0644); CHECKE(g >= 0, "create"); close(g);
+    errno = 0; CHECK(inotify_add_watch(fd, f1, IN_ATTRIB | IN_ONLYDIR) < 0 && errno == ENOTDIR, "ONLYDIR on file errno %d", errno);
+    int wf = inotify_add_watch(fd, f1, IN_ATTRIB); CHECKE(wf >= 1, "watch ATTRIB");
+    CHECK(inotify_add_watch(fd, f1, IN_MODIFY | IN_MASK_ADD) == wf, "MASK_ADD wd");
+    int cr = chmod(f1, 0600);
+    g = open(f1, O_WRONLY | O_APPEND); write(g, "x", 1); close(g);
+    int avail = -1; int ir = ioctl(fd, FIONREAD, &avail);
+    char buf[512]; ssize_t r = read(fd, buf, sizeof buf);
+    uint32_t seen = 0; for (ssize_t o = 0; o > -1 && o < r; ) { struct inotify_event *e = (struct inotify_event *)(buf + o); seen |= e->mask; o += sizeof(*e) + e->len; }
+    CHECK(ir == 0 && avail == (int)(2 * sizeof(struct inotify_event)) && r == avail && (seen & IN_ATTRIB) && (seen & IN_MODIFY),
+          "chmod rc %d, FIONREAD rc %d = %d, read %zd, events 0x%x (want ATTRIB|MODIFY)", cr, ir, avail, r, seen);
+    CHECKE(inotify_rm_watch(fd, wf) == 0, "rm_watch");
+    read(fd, buf, sizeof buf);                          /* IN_IGNORED */
+    int wd = inotify_add_watch(fd, dir, IN_CREATE | IN_ONESHOT | IN_ONLYDIR); CHECKE(wd >= 1, "watch ONESHOT dir");
+    char f2[96], f3[96]; snprintf(f2, sizeof f2, "%s/g", dir); snprintf(f3, sizeof f3, "%s/h", dir);
+    g = open(f2, O_CREAT | O_WRONLY, 0644); close(g);
+    g = open(f3, O_CREAT | O_WRONLY, 0644); close(g);
+    r = read(fd, buf, sizeof buf);
+    int ncreate = 0, nign = 0;
+    for (ssize_t o = 0; o < r; ) { struct inotify_event *e = (struct inotify_event *)(buf + o); if (e->mask & IN_CREATE) ncreate++; if (e->mask & IN_IGNORED) nign++; o += sizeof(*e) + e->len; }
+    CHECK(ncreate == 1 && nign == 1, "ONESHOT: %d creates %d ignored", ncreate, nign);
+    /* blocking read woken by another process */
+    int fb = inotify_init1(0); CHECKE(fb >= 0, "inotify_init1 blocking");
+    CHECKE(inotify_add_watch(fb, dir, IN_DELETE) >= 1, "watch DELETE");
+    pid_t c = fork(); if (c == 0) { msleep(80); unlink(f2); _exit(0); }
+    long long t0 = mono_ms(); r = read(fb, buf, sizeof buf); long long el = mono_ms() - t0;
+    waitpid(c, NULL, 0);
+    CHECK(r >= (ssize_t)sizeof(struct inotify_event) && (((struct inotify_event *)buf)->mask & IN_DELETE) && el >= 40 && el < 1500,
+          "blocking read %zd after %lldms", r, el);
+    close(fb); close(fd);
+    unlink(f1); unlink(f3); rmdir(dir);
+    R(PASS, "ATTRIB+MASK_ADD, ONLYDIR, FIONREAD %d, ONESHOT, blocking read %lldms", avail, el);
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -3287,6 +3692,11 @@ static const struct test tests[] = {
     { "futex", "wait_wake", t_fx_wait_wake, 15, 0 }, { "futex", "private_requeue", t_fx_requeue, 15, 0 },
     { "futex", "bitset_abs", t_fx_bitset, 10, 0 },
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
+    { "eventfd", "semantics", t_efd_sem, 15, 0 }, { "epoll", "nested", t_ep_nested, 15, 0 },
+    { "epoll", "lifetime", t_ep_life, 15, 0 }, { "epoll", "threads", t_ep_threads, 15, 0 },
+    { "epoll", "latency", t_ep_latency, 30, 0 }, { "epoll", "stress", t_ep_stress, 30, 0 },
+    { "timerfd", "overrun", t_tfd_overrun, 15, 0 }, { "signalfd", "siginfo", t_sfd_info, 20, 0 },
+    { "inotify", "flags", t_ino_flags, 15, 0 },
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
     { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 }, { "compat", "exec_cache", t_cx_exec_cache, 120, 0 }, { "compat", "stdev_statfs", t_cx_stdev_statfs, 15, 0 }, { "compat", "poll_sleep", t_cx_poll_sleep, 10, 0 }, { "compat", "poll_timeout_precision", t_cx_poll_prec, 30, 0 }, { "compat", "poll_connect", t_cx_poll_connect, 30, 0 }, { "compat", "tcp_download", t_cx_tcp_download, 120, 0 }, { "epoll", "pwait_sigmask", t_ep_pwait_mask, 15, 0 }, { "futex", "wake_op", t_fx_wake_op, 30, 0 },

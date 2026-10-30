@@ -18,6 +18,7 @@
 #include "mem.h"
 #include "string.h"
 #include "../include/indevos_errno.h"
+#include "kpoll.h"
 
 #define INO_MAX_INST   32
 #define INO_MAX_WATCH  128
@@ -53,6 +54,7 @@ volatile int inotify_active;
 static ino_inst_t *ino_all[INO_MAX_INST];
 static spinlock_t  ino_lock = {0};
 static uint32_t    ino_cookie;
+static uint32_t    ino_pushed;          /* c18: events queued (wake only then) */
 
 /* Collapse "//", "." and ".."; drop a trailing '/'. */
 static void ino_norm(const char *in, char *out) {
@@ -135,6 +137,7 @@ static void ino_push(ino_inst_t *in, int wd, uint32_t mask, uint32_t cookie, con
     in->last = in->tail;
     in->has_last = true;
     in->tail += need;
+    ino_pushed++;
     __atomic_add_fetch(&in->gen, 1, __ATOMIC_RELEASE);
 }
 
@@ -203,8 +206,11 @@ void inotify_vfs_event(const char *path, uint32_t mask) {
     char np[INO_PATH];
     ino_norm(path, np);
     klock(&ino_lock);
+    uint32_t before = ino_pushed;
     ino_event_locked(np, mask, 0);
+    bool pushed = ino_pushed != before;
     kunlock(&ino_lock);
+    if (pushed) kpoll_wake();
 }
 
 void inotify_vfs_rename(const char *oldpath, const char *newpath, bool is_dir) {
@@ -241,6 +247,7 @@ void inotify_vfs_rename(const char *oldpath, const char *newpath, bool is_dir) {
         }
     }
     kunlock(&ino_lock);
+    kpoll_wake();
 }
 
 void *inotify_create(void) {
@@ -310,6 +317,7 @@ int inotify_rm(void *h, int wd) {
         if (in->w[k].wd == wd) {
             ino_drop_watch(in, &in->w[k]);
             kunlock(&ino_lock);
+            kpoll_wake();
             return 0;
         }
     }
