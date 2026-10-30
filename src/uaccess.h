@@ -75,6 +75,15 @@ static inline bool is_user_range(uint64_t addr, size_t len) {
 bool access_ok_user_range(uint64_t addr, size_t len);
 
 /**
+ * @brief Let the calling thread pass the kernel buffer [buf, buf+len) where
+ *        sys_read/sys_write expect a user pointer (sendfile/copy_file_range
+ *        bounce buffers).  Only that exact range, only for this thread.
+ * @return slot for uaccess_kbuf_end(), or -1 when all slots are busy
+ */
+int uaccess_kbuf_begin(const void *buf, size_t len);
+void uaccess_kbuf_end(int slot);
+
+/**
  * @brief Copy data from user-space to kernel-space
  *
  * Validates that the source range lies entirely in user memory,

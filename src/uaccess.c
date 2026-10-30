@@ -15,6 +15,7 @@
 #include "syscall.h"
 #include "serial.h"
 #include "string.h"
+#include "thread.h"
 
 static process_t *uaccess_proc(void) {
     process_t *proc = get_current_process();
@@ -49,7 +50,47 @@ static bool user_page_ok(process_t *proc, uint64_t va, bool write) {
     return false;
 }
 
+/* Kernel bounce buffers a thread may hand to sys_read/sys_write
+ * (uaccess_kbuf_begin).  Owner thread + exact range, so other threads and
+ * other kernel addresses are still refused. */
+#define UKB_SLOTS 16
+static struct { void *volatile thr; uint64_t lo, hi; } ukb[UKB_SLOTS];
+
+int uaccess_kbuf_begin(const void *buf, size_t len) {
+    void *self = (void *)scheduler_get_current_thread();
+    if (!self || !buf || !len) return -1;
+    for (int i = 0; i < UKB_SLOTS; i++) {
+        void *expect = NULL;
+        if (__atomic_compare_exchange_n(&ukb[i].thr, &expect, (void *)1, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            ukb[i].lo = (uint64_t)buf;
+            ukb[i].hi = (uint64_t)buf + len;
+            __atomic_store_n(&ukb[i].thr, self, __ATOMIC_RELEASE);
+            return i;
+        }
+    }
+    return -1;
+}
+
+void uaccess_kbuf_end(int slot) {
+    if (slot < 0 || slot >= UKB_SLOTS) return;
+    ukb[slot].lo = ukb[slot].hi = 0;
+    __atomic_store_n(&ukb[slot].thr, NULL, __ATOMIC_RELEASE);
+}
+
+static bool kbuf_range_ok(uint64_t addr, size_t len) {
+    void *self = (void *)scheduler_get_current_thread();
+    if (!self || addr + len < addr) return false;
+    for (int i = 0; i < UKB_SLOTS; i++)
+        if (__atomic_load_n(&ukb[i].thr, __ATOMIC_ACQUIRE) == self &&
+            addr >= ukb[i].lo && addr + len <= ukb[i].hi)
+            return true;
+    return false;
+}
+
 static bool user_range_ok(uint64_t addr, size_t len, bool write) {
+    if (len && kbuf_range_ok(addr, len))
+        return true;
     if (!is_user_range(addr, len))
         return false;
 

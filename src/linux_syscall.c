@@ -3878,6 +3878,10 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             r = sys_seek((int)in_fd, off, SEEK_SET);
             if (r < 0) { kfree(buf); return r; }
         }
+        /* buf is a kernel bounce buffer: let sys_read/sys_write accept it
+         * (they used to reject it with -EFAULT -- sendfile never worked). */
+        int kb = uaccess_kbuf_begin(buf, count ? count : 1);
+        if (kb < 0) { kfree(buf); return -EAGAIN; }
         long total = 0;
         while ((size_t)total < count) {
             long n = (long)sys_read((int)in_fd, buf + total, count - (size_t)total);
@@ -3894,6 +3898,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             if (woff < n) break;
         }
     sf_done:
+        uaccess_kbuf_end(kb);
         if (uoff && total >= 0) {
             off_t noff = off + (off_t)total;
             (void)lx_put(uoff, &noff, sizeof(noff));
@@ -3920,6 +3925,8 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
         long sout = sys_seek((int)out_fd, 0, SEEK_CUR);
         if (uoff_in) { r = sys_seek((int)in_fd, in_off, SEEK_SET); if (r < 0) { kfree(buf); return r; } }
         if (uoff_out) { r = sys_seek((int)out_fd, out_off, SEEK_SET); if (r < 0) { kfree(buf); return r; } }
+        int kb = uaccess_kbuf_begin(buf, len ? len : 1);   /* kernel bounce buffer, as in sendfile */
+        if (kb < 0) { kfree(buf); return -EAGAIN; }
         long total = 0;
         while ((size_t)total < len) {
             long n = (long)sys_read((int)in_fd, buf, len - (size_t)total);
@@ -3934,6 +3941,7 @@ static long lx_dispatch(linux_syscall_frame_t *fr) {
             total += woff;
         }
     cfr_done:
+        uaccess_kbuf_end(kb);
         if (total >= 0) {
             if (uoff_in) { off_t n = in_off + (off_t)total; (void)lx_put(uoff_in, &n, sizeof(n)); }
             if (uoff_out) { off_t n = out_off + (off_t)total; (void)lx_put(uoff_out, &n, sizeof(n)); }
