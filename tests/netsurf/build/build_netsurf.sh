@@ -92,6 +92,8 @@ python3 "$HERE/patches/forms_orphans.py" "$SRC/netsurf-all-3.11"
 python3 "$HERE/patches/libdom_event_target.py" "$SRC/netsurf-all-3.11/libdom/src/core/node.c"
 # object arrivals: throttled page reformat (many SVGs made layout dominate page load)
 python3 "$HERE/patches/html_reflow_throttle.py" "$SRC/netsurf-all-3.11"
+# request headers from script fetch()/XMLHttpRequest (Accept: application/json, ...)
+python3 "$HERE/patches/js_fetch_headers.py" "$SRC/netsurf-all-3.11"
 bash "$HERE/patches/apply_wm_surface.sh" "$SRC/netsurf-all-3.11/libnsfb"
 export CFLAGS="$CFLAGS $CPPFLAGS"   # env (not make args) so component CFLAGS still append
 cd "$SRC/netsurf-all-3.11"

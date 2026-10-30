@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html><head><title>custom elements test</title></head>
+<body>
+<h1>custom elements</h1>
+<x-early id="e1" greeting="hi">early light text</x-early>
+<x-plain id="p1">plain undefined element</x-plain>
+<template id="tp"><x-early class="fromtpl">tpl</x-early><b>bold</b></template>
+<pre id="out"></pre>
+<script>
+var log = [], pass = 0, fail = 0;
+function ok(c, m) { if (c) pass++; else { fail++; log.push('FAIL ' + m); } }
+function L(s) { log.push(s); }
+var ev = [];
+class XEarly extends HTMLElement {
+	static get observedAttributes() { return ['greeting']; }
+	constructor() { super(); this.made = true; ev.push('ctor:' + (this.id || '?')); }
+	connectedCallback() { ev.push('conn:' + (this.id || this.className)); }
+	disconnectedCallback() { ev.push('disc:' + (this.id || this.className)); }
+	attributeChangedCallback(n, o, v) { ev.push('attr:' + n + ':' + o + '>' + v); }
+	adoptedCallback() {}
+	hello() { return 'hello ' + this.getAttribute('greeting'); }
+}
+ok(customElements.get('x-early') === undefined, 'get before define');
+var wd = customElements.whenDefined('x-early'), wdOk = false;
+wd.then(function (c) { wdOk = c === XEarly; });
+customElements.define('x-early', XEarly);
+var e1 = document.getElementById('e1');
+ok(e1 instanceof XEarly && e1 instanceof HTMLElement, 'upgrade of parsed element');
+ok(e1.made === true && e1.hello() === 'hello hi', 'upgraded methods');
+ok(ev.join() === 'ctor:e1,attr:greeting:null>hi,conn:e1', 'upgrade reactions: ' + ev.join());
+ok(customElements.get('x-early') === XEarly, 'get');
+ok(customElements.getName(XEarly) === 'x-early', 'getName');
+var threw = ''; try { customElements.define('x-early', class extends HTMLElement {}); } catch (e) { threw = e.name; }
+ok(threw === 'NotSupportedError', 'redefine throws ' + threw);
+threw = ''; try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { threw = e.name; }
+ok(threw === 'SyntaxError', 'bad name throws ' + threw);
+threw = ''; try { new HTMLElement(); } catch (e) { threw = e.name; }
+ok(threw === 'TypeError', 'new HTMLElement illegal');
+ev = [];
+var c1 = document.createElement('x-early');
+ok(c1 instanceof XEarly && c1.made, 'createElement constructs synchronously');
+ok(c1.tagName === 'X-EARLY', 'tagName ' + c1.tagName);
+var n1 = new XEarly();
+ok(n1 instanceof XEarly && n1.localName === 'x-early', 'new XEarly()');
+c1.id = 'c1';
+ok(ev.join() === 'ctor:?,ctor:?', 'no attr cb for unobserved id: ' + ev.join());
+ev = [];
+c1.setAttribute('greeting', 'yo');
+document.body.appendChild(c1);
+document.body.removeChild(c1);
+ok(ev.join() === 'attr:greeting:null>yo,conn:c1,disc:c1', 'conn/disc/attr: ' + ev.join());
+ev = [];
+var d = document.createElement('div');
+d.innerHTML = '<x-early id="ih" greeting="g">inner</x-early>';
+var ih = d.firstChild;
+ok(!(ih instanceof XEarly), 'innerHTML in detached div not upgraded yet');
+document.body.appendChild(d);
+ok(ih instanceof XEarly && ih.hello() === 'hello g', 'innerHTML element upgraded on connect');
+ok(ev.join() === 'ctor:ih,attr:greeting:null>g,conn:ih', 'innerHTML reactions: ' + ev.join());
+ev = [];
+d.remove();
+ok(ev.join() === 'disc:ih', 'remove subtree disc: ' + ev.join());
+/* late definition of an element already in the document */
+var lateOrder = [];
+customElements.define('x-plain', class extends HTMLElement { connectedCallback() { lateOrder.push(this.id); } });
+ok(lateOrder.join() === 'p1', 'late define upgrades parsed x-plain');
+customElements.upgrade(document.body);
+/* template / clone */
+var tp = document.getElementById('tp');
+ok(tp.content && tp.content.nodeType === 11, 'template.content fragment');
+ev = [];
+var frag = tp.content.cloneNode(true);
+ok(frag.firstChild instanceof XEarly, 'cloneNode upgrades custom elements');
+document.body.appendChild(frag);
+ok(ev.join() === 'ctor:?,conn:fromtpl', 'fragment insert conn: ' + ev.join());
+/* shadow DOM */
+var host = document.createElement('div');
+var sr = host.attachShadow({ mode: 'open' });
+ok(host.shadowRoot === sr && sr.host === host && sr.mode === 'open', 'attachShadow open');
+sr.innerHTML = '<span id="in-shadow">s</span>';
+ok(sr.getElementById('in-shadow') !== null && sr instanceof ShadowRoot && sr instanceof DocumentFragment, 'shadow content');
+var cl = document.createElement('div').attachShadow({ mode: 'closed' });
+ok(cl.host.shadowRoot === null, 'closed shadow hidden');
+threw = ''; try { host.attachShadow({ mode: 'open' }); } catch (e) { threw = e.name; }
+ok(threw === 'NotSupportedError', 'second attachShadow throws');
+document.body.appendChild(host);
+ok(sr.firstChild.isConnected === true, 'shadow child isConnected');
+/* CustomEvent */
+var got = null;
+host.addEventListener('ping', function (e) { got = e.detail; });
+host.dispatchEvent(new CustomEvent('ping', { detail: 42 }));
+ok(got === 42, 'CustomEvent detail');
+/* ElementInternals */
+class XForm extends HTMLElement {
+	static formAssociated = true;
+	constructor() { super(); this.i = this.attachInternals(); }
+}
+customElements.define('x-form', XForm);
+var xf = new XForm();
+xf.i.setFormValue('v'); xf.i.states.add('--on'); xf.i.setValidity({});
+ok(xf.i.states.has('--on') && xf.i.checkValidity() === true, 'ElementInternals stub');
+/* TreeWalker / NodeIterator */
+var tw0 = document.createElement('div');
+tw0.innerHTML = '<p id="a"><b id="b">x</b></p><i id="c"></i><span id="d"><u id="e"></u></span>';
+var tw = document.createTreeWalker(tw0, NodeFilter.SHOW_ELEMENT, { acceptNode: function (n) { return n.id === 'd' ? NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT; } });
+var seq = []; var nn; while ((nn = tw.nextNode())) seq.push(nn.id);
+ok(seq.join() === 'a,b,c,e', 'TreeWalker nextNode ' + seq.join());
+seq = []; while ((nn = tw.previousNode())) seq.push(nn.id);
+ok(seq.join() === 'c,b,a,', 'TreeWalker previousNode (root last) ' + seq.join());
+tw.currentNode = tw0;
+ok(tw.firstChild().id === 'a' && tw.nextSibling().id === 'c' && tw.nextSibling().id === 'e', 'TreeWalker siblings');
+tw.currentNode = tw0;
+ok(tw.lastChild().id === 'e' && tw.parentNode() === tw0, 'TreeWalker lastChild/parentNode');
+var rj = document.createTreeWalker(tw0, NodeFilter.SHOW_ELEMENT, function (n) { return n.id === 'a' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT; });
+seq = []; while ((nn = rj.nextNode())) seq.push(nn.id);
+ok(seq.join() === 'c,d,e', 'TreeWalker REJECT subtree ' + seq.join());
+var ni = document.createNodeIterator(tw0, NodeFilter.SHOW_ELEMENT);
+seq = []; while ((nn = ni.nextNode())) seq.push(nn.id || nn.tagName);
+ok(seq.join() === 'DIV,a,b,c,d,e', 'NodeIterator ' + seq.join());
+/* MutationObserver */
+var recs = [];
+var mo = new MutationObserver(function (r) { recs = recs.concat(r); });
+var box = document.createElement('div'); document.body.appendChild(box);
+mo.observe(box, { childList: true, attributes: true, subtree: true, attributeOldValue: true });
+box.setAttribute('data-a', '1');
+box.setAttribute('data-a', '2');
+var s1 = document.createElement('span'); box.appendChild(s1);
+s1.className = 'k';
+box.removeChild(s1);
+var tr = mo.takeRecords();
+ok(tr.length === 5, 'takeRecords count ' + tr.length);
+ok(tr[1].oldValue === '1' && tr[2].addedNodes[0] === s1 && tr[3].target === s1 && tr[4].removedNodes[0] === s1, 'record contents');
+box.textContent = 'x';
+var b2 = document.createElement('i');
+var shadowCustom = document.createElement('div').attachShadow({ mode: 'open' });
+Promise.resolve().then(function () {}).then(function () {
+	ok(recs.length === 1 && recs[0].type === 'childList', 'async delivery ' + recs.length);
+	ok(wdOk, 'whenDefined resolved');
+	mo.disconnect();
+	box.setAttribute('z', '1');
+	setTimeout(function () {
+		ok(recs.length === 1, 'disconnect stops records');
+		L('RESULT pass=' + pass + ' fail=' + fail);
+		document.getElementById('out').textContent = log.join('\n');
+		console.log(log.join(' | '));
+	}, 0);
+});
+</script>
+</body></html>

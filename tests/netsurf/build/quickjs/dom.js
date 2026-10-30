@@ -15,11 +15,19 @@ const def = (o, name, get, set) => Object.defineProperty(o, name,
 const val = (o, name, v) => Object.defineProperty(o, name,
 	{ value: v, writable: true, configurable: true, enumerable: false });
 const isNode = (x) => x !== null && typeof x === 'object' && x instanceof Node;
+/* shadow root -> host, host -> shadow root, shadow root -> options, element -> internals */
+const SRH = new WeakMap(), SRS = new WeakMap(), SRM = new WeakMap(), EIS = new WeakMap();
 
 /* ---------------- console ---------------- */
 function fmt1(a) {
 	if (typeof a === 'string') return a;
-	if (a instanceof Error) return a.name + ': ' + a.message;
+	if (a instanceof Error) {
+		let r = a.name + ': ' + a.message;
+		/* console.warn/error: keep the first frames, they are often the only clue */
+		if (fmtStack && typeof a.stack === 'string' && a.stack)
+			r += '\n' + a.stack.split('\n').filter(Boolean).slice(0, 8).join('\n');
+		return r;
+	}
 	if (isNode(a)) return '[' + (a.nodeName || 'node') + (a.id ? '#' + a.id : '') + ']';
 	if (typeof a === 'object' && a !== null) {
 		try { return JSON.stringify(a); } catch (e) { return String(a); }
@@ -46,7 +54,11 @@ function fmt(args) {
 }
 const counts = {}, timesT = {};
 let groupDepth = 0;
-const mk = (lvl) => function (...a) { N.log(lvl, '  '.repeat(groupDepth) + fmt(a)); };
+let fmtStack = false;
+const mk = (lvl) => function (...a) {
+	fmtStack = lvl >= 3;
+	try { N.log(lvl, '  '.repeat(groupDepth) + fmt(a)); } finally { fmtStack = false; }
+};
 G.console = {
 	log: mk(1), info: mk(2), warn: mk(3), error: mk(4), debug: mk(0),
 	trace: mk(0), dir: mk(1), dirxml: mk(1), table: mk(1),
@@ -335,7 +347,7 @@ function jsDispatch(target, ev) {
 /* hook: libdom delivered an event at currentTarget */
 function hookDispatch(cur, ev, phase) {
 	const type = ev.type;
-	if (type === 'DOMContentLoaded') docState = 'interactive';
+	if (type === 'DOMContentLoaded') { docState = 'interactive'; if (ceCount && phase !== 3 && cur && N.nodeType(cur) === 9) ceScan(cur); }
 	runListeners(cur, ev, phase, type);
 	/* the window is not a libdom node: run its listeners at the document */
 	if (cur && cur.nodeType === 9 && phase !== 1 && !ev.__stop && ev.bubbles &&
@@ -349,6 +361,7 @@ function hookDispatch(cur, ev, phase) {
 /* hook: window-level lifecycle events */
 function hookWindow(type, ev) {
 	if (!ev) ev = new Event(type);
+	if ((type === 'DOMContentLoaded' || type === 'load') && ceCount && G.document) ceScan(G.document);
 	if (type === 'DOMContentLoaded') docState = 'interactive';
 	if (type === 'load') docState = 'complete';
 	val(ev, '__cur', winTarget); val(ev, '__phase', 2);
@@ -472,7 +485,7 @@ NP.insertBefore = function (c, ref) {
 };
 NP.removeChild = function (c) { N.remove(this, c); return c; };
 NP.replaceChild = function (nc, old) { N.replace(this, nc, old); return old; };
-NP.cloneNode = function (deep) { return N.clone(this, !!deep); };
+NP.cloneNode = function (deep) { const c = N.clone(this, !!deep); if (ceCount) ceScan(c); return c; };
 NP.contains = function (o) {
 	for (let n = o; n; n = N.parent(n)) if (n === this) return true;
 	return false;
@@ -621,7 +634,6 @@ for (const k of ['scrollIntoView', 'scrollTo', 'scrollBy', 'scroll', 'focus', 'b
 	'releasePointerCapture', 'requestFullscreen'])
 	EP[k] = function () {};
 EP.animate = function () { return { cancel() {}, finish() {}, play() {}, pause() {}, finished: Promise.resolve(), onfinish: null }; };
-EP.attachShadow = function () { throw new Error('NotSupportedError: shadow DOM'); };
 for (const k of ['scrollTop', 'scrollLeft']) def(EP, k, function () { return 0; }, function () {});
 for (const k of ['scrollWidth', 'scrollHeight', 'clientWidth', 'clientHeight', 'clientTop', 'clientLeft']) {
 	def(EP, k, function () {
@@ -791,7 +803,7 @@ function datasetGetter() {
 	return d;
 }
 
-const HTMLElement = sub('HTMLElement', Element);
+const HTMLElement = sub('HTMLElement', Element, HTMLElementCtor);
 const HP = HTMLElement.prototype;
 def(HP, 'style', styleGetter, function (v) { N.setAttr(this, 'style', String(v)); });
 def(HP, 'dataset', datasetGetter);
@@ -1117,7 +1129,18 @@ def(DP, 'implementation', function () { return { hasFeature() { return true; }, 
 	createDocument() { return detachedDoc(); }, createDocumentType(n) { return { nodeType: 10, name: n }; } }; });
 DP.getElementById = function (id) { return N.byId(String(id)); };
 DP.getElementsByName = function (n) { return makeList(qsa(this, '[name="' + String(n).replace(/"/g, '\\"') + '"]', false)); };
-DP.createElement = function (tag) { return N.createElement(String(tag).toLowerCase()); };
+DP.createElement = function (tag) {
+	tag = String(tag).toLowerCase();
+	const d = ceCount ? CE.get(tag) : undefined;
+	if (d && !d.ext) {
+		try {
+			const el = new d.ctor();
+			if (!isNode(el) || N.nodeType(el) !== 1) throw new TypeError("custom element constructor for '" + tag + "' did not return an element");
+			return el;
+		} catch (e) { reportError(e); const u = N.createElement(tag); CES.set(u, false); return u; }
+	}
+	return N.createElement(tag);
+};
 DP.createElementNS = function (ns, tag) { return N.createElement(String(tag).replace(/^.*:/, '').toLowerCase()); };
 DP.createTextNode = function (t) { return N.createText(String(t)); };
 DP.createComment = function (t) { return N.createComment(String(t)); };
@@ -1131,11 +1154,149 @@ DP.createRange = function () {
 	return { setStart() {}, setEnd() {}, selectNode() {}, selectNodeContents() {}, collapse() {}, getBoundingClientRect: zeroRect,
 		createContextualFragment(html) { const f = N.createFragment(); parseHTMLInto(f, String(html)); return f; } };
 };
-DP.createTreeWalker = function (root, what) {
-	const nodes = [];
-	walk(root, (n) => { if (!what || what === 0xFFFFFFFF || (what & (1 << (N.nodeType(n) - 1)))) nodes.push(n); return false; }, true);
-	let i = -1;
-	return { root, currentNode: root, nextNode() { i++; this.currentNode = nodes[i] || null; return this.currentNode; } };
+/* live TreeWalker / NodeIterator (DOM spec traversal; filter: function or {acceptNode}) */
+function twFilter(tw, n) {
+	const w = tw.whatToShow >>> 0;
+	if (!(w & (1 << (N.nodeType(n) - 1)))) return 3;
+	const f = tw.filter;
+	if (!f) return 1;
+	const r = typeof f === 'function' ? f.call(null, n) : f.acceptNode(n);
+	return Number(r) || 3;
+}
+class TreeWalker {
+	constructor(root, what, filter) {
+		val(this, 'root', root); val(this, 'whatToShow', what === undefined ? 0xFFFFFFFF : what >>> 0);
+		val(this, 'filter', filter || null); this.currentNode = root;
+	}
+	parentNode() {
+		let n = this.currentNode;
+		while (n && n !== this.root) {
+			n = N.parent(n);
+			if (n && twFilter(this, n) === 1) { this.currentNode = n; return n; }
+		}
+		return null;
+	}
+	__child(first) {
+		let n = first ? N.first(this.currentNode) : N.last(this.currentNode);
+		while (n) {
+			const r = twFilter(this, n);
+			if (r === 1) { this.currentNode = n; return n; }
+			if (r === 3) { const c = first ? N.first(n) : N.last(n); if (c) { n = c; continue; } }
+			for (;;) {
+				const s = first ? N.next(n) : N.prev(n);
+				if (s) { n = s; break; }
+				const p = N.parent(n);
+				if (!p || p === this.root || p === this.currentNode) return null;
+				n = p;
+			}
+		}
+		return null;
+	}
+	firstChild() { return this.__child(true); }
+	lastChild() { return this.__child(false); }
+	__sib(next) {
+		let n = this.currentNode;
+		if (n === this.root) return null;
+		for (;;) {
+			let s = next ? N.next(n) : N.prev(n);
+			while (s) {
+				n = s;
+				const r = twFilter(this, n);
+				if (r === 1) { this.currentNode = n; return n; }
+				s = next ? N.first(n) : N.last(n);
+				if (r === 2 || !s) s = next ? N.next(n) : N.prev(n);
+			}
+			n = N.parent(n);
+			if (!n || n === this.root) return null;
+			if (twFilter(this, n) === 1) return null;
+		}
+	}
+	nextSibling() { return this.__sib(true); }
+	previousSibling() { return this.__sib(false); }
+	previousNode() {
+		let n = this.currentNode;
+		while (n !== this.root) {
+			let s = N.prev(n);
+			while (s) {
+				n = s;
+				let r = twFilter(this, n);
+				let c;
+				while (r !== 2 && (c = N.last(n))) { n = c; r = twFilter(this, n); }
+				if (r === 1) { this.currentNode = n; return n; }
+				s = N.prev(n);
+			}
+			if (n === this.root) return null;
+			const p = N.parent(n);
+			if (!p) return null;
+			n = p;
+			if (twFilter(this, n) === 1) { this.currentNode = n; return n; }
+		}
+		return null;
+	}
+	nextNode() {
+		let n = this.currentNode, r = 1;
+		for (;;) {
+			let c;
+			while (r !== 2 && (c = N.first(n))) {
+				n = c; r = twFilter(this, n);
+				if (r === 1) { this.currentNode = n; return n; }
+			}
+			let s = null, t = n;
+			while (t) {
+				if (t === this.root) return null;
+				s = N.next(t);
+				if (s) break;
+				t = N.parent(t);
+			}
+			if (!s) return null;
+			n = s; r = twFilter(this, n);
+			if (r === 1) { this.currentNode = n; return n; }
+		}
+	}
+}
+class NodeIterator {
+	constructor(root, what, filter) {
+		val(this, '__tw', new TreeWalker(root, what, filter));
+		val(this, 'root', root); val(this, 'whatToShow', this.__tw.whatToShow); val(this, 'filter', filter || null);
+		this.__before = true;
+	}
+	get referenceNode() { return this.__tw.currentNode; }
+	get pointerBeforeReferenceNode() { return this.__before; }
+	nextNode() {
+		const tw = this.__tw;
+		if (this.__before) { this.__before = false; if (twFilter(tw, tw.currentNode) === 1) return tw.currentNode; }
+		/* NodeIterator: REJECT behaves like SKIP */
+		let n = tw.currentNode;
+		for (;;) {
+			let x = N.first(n);
+			if (!x) { let t = n; while (t && t !== tw.root && !N.next(t)) t = N.parent(t); if (!t || t === tw.root) return null; x = N.next(t); }
+			n = x; tw.currentNode = n;
+			if (twFilter(tw, n) === 1) return n;
+		}
+	}
+	previousNode() {
+		const tw = this.__tw;
+		let n = tw.currentNode;
+		if (!this.__before) { this.__before = true; if (twFilter(tw, n) === 1) return n; }
+		for (;;) {
+			if (n === tw.root) return null;
+			let p = N.prev(n);
+			if (p) { let c; while ((c = N.last(p))) p = c; n = p; } else n = N.parent(n);
+			if (!n) return null;
+			tw.currentNode = n;
+			if (twFilter(tw, n) === 1) return n;
+		}
+	}
+	detach() {}
+}
+G.TreeWalker = TreeWalker; G.NodeIterator = NodeIterator;
+DP.createTreeWalker = function (root, what, filter) {
+	if (!isNode(root)) throw new TypeError('createTreeWalker: root is not a Node');
+	return new TreeWalker(root, what, filter);
+};
+DP.createNodeIterator = function (root, what, filter) {
+	if (!isNode(root)) throw new TypeError('createNodeIterator: root is not a Node');
+	return new NodeIterator(root, what, filter);
 };
 DP.write = function (...s) { N.docWrite(s.join('')); };
 DP.writeln = function (...s) { N.docWrite(s.join('') + '\n'); };
@@ -1147,7 +1308,7 @@ DP.execCommand = function () { return false; };
 DP.queryCommandSupported = function () { return false; };
 DP.elementFromPoint = function () { return null; };
 DP.adoptNode = function (n) { return n; };
-DP.importNode = function (n, deep) { return N.clone(n, !!deep); };
+DP.importNode = function (n, deep) { const c = N.clone(n, !!deep); if (ceCount) ceScan(c); return c; };
 const DocumentType = sub('DocumentType', Node);
 def(DocumentType.prototype, 'name', function () { return N.nodeName(this); });
 
@@ -2046,11 +2207,23 @@ G.Response = Response; G.Request = Request;
 
 let fetchSeq = 0;
 const FET = new Map();
-function nativeFetch(url, method, body, cb) {
+/* request headers the page may set (cookies, host, referer, ... stay with the fetcher) */
+const FORBIDDEN_HDR = /^(accept-charset|accept-encoding|access-control-request-.*|connection|content-length|cookie2?|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|user-agent|via|proxy-.*|sec-.*)$/;
+function headerLines(h) {
+	if (!h || typeof h.forEach !== 'function') return '';
+	let s = '';
+	h.forEach((v, k) => {
+		k = String(k).toLowerCase(); v = String(v);
+		if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k) || FORBIDDEN_HDR.test(k) || /[\r\n\0]/.test(v)) return;
+		s += k + ': ' + v + '\n';
+	});
+	return s;
+}
+function nativeFetch(url, method, body, headers, cb) {
 	const id = ++fetchSeq;
 	FET.set(id, cb);
 	let ok;
-	try { ok = N.fetch(id, String(url), method, body); } catch (e) { FET.delete(id); throw e; }
+	try { ok = N.fetch(id, String(url), method, body, headerLines(headers)); } catch (e) { FET.delete(id); throw e; }
 	if (!ok) { FET.delete(id); return false; }
 	return id;
 }
@@ -2068,7 +2241,7 @@ G.fetch = function (input, init) {
 		let id;
 		let settled = false;
 		try {
-			id = nativeFetch(req.url, req.method, bodyToString(req.__body), (ok, status, url, body, ctype, err) => {
+			id = nativeFetch(req.url, req.method, bodyToString(req.__body), req.headers, (ok, status, url, body, ctype, err) => {
 				if (settled) return;
 				settled = true;
 				if (!ok) { reject(new TypeError('Failed to fetch' + (err ? ': ' + err : ''))); return; }
@@ -2111,7 +2284,7 @@ class XMLHttpRequest extends EventTarget {
 	}
 	send(body) {
 		this.__fire('loadstart');
-		const id = nativeFetch(this.__url, this.__method || 'GET', bodyToString(body), (ok, status, url, text, ctype, err) => {
+		const id = nativeFetch(this.__url, this.__method || 'GET', bodyToString(body), this.__h, (ok, status, url, text, ctype, err) => {
 			this.__id = 0;
 			if (!ok) { this.readyState = 4; this.__fire('readystatechange'); this.__fire('error'); this.__fire('loadend'); return; }
 			this.status = status; this.statusText = 'OK'; this.responseURL = url || this.__url;
@@ -2146,7 +2319,442 @@ class IntersectionObserver {
 	}
 	unobserve() {} disconnect() {} takeRecords() { return []; }
 }
-class MutationObserver { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } }
+/* ---- DOMException ---- */
+const DOMEX_CODES = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
+	NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12,
+	InvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+	NetworkError: 19, AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23, DataCloneError: 25 };
+if (typeof G.DOMException !== 'function') {
+	G.DOMException = class DOMException extends Error {
+		constructor(message, name) {
+			super(message === undefined ? '' : String(message));
+			val(this, 'name', name === undefined ? 'Error' : String(name));
+			val(this, 'code', DOMEX_CODES[this.name] || 0);
+		}
+	};
+}
+function domErr(msg, name) { return new G.DOMException(msg, name); }
+
+/* ---- custom elements ----
+ * Definitions live in CE (name) / CEC (constructor).  CES maps an element to
+ * its definition once it is custom (false while being upgraded / failed).
+ * Reactions are fired synchronously from the N.* mutation wrappers below,
+ * which every JS-side DOM change goes through. */
+const CE = new Map(), CEC = new Map(), CEW = new Map();
+const CES = new WeakMap();
+let ceUp = null, ceCount = 0;
+const CE_RESERVED = new Set(['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri',
+	'font-face-format', 'font-face-name', 'missing-glyph']);
+function ceValidName(n) {
+	return /^[a-z][-.0-9_a-z\u00b7\u00c0-\uffff]*-[-.0-9_a-z\u00b7\u00c0-\uffff]*$/.test(n) && !CE_RESERVED.has(n);
+}
+function ceCall(el, fn, args) {
+	if (typeof fn !== 'function') return;
+	try { fn.apply(el, args); } catch (e) { reportError(e); }
+}
+function ceUpgrade(el, d) {
+	if (CES.has(el)) return;
+	if (!d) { d = CE.get(lname(el)); if (!d || d.ext) return; }
+	CES.set(el, false);
+	const oldProto = Object.getPrototypeOf(el);
+	Object.setPrototypeOf(el, d.proto);
+	ceUp = { el, ctor: d.ctor };
+	let ok = false;
+	try {
+		const r = Reflect.construct(d.ctor, []);
+		if (r !== el) throw new TypeError("custom element constructor for '" + d.name + "' did not return the element");
+		ok = true;
+	} catch (e) { reportError(e); }
+	ceUp = null;
+	if (!ok) { if (Object.getPrototypeOf(el) === d.proto) Object.setPrototypeOf(el, oldProto); return; }
+	CES.set(el, d);
+	if (d.obs && d.attr) for (const a of N.attrs(el)) if (d.obs.has(a[0])) ceCall(el, d.attr, [a[0], null, a[1], null]);
+	if (composedConnected(el)) ceCall(el, d.conn, []);
+}
+/* HTMLElement constructor: only reachable through `new` on a defined class or an upgrade */
+function HTMLElementCtor() {
+	const nt = new.target;
+	if (!nt) illegal();
+	if (ceUp && ceUp.ctor === nt) { const el = ceUp.el; ceUp = null; return el; }
+	const d = CEC.get(nt);
+	if (!d || d.ext) illegal();
+	const el = N.createElement(d.name);
+	Object.setPrototypeOf(el, nt.prototype);
+	CES.set(el, d);
+	return el;
+}
+function composedRoot(n) {
+	for (;;) {
+		let p;
+		while ((p = N.parent(n))) n = p;
+		const h = SRH.get(n);
+		if (!h) return n;
+		n = h;
+	}
+}
+function composedConnected(n) { return N.nodeType(composedRoot(n)) === 9; }
+/* elements in a subtree (inclusive), including open/closed shadow trees */
+function ceSubtree(n, out) {
+	if (N.nodeType(n) === 1) {
+		out.push(n);
+		const sr = SRS.get(n); if (sr) ceSubtree(sr, out);
+	}
+	if (!N.first(n)) return out;
+	/* template contents are inert (libdom keeps them as children of <template>) */
+	const tpl = N.collect(n, 'template', null, null, false);
+	let skip = null;
+	if (tpl.length) { skip = new Set(); for (const t of tpl) for (const e of N.collect(t, null, null, null, false)) skip.add(e); }
+	if (N.nodeType(n) === 1 && lname(n) === 'template') return out;
+	for (const e of N.collect(n, null, null, null, false)) {
+		if (skip && skip.has(e)) continue;
+		out.push(e);
+		const sr = SRS.get(e); if (sr) ceSubtree(sr, out);
+	}
+	return out;
+}
+function ceScan(root) {
+	if (!ceCount) return;
+	for (const e of ceSubtree(root, [])) if (!CES.has(e)) ceUpgrade(e);
+}
+function ceConnectedTree(n) {
+	if (!ceCount) return;
+	for (const e of ceSubtree(n, [])) {
+		const st = CES.get(e);
+		if (st) ceCall(e, st.conn, []);
+		else if (st === undefined) ceUpgrade(e);
+	}
+}
+/* custom elements in a connected subtree that have a disconnectedCallback */
+function ceDiscList(n) {
+	if (!ceCount || !composedConnected(n)) return null;
+	const out = [];
+	for (const e of ceSubtree(n, [])) { const st = CES.get(e); if (st && st.disc) out.push(e); }
+	return out.length ? out : null;
+}
+function ceFireDisc(list) { if (list) for (const e of list) ceCall(e, CES.get(e).disc, []); }
+
+class CustomElementRegistry {
+	define(name, ctor, opts) {
+		name = String(name);
+		if (typeof ctor !== 'function') throw new TypeError('customElements.define: constructor is not a function');
+		if (!ceValidName(name)) throw domErr("'" + name + "' is not a valid custom element name", 'SyntaxError');
+		if (CE.has(name)) throw domErr("the name '" + name + "' has already been used with this registry", 'NotSupportedError');
+		if (CEC.has(ctor)) throw domErr('this constructor has already been used with this registry', 'NotSupportedError');
+		const proto = ctor.prototype;
+		if (proto === null || typeof proto !== 'object') throw new TypeError('customElements.define: prototype is not an object');
+		const cb = (k) => { const f = proto[k]; if (f !== undefined && typeof f !== 'function') throw new TypeError(k + ' is not a function'); return f; };
+		const d = { name, ctor, proto, conn: cb('connectedCallback'), disc: cb('disconnectedCallback'),
+			adopt: cb('adoptedCallback'), attr: cb('attributeChangedCallback'), obs: null,
+			ext: opts && opts.extends ? String(opts.extends).toLowerCase() : null,
+			formAssociated: !!ctor.formAssociated };
+		if (d.attr) {
+			const oa = ctor.observedAttributes;
+			if (oa != null) d.obs = new Set(Array.from(oa, (x) => String(x)));
+		}
+		CE.set(name, d); CEC.set(ctor, d); ceCount++;
+		if (!d.ext && G.document) {
+			for (const e of ceSubtree(G.document, [])) if (!CES.has(e) && lname(e) === name) ceUpgrade(e, d);
+		}
+		const w = CEW.get(name);
+		if (w) { CEW.delete(name); w.res(ctor); }
+	}
+	get(name) { const d = CE.get(String(name)); return d ? d.ctor : undefined; }
+	getName(ctor) { const d = CEC.get(ctor); return d ? d.name : null; }
+	whenDefined(name) {
+		name = String(name);
+		if (!ceValidName(name)) return Promise.reject(domErr("'" + name + "' is not a valid custom element name", 'SyntaxError'));
+		const d = CE.get(name);
+		if (d) return Promise.resolve(d.ctor);
+		let w = CEW.get(name);
+		if (!w) { w = {}; w.p = new Promise((r) => { w.res = r; }); CEW.set(name, w); }
+		return w.p;
+	}
+	upgrade(root) { if (isNode(root)) for (const e of ceSubtree(root, [])) if (!CES.has(e)) ceUpgrade(e); }
+}
+G.CustomElementRegistry = CustomElementRegistry;
+G.customElements = new CustomElementRegistry();
+
+/* ---- MutationObserver ---- */
+const MOREG = new WeakMap();	/* node -> [{mo, o}] */
+let moCount = 0, moQueued = false;
+const moPending = [];
+class MutationRecord {}
+function moList(a) { return makeList(a ? a.slice() : []); }
+function moQueue(target, type, info) {
+	let seen = null;
+	for (let n = target; n; n = N.parent(n)) {
+		const regs = MOREG.get(n);
+		if (!regs) continue;
+		for (const r of regs) {
+			const o = r.o;
+			if (n !== target && !o.subtree) continue;
+			if (type === 'attributes') {
+				if (!o.attributes) continue;
+				if (o.attributeFilter && !o.attributeFilter.includes(info.name)) continue;
+			} else if (type === 'characterData') { if (!o.characterData) continue; }
+			else if (!o.childList) continue;
+			if (!seen) seen = new Map();
+			const keepOld = (type === 'attributes' && o.attributeOldValue) || (type === 'characterData' && o.characterDataOldValue);
+			if (seen.has(r.mo)) { if (keepOld) seen.set(r.mo, true); continue; }
+			seen.set(r.mo, !!keepOld);
+		}
+	}
+	if (!seen) return;
+	for (const [mo, keepOld] of seen) {
+		const rec = Object.create(MutationRecord.prototype);
+		rec.type = type; rec.target = target;
+		rec.addedNodes = moList(info.added); rec.removedNodes = moList(info.removed);
+		rec.previousSibling = info.prev || null; rec.nextSibling = info.next || null;
+		rec.attributeName = type === 'attributes' ? info.name : null; rec.attributeNamespace = null;
+		rec.oldValue = keepOld ? (info.old === undefined ? null : info.old) : null;
+		mo.__q.push(rec);
+		if (!mo.__pend) { mo.__pend = true; moPending.push(mo); }
+	}
+	if (!moQueued) { moQueued = true; Promise.resolve().then(moDeliver); }
+}
+function moDeliver() {
+	moQueued = false;
+	const list = moPending.splice(0);
+	for (const mo of list) {
+		mo.__pend = false;
+		const recs = mo.__q.splice(0);
+		if (recs.length) { try { mo.__cb.call(mo, recs, mo); } catch (e) { reportError(e); } }
+	}
+}
+class MutationObserver {
+	constructor(cb) {
+		if (typeof cb !== 'function') throw new TypeError('MutationObserver: callback is not a function');
+		val(this, '__cb', cb); val(this, '__q', []); val(this, '__t', []); val(this, '__pend', false);
+	}
+	observe(target, opts) {
+		if (!isNode(target)) throw new TypeError('MutationObserver.observe: target is not a Node');
+		const o = Object.assign({}, opts || {});
+		if (o.attributeFilter !== undefined) o.attributeFilter = Array.from(o.attributeFilter, (x) => String(x));
+		if ((o.attributeOldValue || o.attributeFilter) && o.attributes === undefined) o.attributes = true;
+		if (o.characterDataOldValue && o.characterData === undefined) o.characterData = true;
+		if (!o.childList && !o.attributes && !o.characterData)
+			throw new TypeError("MutationObserver.observe: one of 'childList', 'attributes' or 'characterData' must be true");
+		let regs = MOREG.get(target);
+		if (!regs) { regs = []; MOREG.set(target, regs); }
+		const r = regs.find((x) => x.mo === this);
+		if (r) { r.o = o; return; }
+		regs.push({ mo: this, o }); this.__t.push(target); moCount++;
+	}
+	disconnect() {
+		for (const t of this.__t) {
+			const regs = MOREG.get(t); if (!regs) continue;
+			const i = regs.findIndex((x) => x.mo === this);
+			if (i >= 0) { regs.splice(i, 1); moCount--; }
+		}
+		this.__t.length = 0; this.__q.length = 0;
+	}
+	takeRecords() { return this.__q.splice(0); }
+}
+
+/* ---- reaction-aware wrappers around the native mutation primitives ---- */
+{
+	const nAppend = N.append, nIns = N.insertBefore, nRem = N.remove, nRep = N.replace;
+	const nSetAttr = N.setAttr, nRemAttr = N.removeAttr, nSetText = N.setText, nSetValue = N.setValue;
+	const kids = (x) => (N.nodeType(x) === 11 ? childArray(x, false) : [x]);
+	/* x is about to leave its old parent (a move): disconnect + MO record there */
+	function detachPre(x) {
+		const op = N.parent(x);
+		if (!op) return null;
+		const disc = ceDiscList(x);
+		if (moCount) moQueue(op, 'childList', { removed: [x], prev: N.prev(x), next: N.next(x) });
+		return disc;
+	}
+	function inserted(p, nodes, prev, next) {
+		if (moCount && nodes.length) moQueue(p, 'childList', { added: nodes, prev, next });
+		if (ceCount && composedConnected(p)) for (const x of nodes) ceConnectedTree(x);
+	}
+	function doInsert(p, c, ref, fn) {
+		if (!(ceCount || moCount) || !isNode(c) || !isNode(p)) return fn();
+		const frag = N.nodeType(c) === 11;
+		const nodes = kids(c);
+		let disc = null;
+		if (frag) { if (moCount && nodes.length) moQueue(c, 'childList', { removed: nodes }); }
+		else disc = detachPre(c);
+		const r = fn();
+		ceFireDisc(disc);
+		const prev = nodes.length ? N.prev(nodes[0]) : null;
+		inserted(p, nodes, prev, ref || null);
+		return r;
+	}
+	N.append = function (p, c) { return doInsert(p, c, null, () => nAppend(p, c)); };
+	N.insertBefore = function (p, c, ref) { return doInsert(p, c, ref, () => nIns(p, c, ref)); };
+	N.remove = function (p, c) {
+		if (!(ceCount || moCount) || !isNode(c)) return nRem(p, c);
+		const disc = ceDiscList(c);
+		const prev = N.prev(c), next = N.next(c);
+		const r = nRem(p, c);
+		if (moCount) moQueue(p, 'childList', { removed: [c], prev, next });
+		ceFireDisc(disc);
+		return r;
+	};
+	N.replace = function (p, nc, old) {
+		if (!(ceCount || moCount) || !isNode(nc) || !isNode(old)) return nRep(p, nc, old);
+		const nodes = kids(nc);
+		const disc1 = N.nodeType(nc) === 11 ? null : detachPre(nc);
+		const disc2 = ceDiscList(old);
+		const prev = N.prev(old), next = N.next(old);
+		const r = nRep(p, nc, old);
+		if (moCount) moQueue(p, 'childList', { added: nodes, removed: [old], prev: prev === nc ? N.prev(nodes[0]) : prev, next });
+		ceFireDisc(disc1); ceFireDisc(disc2);
+		if (ceCount && composedConnected(p)) for (const x of nodes) ceConnectedTree(x);
+		return r;
+	};
+	function attrChanged(el, name, old, nv) {
+		if (moCount) moQueue(el, 'attributes', { name, old });
+		if (ceCount) {
+			const st = CES.get(el);
+			if (st && st.obs && st.obs.has(name)) ceCall(el, st.attr, [name, old, nv, null]);
+		}
+	}
+	N.setAttr = function (el, name, v) {
+		if (!(ceCount || moCount)) return nSetAttr(el, name, v);
+		name = String(name).toLowerCase();
+		const old = N.getAttr(el, name);
+		const r = nSetAttr(el, name, v);
+		attrChanged(el, name, old, N.getAttr(el, name));
+		return r;
+	};
+	N.removeAttr = function (el, name) {
+		if (!(ceCount || moCount)) return nRemAttr(el, name);
+		name = String(name).toLowerCase();
+		const old = N.getAttr(el, name);
+		const r = nRemAttr(el, name);
+		if (old !== null) attrChanged(el, name, old, null);
+		return r;
+	};
+	N.setText = function (n, s) {
+		const t = N.nodeType(n);
+		if (!(ceCount || moCount) || (t !== 1 && t !== 11)) {
+			if ((t === 3 || t === 8) && moCount) moQueue(n, 'characterData', { old: N.nodeValue(n) });
+			return nSetText(n, s);
+		}
+		const removed = childArray(n, false);
+		const disc = [];
+		for (const c of removed) { const l = ceDiscList(c); if (l) disc.push(...l); }
+		const r = nSetText(n, s);
+		if (moCount) {
+			const added = childArray(n, false);
+			if (removed.length || added.length) moQueue(n, 'childList', { added, removed });
+		}
+		ceFireDisc(disc);
+		return r;
+	};
+	N.setValue = function (n, s) {
+		if (moCount) moQueue(n, 'characterData', { old: N.nodeValue(n) });
+		return nSetValue(n, s);
+	};
+}
+
+/* ---- shadow DOM (minimal: the tree exists for scripts; it is not rendered,
+ * the light DOM stays as the rendered fallback) ---- */
+const ShadowRoot = sub('ShadowRoot', DocumentFragment);
+{
+	const SP = ShadowRoot.prototype;
+	def(SP, 'host', function () { return SRH.get(this) || null; });
+	def(SP, 'mode', function () { const m = SRM.get(this); return m ? m.mode : 'open'; });
+	def(SP, 'delegatesFocus', function () { const m = SRM.get(this); return !!(m && m.delegatesFocus); });
+	def(SP, 'slotAssignment', function () { const m = SRM.get(this); return (m && m.slotAssignment) || 'named'; });
+	def(SP, 'clonable', function () { return false; });
+	def(SP, 'serializable', function () { return false; });
+	def(SP, 'activeElement', function () { return null; });
+	def(SP, 'fullscreenElement', function () { return null; });
+	def(SP, 'pointerLockElement', function () { return null; });
+	def(SP, 'styleSheets', function () { return []; });
+	def(SP, 'adoptedStyleSheets', function () { const m = SRM.get(this); return m ? m.sheets : []; },
+		function (v) { const m = SRM.get(this); if (m) m.sheets = Array.from(v || []); });
+	const ih = Object.getOwnPropertyDescriptor(EP, 'innerHTML');
+	Object.defineProperty(SP, 'innerHTML', {
+		get() { return serializeChildren(this); },
+		set(v) { let c; while ((c = N.first(this))) N.remove(this, c); parseHTMLInto(this, v == null ? '' : String(v)); },
+		configurable: true,
+	});
+	void ih;
+	SP.setHTMLUnsafe = function (h) { this.innerHTML = h; };
+	SP.getHTML = function () { return serializeChildren(this); };
+	SP.elementFromPoint = function () { return null; };
+	SP.elementsFromPoint = function () { return []; };
+	SP.getSelection = function () { return G.getSelection ? G.getSelection() : null; };
+}
+EP.attachShadow = function (init) {
+	if (SRS.has(this)) throw domErr("Element already has a shadow root", 'NotSupportedError');
+	const mode = init && init.mode === 'closed' ? 'closed' : 'open';
+	const sr = N.createFragment();
+	Object.setPrototypeOf(sr, ShadowRoot.prototype);
+	SRH.set(sr, this); SRS.set(this, sr);
+	SRM.set(sr, { mode, delegatesFocus: !!(init && init.delegatesFocus), slotAssignment: init && init.slotAssignment, sheets: [] });
+	return sr;
+};
+def(EP, 'shadowRoot', function () { const sr = SRS.get(this); return sr && SRM.get(sr).mode === 'open' ? sr : null; });
+def(EP, 'assignedSlot', function () { return null; });
+EP.getHTML = function () { return serializeChildren(this); };
+EP.setHTMLUnsafe = function (h) { this.innerHTML = h; };
+DP.adoptedStyleSheets = [];
+if (!G.HTMLSlotElement) {
+	htmlClass('HTMLSlotElement', ['slot'], (P) => {
+		reflect(P, 'name');
+		P.assignedNodes = function () { return []; };
+		P.assignedElements = function () { return []; };
+		P.assign = function () {};
+	});
+}
+/* composed path / host retargeting is not modelled; getRootNode({composed}) crosses hosts */
+NP.getRootNode = function (opt) {
+	if (opt && opt.composed) return composedRoot(this);
+	let n = this, p; while ((p = N.parent(n))) n = p; return n;
+};
+def(NP, 'isConnected', function () { return composedConnected(this); });
+
+/* constructable stylesheets (not applied to rendering) */
+if (!G.CSSStyleSheet || !('replaceSync' in G.CSSStyleSheet.prototype)) {
+	G.CSSStyleSheet = class CSSStyleSheet {
+		constructor(opt) { this.cssRules = []; this.disabled = !!(opt && opt.disabled); this.media = (opt && opt.media) || ''; this.__text = ''; }
+		get rules() { return this.cssRules; }
+		replaceSync(t) { this.__text = String(t); }
+		replace(t) { this.__text = String(t); return Promise.resolve(this); }
+		insertRule(r, i) { i = i === undefined ? 0 : i; this.cssRules.splice(i, 0, { cssText: String(r) }); return i; }
+		deleteRule(i) { this.cssRules.splice(i, 1); }
+		addRule() { return -1; }
+		removeRule(i) { this.deleteRule(i || 0); }
+	};
+}
+
+/* ---- ElementInternals (form-associated bits are stubs) ---- */
+class CustomStateSet extends Set {}
+class ElementInternals {
+	constructor() { illegal(); }
+	get shadowRoot() { const sr = SRS.get(this.__el); return sr || null; }
+	get form() { return this.__el.closest ? this.__el.closest('form') : null; }
+	get labels() { return makeList([]); }
+	get willValidate() { return false; }
+	get validity() { return this.__v; }
+	get validationMessage() { return this.__m; }
+	setFormValue(v) { val(this, '__fv', v); }
+	setValidity(flags, msg) {
+		const v = Object.assign({ valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false,
+			tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
+			customError: false }, flags || {});
+		v.valid = !Object.keys(v).some((k) => v[k] === true);
+		val(this, '__v', v); val(this, '__m', v.valid ? '' : String(msg || ''));
+	}
+	checkValidity() { return this.__v.valid; }
+	reportValidity() { return this.__v.valid; }
+}
+HP.attachInternals = function () {
+	if (EIS.has(this)) throw domErr('ElementInternals already attached', 'NotSupportedError');
+	const i = Object.create(ElementInternals.prototype);
+	val(i, '__el', this); val(i, '__v', { valid: true }); val(i, '__m', '');
+	val(i, 'states', new CustomStateSet());
+	i.role = null;
+	EIS.set(this, i);
+	return i;
+};
+G.ElementInternals = ElementInternals; G.CustomStateSet = CustomStateSet;
+G.ShadowRoot = ShadowRoot; G.MutationRecord = MutationRecord;
 class ResizeObserver { constructor() {} observe() {} unobserve() {} disconnect() {} }
 class PerformanceObserver { constructor() {} observe() {} disconnect() {} static get supportedEntryTypes() { return []; } }
 G.IntersectionObserver = IntersectionObserver; G.MutationObserver = MutationObserver;
@@ -2155,9 +2763,6 @@ G.ResizeObserver = ResizeObserver; G.PerformanceObserver = PerformanceObserver;
 G.BroadcastChannel = class BroadcastChannel extends EventTarget { constructor(n) { super(); this.name = n; } postMessage() {} close() {} };
 G.MessageChannel = class MessageChannel { constructor() { this.port1 = { postMessage() {}, onmessage: null, close() {}, start() {}, addEventListener() {} }; this.port2 = this.port1; } };
 G.CSS = { supports() { return false; }, escape: cssEscape };
-const CE = new Map();
-G.customElements = { define(n, c) { CE.set(String(n), c); }, get(n) { return CE.get(String(n)); },
-	whenDefined(n) { return Promise.resolve(CE.get(String(n))); }, upgrade() {} };
 G.crypto = {
 	getRandomValues(a) {
 		for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 4294967296);

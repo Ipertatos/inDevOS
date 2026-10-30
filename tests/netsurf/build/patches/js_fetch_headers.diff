@@ -1,0 +1,89 @@
+--- a/netsurf/content/llcache.c
++++ b/netsurf/content/llcache.c
+@@ -119,6 +119,8 @@
+ 	bool tried_with_tls_downgrade;	/**< Whether we've tried TLS 1.2 */
+ 
+ 	bool tainted_tls;		/**< Whether the TLS transport is tainted */
++
++	char *extra_headers;		/**< "Name: value\n" lines from JS, or NULL */
+ } llcache_fetch_ctx;
+ 
+ /**
+@@ -888,6 +890,10 @@
+ 	return res;
+ }
+ 
++/* Extra request headers ("Name: value\n" lines) for the fetches started by
++ * the next llcache_handle_retrieve(); set around the call by the JS fetch(). */
++const char *llcache_extra_headers = NULL;
++
+ /**
+  * (Re)fetch an object
+  *
+@@ -917,11 +923,31 @@
+ 	}
+ 
+ 	/* Generate headers */
+-	headers = malloc(4 * sizeof(char *));
++	{
++		size_t nx = 0;
++		const char *x;
++		for (x = object->fetch.extra_headers; x != NULL && *x != '\0'; x++)
++			if (*x == '\n')
++				nx++;
++		headers = malloc((4 + nx) * sizeof(char *));
++	}
+ 	if (headers == NULL) {
+ 		return NSERROR_NOMEM;
+ 	}
+ 
++	/* request headers set by a script fetch() / XMLHttpRequest */
++	if (object->fetch.extra_headers != NULL) {
++		const char *x = object->fetch.extra_headers, *e;
++		while ((e = strchr(x, '\n')) != NULL) {
++			if (e > x) {
++				headers[header_idx] = strndup(x, e - x);
++				if (headers[header_idx] != NULL)
++					header_idx++;
++			}
++			x = e + 1;
++		}
++	}
++
+ 	/* cache-control header for etag */
+ 	if (object->cache.etag != NULL) {
+ 		const size_t len = SLEN("If-None-Match: ") +
+@@ -1041,6 +1067,8 @@
+ 	object->fetch.redirect_count = redirect_count;
+ 	object->fetch.retries_remaining = llcache->fetch_attempts;
+ 	object->fetch.hsts_in_use = hsts_in_use;
++	if (llcache_extra_headers != NULL && object->fetch.extra_headers == NULL)
++		object->fetch.extra_headers = strdup(llcache_extra_headers);
+ 
+ 	return llcache_object_refetch(object);
+ }
+@@ -1082,6 +1110,8 @@
+ 	if (object->fetch.referer != NULL)
+ 		nsurl_unref(object->fetch.referer);
+ 
++	free(object->fetch.extra_headers);
++
+ 	if (object->fetch.post != NULL) {
+ 		if (object->fetch.post->type == LLCACHE_POST_URL_ENCODED) {
+ 			free(object->fetch.post->data.urlenc);
+--- a/netsurf/content/llcache.h
++++ b/netsurf/content/llcache.h
+@@ -178,6 +178,13 @@
+ void llcache_clean(bool purge);
+ 
+ /**
++ * Extra request headers for fetches started by the next
++ * llcache_handle_retrieve() call: "Name: value\n" lines, or NULL.
++ * Set by the JavaScript fetch()/XMLHttpRequest around the call.
++ */
++extern const char *llcache_extra_headers;
++
++/**
+  * Retrieve a handle for a low-level cache object
+  *
+  * \param url      URL of the object to fetch

@@ -65,7 +65,9 @@
 #endif
 #define QJS_COUNTOF(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
-#define QJS_STACK_SIZE (384 * 1024)
+/* React commit phases on GitHub recurse ~500 frames deep; the user stack
+ * grows on demand to 8 MiB (Linux and the OS), so 2 MiB is safe. */
+#define QJS_STACK_SIZE (2 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* types                                                               */
@@ -1947,14 +1949,15 @@ static nserror qjs_fetch_cb(llcache_handle *handle,
 	return NSERROR_OK;
 }
 
-/* fetch(id, url, method, body|null) */
+/* fetch(id, url, method, body|null, headers|undefined)
+ * headers: "Name: value\n" lines (filtered on the JS side) */
 static JSValue n_fetch(JSContext *ctx, JSValueConst this_val, int argc,
 		       JSValueConst *argv)
 {
 	jsthread *t = T(ctx);
 	struct qjs_fetch *f;
 	int32_t id = 0;
-	const char *s, *m;
+	const char *s, *m, *hx = NULL;
 	nsurl *url = NULL, *page = qjs_page_url(t);
 	llcache_post_data post;
 	bool is_post;
@@ -1996,11 +1999,24 @@ static JSValue n_fetch(JSContext *ctx, JSValueConst this_val, int argc,
 	}
 	f->next = t->fetches;
 	t->fetches = f;
+	if (argc > 4 && JS_IsString(argv[4])) {
+		hx = JS_ToCString(ctx, argv[4]);
+		if (hx != NULL && *hx == '\0') {
+			JS_FreeCString(ctx, hx);
+			hx = NULL;
+		}
+	}
+	/* requests with their own headers (Accept: application/json, ...)
+	 * must not be answered from an object cached for another Accept */
+	llcache_extra_headers = hx;
 	err = llcache_handle_retrieve(url,
 			LLCACHE_RETRIEVE_NO_ERROR_PAGES |
-			(is_post ? LLCACHE_RETRIEVE_FORCE_FETCH : 0),
+			((is_post || hx != NULL) ? LLCACHE_RETRIEVE_FORCE_FETCH : 0),
 			page, is_post ? &post : NULL,
 			qjs_fetch_cb, f, &f->h);
+	llcache_extra_headers = NULL;
+	if (hx != NULL)
+		JS_FreeCString(ctx, hx);
 	nsurl_unref(url);
 	if (err != NSERROR_OK) {
 		qjs_fetch_unlink(f);
