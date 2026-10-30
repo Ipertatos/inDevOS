@@ -88,6 +88,9 @@ for t in fakemouse fakekbd faketablet; do
 done
 # /dev/wm demo client (tests/wm/wmdemo.c + userlib/libwm), built by tests/wm/build_wm.sh.
 [[ -f tests/wm/build/wmdemo.exe ]] && mcopy -o -i "$ROOTFS" tests/wm/build/wmdemo.exe ::/bin/wmdemo.exe && echo "    /bin/wmdemo.exe (static musl, /dev/wm demo)"
+# SDL2 (static, inDevOS /dev/wm video driver) demo and Chocolate Doom, built by tests/sdl2/build_sdl2.sh.
+[[ -f tests/sdl2/build/sdl2demo.exe ]] && mcopy -o -i "$ROOTFS" tests/sdl2/build/sdl2demo.exe ::/bin/sdl2demo.exe && echo "    /bin/sdl2demo.exe (static musl, SDL2 demo/selftest)"
+[[ -f tests/sdl2/build/chocolate-doom.exe ]] && mcopy -o -i "$ROOTFS" tests/sdl2/build/chocolate-doom.exe ::/bin/chocolate-doom.exe && echo "    /bin/chocolate-doom.exe (static musl, SDL2; -iwad /doom1.wad)"
 # OS test suite (tests/ostest/ostest.c), built by tests/ostest/build_ostest.sh.
 [[ -f tests/ostest/build/ostest.exe ]] && mcopy -o -i "$ROOTFS" tests/ostest/build/ostest.exe ::/bin/ostest.exe && echo "    /bin/ostest.exe (static musl, OS test suite)"
 for t in "${MUSL_TESTS[@]}"; do

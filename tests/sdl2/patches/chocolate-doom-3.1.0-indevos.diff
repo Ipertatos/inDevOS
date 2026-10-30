@@ -1,0 +1,28 @@
+--- a/src/i_video.c
++++ b/src/i_video.c
+@@ -124,7 +124,7 @@
+ 
+ // Run in full screen mode?  (int type for config code)
+ 
+-int fullscreen = true;
++int fullscreen = false;  // inDevOS: windowed on the desktop by default
+ 
+ // Aspect ratio correction mode
+ 
+@@ -554,11 +554,14 @@
+                 SDL_GetError());
+     }
+ 
+-    while (*w_upscale * SCREENWIDTH > rinfo.max_texture_width)
++    // inDevOS: the SDL software renderer reports 0 (= no limit).
++    while (rinfo.max_texture_width > 0
++        && *w_upscale * SCREENWIDTH > rinfo.max_texture_width)
+     {
+         --*w_upscale;
+     }
+-    while (*h_upscale * SCREENHEIGHT > rinfo.max_texture_height)
++    while (rinfo.max_texture_height > 0
++        && *h_upscale * SCREENHEIGHT > rinfo.max_texture_height)
+     {
+         --*h_upscale;
+     }

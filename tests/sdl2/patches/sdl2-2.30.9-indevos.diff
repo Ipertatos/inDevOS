@@ -1,0 +1,56 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -424,6 +424,7 @@
+ set_option(SDL_DIRECTFB            "Use DirectFB video driver" OFF)
+ dep_option(SDL_DIRECTFB_SHARED     "Dynamically load directfb support" ON "SDL_DIRECTFB" OFF)
+ set_option(SDL_DUMMYVIDEO          "Use dummy video driver" ON)
++set_option(SDL_INDEVOS            "Use inDevOS window server (/dev/wm) video driver" OFF)
+ dep_option(SDL_IBUS                "Enable IBus support" ON ${UNIX_SYS} OFF)
+ set_option(SDL_SYSTEM_ICONV        "Use iconv() from system-installed libraries" ${SDL_SYSTEM_ICONV_DEFAULT})
+ set_option(SDL_LIBICONV            "Prefer iconv() from libiconv, if available, over libc version" OFF)
+@@ -1239,6 +1240,13 @@
+     set(HAVE_DUMMYVIDEO TRUE)
+     set(HAVE_SDL_VIDEO TRUE)
+   endif()
++  if(SDL_INDEVOS)
++    set(SDL_VIDEO_DRIVER_INDEVOS 1)
++    file(GLOB VIDEO_INDEVOS_SOURCES ${SDL2_SOURCE_DIR}/src/video/indevos/*.c)
++    list(APPEND SOURCE_FILES ${VIDEO_INDEVOS_SOURCES})
++    set(HAVE_INDEVOS TRUE)
++    set(HAVE_SDL_VIDEO TRUE)
++  endif()
+   if(SDL_OFFSCREEN)
+     set(SDL_VIDEO_DRIVER_OFFSCREEN 1)
+     file(GLOB VIDEO_OFFSCREEN_SOURCES ${SDL2_SOURCE_DIR}/src/video/offscreen/*.c)
+--- a/include/SDL_config.h.cmake
++++ b/include/SDL_config.h.cmake
+@@ -410,6 +410,7 @@
+ #cmakedefine SDL_VIDEO_DRIVER_UIKIT @SDL_VIDEO_DRIVER_UIKIT@
+ #cmakedefine SDL_VIDEO_DRIVER_DIRECTFB @SDL_VIDEO_DRIVER_DIRECTFB@
+ #cmakedefine SDL_VIDEO_DRIVER_DIRECTFB_DYNAMIC @SDL_VIDEO_DRIVER_DIRECTFB_DYNAMIC@
++#cmakedefine SDL_VIDEO_DRIVER_INDEVOS @SDL_VIDEO_DRIVER_INDEVOS@
+ #cmakedefine SDL_VIDEO_DRIVER_DUMMY @SDL_VIDEO_DRIVER_DUMMY@
+ #cmakedefine SDL_VIDEO_DRIVER_OFFSCREEN @SDL_VIDEO_DRIVER_OFFSCREEN@
+ #cmakedefine SDL_VIDEO_DRIVER_WINDOWS @SDL_VIDEO_DRIVER_WINDOWS@
+--- a/src/video/SDL_sysvideo.h
++++ b/src/video/SDL_sysvideo.h
+@@ -473,6 +473,7 @@
+ extern VideoBootStrap RPI_bootstrap;
+ extern VideoBootStrap KMSDRM_bootstrap;
+ extern VideoBootStrap KMSDRM_LEGACY_bootstrap;
++extern VideoBootStrap INDEVOS_bootstrap;
+ extern VideoBootStrap DUMMY_bootstrap;
+ extern VideoBootStrap DUMMY_evdev_bootstrap;
+ extern VideoBootStrap Wayland_bootstrap;
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -140,6 +140,9 @@
+ #ifdef SDL_VIDEO_DRIVER_NGAGE
+     &NGAGE_bootstrap,
+ #endif
++#ifdef SDL_VIDEO_DRIVER_INDEVOS
++    &INDEVOS_bootstrap,
++#endif
+ #ifdef SDL_VIDEO_DRIVER_OFFSCREEN
+     &OFFSCREEN_bootstrap,
+ #endif

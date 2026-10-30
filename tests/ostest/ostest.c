@@ -1630,6 +1630,29 @@ static int t_dev_wm(char *d, size_t n) {
     R(PASS, "window create/present/title/destroy (event poll -> %d)", e);
 }
 
+/* ===================== sdl2 ===================== */
+/* /bin/sdl2demo.exe (tests/sdl2): static SDL2 with the inDevOS /dev/wm video
+ * driver. --selftest checks init, window, software renderer read-back,
+ * texture, threads, mutex/cond, timer, delay and events, then quits. */
+static int sdl2_selftest(char *d, size_t n, const char *drv) {
+    if (access("/bin/sdl2demo.exe", X_OK) != 0) R(SKIP, "/bin/sdl2demo.exe not installed");
+    char arg[32]; snprintf(arg, sizeof(arg), "--driver=%s", drv);
+    char out[2048]; char *av[] = { "/bin/sdl2demo.exe", "--selftest", arg, NULL };
+    int rc = run_capture(av, out, sizeof(out), 20000);
+    char *ok = strstr(out, "SDL2_SELFTEST_OK"), *nl;
+    if (ok && (nl = strchr(ok, '\n'))) *nl = 0;
+    if (!ok) { char *f = strstr(out, "SDL2_SELFTEST_FAIL"); if (f && (nl = strchr(f, '\n'))) *nl = 0; R(FAIL, "rc=%d: %.300s", rc, f ? f : out); }
+    CHECK(rc == 0, "rc=%d after %s", rc, ok);
+    R(PASS, "%s", ok + 17);
+}
+static int t_sdl2_headless(char *d, size_t n) { return sdl2_selftest(d, n, "dummy"); }
+static int t_sdl2_wm(char *d, size_t n) {
+    int fd = open("/dev/wm", O_RDWR);
+    if (fd < 0) R(SKIP, "/dev/wm: %s (desktop not running?)", strerror(errno));
+    close(fd);
+    return sdl2_selftest(d, n, "indevos");
+}
+
 /* ===================== net ===================== */
 static int t_net_socket(char *d, size_t n) {
     int t = socket(AF_INET, SOCK_STREAM, 0), u = socket(AF_INET, SOCK_DGRAM, 0);
@@ -3245,6 +3268,7 @@ static const struct test tests[] = {
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
     { "dev", "fb0", t_dev_fb, 10, 0 }, { "dev", "evdev", t_dev_evdev, 10, 0 }, { "dev", "uinput", t_dev_uinput, 10, 0 },
     { "dev", "wm", t_dev_wm, 10, 0 },
+    { "sdl2", "headless", t_sdl2_headless, 30, 0 }, { "sdl2", "wm", t_sdl2_wm, 30, 0 },
     { "net", "sockets", t_net_socket, 5, 0 }, { "net", "udp_loopback", t_net_udp_lo, 5, 0 }, { "net", "tcp_loopback", t_net_tcp_lo, 10, 0 }, { "net", "links_http", t_net_links_http, 60, 0 },
     { "net", "dns_connect", t_net_dns, 20, TF_EXPLICIT },
     { "unix", "pair_stream", t_unix_pair_stream, 15, 0 }, { "unix", "pair_dgram", t_unix_pair_dgram, 5, 0 },
