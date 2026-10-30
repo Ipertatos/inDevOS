@@ -16,12 +16,21 @@ static uint8_t ahci_dev_port[MAX_STORAGE_DEVICES];
 /* Non-zero when that AHCI port is an ATAPI CD/DVD (SIG 0xEB140101). */
 static uint8_t ahci_port_atapi[32];
 static int ahci_atapi_cache_valid;
-static uint32_t ahci_atapi_cache_blk;
+static uint32_t ahci_atapi_cache_blk;   /* first CD block held */
+static uint32_t ahci_atapi_cache_nblk;  /* number of CD blocks held */
 static int ahci_atapi_cache_port = -1;
-/* Dedicated 2048-byte ATAPI block cache. Must NOT alias dma_bounce: ATA
- * DMA reuses dma_bounce and would otherwise serve stale/corrupt CD data
- * while cache_valid stays set (live Links segfault reading /bin/links). */
+/* Dedicated ATAPI block cache (up to AHCI_ATAPI_MAX_BLKS 2048-byte CD
+ * blocks). Must NOT alias dma_bounce: ATA DMA reuses dma_bounce and would
+ * otherwise serve stale/corrupt CD data while cache_valid stays set (live
+ * Links segfault reading /bin/links). */
 static uint8_t *ahci_atapi_cache_data;
+/* One READ(10) moves up to 32 CD blocks (64 KB, same size and allocation
+ * as dma_bounce). Reading /bin/netsurf (9.3 MB) used to issue ~4560
+ * single-block PACKET commands; each command is a full MMIO + AIO round
+ * trip in QEMU, and under TCG with Doom running a single read stalled for
+ * ~148 s (desk try1). Multi-block reads cut the command count ~32x. */
+#define AHCI_ATAPI_MAX_BLKS 32u
+#define AHCI_ATAPI_CACHE_BYTES (AHCI_ATAPI_MAX_BLKS * 2048u)
 
 static uint8_t ahci_port_of(storage_device_t *dev) {
     if (dev && dev->device_id < MAX_STORAGE_DEVICES &&
@@ -472,7 +481,12 @@ static int ahci_wait_completion(uint8_t port, int timeout_ms) {
             break;
         }
 
-        __asm__ volatile("pause");
+        /* Back off between PxCI/HPET reads: every MMIO read traps to QEMU
+         * and takes its big lock, so a tight poll here (plus the HPET read in
+         * ktime_expired) competes with the main loop that completes the
+         * very DMA we are waiting for. ~64 PAUSEs is a few us on hardware. */
+        for (int i = 0; i < 64; i++)
+            __asm__ volatile("pause");
     }
 
     printf("AHCI: Command timeout on port %d\n", port);
@@ -568,7 +582,7 @@ void ahci_init(void) {
      * so PRDT phys translation stays on a dedicated, page-backed buffer and
      * never aliases dma_bounce (ATA DMA). */
     if (!ahci_atapi_cache_data) {
-        ahci_atapi_cache_data = kalloc(4096);
+        ahci_atapi_cache_data = kalloc(AHCI_ATAPI_CACHE_BYTES);
         if (!ahci_atapi_cache_data) {
             printf("AHCI: Failed to allocate ATAPI DMA cache\n");
             return;
@@ -744,8 +758,11 @@ static int ahci_atapi_packet(uint8_t port, const uint8_t cdb[12],
     fis->c = 1;
     fis->command = ATA_CMD_PACKET;
     fis->featurel = 1; /* DMA */
-    fis->lba1 = (uint8_t)(buflen & 0xFF);
-    fis->lba2 = (uint8_t)((buflen >> 8) & 0xFF);
+    /* Byte-count limit is a 16-bit field (PIO only; DMA ignores it).
+     * A 64 KB multi-block read would wrap to 0, so clamp it. */
+    uint32_t bcl = buflen > 0xFFFEu ? 0xFFFEu : buflen;
+    fis->lba1 = (uint8_t)(bcl & 0xFF);
+    fis->lba2 = (uint8_t)((bcl >> 8) & 0xFF);
 
     ahci_cmd_header_t *hdr = (ahci_cmd_header_t *)ahci_ctrl.cmd_list[port];
     uint64_t ct_phys = ((uint64_t)ahci_ctrl.cmd_table[port]) - vmm_higher_half_offset;
@@ -809,20 +826,26 @@ static int ahci_atapi_capacity(uint8_t port) {
     return 0;
 }
 
-static int ahci_atapi_fill(uint8_t port, uint32_t blk, void *dma_buf) {
+static int ahci_atapi_fill(uint8_t port, uint32_t blk, uint32_t nblk, void *dma_buf) {
     uint8_t cdb[12];
+    if (nblk == 0)
+        nblk = 1;
+    if (nblk > AHCI_ATAPI_MAX_BLKS)
+        nblk = AHCI_ATAPI_MAX_BLKS;
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = 0x28; /* READ(10) */
     cdb[2] = (uint8_t)((blk >> 24) & 0xFF);
     cdb[3] = (uint8_t)((blk >> 16) & 0xFF);
     cdb[4] = (uint8_t)((blk >> 8) & 0xFF);
     cdb[5] = (uint8_t)(blk & 0xFF);
-    cdb[8] = 1;
-    if (ahci_atapi_packet(port, cdb, dma_buf, 2048) != 0) {
+    cdb[7] = (uint8_t)((nblk >> 8) & 0xFF);
+    cdb[8] = (uint8_t)(nblk & 0xFF);
+    if (ahci_atapi_packet(port, cdb, dma_buf, nblk * 2048u) != 0) {
         ahci_atapi_cache_valid = 0;
         return -1;
     }
     ahci_atapi_cache_blk = blk;
+    ahci_atapi_cache_nblk = nblk;
     ahci_atapi_cache_port = (int)port;
     ahci_atapi_cache_valid = 1;
     return 0;
@@ -831,8 +854,8 @@ static int ahci_atapi_fill(uint8_t port, uint32_t blk, void *dma_buf) {
 static int ahci_atapi_ensure_cache(void) {
     if (ahci_atapi_cache_data)
         return 0;
-    /* Late path (should be rare): still demand a full page, not slab 2048. */
-    ahci_atapi_cache_data = kalloc(4096);
+    /* Late path (should be rare): same page-backed allocation as init. */
+    ahci_atapi_cache_data = kalloc(AHCI_ATAPI_CACHE_BYTES);
     if (!ahci_atapi_cache_data)
         return -1;
     return 0;
@@ -847,16 +870,24 @@ static int ahci_atapi_read_512(uint8_t port, uint64_t lba, uint32_t count, void 
         return -1;
     while (count) {
         uint32_t blk = (uint32_t)(lba >> 2);
-        uint32_t off = (uint32_t)(lba & 3u) * 512u;
         if (!ahci_atapi_cache_valid || ahci_atapi_cache_port != (int)port ||
-            ahci_atapi_cache_blk != blk) {
-            if (ahci_atapi_fill(port, blk, dma_buf) != 0)
+            blk < ahci_atapi_cache_blk ||
+            blk >= ahci_atapi_cache_blk + ahci_atapi_cache_nblk) {
+            /* Fetch only the blocks this request still needs (no read-ahead
+             * past the request), capped at AHCI_ATAPI_MAX_BLKS. */
+            uint64_t last_lba = lba + count - 1;
+            uint32_t need = (uint32_t)(last_lba >> 2) - blk + 1;
+            if (ahci_atapi_fill(port, blk, need, dma_buf) != 0)
                 return -1;
         }
-        memcpy(dst, (uint8_t *)dma_buf + off, 512);
-        dst += 512;
-        lba++;
-        count--;
+        uint32_t off = (blk - ahci_atapi_cache_blk) * 2048u +
+                       (uint32_t)(lba & 3u) * 512u;
+        uint32_t avail = (ahci_atapi_cache_nblk * 2048u - off) / 512u;
+        uint32_t n = count < avail ? count : avail;
+        memcpy(dst, (uint8_t *)dma_buf + off, (size_t)n * 512u);
+        dst += (size_t)n * 512u;
+        lba += n;
+        count -= n;
     }
     return 0;
 }

@@ -68,8 +68,13 @@ void ktime_pace_hz(uint32_t hz) {
         uint64_t deadline = next_ms;
         if (deadline > now + 100)
             deadline = now + 100;
-        while (ktime_now_ms() < deadline)
-            __asm__ volatile("sti; pause" ::: "memory");
+        /* Read the clock (HPET MMIO) only every 256 PAUSEs: a tight
+         * MMIO poll from the compositor and Doom presents (~28 ms per frame
+         * each) starves QEMU's main loop and stalls disk I/O completion. */
+        while (ktime_now_ms() < deadline) {
+            for (int i = 0; i < 256; i++)
+                __asm__ volatile("sti; pause" ::: "memory");
+        }
         now = ktime_now_ms();
     }
     next_ms = now + period;
