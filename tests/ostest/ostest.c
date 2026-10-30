@@ -37,6 +37,8 @@
 #include <sys/utsname.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/sendfile.h>
+#include <sys/syscall.h>
 #include <stddef.h>
 #include <sys/sysinfo.h>
 #include <sys/statfs.h>
@@ -3065,6 +3067,158 @@ static int t_cx_tcp_download(char *d, size_t n) {
     CHECK(tot > 200000, "short download %lld bytes in %lldms", tot, us / 1000);
     R(PASS, "%lld bytes in %lldms = %.0f KB/s%s", tot, us / 1000, tot / 1024.0 / (us / 1e6), eof ? "" : " (40s cap)");
 }
+/* ===================== dyn: dynamically linked programs (PT_INTERP) =====================
+ * tests/dynlink/build_dynlink.sh builds musl's libc.so (= /lib/ld-musl-x86_64.so.1) and
+ * the programs; make_install_iso.sh installs them.  SKIP when they are not installed. */
+#define DYN_LDSO "/lib/ld-musl-x86_64.so.1"
+static int dyn_have(const char *exe, char *d, size_t n) {
+    if (access(DYN_LDSO, F_OK)) { snprintf(d, n, DYN_LDSO " missing"); return 0; }
+    if (access(exe, F_OK)) { snprintf(d, n, "%s missing", exe); return 0; }
+    return 1;
+}
+static void dyn_oneline(char *s) { for (; *s; s++) if (*s == '\n' || *s == '\r') *s = ' '; }
+static int t_dyn_hello(char *d, size_t n) {
+    if (!dyn_have("/bin/hello_dyn.exe", d, n)) return SKIP;
+    char out[512]; char *av[] = { "/bin/hello_dyn.exe", "5", NULL };
+    int r = run_capture(av, out, sizeof(out), 8000); dyn_oneline(out);
+    CHECK(r == 5, "exit %d (want 5) out='%.200s'", r, out);
+    CHECK(strstr(out, "DYN_HELLO argc=2") && strstr(out, "tls=42") && strstr(out, "heap ok") && strstr(out, "path=set"),
+          "output '%.200s'", out);
+    const char *m = strstr(out, "main="), *b = strstr(out, "at_base=");
+    unsigned long long mv = m ? strtoull(m + 5, NULL, 16) : 0, bv = b ? strtoull(b + 8, NULL, 16) : 0;
+    CHECK(mv >= 0x10000 && bv != 0, "PIE main=%#llx AT_BASE=%#llx (want both nonzero)", mv, bv);
+    R(PASS, "PIE via ld-musl: exit 5, TLS, malloc, env; main=%#llx AT_BASE=%#llx", mv, bv);
+}
+static int t_dyn_nopie(char *d, size_t n) {
+    if (!dyn_have("/bin/hello_dyn_nopie.exe", d, n)) return SKIP;
+    char out[512]; char *av[] = { "/bin/hello_dyn_nopie.exe", NULL };
+    int r = run_capture(av, out, sizeof(out), 8000); dyn_oneline(out);
+    CHECK(r == 0 && strstr(out, "DYN_HELLO argc=1") && strstr(out, "tls=42"), "exit %d out='%.200s'", r, out);
+    R(PASS, "ET_EXEC + PT_INTERP: %.90s", out);
+}
+static int t_dyn_needed(char *d, size_t n) {
+    if (!dyn_have("/bin/needed_test.exe", d, n)) return SKIP;
+    if (access("/lib/libdltest.so", F_OK)) R(SKIP, "/lib/libdltest.so missing");
+    char out[512]; char *av[] = { "/bin/needed_test.exe", NULL };
+    int r = run_capture(av, out, sizeof(out), 8000); dyn_oneline(out);
+    CHECK(r == 0 && strstr(out, "NEEDED_OK"), "exit %d out='%.200s'", r, out);
+    R(PASS, "DT_NEEDED libdltest.so: %.80s", out);
+}
+static int t_dyn_dlopen(char *d, size_t n) {
+    if (!dyn_have("/bin/dlopen_test.exe", d, n)) return SKIP;
+    if (access("/lib/libdltest.so", F_OK)) R(SKIP, "/lib/libdltest.so missing");
+    char out[512]; char *av[] = { "/bin/dlopen_test.exe", NULL };
+    int r = run_capture(av, out, sizeof(out), 8000); dyn_oneline(out);
+    CHECK(r == 0 && strstr(out, "DLOPEN_OK"), "exit %d out='%.200s'", r, out);
+    R(PASS, "dlopen/dlsym/ctor/TLS/dlclose: %.100s", out);
+}
+/* A copy of hello_dyn.exe whose PT_INTERP names a missing loader must fail
+ * cleanly with ENOENT (child exits 127), not crash. */
+static int t_dyn_bad_interp(char *d, size_t n) {
+    if (!dyn_have("/bin/hello_dyn.exe", d, n)) return SKIP;
+    static char img[256 << 10]; ssize_t sz = get_file("/bin/hello_dyn.exe", img, sizeof(img));
+    CHECK(sz > 64 && sz < (ssize_t)sizeof(img), "read hello_dyn.exe: %zd", sz);
+    const char *from = DYN_LDSO, *to = "/lib/ld-nothere-x86.so.1";
+    size_t L = strlen(from); CHECK(strlen(to) == L, "length mismatch");
+    char *hit = NULL;
+    for (ssize_t i = 0; i + (ssize_t)L <= sz; i++) if (!memcmp(img + i, from, L)) { hit = img + i; break; }
+    CHECK(hit, "PT_INTERP string not found");
+    memcpy(hit, to, L);
+    char f[160]; tpath(f, sizeof(f), "badinterp.exe");
+    CHECKE(put_file(f, img, (size_t)sz) == 0, "write copy"); chmod(f, 0755);
+    char out[256]; char *av[] = { f, NULL };
+    int r = run_capture(av, out, sizeof(out), 8000); dyn_oneline(out);
+    /* child reports execv's errno as its exit status */
+    int en = -1; pid_t c = fork();
+    if (c == 0) { execv(f, av); _exit(errno & 0x7f); }
+    if (c > 0) { int st = 0; if (waitpid(c, &st, 0) == c && WIFEXITED(st)) en = WEXITSTATUS(st); }
+    unlink(f);
+    CHECK(r == 127, "exec with missing interpreter -> %d (want 127) out='%.100s'", r, out);
+    CHECK(en == ENOENT || en == ENOEXEC, "execv errno %d (want ENOENT/ENOEXEC)", en);
+    R(PASS, "missing PT_INTERP loader -> execv %s, child 127", strerror(en));
+}
+/* glibc programs through glibc's own ld.so (/lib64/ld-linux-x86-64.so.2). */
+#define GLIBC_LDSO "/lib64/ld-linux-x86-64.so.2"
+static int glibc_have(const char *exe, char *d, size_t n) {
+    if (access(GLIBC_LDSO, F_OK) || access("/lib/x86_64-linux-gnu/libc.so.6", F_OK)) { snprintf(d, n, "glibc runtime not installed"); return 0; }
+    if (access(exe, F_OK)) { snprintf(d, n, "%s missing", exe); return 0; }
+    return 1;
+}
+static int t_dyn_glibc_hello(char *d, size_t n) {
+    if (!glibc_have("/bin/hello_glibc.exe", d, n)) return SKIP;
+    char out[512]; char *av[] = { "/bin/hello_glibc.exe", "6", NULL };
+    int r = run_capture(av, out, sizeof(out), 15000); dyn_oneline(out);
+    CHECK(r == 6 && strstr(out, "DYN_HELLO argc=2") && strstr(out, "tls=42") && strstr(out, "heap ok"),
+          "exit %d (want 6) out='%.200s'", r, out);
+    R(PASS, "glibc PIE: %.110s", out);
+}
+static int t_dyn_glibc_coreutils(char *d, size_t n) {
+    if (!glibc_have("/bin/true_glibc.exe", d, n)) return SKIP;
+    char out[512]; char *av[] = { "/bin/true_glibc.exe", NULL };
+    int r = run_capture(av, out, sizeof(out), 15000); dyn_oneline(out);
+    CHECK(r == 0, "true: exit %d out='%.200s'", r, out);
+    int k = 1;
+    if (!access("/bin/echo_glibc.exe", F_OK)) {
+        char *av2[] = { "/bin/echo_glibc.exe", "glibc", "echo", NULL };
+        r = run_capture(av2, out, sizeof(out), 15000);
+        CHECK(r == 0 && !strcmp(out, "glibc echo\n"), "echo: exit %d out='%.200s'", r, out); k++;
+    }
+    char f[160]; tpath(f, sizeof(f), "glibc_cat.txt"); CHECKE(put_file(f, "cat via glibc\n", 14) == 0, "write");
+    if (!access("/bin/io_glibc.exe", F_OK)) {      /* cat's I/O steps one by one: names a failing syscall */
+        char *avi[] = { "/bin/io_glibc.exe", f, NULL };
+        r = run_capture(avi, out, sizeof(out), 15000); dyn_oneline(out);
+        if (r != 0 || !strstr(out, "IO_OK")) unlink(f);
+        CHECK(r == 0 && strstr(out, "IO_OK"), "io: exit %d out='%.200s'", r, out);
+    }
+    if (!access("/bin/cat_glibc.exe", F_OK)) {
+        char *av3[] = { "/bin/cat_glibc.exe", f, NULL };
+        r = run_capture(av3, out, sizeof(out), 15000);
+        if (r != 0 || strcmp(out, "cat via glibc\n")) unlink(f);
+        CHECK(r == 0 && !strcmp(out, "cat via glibc\n"), "cat: exit %d out='%.200s'", r, out); k++;
+    }
+    unlink(f);
+    R(PASS, "%d Ubuntu coreutils binaries (true/echo/cat) ran unmodified", k);
+}
+static int t_dyn_glibc_dlopen(char *d, size_t n) {
+    if (!glibc_have("/bin/dlopen_glibc.exe", d, n)) return SKIP;
+    const char *lib = "/lib/x86_64-linux-gnu/libdltest_glibc.so";
+    if (access(lib, F_OK)) R(SKIP, "%s missing", lib);
+    char out[512]; char *av[] = { "/bin/dlopen_glibc.exe", (char *)lib, NULL };
+    int r = run_capture(av, out, sizeof(out), 15000); dyn_oneline(out);
+    CHECK(r == 0 && strstr(out, "DLOPEN_OK"), "exit %d out='%.200s'", r, out);
+    R(PASS, "glibc dlopen: %.100s", out);
+}
+/* sendfile + copy_file_range between regular files (the kernel used to hand its
+ * bounce buffer to sys_read, which refused it: both always failed with EFAULT;
+ * glibc cat uses copy_file_range when stdout is a file). */
+static int t_fs_sendfile_cfr(char *d, size_t n) {
+    enum { SZ = 100000 };
+    static char a[SZ], b[SZ];
+    for (int i = 0; i < SZ; i++) a[i] = (char)(i * 7 + (i >> 9));
+    char src[160], d1[160], d2[160];
+    tpath(src, sizeof(src), "sf_src"); tpath(d1, sizeof(d1), "sf_d1"); tpath(d2, sizeof(d2), "sf_d2");
+    CHECKE(put_file(src, a, SZ) == 0, "write src");
+    int in = open(src, O_RDONLY), o1 = open(d1, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECKE(in >= 0 && o1 >= 0, "open");
+    long tot = 0, k;
+    while (tot < SZ && (k = sendfile(o1, in, NULL, SZ - tot)) > 0) tot += k;
+    int e1 = errno; close(o1);
+    CHECK(tot == SZ, "sendfile copied %ld of %d (%s)", tot, SZ, strerror(e1));
+    CHECK(lseek(in, 0, SEEK_CUR) == SZ, "sendfile(NULL off) left in offset %ld", (long)lseek(in, 0, SEEK_CUR));
+    int f1 = open(d1, O_RDONLY); ssize_t g = f1 >= 0 ? read(f1, b, SZ) : -1; if (f1 >= 0) close(f1);
+    CHECK(g == SZ && !memcmp(a, b, SZ), "sendfile data mismatch (read %ld)", (long)g);
+    int o2 = open(d2, O_WRONLY | O_CREAT | O_TRUNC, 0644); CHECKE(o2 >= 0, "open d2");
+    loff_t off = 1000; tot = 0;
+    while (tot < SZ - 1000 && (k = syscall(SYS_copy_file_range, in, &off, o2, NULL, (size_t)(SZ - 1000 - tot), 0)) > 0) tot += k;
+    int e2 = errno; close(o2);
+    CHECK(tot == SZ - 1000 && off == SZ, "copy_file_range copied %ld, off %ld (%s)", tot, (long)off, strerror(e2));
+    CHECK(lseek(in, 0, SEEK_CUR) == SZ, "copy_file_range(&off) moved in offset to %ld", (long)lseek(in, 0, SEEK_CUR));
+    close(in);
+    int f2 = open(d2, O_RDONLY); g = f2 >= 0 ? read(f2, b, SZ) : -1; if (f2 >= 0) close(f2);
+    unlink(src); unlink(d1); unlink(d2);
+    CHECK(g == SZ - 1000 && !memcmp(a + 1000, b, SZ - 1000), "copy_file_range data mismatch (read %ld)", (long)g);
+    R(PASS, "sendfile %d B + copy_file_range %d B (off_in ptr) byte-exact", SZ, SZ - 1000);
+}
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -3085,7 +3239,7 @@ static const struct test tests[] = {
     { "fs", "rw_seek", t_fs_rw, 10, 0 }, { "fs", "append", t_fs_append, 10, 0 }, { "fs", "truncate", t_fs_truncate, 15, 0 },
     { "fs", "rename", t_fs_rename, 10, 0 }, { "fs", "dirs", t_fs_dirs, 15, 0 }, { "fs", "readdir_stat", t_fs_readdir_stat, 10, 0 }, { "fs", "readdir_many", t_fs_readdir_many, 120, 0 },
     { "fs", "many_files", t_fs_many, 120, 0 }, { "fs", "large_24mb", t_fs_large, 180, 0 },
-    { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 }, { "fs", "seek_far_read", t_fs_seek_far_read, 30, 0 },
+    { "fs", "readback_busybox", t_fs_readback_busybox, 15, 0 }, { "fs", "fd_offsets", t_fs_fd_offsets, 10, 0 }, { "fs", "seek_far_read", t_fs_seek_far_read, 30, 0 }, { "fs", "sendfile_cfr", t_fs_sendfile_cfr, 20, 0 },
     { "vol", "read_all", t_vol_read, 120, 0 }, { "vol", "rw_if_writable", t_vol_rw, 60, 0 }, { "vol", "ext_write", t_vol_extwrite, 60, 0 }, { "vol", "ext_ns", t_vol_extns, 120, 0 }, { "vol", "ext_dir", t_vol_extdir, 60, 0 }, { "vol", "ext_htree", t_vol_exthtree, 120, 0 }, { "vol", "ext_sparse", t_vol_extsparse, 60, 0 }, { "vol", "ext_deep", t_vol_extdeep, 120, 0 }, { "vol", "ext_journal", t_vol_extjournal, 120, 0 }, { "vol", "ext_e4dw", t_vol_exte4dw, 60, 0 }, { "vol", "ext_links", t_vol_extlinks, 120, 0 }, { "vol", "mount_slots", t_vol_mountslots, 30, 0 },
     { "vol", "ext_meta", t_vol_extmeta, 180, 0 },
     { "dev", "null_zero", t_dev_null_zero, 5, 0 }, { "dev", "random", t_dev_random, 5, 0 }, { "dev", "tty", t_dev_tty, 5, 0 },
@@ -3112,6 +3266,11 @@ static const struct test tests[] = {
     { "compat", "big_exec", t_cx_bigexec, 15, 0 }, { "compat", "shebang", t_cx_shebang, 15, 0 },
     { "compat", "modes", t_cx_modes, 5, 0 }, { "compat", "close_stdio", t_cx_close_stdio, 5, 0 },
     { "compat", "proc_files", t_cx_proc, 5, 0 }, { "compat", "erofs", t_cx_erofs, 5, 0 }, { "compat", "seek_hole", t_cx_seek_hole, 10, 0 }, { "compat", "binutils", t_cx_binutils, 120, 0 }, { "compat", "fat_times", t_cx_fat_times, 10, 0 }, { "compat", "applets", t_cx_applets, 30, 0 }, { "compat", "configure", t_cx_configure, 180, 0 }, { "inotify", "tmpfs", t_inotify_tmp, 10, 0 }, { "inotify", "volumes", t_inotify_vols, 30, 0 }, { "compat", "tmp_big", t_cx_tmp_big, 60, 0 }, { "compat", "perf", t_cx_perf, 90, 0 }, { "compat", "exec_cache", t_cx_exec_cache, 120, 0 }, { "compat", "stdev_statfs", t_cx_stdev_statfs, 15, 0 }, { "compat", "poll_sleep", t_cx_poll_sleep, 10, 0 }, { "compat", "poll_timeout_precision", t_cx_poll_prec, 30, 0 }, { "compat", "poll_connect", t_cx_poll_connect, 30, 0 }, { "compat", "tcp_download", t_cx_tcp_download, 120, 0 }, { "epoll", "pwait_sigmask", t_ep_pwait_mask, 15, 0 }, { "futex", "wake_op", t_fx_wake_op, 30, 0 },
+    { "dyn", "hello", t_dyn_hello, 20, 0 }, { "dyn", "nopie", t_dyn_nopie, 20, 0 },
+    { "dyn", "needed", t_dyn_needed, 20, 0 }, { "dyn", "dlopen", t_dyn_dlopen, 20, 0 },
+    { "dyn", "bad_interp", t_dyn_bad_interp, 20, 0 },
+    { "dyn", "glibc_hello", t_dyn_glibc_hello, 30, 0 }, { "dyn", "glibc_coreutils", t_dyn_glibc_coreutils, 30, 0 },
+    { "dyn", "glibc_dlopen", t_dyn_glibc_dlopen, 30, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 

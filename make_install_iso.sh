@@ -103,6 +103,33 @@ if [[ -f tests/busybox/build/busybox.exe ]]; then
     echo "    /bin/busybox.exe (static musl BusyBox)"
 fi
 
+# Dynamic linking (PT_INTERP): musl's libc.so doubles as its dynamic loader,
+# /lib/ld-musl-x86_64.so.1, so dynamically linked musl programs run.  Plus the
+# dyn test programs ostest runs.  Built by tests/dynlink/build_dynlink.sh;
+# optional, skipped when not built.
+DYN=tests/dynlink/build
+if [[ -f $DYN/ld-musl-x86_64.so.1 ]]; then
+    mmd -D s -i "$ROOTFS" ::/lib 2>/dev/null </dev/null || true
+    mcopy -o -i "$ROOTFS" "$DYN/ld-musl-x86_64.so.1" ::/lib/ld-musl-x86_64.so.1
+    echo "    /lib/ld-musl-x86_64.so.1 (musl libc.so + dynamic loader)"
+    [[ -f $DYN/libdltest.so ]] && mcopy -o -i "$ROOTFS" "$DYN/libdltest.so" ::/lib/libdltest.so && echo "    /lib/libdltest.so (dyn test library)"
+    for t in hello_dyn hello_dyn_nopie dlopen_test needed_test; do
+        [[ -f $DYN/$t.exe ]] && mcopy -o -i "$ROOTFS" "$DYN/$t.exe" "::/bin/$t.exe" && echo "    /bin/$t.exe (dynamic musl test)"
+    done
+fi
+# Optional glibc runtime (host's ld-linux-x86-64.so.2 + libc.so.6, copied by
+# build_dynlink.sh) and glibc test programs.
+if [[ -f $DYN/glibc/ld-linux-x86-64.so.2 && -f $DYN/glibc/libc.so.6 ]]; then
+    mmd -D s -i "$ROOTFS" ::/lib ::/lib64 ::/lib/x86_64-linux-gnu 2>/dev/null </dev/null || true
+    mcopy -o -i "$ROOTFS" "$DYN/glibc/ld-linux-x86-64.so.2" ::/lib64/ld-linux-x86-64.so.2
+    mcopy -o -i "$ROOTFS" "$DYN/glibc/libc.so.6" ::/lib/x86_64-linux-gnu/libc.so.6
+    [[ -f $DYN/glibc/libdltest_glibc.so ]] && mcopy -o -i "$ROOTFS" "$DYN/glibc/libdltest_glibc.so" ::/lib/x86_64-linux-gnu/libdltest_glibc.so
+    echo "    /lib64/ld-linux-x86-64.so.2 + /lib/x86_64-linux-gnu/libc.so.6 (glibc runtime)"
+    for f in "$DYN"/glibc/*.exe; do
+        [[ -f $f ]] && mcopy -o -i "$ROOTFS" "$f" "::/bin/$(basename "$f")" && echo "    /bin/$(basename "$f") (dynamic glibc test)"
+    done
+fi
+
 # Networking config + CA bundle (HTTPS cert validation) + optional static curl.
 NETTMP=$(mktemp -d)
 printf "nameserver 10.0.2.3\n" > "$NETTMP/resolv.conf"

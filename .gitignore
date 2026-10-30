@@ -47,6 +47,7 @@ tests/busybox/build/
 tests/binutils/build/
 tests/make/build/
 tests/musl/build/
+tests/dynlink/build/
 *.ko
 shot-*/
 serial-*.txt

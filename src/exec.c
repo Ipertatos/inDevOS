@@ -77,6 +77,7 @@ typedef struct {
     uint64_t phent;     /* AT_PHENT */
     uint64_t phnum;     /* AT_PHNUM */
     uint64_t entry;     /* AT_ENTRY */
+    uint64_t base;      /* AT_BASE: interpreter load bias (0 = no PT_INTERP) */
 } exec_auxinfo_t;
 static exec_auxinfo_t exec_cur_aux;
 
@@ -254,7 +255,7 @@ static uint64_t exec_build_abi_stack(uint64_t *user_pml4, uint64_t ustack_top,
         { AT_PHENT,    exec_cur_aux.phent },
         { AT_PHNUM,    exec_cur_aux.phnum },
         { AT_PAGESZ,   PAGE_SIZE },
-        { AT_BASE,     0 },                 /* no dynamic loader */
+        { AT_BASE,     exec_cur_aux.base }, /* dynamic loader bias, 0 if static */
         { AT_FLAGS,    0 },
         { AT_ENTRY,    exec_cur_aux.entry },
         { AT_UID,      uid },
@@ -779,8 +780,6 @@ static const char *exec_elf_unsupported(const void *image, uint32_t size)
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)((const uint8_t *)image +
                                 eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type == PT_INTERP)
-            return "dynamically linked (PT_INTERP); only static binaries are supported";
         if (ph->p_type == PT_LOAD && ph->p_filesz &&
             ph->p_offset + ph->p_filesz > size)
             return "PT_LOAD outside the file";
@@ -788,9 +787,9 @@ static const char *exec_elf_unsupported(const void *image, uint32_t size)
     return NULL;
 }
 
-/* Fill exec_cur_aux (AT_PHDR/PHENT/PHNUM/ENTRY) for the image being loaded.
- * Images are mapped at their own p_vaddr (load bias 0). */
-static void exec_collect_auxinfo(const void *image)
+/* Fill *aux (AT_PHDR/PHENT/PHNUM/ENTRY) for the program image, which is
+ * mapped at p_vaddr + bias (bias 0 unless it is a PIE with PT_INTERP). */
+static void exec_collect_auxinfo(const void *image, uint64_t bias, exec_auxinfo_t *aux)
 {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
     uint64_t phdr = 0;
@@ -810,10 +809,11 @@ static void exec_collect_auxinfo(const void *image)
             }
         }
     }
-    exec_cur_aux.phdr  = phdr;
-    exec_cur_aux.phent = eh->e_phentsize;
-    exec_cur_aux.phnum = eh->e_phnum;
-    exec_cur_aux.entry = eh->e_entry;
+    aux->phdr  = phdr ? phdr + bias : 0;
+    aux->phent = eh->e_phentsize;
+    aux->phnum = eh->e_phnum;
+    aux->entry = eh->e_entry + bias;
+    aux->base  = 0;
 }
 
 /* Back one page of a PT_LOAD segment.  Static non-PIE binaries (musl-gcc
@@ -872,6 +872,224 @@ static void exec_apply_relocations(uint64_t *pml4, const Elf64_Phdr *dyn_ph)
     }
 }
 
+
+/* ---- Dynamically linked programs (PT_INTERP) ----
+ *
+ * A program with PT_INTERP is started through its interpreter, the dynamic
+ * loader named there (musl: /lib/ld-musl-x86_64.so.1, glibc:
+ * /lib64/ld-linux-x86-64.so.2), like Linux does:
+ *   - the program's PT_LOADs are mapped: a PIE (ET_DYN) at EXEC_PIE_BASE, a
+ *     non-PIE (ET_EXEC) at its own addresses.  The kernel applies no
+ *     relocations; the dynamic loader does;
+ *   - the interpreter (must be ET_DYN, no PT_INTERP of its own) is mapped at
+ *     EXEC_INTERP_BASE;
+ *   - AT_PHDR/AT_ENTRY describe the program, AT_BASE is the interpreter's
+ *     load bias, and the first user instruction is the interpreter's entry.
+ * The loader then maps shared libraries itself (open + mmap MAP_PRIVATE of
+ * the file, MAP_FIXED per segment, mprotect for RELRO).
+ *
+ * Programs without PT_INTERP keep the old layout: load bias 0 and the
+ * kernel's RELATIVE/64/GLOB_DAT pass (the native -static-pie apps rely on it;
+ * musl static-pie self-relocation is idempotent on top of it). */
+#define EXEC_PIE_BASE     0x0000555555554000ULL
+#define EXEC_INTERP_BASE  0x00007F0000000000ULL
+#define EXEC_INTERP_SPAN  (1ULL << 30)          /* max interpreter image span */
+#define EXEC_INTERP_PATH  128
+
+static const Elf64_Phdr *exec_phdr_at(const void *image, uint16_t i)
+{
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    return (const Elf64_Phdr *)((const uint8_t *)image + eh->e_phoff +
+                                (uint64_t)i * eh->e_phentsize);
+}
+
+/* Copy the PT_INTERP path into buf.  1 = found, 0 = none, -1 = malformed
+ * (outside the file, not NUL-terminated, not absolute, or too long). */
+static int exec_interp_path(const void *image, uint32_t size, char *buf, size_t cap)
+{
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = exec_phdr_at(image, i);
+        if (ph->p_type != PT_INTERP)
+            continue;
+        if (ph->p_filesz < 2 || ph->p_filesz > cap ||
+            ph->p_offset > size || ph->p_filesz > size - ph->p_offset)
+            return -1;
+        const char *src = (const char *)image + ph->p_offset;
+        if (src[ph->p_filesz - 1] != 0 || src[0] != '/')
+            return -1;
+        memcpy(buf, src, (size_t)ph->p_filesz);
+        if (strlen(buf) + 1 != (size_t)ph->p_filesz)
+            return -1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Load bias of the program image itself: EXEC_PIE_BASE for a dynamically
+ * linked PIE, 0 otherwise (static and native images keep their p_vaddr). */
+static uint64_t exec_main_bias(const void *image, uint32_t size)
+{
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    char tmp[EXEC_INTERP_PATH];
+    if (eh->e_type != ET_DYN || exec_interp_path(image, size, tmp, sizeof tmp) != 1)
+        return 0;
+    return EXEC_PIE_BASE;
+}
+
+/* Map every PT_LOAD of image at p_vaddr + bias and copy its file bytes.
+ * Returns 0, or -1 when out of memory. */
+static int exec_map_loads(uint64_t *pml4, const void *image, uint64_t bias)
+{
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = exec_phdr_at(image, i);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0)
+            continue;
+        uint64_t va  = ph->p_vaddr + bias;
+        uint64_t sv  = va & ~0xFFFULL;
+        uint64_t se  = (va + ph->p_memsz + 0xFFF) & ~0xFFFULL;
+        uint64_t np  = (se - sv) / PAGE_SIZE;
+        uint64_t flags = VMM_PRESENT | VMM_USER;
+        if (ph->p_flags & 0x2) flags |= VMM_WRITABLE;       /* PF_W */
+        if (!(ph->p_flags & 0x1)) flags |= VMM_NX;          /* !PF_X */
+        for (uint64_t pg = 0; pg < np; pg++) {
+            /* Zeroed frame, or the frame already backing this page when a
+             * previous segment ends inside it (static non-PIE layouts). */
+            if (exec_map_segment_page(pml4, sv + pg * PAGE_SIZE, flags) != 0) {
+                serial_printf("exec: out of memory mapping page at 0x%llx\n",
+                              (unsigned long long)(sv + pg * PAGE_SIZE));
+                return -1;
+            }
+        }
+        /* Copy file data into the mapped pages through the HHDM. */
+        const uint8_t *src = (const uint8_t *)image + ph->p_offset;
+        uint64_t cv  = va;
+        uint64_t rem = ph->p_filesz;
+        while (rem > 0) {
+            uint64_t pv = cv & ~0xFFFULL;
+            uint64_t po = cv & 0xFFF;
+            uint64_t phys = vmm_is_mapped_in(pml4, pv);
+            if (!phys) break;
+            uint64_t chunk = PAGE_SIZE - po;
+            if (chunk > rem) chunk = rem;
+            memcpy((uint8_t *)phys_to_virt(phys) + po, src, chunk);
+            src += chunk; cv += chunk; rem -= chunk;
+        }
+    }
+    return 0;
+}
+
+/* Read a whole file into a kalloc'd buffer (the exec cache when the VFS is
+ * mounted, FAT32 otherwise).  Returns the byte count or a negative errno. */
+static int exec_read_whole(const char *path, void **out)
+{
+    *out = NULL;
+    if (vfs_has_root_mount()) {
+        int n = exec_image_load(path, out);
+        if (n <= 0 || !*out) {
+            if (*out) { kfree(*out); *out = NULL; }
+            return n < 0 ? n : -ENOENT;
+        }
+        return n;
+    }
+    if (!fat32_is_mounted())
+        return -ENOENT;
+    fat32_file_t *f = fat32_open(path, "r");
+    if (!f)
+        return -ENOENT;
+    uint32_t sz = f->file_size;
+    void *b = sz ? kalloc(sz) : NULL;
+    if (!b) { fat32_close(f); return sz ? -ENOMEM : -ENOEXEC; }
+    int n = fat32_read(f, b, sz);
+    fat32_close(f);
+    if (n != (int)sz) { kfree(b); return -EIO; }
+    *out = b;
+    return n;
+}
+
+/* Map the program (at bias, see exec_main_bias) and, when it has PT_INTERP,
+ * its interpreter into pml4.  Fills *aux and the first user RIP.  Static
+ * programs get the old kernel relocation pass.  who prefixes serial logs.
+ * Returns 0, -ENOMEM, -ENOENT (interpreter missing) or -ENOEXEC. */
+static int exec_map_program(uint64_t *pml4, const void *image, uint32_t size,
+                            uint64_t bias, const char *who,
+                            uint64_t *entry_out, exec_auxinfo_t *aux)
+{
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    char interp[EXEC_INTERP_PATH];
+    int has_interp = exec_interp_path(image, size, interp, sizeof interp);
+    if (has_interp < 0) {
+        serial_printf("%s: malformed PT_INTERP\n", who);
+        return -ENOEXEC;
+    }
+    if (exec_map_loads(pml4, image, bias) != 0)
+        return -ENOMEM;
+    exec_collect_auxinfo(image, bias, aux);
+
+    if (!has_interp) {
+        const Elf64_Phdr *dyn_ph = NULL;
+        for (uint16_t i = 0; i < eh->e_phnum; i++) {
+            const Elf64_Phdr *ph = exec_phdr_at(image, i);
+            if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
+        }
+        if (dyn_ph)
+            exec_apply_relocations(pml4, dyn_ph);
+        *entry_out = eh->e_entry + bias;
+        return 0;
+    }
+
+    void *ib = NULL;
+    int n = exec_read_whole(interp, &ib);
+    if (n <= 0) {
+        serial_printf("%s: interpreter %s: not found (%d)\n", who, interp, n);
+        return -ENOENT;
+    }
+    const char *why = NULL;
+    const Elf64_Ehdr *ie = (const Elf64_Ehdr *)ib;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    if ((uint32_t)n < sizeof(Elf64_Ehdr) || memcmp(ib, ELF_MAGIC, 4) != 0)
+        why = "not an ELF file";
+    else if (ie->e_phoff == 0 || ie->e_phnum == 0)
+        why = "no program headers";
+    else if ((why = exec_elf_unsupported(ib, (uint32_t)n)) != NULL)
+        ;
+    else if (ie->e_type != ET_DYN)
+        why = "not ET_DYN";
+    else {
+        char tmp[EXEC_INTERP_PATH];
+        if (exec_interp_path(ib, (uint32_t)n, tmp, sizeof tmp) != 0)
+            why = "has its own PT_INTERP";
+    }
+    if (!why) {
+        for (uint16_t i = 0; i < ie->e_phnum; i++) {
+            const Elf64_Phdr *ph = exec_phdr_at(ib, i);
+            if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+            if (ph->p_vaddr < lo) lo = ph->p_vaddr;
+            if (ph->p_vaddr + ph->p_memsz > hi) hi = ph->p_vaddr + ph->p_memsz;
+        }
+        lo &= ~0xFFFULL;
+        if (hi <= lo || hi - lo > EXEC_INTERP_SPAN)
+            why = "bad PT_LOAD layout";
+    }
+    if (why) {
+        serial_printf("%s: interpreter %s: %s\n", who, interp, why);
+        kfree(ib);
+        return -ENOEXEC;
+    }
+    uint64_t ibias = EXEC_INTERP_BASE - lo;
+    if (exec_map_loads(pml4, ib, ibias) != 0) {
+        kfree(ib);
+        return -ENOMEM;
+    }
+    *entry_out = ie->e_entry + ibias;
+    aux->base = ibias;
+    ktrace("%s: PT_INTERP %s at 0x%llx, program bias 0x%llx, entry 0x%llx\n",
+           who, interp, (unsigned long long)ibias, (unsigned long long)bias,
+           (unsigned long long)*entry_out);
+    kfree(ib);
+    return 0;
+}
 
 /* ELF section / symbol (for user backtraces) */
 typedef struct __attribute__((packed)) {
@@ -1129,6 +1347,9 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
         kfree(image);
         return -1;
     }
+    uint64_t load_bias = exec_main_bias(image, size);
+    seg_base += load_bias;
+    seg_end  += load_bias;
     exec_dbg_mark("segments scanned");
 
     /* ---- Step 2: Create user address space ---- */
@@ -1139,66 +1360,22 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
         return -1;
     }
 
-    /* ---- Step 3: Map each PT_LOAD segment into user address space ---- */
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type != PT_LOAD) continue;
-        if (ph->p_memsz == 0) continue;
-
-        uint64_t seg_vaddr = ph->p_vaddr & ~0xFFFULL;       /* page-align start */
-        uint64_t seg_vend  = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFFULL;
-        uint64_t num_pages = (seg_vend - seg_vaddr) / PAGE_SIZE;
-
-        uint64_t flags = VMM_PRESENT | VMM_USER;
-        if (ph->p_flags & 0x2) flags |= VMM_WRITABLE;       /* PF_W */
-        if (!(ph->p_flags & 0x1)) flags |= VMM_NX;          /* !PF_X */
-
-        for (uint64_t p = 0; p < num_pages; p++) {
-            /* Zeroed frame, or the frame already backing this page when a
-             * previous segment ends inside it (static non-PIE layouts). */
-            if (exec_map_segment_page(user_pml4, seg_vaddr + p * PAGE_SIZE, flags) != 0) {
-                printf("exec: out of memory mapping page at 0x%llx\n",
-                       (unsigned long long)(seg_vaddr + p * PAGE_SIZE));
-                vmm_destroy_address_space(user_pml4);
-                kfree(image);
-                return -1;
-            }
+    /* ---- Step 3: Map the PT_LOAD segments (+ PT_INTERP interpreter);
+     *      static images also get the kernel relocation pass ---- */
+    uint64_t prog_entry = 0;
+    exec_auxinfo_t prog_aux;
+    {
+        int mr = exec_map_program(user_pml4, image, size, load_bias, "exec",
+                                  &prog_entry, &prog_aux);
+        if (mr != 0) {
+            printf("exec: %s: %s\n", name,
+                   mr == -ENOMEM ? "out of memory mapping the image" :
+                   mr == -ENOENT ? "dynamic loader (PT_INTERP) not found" :
+                                   "cannot load the dynamic loader (PT_INTERP)");
+            vmm_destroy_address_space(user_pml4);
+            kfree(image);
+            return -1;
         }
-
-        /* Copy file data into the mapped pages (through HHDM mapping).
-         * We need the physical address of each page to write via HHDM. */
-        if (ph->p_filesz > 0) {
-            uint8_t *src = (uint8_t *)image + ph->p_offset;
-            uint64_t copy_vaddr = ph->p_vaddr;
-            uint64_t remaining  = ph->p_filesz;
-
-            while (remaining > 0) {
-                uint64_t page_vaddr = copy_vaddr & ~0xFFFULL;
-                uint64_t page_off   = copy_vaddr & 0xFFF;
-                uint64_t phys = vmm_is_mapped_in(user_pml4, page_vaddr);
-                if (!phys) break;
-
-                uint64_t chunk = PAGE_SIZE - page_off;
-                if (chunk > remaining) chunk = remaining;
-
-                memcpy((uint8_t *)phys_to_virt(phys) + page_off, src, chunk);
-                src        += chunk;
-                copy_vaddr += chunk;
-                remaining  -= chunk;
-            }
-        }
-    }
-    exec_dbg_mark("PT_LOAD mapped");
-
-    /* ---- Step 3b: Handle dynamic relocations ---- */
-    Elf64_Phdr *dyn_ph = NULL;
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
-    }
-
-    if (dyn_ph) {
-        exec_apply_relocations(user_pml4, dyn_ph);
     }
     exec_dbg_mark("relocations done");
 
@@ -1244,7 +1421,7 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
      * physical frames and is readable by user code after the address-space
      * switch.
      */
-    exec_collect_auxinfo(image);
+    exec_cur_aux = prog_aux;
     ustack_top = exec_build_abi_stack(user_pml4, ustack_top, name);
     exec_dbg_mark("user stack + abi frame");
     exec_dbg_mark("user stack + abi frame");
@@ -1319,7 +1496,7 @@ static int exec_run_elf(void *image, uint32_t size, const char *name) {
 
     exec_load_elf_symbols(image, size, proc);
     exec_dbg_mark("symbols loaded");
-    uint64_t entry_rip = eh->e_entry;
+    uint64_t entry_rip = prog_entry;
     ktrace("exec: launching '%s' in Ring 3 (PID %d, entry 0x%llx)\n",
            name, (int)proc->pid, (unsigned long long)entry_rip);
 
@@ -1526,50 +1703,25 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
         if (ph->p_vaddr + ph->p_memsz > seg_end) seg_end = ph->p_vaddr + ph->p_memsz;
     }
     if (seg_base == UINT64_MAX) { kfree(image); return -ENOEXEC; }
+    uint64_t load_bias = exec_main_bias(image, fsize);
+    seg_base += load_bias;
+    seg_end  += load_bias;
 
     uint64_t *new_pml4 = vmm_create_address_space();
     if (!new_pml4) { kfree(image); return -ENOMEM; }
 
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
-        uint64_t sv = ph->p_vaddr & ~0xFFFULL;
-        uint64_t se = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFFULL;
-        uint64_t np = (se - sv) / PAGE_SIZE;
-        uint64_t flags = VMM_PRESENT | VMM_USER;
-        if (ph->p_flags & 0x2) flags |= VMM_WRITABLE;
-        if (!(ph->p_flags & 0x1)) flags |= VMM_NX;
-        for (uint64_t pg = 0; pg < np; pg++) {
-            if (exec_map_segment_page(new_pml4, sv + pg * PAGE_SIZE, flags) != 0) {
-                vmm_destroy_address_space(new_pml4);
-                kfree(image);
-                return -ENOMEM;
-            }
-        }
-        if (ph->p_filesz > 0) {
-            uint8_t *src = (uint8_t *)image + ph->p_offset;
-            uint64_t cv = ph->p_vaddr;
-            uint64_t rem = ph->p_filesz;
-            while (rem > 0) {
-                uint64_t pv = cv & ~0xFFFULL;
-                uint64_t po = cv & 0xFFF;
-                uint64_t phys = vmm_is_mapped_in(new_pml4, pv);
-                if (!phys) break;
-                uint64_t chunk = PAGE_SIZE - po;
-                if (chunk > rem) chunk = rem;
-                memcpy((uint8_t *)phys_to_virt(phys) + po, src, chunk);
-                src += chunk; cv += chunk; rem -= chunk;
-            }
+    uint64_t prog_entry = 0;
+    exec_auxinfo_t prog_aux;
+    {
+        int mr = exec_map_program(new_pml4, image, fsize, load_bias, "exec_replace",
+                                  &prog_entry, &prog_aux);
+        if (mr != 0) {
+            serial_printf("exec_replace: %s: load failed (%d)\n", resolved, mr);
+            vmm_destroy_address_space(new_pml4);
+            kfree(image);
+            return mr;
         }
     }
-
-    Elf64_Phdr *dyn_ph = NULL;
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
-    }
-    if (dyn_ph)
-        exec_apply_relocations(new_pml4, dyn_ph);
 
     uint64_t ustack_top  = USER_STACK_TOP;
     uint64_t ustack_base = ustack_top - (USER_STACK_PAGES * PAGE_SIZE);
@@ -1585,9 +1737,9 @@ static int exec_replace_impl(process_t *proc, const char *filename, char *const 
         vmm_map_page_in(new_pml4, vaddr, frame,
                         VMM_PRESENT | VMM_USER | VMM_WRITABLE | VMM_NX);
     }
-    exec_collect_auxinfo(image);
+    exec_cur_aux = prog_aux;
     ustack_top = exec_build_abi_stack(new_pml4, ustack_top, resolved);
-    uint64_t entry_rip = eh->e_entry;
+    uint64_t entry_rip = prog_entry;
 
     /* Tear down old user AS — switch to kernel first so we don't free CR3.
      * A CLONE_VM (vfork) child shares its parent's PML4: execve must only
@@ -1778,56 +1930,27 @@ int exec_spawn(const char *filename, char *const argv[]) {
         if (ph->p_vaddr + ph->p_memsz > seg_end) seg_end = ph->p_vaddr + ph->p_memsz;
     }
     if (seg_base == UINT64_MAX) { kfree(image); return -1; }
+    uint64_t load_bias = exec_main_bias(image, fsize);
+    seg_base += load_bias;
+    seg_end  += load_bias;
     exec_dbg_mark("segments scanned");
 
     /* ---- Step 2: Create user address space ---- */
     uint64_t *user_pml4 = vmm_create_address_space();
     if (!user_pml4) { kfree(image); return -1; }
 
-    /* ---- Step 3: Map PT_LOAD segments ---- */
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
-
-        uint64_t sv = ph->p_vaddr & ~0xFFFULL;
-        uint64_t se = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFFULL;
-        uint64_t np = (se - sv) / PAGE_SIZE;
-        uint64_t flags = VMM_PRESENT | VMM_USER;
-        if (ph->p_flags & 0x2) flags |= VMM_WRITABLE;
-        if (!(ph->p_flags & 0x1)) flags |= VMM_NX;
-
-        for (uint64_t p = 0; p < np; p++) {
-            if (exec_map_segment_page(user_pml4, sv + p * PAGE_SIZE, flags) != 0) {
-                vmm_destroy_address_space(user_pml4); kfree(image); return -1;
-            }
+    /* ---- Step 3: Map the PT_LOAD segments (+ PT_INTERP interpreter) ---- */
+    uint64_t prog_entry = 0;
+    exec_auxinfo_t prog_aux;
+    {
+        int mr = exec_map_program(user_pml4, image, fsize, load_bias, "exec_spawn",
+                                  &prog_entry, &prog_aux);
+        if (mr != 0) {
+            serial_printf("exec_spawn: '%s': load failed (%d)\n", filename, mr);
+            vmm_destroy_address_space(user_pml4);
+            kfree(image);
+            return -1;
         }
-
-        if (ph->p_filesz > 0) {
-            uint8_t *src = (uint8_t *)image + ph->p_offset;
-            uint64_t cv = ph->p_vaddr;
-            uint64_t rem = ph->p_filesz;
-            while (rem > 0) {
-                uint64_t pv = cv & ~0xFFFULL;
-                uint64_t po = cv & 0xFFF;
-                uint64_t phys = vmm_is_mapped_in(user_pml4, pv);
-                if (!phys) break;
-                uint64_t chunk = PAGE_SIZE - po;
-                if (chunk > rem) chunk = rem;
-                memcpy((uint8_t *)phys_to_virt(phys) + po, src, chunk);
-                src += chunk; cv += chunk; rem -= chunk;
-            }
-        }
-    }
-    exec_dbg_mark("PT_LOAD mapped");
-
-    /* ---- Step 3b: Handle dynamic relocations ---- */
-    Elf64_Phdr *dyn_ph = NULL;
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)image + eh->e_phoff + i * eh->e_phentsize);
-        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
-    }
-    if (dyn_ph) {
-        exec_apply_relocations(user_pml4, dyn_ph);
     }
     exec_dbg_mark("relocations done");
 
@@ -1843,7 +1966,7 @@ int exec_spawn(const char *filename, char *const argv[]) {
                         VMM_PRESENT | VMM_USER | VMM_WRITABLE | VMM_NX);
     }
 
-    exec_collect_auxinfo(image);
+    exec_cur_aux = prog_aux;
     {
         /* PWD + caller envp for exec_spawn_ex(). */
         static char pwd_env[268];
@@ -1933,7 +2056,7 @@ int exec_spawn(const char *filename, char *const argv[]) {
 
     exec_load_elf_symbols(image, fsize, proc);
     exec_dbg_mark("symbols loaded");
-    uint64_t entry_rip = eh->e_entry;
+    uint64_t entry_rip = prog_entry;
     kfree(image);
 
     /* ---- Step 7: Create scheduled thread for Ring-3 execution ---- */
