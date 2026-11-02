@@ -53,6 +53,7 @@
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
+#include <elf.h>
 #include <pthread.h>
 #include <sched.h>
 #include <netinet/in.h>
@@ -3647,6 +3648,63 @@ static int t_ino_flags(char *d, size_t n) {
     R(PASS, "ATTRIB+MASK_ADD, ONLYDIR, FIONREAD %d, ONESHOT, blocking read %lldms", avail, el);
 }
 
+/* ===================== tcc: TinyCC compiles itself =====================
+ * /usr/src/tcc holds TinyCC's own source with the inDevOS config.h
+ * (tests/tcc/build_tcc_src.sh; installed by make_install_iso.sh and
+ * tests/ostest/stage_disk.sh).  The installed tcc builds tcc2 from it, tcc2
+ * compiles and runs a hello, tcc2 builds tcc3, and tcc3 must be byte-identical
+ * to tcc2 (a compiler fixed point).  No -DTCC_TARGET_X86_64: config.h only
+ * applies the inDevOS paths, musl, ld-musl and -static when no target is
+ * given (with it, tcc2 linked glibc-style dynamic programs and tcc3 differed). */
+static int t_tcc_selfhost(char *d, size_t n) {
+    const char *cc = !access("/bin/tcc.exe", X_OK) ? "/bin/tcc.exe" : !access("/bin/cc.exe", X_OK) ? "/bin/cc.exe" : NULL;
+    if (!cc) R(SKIP, "/bin/tcc.exe (or /bin/cc.exe) not installed");
+    if (access("/usr/src/tcc/tcc.c", R_OK) || access("/usr/src/tcc/config.h", R_OK) || access("/usr/src/tcc/tccdefs_.h", R_OK))
+        R(SKIP, "/usr/src/tcc not installed (tests/tcc/build_tcc_src.sh)");
+    static char b2[1 << 20], b3[1 << 20];
+    static const char hello[] = "#include <stdio.h>\n#include <stdlib.h>\n"
+        "int main(int c, char **v) { int k = c > 1 ? atoi(v[1]) : 1; printf(\"TCC2_HELLO_OK %d\\n\", k - 1); return k; }\n";
+    char t2[160], t3[160], hc[160], hx[160], out[4096], ver[96];
+    tpath(t2, sizeof(t2), "tcc2"); tpath(t3, sizeof(t3), "tcc3");
+    tpath(hc, sizeof(hc), "tcc2_hello.c"); tpath(hx, sizeof(hx), "tcc2_hello");
+    long long t0 = mono_ms();
+    char *a1[] = { (char *)cc, "-DONE_SOURCE=1", "-o", t2, "/usr/src/tcc/tcc.c", NULL };
+    int r = run_capture(a1, out, sizeof(out), 150000); dyn_oneline(out);
+    long long ms1 = mono_ms() - t0;
+    CHECK(r == 0 && access(t2, X_OK) == 0, "stage 1 (%s tcc.c -> tcc2): rc=%d after %lldms '%.300s'", cc, r, ms1, out);
+    char *a2[] = { t2, "-v", NULL };
+    r = run_capture(a2, out, sizeof(out), 10000); dyn_oneline(out);
+    CHECK(r == 0 && strstr(out, "tcc version"), "tcc2 -v: rc=%d '%.200s'", r, out);
+    snprintf(ver, sizeof(ver), "%.60s", out);
+    CHECKE(put_file(hc, hello, sizeof(hello) - 1) == 0, "write hello.c");
+    char *a3[] = { t2, "-o", hx, hc, NULL };
+    r = run_capture(a3, out, sizeof(out), 30000); dyn_oneline(out);
+    CHECK(r == 0, "tcc2 compiling hello: rc=%d '%.300s'", r, out);
+    char *a4[] = { hx, "7", NULL };
+    r = run_capture(a4, out, sizeof(out), 10000); dyn_oneline(out);
+    CHECK(r == 7 && strstr(out, "TCC2_HELLO_OK 6"), "hello built by tcc2: rc=%d '%.200s'", r, out);
+    {   /* tcc2 must keep the inDevOS defaults: static (no PT_INTERP) */
+        Elf64_Ehdr eh; Elf64_Phdr ph; int fd = open(hx, O_RDONLY), interp = -1;
+        if (fd >= 0 && pread(fd, &eh, sizeof(eh), 0) == (ssize_t)sizeof(eh) && !memcmp(eh.e_ident, ELFMAG, SELFMAG)) {
+            interp = 0;
+            for (int i = 0; i < eh.e_phnum; i++)
+                if (pread(fd, &ph, sizeof(ph), eh.e_phoff + (off_t)i * eh.e_phentsize) == (ssize_t)sizeof(ph) && ph.p_type == PT_INTERP) interp = 1;
+        }
+        if (fd >= 0) close(fd);
+        CHECK(interp == 0, "hello built by tcc2 is %s (tcc2 lost the -static default)", interp < 0 ? "not ELF" : "dynamic");
+    }
+    t0 = mono_ms();
+    char *a5[] = { t2, "-DONE_SOURCE=1", "-o", t3, "/usr/src/tcc/tcc.c", NULL };
+    r = run_capture(a5, out, sizeof(out), 150000); dyn_oneline(out);
+    long long ms2 = mono_ms() - t0;
+    CHECK(r == 0, "stage 2 (tcc2 tcc.c -> tcc3): rc=%d after %lldms '%.300s'", r, ms2, out);
+    ssize_t s2 = get_file(t2, b2, sizeof(b2)), s3 = get_file(t3, b3, sizeof(b3));
+    CHECK(s2 > 100000 && s2 < (ssize_t)sizeof(b2), "tcc2 size %zd", s2);
+    CHECK(s2 == s3 && memcmp(b2, b3, s2) == 0, "tcc3 differs from tcc2 (%zd vs %zd bytes)", s2, s3);
+    unlink(t2); unlink(t3); unlink(hc); unlink(hx);
+    R(PASS, "%s built tcc2 (%zd bytes, %lldms); tcc2 ran a static hello; tcc2 built tcc3 (%lldms), identical; %s", cc, s2, ms1, ms2, ver);
+}
+
 static const struct test tests[] = {
     { "sys", "uname", t_uname, 5, 0 }, { "sys", "pids", t_pids, 5, 0 }, { "sys", "ids", t_ids, 5, 0 },
     { "sys", "clock", t_clock, 10, 0 }, { "sys", "nanosleep", t_nanosleep, 10, 0 },
@@ -3705,6 +3763,7 @@ static const struct test tests[] = {
     { "dyn", "bad_interp", t_dyn_bad_interp, 20, 0 },
     { "dyn", "glibc_hello", t_dyn_glibc_hello, 30, 0 }, { "dyn", "glibc_coreutils", t_dyn_glibc_coreutils, 30, 0 },
     { "dyn", "glibc_dlopen", t_dyn_glibc_dlopen, 30, 0 },
+    { "tcc", "selfhost", t_tcc_selfhost, 400, 0 },
 };
 #define NTESTS (int)(sizeof(tests) / sizeof(tests[0]))
 
@@ -3816,7 +3875,7 @@ int main(int argc, char **argv) {
     struct utsname u; uname(&u); time_t now = time(NULL); struct tm tm; gmtime_r(&now, &tm);
     out("ostest: %s %s %s %s | boot #%d | %04d-%02d-%02d %02d:%02d:%02d UTC | groups=%s%s\n", u.sysname, u.release, u.version, u.machine, boot_number(),
         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, sel ? sel : "all", destructive ? " +destructive" : "");
-    int cnt[3] = {0}, gc[3] = {0}; char gsum[1200] = ""; int go = 0; const char *lastg = NULL;
+    int cnt[3] = {0}, gc[3] = {0}; char gsum[2400] = ""; int go = 0; const char *lastg = NULL;
     long long t_all = mono_ms();
     for (int i = 0; i < NTESTS; i++) {
         const struct test *t = &tests[i];

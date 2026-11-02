@@ -41,6 +41,8 @@ ref/
 forksig_backups_*/
 tests/curl/
 tests/tcc/stage
+# TinyCC source staged for /usr/src/tcc (tests/tcc/build_tcc_src.sh)
+tests/tcc/src/
 tests/fbdev/build/
 tests/forksig/build/
 tests/busybox/build/

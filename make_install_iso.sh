@@ -221,6 +221,15 @@ if [[ -n "$TCC_STAGE" && -x "$TCC_STAGE/bin/tcc.exe" ]]; then
     if [[ -d "$TCC_STAGE/home/user/mk" ]]; then
         mcopy -o -s -i "$ROOTFS" "$TCC_STAGE/home/user/mk" ::/home/user/
     fi
+    # TinyCC's own source (tests/tcc/build_tcc_src.sh) so tcc can rebuild
+    # itself on inDevOS: cd /usr/src/tcc && tcc -DONE_SOURCE=1 -o /tmp/tcc2 tcc.c
+    if [[ -f tests/tcc/src/tcc.c ]]; then
+        mmd -D s -i "$ROOTFS" ::/usr/src 2>/dev/null </dev/null || true
+        mmd -D s -i "$ROOTFS" ::/usr/src/tcc 2>/dev/null </dev/null || true
+        mcopy -o -i "$ROOTFS" tests/tcc/src/* ::/usr/src/tcc/
+        mdir -i "$ROOTFS" ::/usr/src/tcc/tccdefs_.h >/dev/null 2>&1 || die "rootfs is missing /usr/src/tcc/tccdefs_.h after copying the TinyCC source"
+        echo "    /usr/src/tcc (TinyCC source, $(ls tests/tcc/src | wc -l) files, tcc.selfhost)"
+    fi
     echo "    /bin/tcc.exe + /usr/{include,lib} from $TCC_STAGE ($(find "$TCC_STAGE/usr" -type f | wc -l) files)"
     # mtools writes long names (stdio_ext.h, bits/alltypes.h, ...) as VFAT LFN
     # entries; check a few made it with their real names.
