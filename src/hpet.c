@@ -516,6 +516,127 @@ uint64_t hpet_get_time_us(void) {
     return (*hpet_main_cnt) * 1000000ULL / hpet_freq;
 }
 
+/* Fast microsecond clock for the Linux time syscalls (clock_gettime is
+ * called thousands of times a second by browsers).  Every HPET read is an
+ * uncached MMIO access (very expensive under emulation), so interpolate with
+ * the TSC between HPET anchors taken at most every FAST_REANCHOR_US.  The
+ * TSC rate is re-derived at each anchor over the whole time since the first
+ * anchor, and a new anchor never moves the clock backwards.  Falls back to
+ * hpet_get_time_us() unless the HPET is the clock source and the TSC is
+ * invariant or we run under a hypervisor (TSC synchronised across CPUs). */
+#define FAST_REANCHOR_US 2000ULL
+#define FAST_SLOW_READ_US 50ULL
+static int fast_tsc_ok = -1;
+static volatile uint32_t fast_seq;
+static volatile uint32_t fast_lock;
+static uint64_t fast_tsc0, fast_us0;        /* first anchor */
+static uint64_t fast_tsc_a, fast_us_a;      /* current anchor */
+static uint64_t fast_mult;                  /* us per tick << 32 */
+
+/* (du << 32) / dt without libgcc's 128-bit division (needs du >> 32 < dt). */
+static inline uint64_t fast_rate(uint64_t du, uint64_t dt) {
+    uint64_t q, r;
+    __asm__("divq %4" : "=a"(q), "=d"(r) : "a"(du << 32), "d"(du >> 32), "rm"(dt));
+    return q;
+}
+
+static int fast_tsc_usable(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (c & (1u << 31))
+        return 1;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+    if (a < 0x80000007u)
+        return 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000007u), "c"(0));
+    return (d & (1u << 8)) ? 1 : 0;
+}
+
+uint64_t hpet_get_time_us_fast(void) {
+    if (clk_src != CLK_HPET || !hpet_main_cnt || !hpet_freq)
+        return hpet_get_time_us();
+    if (fast_tsc_ok < 0)
+        fast_tsc_ok = fast_tsc_usable();
+    if (!fast_tsc_ok)
+        return hpet_get_time_us();
+
+    for (;;) {
+        uint32_t s = __atomic_load_n(&fast_seq, __ATOMIC_ACQUIRE);
+        if (s & 1) {
+            __asm__ volatile("pause");
+            continue;
+        }
+        uint64_t ta = fast_tsc_a, ua = fast_us_a, m = fast_mult;
+        uint64_t now = hpet_rdtsc();
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&fast_seq, __ATOMIC_RELAXED) != s)
+            continue;
+        if (m && now < ta)
+            return ua;                      /* small cross-CPU TSC skew */
+        if (m) {
+            uint64_t dus = (uint64_t)(((unsigned __int128)(now - ta) * m) >> 32);
+            if (dus < FAST_REANCHOR_US ||
+                __atomic_exchange_n(&fast_lock, 1, __ATOMIC_ACQUIRE))
+                return ua + dus;
+            /* We hold fast_lock: take a new anchor. */
+            uint64_t t0 = hpet_rdtsc();
+            uint64_t raw = hpet_get_time_us();
+            uint64_t t2 = hpet_rdtsc();
+            uint64_t ext2 = ua + (uint64_t)(((unsigned __int128)(t2 - ta) * m) >> 32);
+            if ((((unsigned __int128)(t2 - t0) * m) >> 32) > FAST_SLOW_READ_US) {
+                /* The HPET read itself was slow (emulation, contention): its
+                 * time is uncertain, keep the current anchor. */
+                __atomic_store_n(&fast_lock, 0, __ATOMIC_RELEASE);
+                return ext2;
+            }
+            uint64_t t1 = t0 + (t2 - t0) / 2;
+            uint64_t ext = ua + (uint64_t)(((unsigned __int128)(t1 - ta) * m) >> 32);
+            /* Rate from the raw HPET over the whole baseline (never from a
+             * clamped value, or an early error would ratchet upwards). */
+            uint64_t nm = m;
+            if (t1 > fast_tsc0 && raw > fast_us0 + 10000)
+                nm = fast_rate(raw - fast_us0, t1 - fast_tsc0);
+            uint64_t u1 = raw;
+            if (raw < ext) {
+                /* Ahead of the HPET: never step backwards; instead run slower
+                 * so the gap closes over the next anchor interval. */
+                uint64_t d = ext - raw;
+                if (d > FAST_REANCHOR_US / 2)
+                    d = FAST_REANCHOR_US / 2;
+                nm = nm - (nm / FAST_REANCHOR_US) * d;
+                u1 = ext;
+            }
+            __atomic_store_n(&fast_seq, s + 1, __ATOMIC_RELAXED);
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            fast_tsc_a = t1; fast_us_a = u1; fast_mult = nm;
+            __atomic_store_n(&fast_seq, s + 2, __ATOMIC_RELEASE);
+            __atomic_store_n(&fast_lock, 0, __ATOMIC_RELEASE);
+            return u1;
+        }
+        /* No rate yet (first 10 ms): read the HPET and, if nobody else is,
+         * record the anchors. */
+        uint64_t t1 = hpet_rdtsc();
+        uint64_t u1 = hpet_get_time_us();
+        if (u1 < ua)
+            u1 = ua;
+        if (!__atomic_exchange_n(&fast_lock, 1, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&fast_seq, __ATOMIC_RELAXED) == s) {
+                __atomic_store_n(&fast_seq, s + 1, __ATOMIC_RELAXED);
+                __atomic_thread_fence(__ATOMIC_RELEASE);
+                if (!fast_tsc0) {
+                    fast_tsc0 = t1; fast_us0 = u1; fast_mult = 0;
+                } else if (u1 > fast_us0 + 10000 && t1 > fast_tsc0) {
+                    fast_mult = fast_rate(u1 - fast_us0, t1 - fast_tsc0);
+                }
+                fast_tsc_a = t1; fast_us_a = u1;
+                __atomic_store_n(&fast_seq, s + 2, __ATOMIC_RELEASE);
+            }
+            __atomic_store_n(&fast_lock, 0, __ATOMIC_RELEASE);
+        }
+        return u1;
+    }
+}
+
 uint64_t hpet_get_current_interval(void){
     return current_interval_ms;
 }

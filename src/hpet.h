@@ -25,6 +25,8 @@ void hpet_set_periodic(uint64_t ms);
 uint64_t hpet_get_ticks();
 /* Microseconds since boot from the raw HPET main counter (finest resolution). */
 uint64_t hpet_get_time_us(void);
+/* Same clock, TSC-interpolated between HPET anchors (Linux time syscalls). */
+uint64_t hpet_get_time_us_fast(void);
 uint64_t hpet_get_current_interval(void);
 uint64_t hpet_get_frequency(void);
 void hpet_print_status(void);

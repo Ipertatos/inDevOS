@@ -221,6 +221,8 @@ static bool lx_fd_ok(process_t *p, long fd) {
 /* fds 0..2 that were never redirected are the console. */
 #include "pty.h"
 #include "pipe.h"
+#include "profiler.h"
+#include "hpet.h"
 /* /dev/zero, /dev/urandom tags in a DEV_NULL fd's file_handle */
 #define LX_NULLTAG_ZERO    ((void *)1)
 #define LX_NULLTAG_RANDOM  ((void *)2)
@@ -885,15 +887,17 @@ void lx_clear_child_tid(process_t *p) {
 static uint64_t lx_epoch_base_us;
 static bool     lx_epoch_valid;
 
-static uint64_t lx_mono_us(void) { return ktime_now_us(); }
+/* TSC-interpolated HPET time: clock_gettime runs thousands of times a second
+ * in browsers and a raw HPET MMIO read per call is costly. */
+static uint64_t lx_mono_us(void) { return hpet_get_time_us_fast(); }
 static uint64_t lx_real_us(void) {
     if (!lx_epoch_valid) {
-        uint64_t now = ktime_now_us();
+        uint64_t now = lx_mono_us();
         uint64_t epoch = rtc_unix_epoch();
         lx_epoch_base_us = epoch * 1000000ULL - now;
         lx_epoch_valid = true;
     }
-    return lx_epoch_base_us + ktime_now_us();
+    return lx_epoch_base_us + lx_mono_us();
 }
 
 static uint64_t lx_rand_state;
@@ -4397,7 +4401,10 @@ uint64_t linux_syscall_dispatch(linux_syscall_frame_t *f) {
                       (unsigned)(scheduler_get_current_thread() ? scheduler_get_current_thread()->id : 0),
                       (unsigned long long)f->nr, (unsigned long long)f->a1, (unsigned long long)f->a2,
                       (unsigned long long)f->a3, (unsigned long long)f->a4);
+    uint64_t prof_t0 = profiler_lx_syscall_start();
     long r = lx_dispatch(f);
+    if (prof_t0)
+        profiler_lx_syscall_done(f->nr, prof_t0);
     if (lx_strace)
         serial_printf("lxt: pid %u nr %llu -> %ld\n", p ? p->pid : 0, (unsigned long long)f->nr, r);
 
