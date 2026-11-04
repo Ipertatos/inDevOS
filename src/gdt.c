@@ -139,6 +139,24 @@ void gdt_init_ap(uint32_t cpu_id) {
     s_settss();
 }
 
+/* Index of the CPU we are running on, derived from the GDT this CPU has
+ * loaded (BSP: gdt, AP n: gdt_ap[n]).  SGDT is a cheap register read, unlike
+ * the LAPIC ID MMIO read, which is slow on real hardware and very slow under
+ * emulation.  Returns -1 while a CPU still runs on a GDT we did not install
+ * (early AP bring-up); the caller then falls back to the LAPIC ID. */
+int gdt_current_cpu_index(void) {
+    gdt_pointer_t cur;
+    __asm__ volatile("sgdt %0" : "=m"(cur));
+    uint64_t b = cur.base;
+    if (b == (uint64_t)&gdt[0])
+        return 0;
+    uint64_t a0 = (uint64_t)&gdt_ap[0][0];
+    uint64_t stride = sizeof(gdt_ap[0]);
+    if (b > a0 && b < a0 + stride * MAX_CPUS && ((b - a0) % stride) == 0)
+        return (int)((b - a0) / stride);
+    return -1;
+}
+
 void gdt_set_kernel_stack(uint64_t stack_top) {
     per_cpu_t *cpu = smp_get_current_cpu();
     uint32_t id = (cpu && cpu->cpu_id < MAX_CPUS) ? cpu->cpu_id : 0;

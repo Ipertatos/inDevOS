@@ -84,6 +84,9 @@ uint32_t smp_get_lapic_id(void) {
 uint32_t smp_cpu_index_fast(void) {
     if (!smp_initialized || !lapic_addr)
         return 0;
+    int g = gdt_current_cpu_index();
+    if (g >= 0)
+        return (uint32_t)g;
     uint32_t id = smp_get_lapic_id();
     if (id > 255) return 0;
     uint8_t idx = smp_lapic_to_cpu[id];
@@ -183,6 +186,9 @@ static void ap_entry(struct limine_smp_info *smp_info) {
     cpu_enable_protections();
     { extern void fb_wc_pat_init_cpu(void); fb_wc_pat_init_cpu(); }
     gdt_init_ap(cpu_idx);
+    if (gdt_current_cpu_index() != (int)cpu_idx)
+        serial_printf("smp: WARNING AP %u GDT index %d mismatch\n",
+                      cpu_idx, gdt_current_cpu_index());
     idt_load_current();
     fpu_sse_init();
     syscall_enable_cpu(cpu_idx);

@@ -38,6 +38,7 @@ typedef struct {
 
 void gdt_init(void);
 void gdt_init_ap(uint32_t cpu_id);
+int gdt_current_cpu_index(void);
 void gdt_set_entry(int num, uint64_t base, uint64_t limit,uint8_t access, uint8_t granularity);
 void gdt_set_kernel_stack(uint64_t stack_top);
 uint64_t gdt_get_kernel_stack(void);
