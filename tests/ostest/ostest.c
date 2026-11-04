@@ -1971,6 +1971,101 @@ static int t_fx_requeue(char *d, size_t n) {
     CHECK(w1 == 0 && w2 == 1 && fx_done == 2, "after requeue WAKE w1=%ld w2=%ld done=%u", w1, w2, fx_done);
     R(PASS, "private wake, CMP_REQUEUE EAGAIN + 1 woken/1 moved, target WAKE=1");
 }
+/* futex.pingpong (batch 21): 200 WAIT/WAKE round trips between two threads.
+ * WAKE now kicks the sleeping waiter instead of it polling every 1 ms. */
+static volatile uint32_t fx_pp, fx_pp_err;
+#define FX_PP_N 200
+static void *fx_pp_thr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < FX_PP_N; i++) {
+        while (__atomic_load_n(&fx_pp, __ATOMIC_ACQUIRE) != 1) {
+            long r = fx(&fx_pp, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+            if (r == -1 && errno != EAGAIN && errno != EINTR) { fx_pp_err = (uint32_t)errno; return NULL; }
+        }
+        __atomic_store_n(&fx_pp, 0, __ATOMIC_RELEASE);
+        fx(&fx_pp, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    }
+    return NULL;
+}
+static int t_fx_pingpong(char *d, size_t n) {
+    pthread_t a;
+    fx_pp = 0; fx_pp_err = 0;
+    if (pthread_create(&a, NULL, fx_pp_thr, NULL)) R(SKIP, "pthread_create failed");
+    long long t0 = mono_ms();
+    for (int i = 0; i < FX_PP_N && !fx_pp_err; i++) {
+        __atomic_store_n(&fx_pp, 1, __ATOMIC_RELEASE);
+        fx(&fx_pp, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+        while (__atomic_load_n(&fx_pp, __ATOMIC_ACQUIRE) != 0 && !fx_pp_err) {
+            struct timespec to = { 1, 0 };
+            fx(&fx_pp, FUTEX_WAIT_PRIVATE, 1, &to, NULL, 0);
+            if (mono_ms() - t0 > 20000) break;
+        }
+    }
+    long long el = mono_ms() - t0;
+    pthread_join(a, NULL);
+    CHECK(!fx_pp_err, "waiter errno %u", fx_pp_err);
+    CHECK(el < 6000, "%d round trips took %lldms", FX_PP_N, el);
+    R(PASS, "%d round trips in %lldms (%lld us each)", FX_PP_N, el, el * 1000 / FX_PP_N);
+}
+/* sched.short_poll (batch 21 k4): 40 poll() timeouts of 5 ms on an empty
+ * pipe while another thread spins. Sleeps used to end only at CPU0's
+ * every-4th-tick sweep (skipped while CPU0 ran non-preemptible), so short
+ * timeouts came back 100-300 ms late; now every tick checks the deadline. */
+static volatile int sp_stop;
+static void *sp_spin(void *arg) { (void)arg; while (!sp_stop) __asm__ __volatile__("pause"); return NULL; }
+static int t_sched_short_poll(char *d, size_t n) {
+    int fd[2]; pthread_t a; int have = 0;
+    CHECKE(pipe(fd) == 0, "pipe");
+    sp_stop = 0;
+    if (!pthread_create(&a, NULL, sp_spin, NULL)) have = 1;
+    long long worst = 0, sum = 0;
+    for (int i = 0; i < 40; i++) {
+        struct pollfd p = { fd[0], POLLIN, 0 };
+        long long t0 = now_ns(CLOCK_MONOTONIC);
+        int r = poll(&p, 1, 5);
+        long long late = (now_ns(CLOCK_MONOTONIC) - t0) / 1000 - 5000;
+        if (r != 0) { sp_stop = 1; if (have) pthread_join(a, NULL); close(fd[0]); close(fd[1]); R(FAIL, "poll returned %d", r); }
+        if (late > worst) worst = late;
+        sum += late;
+    }
+    sp_stop = 1; if (have) pthread_join(a, NULL);
+    close(fd[0]); close(fd[1]);
+    CHECK(worst < 40000, "5ms poll worst lateness %lldus (avg %lldus)", worst, sum / 40);
+    R(PASS, "5ms poll x40: avg late %lldus, worst %lldus%s", sum / 40, worst, have ? " (with spinner)" : "");
+}
+/* mm.munmap_threads (batch 21): two threads mmap/touch/munmap concurrently
+ * (targeted TLB shootdown on the shared CR3), then the parent's mapping
+ * survives a child's (separate CR3) munmap storm. */
+static volatile int mm_thr_bad;
+static void *mm_thr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 150; i++) {
+        unsigned char *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { mm_thr_bad = 1; return NULL; }
+        for (int k = 0; k < 65536; k += 4096) p[k] = (unsigned char)(i + k);
+        for (int k = 0; k < 65536; k += 4096) if (p[k] != (unsigned char)(i + k)) mm_thr_bad = 2;
+        munmap(p, 65536);
+    }
+    return NULL;
+}
+static int t_mm_munmap_threads(char *d, size_t n) {
+    pthread_t a, b;
+    mm_thr_bad = 0;
+    unsigned char *keep = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECKE(keep != MAP_FAILED, "mmap keep");
+    memset(keep, 0x5a, 8192);
+    if (pthread_create(&a, NULL, mm_thr, NULL)) R(SKIP, "pthread_create failed");
+    CHECK(pthread_create(&b, NULL, mm_thr, NULL) == 0, "pthread_create b");
+    pid_t c = fork(); CHECKE(c >= 0, "fork");
+    if (c == 0) { mm_thr(NULL); _exit(mm_thr_bad); }
+    pthread_join(a, NULL); pthread_join(b, NULL);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(mm_thr_bad == 0, "thread mapping bad %d", mm_thr_bad);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "child st %d", st);
+    for (int k = 0; k < 8192; k++) if (keep[k] != 0x5a) CHECK(0, "keep[%d]=%x", k, keep[k]);
+    munmap(keep, 8192);
+    R(PASS, "2 threads + child x150 mmap/touch/munmap 64K");
+}
 /* futex.bitset_abs: WAIT_BITSET absolute deadlines (MONOTONIC and
  * CLOCK_REALTIME), EINVAL on bitset 0, non-matching WAKE_BITSET wakes none. */
 static int t_fx_bitset(char *d, size_t n) {
@@ -3748,7 +3843,8 @@ static const struct test tests[] = {
     { "epoll", "ctl_errors", t_ep_ctl, 10, 0 }, { "epoll", "tty", t_ep_tty, 5, 0 },
     { "epoll", "edge", t_ep_edge, 10, 0 }, { "epoll", "edge_strict", t_ep_edge2, 10, 0 },
     { "futex", "wait_wake", t_fx_wait_wake, 15, 0 }, { "futex", "private_requeue", t_fx_requeue, 15, 0 },
-    { "futex", "bitset_abs", t_fx_bitset, 10, 0 },
+    { "futex", "bitset_abs", t_fx_bitset, 10, 0 }, { "futex", "pingpong", t_fx_pingpong, 30, 0 }, { "sched", "short_poll", t_sched_short_poll, 20, 0 },
+    { "mem", "munmap_threads", t_mm_munmap_threads, 30, 0 },
     { "timerfd", "basic", t_tfd_basic, 15, 0 }, { "signalfd", "basic", t_sfd_basic, 15, 0 },
     { "eventfd", "semantics", t_efd_sem, 15, 0 }, { "epoll", "nested", t_ep_nested, 15, 0 },
     { "epoll", "lifetime", t_ep_life, 15, 0 }, { "epoll", "threads", t_ep_threads, 15, 0 },
