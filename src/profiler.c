@@ -69,9 +69,45 @@ typedef struct {
 
 static prof_sc_slot_t sc_slots[PROF_SC_MAX];
 
+/* "prof hist": cheap leaf-PC histogram + per-second timeline. Skips the
+ * folded-path build (symbol lookups per frame), so it can run at a high
+ * sample rate. Dumped to serial as KH/KT/KL lines for host symbolization. */
+#define PROF_HIST_SLOTS   8192u
+#define PROF_HIST_PROBE   48u
+#define PROF_TL_SECS      600u
+#define PROF_TL_PIDS      8u
+#define PROF_LX_MAX       512u
+
+typedef struct {
+    uint64_t rip;
+    uint64_t c1;
+    uint64_t c2;
+    uint32_t pid;
+    uint32_t count;
+} prof_hist_slot_t;
+
+static volatile bool prof_hist_mode;
+static prof_hist_slot_t hist_slots[PROF_HIST_SLOTS];
+static volatile uint64_t hist_samples;
+static volatile uint64_t hist_dropped;
+static volatile int hist_lock;
+static uint64_t hist_t0_us;
+static uint64_t hist_t0_tsc;
+/* [sec][pid&7][0=user 1=kernel 2=idle] */
+static uint16_t hist_tl[PROF_TL_SECS][PROF_TL_PIDS][3];
+static prof_sc_slot_t lx_slots[PROF_LX_MAX];
+static inline uint64_t profiler_tsc(void);
+
 static void profiler_agg_reset(void) {
     memset(flame_slots, 0, sizeof flame_slots);
     memset(sc_slots, 0, sizeof sc_slots);
+    memset(hist_slots, 0, sizeof hist_slots);
+    memset(hist_tl, 0, sizeof hist_tl);
+    memset(lx_slots, 0, sizeof lx_slots);
+    hist_samples = 0;
+    hist_dropped = 0;
+    hist_t0_us = profiler_now_us();
+    hist_t0_tsc = profiler_tsc();
     flame_samples = 0;
     flame_dropped = 0;
 }
@@ -286,6 +322,142 @@ static const char *profiler_syscall_name(uint64_t n) {
     }
 }
 
+static void profiler_hist_sample(registers_t *r, per_cpu_t *pc_cpu,
+                                 thread_t *thr) {
+    int user_mode = (r->cs & 3u) ? 1 : 0;
+    process_t *up = exec_user_as_process();
+    uint32_t pid = up ? (uint32_t)up->pid : 0;
+    /* Idle = the per-CPU idle thread, or any kernel context interrupted
+     * right after a HLT (kmain's "sti; hlt" waits are idle time too). */
+    bool idle = (!user_mode && pc_cpu && thr && thr == pc_cpu->idle_thread);
+    if (!idle && !user_mode && r->rip >= 0xffff800000000001ULL &&
+        *(const volatile uint8_t *)(r->rip - 1) == 0xF4)
+        idle = true;
+
+    uint64_t c1 = 0, c2 = 0;
+    if (!user_mode && profiler_rbp_is_safe(r->rbp) &&
+        profiler_rbp_is_safe(r->rbp + 8)) {
+        uint64_t rbp = r->rbp;
+        c1 = *(uint64_t *)(rbp + 8);
+        rbp = *(uint64_t *)rbp;
+        if (profiler_rbp_is_safe(rbp) && profiler_rbp_is_safe(rbp + 8))
+            c2 = *(uint64_t *)(rbp + 8);
+    }
+
+    uint64_t now = profiler_now_us();
+    uint64_t sec = now > hist_t0_us ? (now - hist_t0_us) / 1000000ull : 0;
+    if (sec < PROF_TL_SECS) {
+        uint32_t cat = user_mode ? 0u : (idle ? 2u : 1u);
+        __atomic_fetch_add(&hist_tl[sec][pid & (PROF_TL_PIDS - 1)][cat], 1,
+                           __ATOMIC_RELAXED);
+    }
+    if (idle) {
+        __atomic_fetch_add(&hist_samples, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    uint32_t key_pid = pid | (user_mode ? 0x80000000u : 0u);
+    uint64_t h = (r->rip ^ (c1 * 0x9E3779B97F4A7C15ull) ^ key_pid) *
+                 0x9E3779B97F4A7C15ull;
+    uint32_t base = (uint32_t)(h >> 51) & (PROF_HIST_SLOTS - 1);
+    while (__atomic_exchange_n(&hist_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+    bool done = false;
+    for (uint32_t probe = 0; probe < PROF_HIST_PROBE; probe++) {
+        prof_hist_slot_t *s = &hist_slots[(base + probe) & (PROF_HIST_SLOTS - 1)];
+        if (s->count == 0) {
+            s->rip = r->rip;
+            s->c1 = c1;
+            s->c2 = c2;
+            s->pid = key_pid;
+            s->count = 1;
+            done = true;
+            break;
+        }
+        if (s->rip == r->rip && s->c1 == c1 && s->pid == key_pid) {
+            s->count++;
+            done = true;
+            break;
+        }
+    }
+    __atomic_store_n(&hist_lock, 0, __ATOMIC_RELEASE);
+    hist_samples++;
+    if (!done) hist_dropped++;
+}
+
+static inline uint64_t profiler_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* TSC, not HPET: an HPET MMIO read per syscall is expensive under TCG and
+ * showed up as ~40% of NetSurf's kernel samples. Converted at dump time. */
+uint64_t profiler_lx_syscall_start(void) {
+    return prof_running ? profiler_tsc() : 0;
+}
+
+void profiler_lx_syscall_done(uint64_t nr, uint64_t t0) {
+    if (!prof_running || !t0 || nr >= PROF_LX_MAX) return;
+    uint64_t t1 = profiler_tsc();
+    uint64_t d = t1 > t0 ? t1 - t0 : 0;
+    prof_sc_slot_t *s = &lx_slots[nr];
+    __atomic_fetch_add(&s->count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s->total_us, d, __ATOMIC_RELAXED);
+    if (d > s->max_us) s->max_us = d;
+}
+
+static void profiler_dump_hist(void) {
+    bool was = prof_running;
+    prof_running = false;
+    uint64_t now_us = profiler_now_us();
+    uint64_t el_us = now_us > hist_t0_us ? now_us - hist_t0_us : 1;
+    uint64_t el_tsc = profiler_tsc() - hist_t0_tsc;
+    uint64_t tsc_per_ms = el_tsc / (el_us / 1000ull ? el_us / 1000ull : 1ull);
+    if (!tsc_per_ms) tsc_per_ms = 1;
+    uint64_t secs = el_us / 1000000ull;
+    printf("profiler hist: %llu samples, %llu dropped, %llu s; dumping to serial\n",
+           (unsigned long long)hist_samples, (unsigned long long)hist_dropped,
+           (unsigned long long)secs);
+    serial_printf("--- PROFILER HIST samples=%llu dropped=%llu t0_us=%llu el_us=%llu tsc_per_ms=%llu ---\n",
+                  (unsigned long long)hist_samples, (unsigned long long)hist_dropped,
+                  (unsigned long long)hist_t0_us, (unsigned long long)el_us,
+                  (unsigned long long)tsc_per_ms);
+    if (secs >= PROF_TL_SECS) secs = PROF_TL_SECS - 1;
+    /* KT,sec,pidslot,user,kernel,idle */
+    for (uint32_t sec = 0; sec <= secs; sec++) {
+        for (uint32_t pi = 0; pi < PROF_TL_PIDS; pi++) {
+            const uint16_t *t = hist_tl[sec][pi];
+            if (!t[0] && !t[1] && !t[2]) continue;
+            serial_printf("KT,%u,%u,%u,%u,%u\n", (unsigned)sec, (unsigned)pi,
+                          (unsigned)t[0], (unsigned)t[1], (unsigned)t[2]);
+        }
+    }
+    /* KL,nr,count,total_us,max_us */
+    for (uint32_t nr = 0; nr < PROF_LX_MAX; nr++) {
+        const prof_sc_slot_t *s = &lx_slots[nr];
+        if (!s->count) continue;
+        serial_printf("KL,%u,%llu,%llu,%llu\n", (unsigned)nr,
+                      (unsigned long long)s->count,
+                      (unsigned long long)(s->total_us * 1000ull / tsc_per_ms),
+                      (unsigned long long)(s->max_us * 1000ull / tsc_per_ms));
+    }
+    /* KH,pid,user,count,rip,c1,c2 (count >= 2; singletons summed in KS) */
+    uint64_t singles = 0;
+    for (uint32_t i = 0; i < PROF_HIST_SLOTS; i++) {
+        const prof_hist_slot_t *s = &hist_slots[i];
+        if (!s->count) continue;
+        if (s->count < 2) { singles++; continue; }
+        serial_printf("KH,%u,%u,%u,%llx,%llx,%llx\n",
+                      (unsigned)(s->pid & 0x7fffffffu), (unsigned)(s->pid >> 31),
+                      (unsigned)s->count, (unsigned long long)s->rip,
+                      (unsigned long long)s->c1, (unsigned long long)s->c2);
+    }
+    serial_printf("KS,%llu\n", (unsigned long long)singles);
+    serial_puts("--- END PROFILER HIST ---\n");
+    prof_running = was;
+}
+
 void profiler_sample_from_isr(registers_t *r) {
     static volatile uint64_t sample_tick[MAX_CPUS];
 
@@ -302,6 +474,11 @@ void profiler_sample_from_isr(registers_t *r) {
     uint64_t t = __atomic_fetch_add(&sample_tick[c], 1, __ATOMIC_RELAXED)
                  % (uint64_t)prof_sample_divisor;
     if (t != 0) return;
+
+    if (prof_hist_mode) {
+        profiler_hist_sample(r, pc_cpu, thr_pc);
+        return;
+    }
 
     uint64_t frames[PROF_WALK_DEPTH];
     int depth = 0;
@@ -656,7 +833,7 @@ void profiler_on_sdl_present(struct SDL_Window *window) {
 
 void profiler_cli(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: prof start [div]|stop|reset|stats|dump|flame|syscalls|overlay on|off|sample <n>\n");
+        printf("Usage: prof start [div]|hist [div]|hist dump|stop|reset|stats|dump|flame|syscalls|overlay on|off|sample <n>\n");
         printf("  flame    - folded stack samples (text flamegraph)\n");
         printf("  syscalls - time spent inside each syscall\n");
         return;
@@ -671,6 +848,25 @@ void profiler_cli(int argc, char **argv) {
                (unsigned)profiler_get_sample_divisor());
         return;
     }
+    if (kstrcmp(argv[1], "hist") == 0) {
+        if (argc >= 3 && kstrcmp(argv[2], "dump") == 0) {
+            profiler_dump_hist();
+            return;
+        }
+        if (argc >= 3) {
+            uint32_t d = (uint32_t)atoi(argv[2]);
+            profiler_set_sample_divisor(d ? d : 1);
+        }
+        prof_running = false;
+        profiler_agg_reset();
+        prof_hist_mode = true;
+        prof_running = true;
+        printf("profiler: hist mode started (sample divisor=%u); prof hist dump\n",
+               (unsigned)profiler_get_sample_divisor());
+        return;
+    }
+    if (kstrcmp(argv[1], "start") == 0 && prof_hist_mode)
+        prof_hist_mode = false;
     if (kstrcmp(argv[1], "stop") == 0) {
         profiler_set_enabled(false);
         printf("profiler: stopped\n");

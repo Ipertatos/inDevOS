@@ -67,3 +67,6 @@ void profiler_syscall_enter(uint64_t syscall_num);
 void profiler_syscall_leave(uint64_t syscall_num, uint64_t retval);
 void profiler_sched_switch(thread_t *from, thread_t *to);
 void profiler_on_frame_present(uint64_t window_ptr_u64);
+/** Linux-ABI syscall timing (TSC); 0 from _start when the profiler is off. */
+uint64_t profiler_lx_syscall_start(void);
+void profiler_lx_syscall_done(uint64_t nr, uint64_t t0);
