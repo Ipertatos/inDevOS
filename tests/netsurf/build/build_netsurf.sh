@@ -12,6 +12,7 @@
 # Work tree (sources, sysroot, logs; ~1.5 GB): $NETSURF_WORK, default ~/netsurf-build.
 # Tarballs are downloaded there on first run and checked against SHA-256 below.
 # Env: J=<jobs> (default nproc), NETSURF_WORK=<dir>, ONLY_DHCP=1 (just rebuild dhcp),
+#   NETSURF_MALLOC=mimalloc (default: mimalloc 2.1.7 replaces musl's mallocng in netsurf) or musl,
 #   NETSURF_JS=quickjs (default: QuickJS 2025-04-26 + quickjs/ bindings, CSS Grid, ES modules)
 #   or NETSURF_JS=duktape (NetSurf's stock Duktape bindings).
 set -euo pipefail
@@ -22,6 +23,8 @@ FONTDIR=${FONTDIR:-/usr/share/fonts/truetype/dejavu}
 SRC=$NS/src; SR=$NS/sysroot; J=${J:-$(nproc)}
 JSENG=${NETSURF_JS:-quickjs}
 case "$JSENG" in quickjs|duktape) ;; *) echo "NETSURF_JS must be quickjs or duktape" >&2; exit 1;; esac
+MALLOC=${NETSURF_MALLOC:-mimalloc}
+case "$MALLOC" in mimalloc|musl) ;; *) echo "NETSURF_MALLOC must be mimalloc or musl" >&2; exit 1;; esac
 step() { echo "=== $1 $(date +%T)"; }
 
 step dhcp
@@ -49,6 +52,10 @@ unpack openssl-3.0.15.tar.gz openssl-3.0.15; unpack zlib-1.3.1.tar.gz zlib-1.3.1
 unpack jpegsrc.v9f.tar.gz jpeg-9f; unpack expat-2.6.3.tar.xz expat-2.6.3; unpack curl-8.10.1.tar.xz curl-8.10.1
 unpack freetype-2.13.3.tar.xz freetype-2.13.3; unpack netsurf-all-3.11.tar.gz netsurf-all-3.11
 unpack quickjs-2025-04-26.tar.xz quickjs-2025-04-26
+if [ "$MALLOC" = mimalloc ]; then
+  fetch mimalloc-2.1.7.tar.gz 0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d https://github.com/microsoft/mimalloc/archive/refs/tags/v2.1.7.tar.gz
+  unpack mimalloc-2.1.7.tar.gz mimalloc-2.1.7
+fi
 
 cd "$SRC"
 # musl has no kernel headers: expose the host's linux/asm headers after musl's own
@@ -78,6 +85,17 @@ export PKG_CONFIG_LIBDIR=$SR/lib/pkgconfig PKG_CONFIG_PATH= PKG_CONFIG="pkg-conf
      musl-gcc -O2 -fwrapv -D_GNU_SOURCE -DCONFIG_VERSION=\"2025-04-26\" -idirafter "$NS/kh" -c $f.c -o $f.o || exit 1; done &&
    ar rcs "$SR/lib/libquickjs.a" quickjs.o libregexp.o libunicode.o cutils.o dtoa.o && cp quickjs.h "$SR/include/") >"$NS/log_quickjs.txt" 2>&1; }
 
+# mimalloc: one object (src/static.c) overriding malloc/free/...; musl's mallocng spent much of
+# NetSurf's time in mmap/munmap/madvise round trips.  Arenas are reserved 64 MiB at a time (default
+# 1 GiB) so a 1 GiB machine is not asked for a 1 GiB mapping up front.
+MIMALLOC_O="$SR/lib/mimalloc-2.1.7-a64.o"
+if [ "$MALLOC" = mimalloc ] && [ ! -f "$MIMALLOC_O" ]; then step mimalloc
+  (cd mimalloc-2.1.7 && sed -i 's|{ 1024L\*1024L, UNINIT, MI_OPTION(arena_reserve) }|{ 64L*1024L, UNINIT, MI_OPTION(arena_reserve) }|' src/options.c &&
+   grep -q '{ 64L\*1024L, UNINIT, MI_OPTION(arena_reserve) }' src/options.c &&
+   musl-gcc -O2 -DNDEBUG -DMI_DEBUG=0 -DMI_MALLOC_OVERRIDE -DMI_LIBC_MUSL=1 -fno-builtin-malloc -ftls-model=initial-exec \
+     -idirafter "$NS/kh" -Iinclude -c src/static.c -o "$MIMALLOC_O") >"$NS/log_mimalloc.txt" 2>&1 || { cat "$NS/log_mimalloc.txt"; exit 1; }
+fi
+
 step netsurf
 python3 "$HERE/patches/html_preload_css.py" "$SRC/netsurf-all-3.11/netsurf/content/handlers/html/css.c"
 python3 "$HERE/patches/js_events.py" "$SRC/netsurf-all-3.11/netsurf"
@@ -94,8 +112,11 @@ python3 "$HERE/patches/libdom_event_target.py" "$SRC/netsurf-all-3.11/libdom/src
 python3 "$HERE/patches/html_reflow_throttle.py" "$SRC/netsurf-all-3.11"
 # request headers from script fetch()/XMLHttpRequest (Accept: application/json, ...)
 python3 "$HERE/patches/js_fetch_headers.py" "$SRC/netsurf-all-3.11"
+# main loop: no idle waits with callbacks due; fetch sockets end the input wait
+python3 "$HERE/patches/fb_event_loop.py" "$SRC/netsurf-all-3.11"
 bash "$HERE/patches/apply_wm_surface.sh" "$SRC/netsurf-all-3.11/libnsfb"
 export CFLAGS="$CFLAGS $CPPFLAGS"   # env (not make args) so component CFLAGS still append
+[ "$MALLOC" = mimalloc ] && export LDFLAGS="$LDFLAGS $MIMALLOC_O"   # objects before libc.a: replaces malloc
 cd "$SRC/netsurf-all-3.11"
 if [ "$JSENG" = quickjs ]; then JSFLAGS="NETSURF_USE_QUICKJS=YES NETSURF_USE_DUKTAPE=NO"
 else JSFLAGS="NETSURF_USE_QUICKJS=NO NETSURF_USE_DUKTAPE=YES"; fi

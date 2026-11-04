@@ -246,12 +246,19 @@ static bool wm_translate(struct wm_priv *p, const struct wm_event *ev,
 	}
 }
 
+/* Optional frontend hook (NetSurf fb_event_loop): fills up to max extra fds
+ * (fetch sockets) to wait on with the window fd, and may lower *timeout.
+ * Readiness of an extra fd ends the wait as a timeout. */
+#define WM_WAIT_EXTRA_FDS 64
+int (*nsfb_wm_wait_fds)(struct pollfd *pfd, int max, int *timeout) = NULL;
+
 /* timeout: ms, <0 = block forever, 0 = poll. */
 static bool wm_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 {
 	struct wm_priv *p = nsfb->surface_priv;
 	struct wm_event ev;
-	struct pollfd pfd;
+	struct pollfd pfds[1 + WM_WAIT_EXTRA_FDS];
+	int nfds;
 	ssize_t n;
 
 	if (p == NULL)
@@ -262,10 +269,13 @@ static bool wm_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 		return true;
 	}
 	for (;;) {
-		pfd.fd = p->fd;
-		pfd.events = POLLIN;
-		pfd.revents = 0;
-		if (poll(&pfd, 1, timeout) <= 0) {
+		pfds[0].fd = p->fd;
+		pfds[0].events = POLLIN;
+		pfds[0].revents = 0;
+		nfds = 1;
+		if (timeout != 0 && nsfb_wm_wait_fds != NULL)
+			nfds += nsfb_wm_wait_fds(pfds + 1, WM_WAIT_EXTRA_FDS, &timeout);
+		if (poll(pfds, nfds, timeout) <= 0 || pfds[0].revents == 0) {
 			event->type = NSFB_EVENT_CONTROL;
 			event->value.controlcode = NSFB_CONTROL_TIMEOUT;
 			return true;

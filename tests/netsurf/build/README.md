@@ -25,7 +25,7 @@ Then run `./make_install_iso.sh` as usual.
 - Work tree: `$NETSURF_WORK` (default `~/netsurf-build`, ~1.5 GB) holds the
   downloaded tarballs, the extracted sources, a static sysroot
   (OpenSSL 3.0.15, freetype 2.13.3, zlib 1.3.1, libpng 1.6.44, IJG jpeg 9f, expat 2.6.3,
-  curl 8.10.1) and `log_*.txt`. Tarballs are SHA-256-checked. A failing step
+  curl 8.10.1, mimalloc 2.1.7) and `log_*.txt`. Tarballs are SHA-256-checked. A failing step
   leaves its log there; delete `$NETSURF_WORK/sysroot/lib/lib<x>.a` to redo a lib.
 - `J=<n>` sets make parallelism (default `nproc`).
 - No absolute paths from the original build machine are used. The script
@@ -63,6 +63,21 @@ op 3 = status). `dhcp -a` is what the NetSurf desktop shortcut runs.
   hundreds of SVG icons).
 - `patches/js_fetch_headers.py <netsurf-all-3.11>`: llcache sends the request
   headers a script passes to `fetch()` / `XMLHttpRequest` (e.g. `Accept: application/json`).
+- `patches/fb_event_loop.py <netsurf-all-3.11>`: framebuffer main loop. The scheduler
+  keeps callbacks sorted (FIFO for equal deadlines; they used to run LIFO) and
+  `schedule_run()` returns the time to the next callback measured after the callbacks
+  ran (it was measured from entry, so a 0 ms reschedule became a multi-ms poll that
+  the kernel overslept by 20-300 ms). The wm surface's poll on `/dev/wm` also waits
+  on the fetchers' sockets (`fetch_fdset()`, via the `nsfb_wm_wait_fds` hook in
+  `nsfb_wm.c`) with the timeout capped to the next scheduled callback, so arriving
+  network data and due JS timers wake NetSurf at once. Wikipedia /wiki/Greece in
+  box QEMU/TCG: 46.2 s -> 19.6 s.
+
+## Allocator
+
+`NETSURF_MALLOC=mimalloc` (default) links mimalloc 2.1.7 (`src/static.c`, one object,
+`MI_MALLOC_OVERRIDE`, arena reserve lowered from 1 GiB to 64 MiB) in place of musl's
+mallocng; `NETSURF_MALLOC=musl` keeps musl's. /wiki/Greece: 19.6 s -> 14.9 s.
 
 ## JavaScript engine: QuickJS (default)
 
