@@ -22,7 +22,9 @@ cd "$(dirname "$0")"
 OUT="os_install.iso"
 ROOTFS="iso_rootfs.img"
 STAGING="iso_install"
-ROOTFS_MB=80
+# Live root size. 80 MiB left only ~4.6 MiB free; 160 MiB leaves ~85 MiB
+# for files created on the live system (the ISO grows by the same 80 MiB).
+ROOTFS_MB=160
 
 # Real userspace tools (apps/*.c). Not demos or tests
 # (udp_test, tcp_test, sdl_user_demo, example_widgets_demo, herb_engine, ...).
