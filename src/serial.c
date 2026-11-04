@@ -66,11 +66,25 @@ static bool in_timestamp;
 static char line_peek[SERIAL_LINE_PEEK];
 static int line_peek_len;
 
+/* TX FIFO bursts (batch 21). On a 16550A, LSR.THRE means the whole 16-byte
+ * transmit FIFO is empty, so after one THRE poll up to 16 bytes can be
+ * written back to back. Under QEMU every port access is a slow exit, so this
+ * roughly halves the cost of serial output. serial_init() sets the depth to
+ * 16 only when IIR reports a working FIFO; 8250/16450-class UARTs (and the
+ * time before init) keep the old poll-per-byte behaviour. Callers hold
+ * serial_out_lock (or run before SMP), which also guards serial_tx_room. */
+static int serial_fifo_depth = 1;
+static int serial_tx_room;
+
 static void serial_hw_putc(char c) {
     bootlog_putc(c);           /* RAM boot log, written to /BOOTLOG.TXT */
-    while ((inb(SERIAL_PORT + 5) & 0x20) == 0)
-        ;
+    if (serial_tx_room <= 0) {
+        while ((inb(SERIAL_PORT + 5) & 0x20) == 0)
+            ;
+        serial_tx_room = serial_fifo_depth;
+    }
     outb(SERIAL_PORT, c);
+    serial_tx_room--;
 }
 
 static void serial_hw_put_u64_padded(uint64_t val, int min_width) {
@@ -245,6 +259,9 @@ void serial_init(void) {
     outb(SERIAL_PORT + 3, 0x03);
     outb(SERIAL_PORT + 2, 0xC7);
     outb(SERIAL_PORT + 4, 0x0B);
+    /* IIR bits 7:6 = 11: FIFO enabled and working (16550A or later). */
+    serial_tx_room = 0;
+    serial_fifo_depth = ((inb(SERIAL_PORT + 2) & 0xC0) == 0xC0) ? 16 : 1;
 }
 
 void serial_putc(char c) {
