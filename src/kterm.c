@@ -464,10 +464,46 @@ static void kt_vt_resize(int rows, int cols) {
     kt_vt_clamp();
 }
 
+/* Log mirror queue (batch 20). Every terminal row that scrolls out is
+ * mirrored to the serial log for the test harnesses, but serial output is
+ * slow (~0.4 ms/char under QEMU TCG). Printing it inline made the main loop
+ * stall ~40 ms per row while draining the shell pipe, so a program writing
+ * a lot to its tty (NetSurf console stack traces) blocked in write() for
+ * seconds. Rows are queued here and printed a few per main-loop pass;
+ * nothing is dropped: when the queue is full the oldest rows are printed
+ * synchronously, as before. Only touched under kt_busy. */
+#define KT_MQ_SIZE   65536u          /* power of two */
+#define KT_MQ_BUDGET 2               /* rows printed per pump/tick call */
+static char     kt_mq[KT_MQ_SIZE];
+static uint32_t kt_mq_head, kt_mq_tail;   /* free-running; head = write */
+
+static bool kt_mq_pop_print(void) {
+    if (kt_mq_tail == kt_mq_head) return false;
+    char line[KT_COLS + 1];
+    int n = 0;
+    for (;;) {
+        char c = kt_mq[kt_mq_tail++ & (KT_MQ_SIZE - 1)];
+        if (c == '\0') break;
+        if (n < KT_COLS) line[n++] = c;
+    }
+    line[n] = '\0';
+    serial_printf("[kterm] | %s\n", line);    /* mirror for logs */
+    return true;
+}
+
+static void kt_mq_flush(int max_rows) {
+    while (max_rows-- > 0 && kt_mq_pop_print())
+        ;
+}
+
 static void kt_vt_mirror_row(int r) {
     char line[KT_COLS];
     kt_vt_rowtext(r, line, KT_COLS);
-    serial_printf("[kterm] | %s\n", line);    /* mirror for logs */
+    uint32_t need = (uint32_t)strlen(line) + 1;
+    while (KT_MQ_SIZE - (kt_mq_head - kt_mq_tail) < need && kt_mq_pop_print())
+        ;                                       /* full: old behaviour */
+    for (uint32_t i = 0; i < need; i++)
+        kt_mq[kt_mq_head++ & (KT_MQ_SIZE - 1)] = line[i];
 }
 
 static void kt_vt_lf(void) {
@@ -1222,6 +1258,7 @@ bool kterm_pump(void) {
         K = &kt_pool[i];
         if (kt_pump_one()) got = true;
     }
+    kt_mq_flush(KT_MQ_BUDGET);
     kt_leave();
     return got;
 }
@@ -1241,6 +1278,7 @@ bool kterm_tick(void) {
         kunlock(&kt_win->content_lock);
         drew = true;
     }
+    kt_mq_flush(KT_MQ_BUDGET);
     kt_leave();
     return drew;
 }
