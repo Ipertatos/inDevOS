@@ -57,16 +57,24 @@ op 3 = status). `dhcp -a` is what the NetSurf desktop shortcut runs.
   `setAttribute('class')` now restyle when done before layout).
 - `patches/libdom_event_target.py <libdom/src/core/node.c>`: listeners on the event
   target ran twice (AT_TARGET and BUBBLING); now once.
+- `patches/html_reflow_throttle.py <netsurf-all-3.11>`: each arriving reformattable
+  object (SVG) no longer triggers an unthrottled full-page reformat; object reformats
+  honour the content reformat time with one deferred reformat (Wikipedia has
+  hundreds of SVG icons).
+- `patches/js_fetch_headers.py <netsurf-all-3.11>`: llcache sends the request
+  headers a script passes to `fetch()` / `XMLHttpRequest` (e.g. `Accept: application/json`).
 
 ## JavaScript engine: QuickJS (default)
 
 `NETSURF_JS=quickjs` (default) builds Bellard's QuickJS 2025-04-26 (engine only,
 `$NETSURF_WORK/sysroot/lib/libquickjs.a`) and NetSurf's JS backend from
 `quickjs/qjs.c` (bindings, timers, fetch/XHR, post-layout relayout "rebox",
-ES module loader via libcurl) and `quickjs/dom.js` (DOM prelude, minimal Intl),
-compiled in with xxd. `NETSURF_JS=duktape` builds the stock Duktape backend
-instead (use a fresh `$NETSURF_WORK` when switching an already patched tree).
-Debug env: `NETSURF_QJS_DUMP=1` (DOM/box dumps), `NETSURF_GRID_DEBUG=1`.
+ES module loader via libcurl, native `N.collect` subtree walks for selectors,
+2 MiB JS stack) and `quickjs/dom.js` (DOM prelude, minimal Intl, custom elements,
+shadow DOM, MutationObserver, TreeWalker/NodeIterator), compiled in with xxd.
+`NETSURF_JS=duktape` builds the stock Duktape backend instead (use a fresh
+`$NETSURF_WORK` when switching an already patched tree). Debug env:
+`NETSURF_QJS_DUMP=1` (DOM/box dumps), `NETSURF_GRID_DEBUG=1`.
 
 Patches for it (unified diffs `patches/<name>.diff`, -p1 against netsurf-all-3.11,
 applied by `patches/<name>.py <netsurf-all-3.11>` through `patches/nsdiff.py`;
@@ -84,13 +92,13 @@ needs GNU `patch`; idempotent):
 - `forms_orphans`: frees form controls outside any `<form>` (were leaked per relayout).
 - `js_modules`: `<script type=module>` (external ones deferred), `type=importmap`, `nomodule`.
 
-Not supported: subgrid, named lines/areas, dense packing, custom element upgrades.
-Test pages: `tests/netsurf/test/` (grid1, inl, module + mod/, orphan).
+Not supported: subgrid, named lines/areas, dense packing.
+Test pages: `tests/netsurf/test/` (grid1, inl, module + mod/, orphan, custom_el).
 
 ## Reference
 
-The binaries used for the gated ISOs (`os_install.iso` md5 de8f94c9...) had
-these md5s: `netsurf` 043e3c39b68f887ddd1007ade1ab364b (9,397,632 B),
-`dhcp` 1d60041ef367aa5e36741a363b0a3625 (30,312 B). A rebuild need not be
-byte-identical. `../MD5SUMS` covers only the tracked runtime files.
+The binaries in the current gated `os_install.iso` (md5 afda007c..., batch 20)
+have these md5s: `netsurf` 5209686c49fba58e20e0652f887c2231 (9,335,280 B,
+QuickJS build), `dhcp` 563c8a459504b6214a0ad15d479e0663 (26,232 B). A rebuild
+need not be byte-identical. `../MD5SUMS` covers only the tracked runtime files.
 See `NOTES.md` for build notes and the syscalls NetSurf uses.

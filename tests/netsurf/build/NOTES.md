@@ -1,6 +1,6 @@
 # NetSurf 3.11 -> inDevOS (build notes, 2026-10-24)
-- Build: ./build_netsurf.sh  -> tests/netsurf/netsurf (static musl ELF EXEC, no interp, 9,397,632 B stripped; 19,266,360 unstripped), tests/netsurf/res (1.1 MB with fonts/, which is dropped)
-- Features: curl 8.10.1 + OpenSSL 3.0.15 + zlib, PNG, JPEG, GIF, BMP, SVG, RISC OS sprite, PSL, nslog, Duktape JS, utf8proc; freetype 2.13.3 + DejaVu TTFs (Greek etc.). Off: WebP, JPEG-XL, video, PDF export.
+- Build: ./build_netsurf.sh  -> tests/netsurf/netsurf (static musl ELF EXEC, no interp, 9,335,280 B stripped with QuickJS as of 2026-11-02; the first Duktape build was 9,397,632 B), tests/netsurf/res (UI resources plus six DejaVu TTFs; the stock fonts/ dir is dropped)
+- Features: curl 8.10.1 + OpenSSL 3.0.15 + zlib, PNG, JPEG, GIF, BMP, SVG, RISC OS sprite, PSL, nslog, QuickJS 2025-04-26 (default; Duktape via NETSURF_JS=duktape), utf8proc; freetype 2.13.3 + DejaVu TTFs (Greek etc.). Off: WebP, JPEG-XL, video, PDF export.
 - libnsfb surfaces: ram (stock) + wm (patches/nsfb_wm.c, /dev/wm ABI v1.1; lowest enum => default). No linux-fbdev surface in libnsfb 0.2.x; SDL/X/VNC/Wayland not built.
 - Resource search path (NETSURF_FB_RESPATH): ~/.netsurf/, $NETSURFRES, /etc/netsurf/, /cdrom/etc/netsurf/, /usr/share/netsurf/, /cdrom/usr/share/netsurf/.
 - Host smoke test (ram surface): HOME=/tmp/nst NETSURFRES=$PWD/tests/netsurf/res/ tests/netsurf/netsurf -v -f ram file:///tmp/nst/t.html
