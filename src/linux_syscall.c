@@ -2367,6 +2367,7 @@ typedef struct lx_futex_waiter {
     uint32_t bitset;
     volatile int woken;
     bool requeued;
+    thread_t *thr;             /* waiting thread, kicked by WAKE (batch 21) */
 } lx_futex_waiter_t;
 static lx_futex_waiter_t *lx_futex_q;
 static spinlock_t lx_futex_lock;
@@ -2400,7 +2401,12 @@ static int lx_futex_wake_locked(uint64_t as, uint64_t addr, int n, uint32_t bits
         lx_futex_waiter_t *w = *pp;
         if (w->key_as == as && w->key_addr == addr && (w->bitset & bitset)) {
             *pp = w->next; w->next = NULL;
+            thread_t *thr = w->thr;   /* w lives on the waiter's stack */
             __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
+            /* Still under lx_futex_lock: the waiter cannot leave
+             * lx_futex() until we drop it, so thr is sleeping in the wait
+             * loop (or about to re-check), never in an unrelated sleep. */
+            if (thr) thread_wake(thr);
             woke++;
         } else pp = &w->next;
     }
@@ -2443,7 +2449,7 @@ static long lx_futex(process_t *p, uint64_t uaddr, long opw, uint32_t val, uint6
             dl = ktime_deadline_ms((rel_us + 999) / 1000);
         }
         if (lx_get(&cur, (void *)uaddr, 4)) return -EFAULT;   /* fault the page in */
-        lx_futex_waiter_t w = { NULL, as, addr, bitset, 0, false };
+        lx_futex_waiter_t w = { NULL, as, addr, bitset, 0, false, scheduler_get_current_thread() };
         klock(&lx_futex_lock);
         if (lx_get(&cur, (void *)uaddr, 4)) { kunlock(&lx_futex_lock); return -EFAULT; }
         if (cur != val) { kunlock(&lx_futex_lock); return -EAGAIN; }
@@ -2451,12 +2457,14 @@ static long lx_futex(process_t *p, uint64_t uaddr, long opw, uint32_t val, uint6
         kunlock(&lx_futex_lock);
         long ret = 0;
         for (;;) {
-            if (__atomic_load_n(&w.woken, __ATOMIC_ACQUIRE)) return 0;
+            if (__atomic_load_n(&w.woken, __ATOMIC_ACQUIRE)) break;   /* exit via the lock */
             if (has_to && ktime_expired(dl)) { ret = -ETIMEDOUT; break; }
             if (proc_kill_pending(p) || (p->linux_abi && proc_signal_interrupts(p))) { ret = -EINTR; break; }
             if (!w.requeued && lx_get(&cur, (void *)uaddr, 4) == 0 && cur != val) { ret = 0; break; }
             fork_release_pending(p);
-            thread_sleep(1);
+            /* WAKE kicks us (thread_wake); the timed sleep only bounds the
+             * rare lost-kick window and the signal / changed-word checks. */
+            thread_sleep(has_to ? 1 : 5);   /* keep timeout precision */
         }
         klock(&lx_futex_lock);
         if (__atomic_load_n(&w.woken, __ATOMIC_ACQUIRE)) ret = 0;   /* woken meanwhile */
