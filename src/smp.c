@@ -499,7 +499,25 @@ static void tlb_sd_report(uint64_t g, uint32_t missing, uint32_t me, void *ra) {
     }
 }
 
-void smp_tlb_shootdown(void) {
+/* Per-CPU physical CR3 currently loaded, 0 = unknown (always targeted).
+ * Written by vmm_switch_address_space() BEFORE the CR3 write, with IRQs off:
+ * an initiator that clears PTEs and then reads a stale (old) value here can
+ * only miss a CPU whose CR3 load - and so its TLB flush and every later walk -
+ * comes after the PTE change was made visible (batch 21). */
+volatile uint64_t smp_cpu_cr3[MAX_CPUS];
+static volatile uint64_t tlb_sd_skipped;   /* IPIs saved, for ostest/debug */
+
+void smp_note_cr3(uint64_t phys) {
+    uint32_t me = smp_cpu_index_fast();
+    if (me < MAX_CPUS)
+        __atomic_store_n(&smp_cpu_cr3[me], phys, __ATOMIC_SEQ_CST);
+}
+
+uint64_t smp_tlb_shootdown_skipped(void) { return tlb_sd_skipped; }
+
+/* as_cr3 == 0: every online CPU (kernel mappings, COW, clone).
+ * as_cr3 != 0: only CPUs that have that address space loaded (or unknown). */
+static void tlb_shootdown_common(uint64_t as_cr3) {
     uint64_t online = cpus_online;
     if (online <= 1) {
         tlb_flush_local();
@@ -515,7 +533,25 @@ void smp_tlb_shootdown(void) {
     uint32_t me = smp_cpu_index_fast();
     uint64_t g = __atomic_add_fetch(&tlb_sd_gen, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&spin_tlb_pending, 1, __ATOMIC_SEQ_CST);
-    smp_send_ipi_all_except_self(IPI_VECTOR_TLB_FLUSH);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* PTE stores before cr3 reads */
+    uint64_t target = 0;                       /* bit c: wait for cpu c */
+    for (uint32_t c = 0; c < MAX_CPUS && c < 64; c++) {
+        if (c == me || !cpu_data[c].online) continue;
+        if (as_cr3) {
+            uint64_t cc = __atomic_load_n(&smp_cpu_cr3[c], __ATOMIC_SEQ_CST);
+            if (cc && (cc & ~0xFFFULL) != (as_cr3 & ~0xFFFULL)) {
+                tlb_sd_skipped++;
+                continue;
+            }
+        }
+        target |= 1ULL << c;
+    }
+    if (!as_cr3)
+        smp_send_ipi_all_except_self(IPI_VECTOR_TLB_FLUSH);
+    else
+        for (uint32_t c = 0; c < MAX_CPUS && c < 64; c++)
+            if (target & (1ULL << c))
+                smp_send_ipi(cpu_data[c].lapic_id, IPI_VECTOR_TLB_FLUSH);
     tlb_flush_local();
     if (me < MAX_CPUS)
         __atomic_store_n(&tlb_sd_acked[me], g, __ATOMIC_SEQ_CST);
@@ -525,6 +561,7 @@ void smp_tlb_shootdown(void) {
         missing = 0;
         for (uint32_t c = 0; c < MAX_CPUS; c++) {
             if (c == me || !cpu_data[c].online) continue;
+            if (c < 64 && !(target & (1ULL << c))) continue;
             if (__atomic_load_n(&tlb_sd_acked[c], __ATOMIC_ACQUIRE) < g)
                 missing |= (c < 32) ? (1u << c) : 0x80000000u;
         }
@@ -535,13 +572,15 @@ void smp_tlb_shootdown(void) {
     __atomic_store_n(&spin_tlb_pending, 0, __ATOMIC_SEQ_CST);
     if (missing && tlb_sd_timeouts < 16) {
         tlb_sd_timeouts++;
-        /* Still holding tlb_sd_lock with IF=0: the report reflects the
-         * stuck state, and no other shootdown can interleave with it. */
         tlb_sd_report(g, missing, me, __builtin_return_address(0));
     }
     __sync_lock_release(&tlb_sd_lock.lock);
     irq_restore(flags);
 }
+
+void smp_tlb_shootdown(void) { tlb_shootdown_common(0); }
+
+void smp_tlb_shootdown_as(uint64_t cr3_phys) { tlb_shootdown_common(cr3_phys); }
 
 void smp_reschedule_cpu(uint32_t cpu_id) {
     if (cpu_id >= MAX_CPUS || !cpu_data[cpu_id].online) return;

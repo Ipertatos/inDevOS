@@ -150,6 +150,10 @@ void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector);
 void smp_send_ipi_all_except_self(uint8_t vector);
 /** Broadcast TLB flush and wait until every online CPU has flushed. */
 void smp_tlb_shootdown(void);
+/* Flush only CPUs that have this address space (physical CR3) loaded. */
+void smp_tlb_shootdown_as(uint64_t cr3_phys);
+void smp_note_cr3(uint64_t phys);
+uint64_t smp_tlb_shootdown_skipped(void);
 /** Called from IPI_VECTOR_TLB_FLUSH handler after local flush. */
 void smp_tlb_shootdown_ack(void);
 

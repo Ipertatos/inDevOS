@@ -975,11 +975,12 @@ typedef struct {
     uint64_t tables[VMM_TABLE_BATCH];
     unsigned nf, nt;
     bool need_flush;
+    uint64_t as_phys;      /* address space being unmapped (batch 21) */
 } vmm_unmap_batch_t;
 
 static void vmm_unmap_batch_flush(vmm_unmap_batch_t *b) {
     if (b->need_flush)
-        smp_tlb_shootdown();
+        smp_tlb_shootdown_as(b->as_phys);   /* user half only: CPUs on this CR3 */
     b->need_flush = false;
     for (unsigned j = 0; j < b->nf; j++)
         vmm_leaf_release(b->frames[j]);
@@ -1011,6 +1012,7 @@ int vmm_unmap_range_release_in(uint64_t *pml4, uint64_t virtual_addr,
     vmm_unmap_batch_t b;
     b.nf = b.nt = 0;
     b.need_flush = false;
+    b.as_phys = virt_to_phys(pml4);
     int cleared = 0;
 
     uint64_t va  = virtual_addr & ~(uint64_t)(PAGE_SIZE - 1);
@@ -1283,7 +1285,12 @@ uint64_t* vmm_clone_address_space(uint64_t *src_pml4) {
 void vmm_switch_address_space(uint64_t *pml4) {
     if (!pml4) return;
     uint64_t phys = virt_to_phys(pml4);
+    /* Note the CR3 for targeted shootdowns before loading it, both with IRQs
+     * off so the note and the load happen on the same CPU. */
+    uint64_t fl = irq_save();
+    smp_note_cr3(phys);
     __asm__ volatile("mov %0, %%cr3" : : "r"(phys) : "memory");
+    irq_restore(fl);
 }
 
 /**
