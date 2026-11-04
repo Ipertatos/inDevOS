@@ -507,6 +507,10 @@ int perm_chmod(const char *path, uint16_t mode) {
         printf("chmod: permission denied\n");
         return -1;
     }
+    /* Filesystems with on-disk inode modes (ext4, tmpfs) keep the bits, so
+     * the chmod survives remount and reboot; FAT/exFAT/ISO return -ENOSYS
+     * and keep only this per-boot table entry (batch 21). */
+    (void)vfs_setattr(path, VFS_SA_MODE, (uint32_t)(mode & 07777), 0, 0);
     return perm_set(path, file_uid, file_gid, mode);
 }
 
