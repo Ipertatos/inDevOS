@@ -126,6 +126,10 @@ static void post(uint32_t desk_id, struct wm_event *ev) {
         q_push_locked(c, ev);
     }
     kunlock(&wm_lock);
+    if (c) {
+        extern void kpoll_wake(void);
+        kpoll_wake();                   /* batch 21: /dev/wm pollers */
+    }
 }
 
 /* Remove a surface's pages from the address space that mapped them, if that

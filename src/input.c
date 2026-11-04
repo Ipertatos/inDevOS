@@ -173,7 +173,7 @@ void input_event(input_dev_t *d, unsigned type, unsigned code, int32_t value) {
     if (!d || !d->present || type > EV_MAX) return;
     if (!input_test_bit(d->evbit, type)) return;
     uint64_t us = ktime_now_us();
-    bool run_handlers = false;
+    bool run_handlers = false, pushed = false;
     uint64_t f = ilock();
     switch (type) {
     case EV_KEY:
@@ -214,9 +214,14 @@ void input_event(input_dev_t *d, unsigned type, unsigned code, int32_t value) {
         if (c->dev != d || c->revoked) continue;
         if (d->grab && d->grab != c) continue;
         client_push(c, us, (uint16_t)type, (uint16_t)code, value);
+        pushed = true;
     }
 out:
     iunlock(f);
+    if (pushed) {
+        extern void kpoll_wake(void);
+        kpoll_wake();                   /* batch 21: evdev pollers */
+    }
     if (run_handlers) {
         for (int i = 0; i < n_sync_handlers; i++) sync_handlers[i](d);
     }

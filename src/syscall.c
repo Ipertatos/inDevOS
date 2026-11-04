@@ -4002,7 +4002,7 @@ short poll_eval_obj(process_t *proc, int fd, uint8_t type, void *h, short events
             rev |= (short)ux_poll(ks, events | 0x2000);
             if (!(events & 0x2000)) rev &= ~0x2000;
         } else if (ks && ks->type == SOCK_DGRAM) {
-            hint->nonevent = true;
+            /* batch 21: udp_pcb_deliver() calls kpoll_wake() */
             udp_pcb_t *pcb = (udp_pcb_t *)ks->transport;
             if ((events & POLLIN) && pcb && udp_pcb_rx_ready(pcb) > 0)
                 rev |= POLLIN;
@@ -4011,7 +4011,8 @@ short poll_eval_obj(process_t *proc, int fd, uint8_t type, void *h, short events
                 if (events & 0x0100) rev |= 0x0100;
             }
         } else {
-            hint->nonevent = true;
+            /* batch 21: tcp_handle_packet() calls kpoll_wake() after every
+             * segment; timer-driven closes are caught by the kpoll cap */
             tcp_socket_t *ts = ks ? (tcp_socket_t *)ks->transport : NULL;
             tcp_connection_t *conn = ts ? ts->connection : NULL;
             extern bool tcp_conn_at_eof(tcp_connection_t *c);
@@ -4085,7 +4086,10 @@ short poll_eval_obj(process_t *proc, int fd, uint8_t type, void *h, short events
     case 10: {  /* FD_TYPE_DEV_INPUT */
         extern bool evdev_poll_ready(void *handle, bool *hup);
         bool hup = false;
-        hint->nonevent = true;
+        /* batch 21: input_event() calls kpoll_wake(); polled USB HID still
+         * needs pumping (evdev_poll_ready -> usb_poll), so re-check every
+         * 8 ms instead of every tick */
+        kpoll_hint_timer(hint, ktime_now_us() + 8000);
         if (evdev_poll_ready(h, &hup)) {
             if (events & POLLIN) rev |= POLLIN;
             if (hup) rev |= POLLHUP | POLLERR;
@@ -4101,7 +4105,7 @@ short poll_eval_obj(process_t *proc, int fd, uint8_t type, void *h, short events
         break;
     case 12: {  /* FD_TYPE_DEV_WM */
         extern bool wm_dev_poll_ready(void *handle);
-        hint->nonevent = true;
+        /* batch 21: post() calls kpoll_wake() */
         if ((events & POLLIN) && wm_dev_poll_ready(h))
             rev |= POLLIN;
         rev |= events & POLLOUT;

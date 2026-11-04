@@ -406,6 +406,10 @@ static int udp_pcb_deliver(uint16_t src_port, uint16_t dst_port,
     s->rx_tail = (s->rx_tail + 1) % UDP_RX_MAX;
     s->rx_count++;
     kunlock(&udp_lock);
+    {
+        extern void kpoll_wake(void);
+        kpoll_wake();                   /* batch 21: pollers see POLLIN */
+    }
     return 1;
 }
 

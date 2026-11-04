@@ -958,7 +958,16 @@ int tcp_close(tcp_connection_t *conn) {
 }
 
 // Packet handling
+/* batch 21: every processed segment may change what a poller sees (data,
+ * accept queue, connect done, FIN/RST): wake kpoll sleepers after it. */
+static void tcp_handle_packet_in(const uint8_t *frame, uint32_t len);
 void tcp_handle_packet(const uint8_t *frame, uint32_t len) {
+    extern void kpoll_wake(void);
+    tcp_handle_packet_in(frame, len);
+    kpoll_wake();
+}
+
+static void tcp_handle_packet_in(const uint8_t *frame, uint32_t len) {
     if (len < 34) { // Ethernet (14) + minimal IP (20)
         tcp_dbg("TCP: Packet too short\n");
         return;
