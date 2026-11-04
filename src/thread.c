@@ -611,10 +611,43 @@ bool scheduler_has_ready_user_threads(void) {
  * slept until a deadline (frame pacing, input poll, timeout) is exactly
  * the kind of latency-sensitive work that should not sit behind
  * CPU-bound threads at the tail. */
-void scheduler_wake_expired(uint64_t now) {
+/* batch 21: earliest sleep_until of a kpoll (poll/select/epoll timeout)
+ * sleeper in the sleeping queue (UINT64_MAX = none).  Only poll timeouts
+ * get the precise per-tick wakeup: doing it for every thread_sleep let
+ * Doom's paced sleeps keep CPU0 busy enough to starve the kernel main loop
+ * (DHCP, keyboard fallback) for ~60 s on the desktop.
+ * Lowered on every insert, recomputed by the sweep; a stale LOW value only
+ * costs one empty sweep, it is never stale high.  Lets every CPU's timer
+ * tick check "anything due?" without the lock, so sleeps end on time
+ * instead of waiting for CPU0's every-4th-tick sweep (which was also
+ * skipped while CPU0 ran with preemption disabled: 100-300 ms late). */
+volatile uint64_t sched_next_wake = ~0ULL;
+
+static inline void sched_note_wake_unlocked(uint64_t t) {
+    if (t < sched_next_wake) __atomic_store_n(&sched_next_wake, t, __ATOMIC_RELEASE);
+}
+
+static uint32_t scheduler_wake_expired_locked(uint64_t now);
+
+/* Timer-tick fast path (any CPU, IRQs off): sweep if something is due and
+ * the scheduler lock is free; otherwise the next tick retries. */
+void scheduler_tick_wake_due(void) {
+    if (hpet_get_ticks() < __atomic_load_n(&sched_next_wake, __ATOMIC_ACQUIRE)) return;
+    if (__sync_lock_test_and_set(&global_scheduler.scheduler_lock.lock, 1)) return;
+    uint32_t woke_mask = scheduler_wake_expired_locked(hpet_get_ticks());
+    spinlock_unlock(&global_scheduler.scheduler_lock);
+    if (!woke_mask) return;
+    per_cpu_t *me = smp_get_current_cpu();
+    uint32_t my_id = me ? me->cpu_id : 0;
+    for (uint32_t c = 0; c < 32 && c < MAX_CPUS; c++) {
+        if (c == my_id) continue;
+        if ((woke_mask & (1u << c)) && cpu_data[c].online)
+            smp_reschedule_cpu(c);
+    }
+}
+
+static uint32_t scheduler_wake_expired_locked(uint64_t now) {
     uint32_t woke_mask = 0;
-    uint64_t flags = irq_save();
-    spinlock_lock(&global_scheduler.scheduler_lock);
     while (global_scheduler.sleeping_queue) {
         thread_t *thread = global_scheduler.sleeping_queue;
         if (now < thread->sleep_until)
@@ -628,6 +661,20 @@ void scheduler_wake_expired(uint64_t now) {
         _scheduler_add_thread_front_unlocked(thread);
         woke_mask |= (thread->home_cpu < 32) ? (1u << thread->home_cpu) : 0;
     }
+    {
+        uint64_t nw = ~0ULL;
+        for (thread_t *t = global_scheduler.sleeping_queue; t; t = t->next)
+            if (t->kpoll_waiting) { nw = t->sleep_until; break; }
+        __atomic_store_n(&sched_next_wake, nw, __ATOMIC_RELEASE);
+    }
+    return woke_mask;
+}
+
+void scheduler_wake_expired(uint64_t now) {
+    uint32_t woke_mask = 0;
+    uint64_t flags = irq_save();
+    spinlock_lock(&global_scheduler.scheduler_lock);
+    woke_mask = scheduler_wake_expired_locked(now);
     spinlock_unlock(&global_scheduler.scheduler_lock);
     irq_restore(flags);
 
@@ -1128,6 +1175,7 @@ void kpoll_sleep_ms(uint32_t snap, uint64_t ms) {
     *pp = current;
     current->prev = prev_node;
     current->kpoll_waiting = 1;
+    sched_note_wake_unlocked(wakeup_time);
     spinlock_unlock(&global_scheduler.scheduler_lock);
     irq_restore(flags);
     thread_yield();

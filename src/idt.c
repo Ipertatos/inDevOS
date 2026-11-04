@@ -1193,6 +1193,12 @@ void preemptive_schedule(registers_t *r) {
     sched_oncpu_flush();
     /* Grace-period mark for the dead-thread reaper, then free what is safe. */
     thread_reaper_tick();
+    /* batch 21: any CPU, every tick, even with preemption disabled here:
+     * wake sleepers that are due (cheap unlocked check, trylock sweep). */
+    {
+        extern void scheduler_tick_wake_due(void);
+        scheduler_tick_wake_due();
+    }
 
     per_cpu_t *me = smp_get_current_cpu();
     uint32_t cpu_idx = (me && me->cpu_id < MAX_CPUS) ? me->cpu_id : 0;
